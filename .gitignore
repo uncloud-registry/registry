@@ -1,0 +1,22 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# Build and test output
+/registry
+/controlplane
+/bin/
+/dist/
+coverage.out
+*.coverprofile
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
