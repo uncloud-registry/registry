@@ -13,6 +13,22 @@ if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
   exit 2
 fi
 
+# Resolve the repository top-level and anchor all subsequent scan/path
+# operations to it. git grep and git ls-files default to the CURRENT
+# directory (not the repo root), so without this a nested invocation would
+# miss credentials and tracked runtime files elsewhere in the repo. Fail
+# closed if the top-level cannot be resolved.
+top="$(git rev-parse --show-toplevel 2>&1)" || {
+  echo "error: cannot resolve repository top-level:" >&2
+  printf '%s\n' "$top" >&2
+  exit 2
+}
+if [ ! -d "$top" ]; then
+  echo "error: repository top-level is not a directory: $top" >&2
+  exit 2
+fi
+cd "$top" || { echo "error: cannot cd to $top" >&2; exit 2; }
+
 # Credential-like patterns enforced on tracked files.
 #  - PEM headers: RSA / EC / OPENSSH, and PKCS#8 ('BEGIN[ ]PRIVATE KEY';
 #    '[ ]' instead of a literal space keeps this source text from matching its

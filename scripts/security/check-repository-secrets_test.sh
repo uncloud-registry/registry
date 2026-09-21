@@ -98,6 +98,37 @@ new_repo "$env"
 add_tracked "$env" ".env" "FOO=bar"
 assert_exit 1 "$env" "tracked .env rejected"
 
+say "== invocation from a nested subdirectory scans the whole repository =="
+# A credential-like file at the REPO ROOT must still be rejected when the
+# scanner is launched from a nested working directory. Regression for the
+# root-normalization bypass: git grep/ls-files default to the CURRENT
+# directory, so a nested cwd used to hide root-level findings.
+nested_cred="$tmpdir/nested-cred"
+new_repo "$nested_cred"
+mkdir -p "$nested_cred/sub"
+add_tracked "$nested_cred" "secret.txt" "prefix $pem_rsa suffix"
+assert_exit 1 "$nested_cred/sub" "credential at repo root rejected from nested cwd"
+
+# Sensitive runtime file tracked at REPO ROOT must be rejected from a nested cwd.
+nested_db="$tmpdir/nested-db"
+new_repo "$nested_db"
+mkdir -p "$nested_db/sub"
+add_tracked "$nested_db" "controlplane.db" "some database bytes"
+assert_exit 1 "$nested_db/sub" "tracked controlplane.db at root rejected from nested cwd"
+
+# .env at ROOT likewise rejected from a nested cwd.
+nested_env="$tmpdir/nested-env"
+new_repo "$nested_env"
+mkdir -p "$nested_env/sub"
+add_tracked "$nested_env" ".env" "FOO=bar"
+assert_exit 1 "$nested_env/sub" "tracked .env at root rejected from nested cwd"
+
+# Positive control: a clean repo with a nested subdir still passes from there.
+nested_clean="$tmpdir/nested-clean"
+new_repo "$nested_clean"
+mkdir -p "$nested_clean/sub"
+assert_exit 0 "$nested_clean/sub" "clean repo passes from nested cwd"
+
 say "== git operational errors do not return success =="
 op="$tmpdir/op"
 new_repo "$op"
