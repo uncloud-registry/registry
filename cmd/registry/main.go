@@ -149,9 +149,15 @@ func envOrDefault(name string, fallback string) string {
 // authorized). When present but empty/weak, NewSessionTokenManager rejects it
 // and the error is returned so startup config construction fails rather than
 // silently falling back to a nil manager.
+//
+// Whitespace is used only to detect a missing/all-whitespace value; any
+// nonblank secret is preserved byte-for-byte as the HMAC key. This mirrors
+// cmd/controlplane's envRequiredSecret so the two processes derive the
+// identical key from the same shared env value (secrets are opaque bytes, not
+// human text to be trimmed).
 func tokenManagerFromEnv() (*auth.SessionTokenManager, error) {
-	secret := strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_SECRET"))
-	if secret == "" {
+	secret := os.Getenv("REGISTRY_TOKEN_SECRET")
+	if strings.TrimSpace(secret) == "" {
 		return nil, nil
 	}
 	return auth.NewSessionTokenManager(secret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
