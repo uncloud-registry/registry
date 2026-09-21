@@ -7,7 +7,8 @@ import "time"
 // (User, Registry, Membership, Invite) must never be marshaled or handed to a
 // template directly; secrets such as User.PasswordHash, Registry.FeedKey
 // (the at-rest AES-GCM envelope for the feed-owner signing key), and
-// Invite.TokenHash have no public representation.
+// Invite.TokenDigest (the one-way SHA-256 of the raw invite token) have no
+// public representation.
 
 type PublicUser struct {
 	ID        int64     `json:"id"`

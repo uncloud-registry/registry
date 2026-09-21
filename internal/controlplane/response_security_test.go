@@ -99,10 +99,10 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 		t.Fatalf("expected member email rendered in detail page (public boundary), body: %s", uiDetailBody)
 	}
 
-	// API invite create: one-time raw token in its own field, token hash never.
+	// API invite create: one-time raw token in its own field, digest never.
 	inviteBody := postJSON(t, client, server.URL, "/api/registries/"+strconv.FormatInt(created.ID, 10)+"/invites",
 		map[string]any{"email": "bob@example.com", "canPull": true, "canPush": true}, aliceSession)
-	assertNoSecretField(t, inviteBody, []byte("TokenHash"), []byte("tokenHash"))
+	assertNoSecretField(t, inviteBody, []byte("TokenHash"), []byte("tokenHash"), []byte("TokenDigest"), []byte("tokenDigest"))
 	var invited map[string]any
 	if err := json.Unmarshal(inviteBody, &invited); err != nil {
 		t.Fatalf("decode invite response: %v", err)
@@ -112,7 +112,7 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 		t.Fatalf("expected raw invite token in creation response, body: %s", inviteBody)
 	}
 
-	// API invite accept: bob accepts; response must not carry the token hash.
+	// API invite accept: bob accepts; response must not carry the digest in any form.
 	if _, _, err := service.RegisterUser(context.Background(), "bob@example.com", "password123"); err != nil {
 		t.Fatalf("register bob: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 	}
 	acceptBody := postJSON(t, client, server.URL, "/api/invites/accept",
 		map[string]string{"token": rawToken}, bobSession)
-	assertNoSecretField(t, acceptBody, []byte("TokenHash"), []byte("tokenHash"))
+	assertNoSecretField(t, acceptBody, []byte("TokenHash"), []byte("tokenHash"), []byte("TokenDigest"), []byte("tokenDigest"))
 }
 
 // TestUIRegistryDetailDoesNotReconstructInviteToken proves the one-time raw
@@ -179,19 +179,22 @@ func TestUIRegistryDetailDoesNotReconstructInviteToken(t *testing.T) {
 		t.Fatalf("expected one-time raw token in creation response, body: %s", inviteBody)
 	}
 
-	// Persisted TokenHash is hex(raw token); capture it from the store.
+	// Persisted TokenDigest is the one-way SHA-256 of the raw token; capture it
+	// from the store. It is exactly 32 bytes and can never be reversed into the
+	// token.
 	pending, err := store.ListInvitesForRegistry(context.Background(), created.ID)
 	if err != nil || len(pending) == 0 {
 		t.Fatalf("no persisted invite found: %v", err)
 	}
-	persistedHash := pending[0].TokenHash
-	if persistedHash == "" || hex.EncodeToString([]byte(rawToken)) != persistedHash {
-		t.Fatalf("expected persisted TokenHash to be hex(raw token), got %q", persistedHash)
+	persistedDigest := pending[0].TokenDigest
+	if len(persistedDigest) != 32 || !bytes.Equal(persistedDigest, DigestInviteToken(rawToken)) {
+		t.Fatalf("expected persisted digest to be SHA-256(raw token), got %x", persistedDigest)
 	}
+	digestHex := hex.EncodeToString(persistedDigest)
 
 	// Request the registry-detail UI and prove the one-time token is not re-exposed.
 	detailBody := getWithCookie(t, client, server.URL, "/ui/registries/"+strconv.FormatInt(created.ID, 10), aliceSession)
-	assertNoSecretField(t, detailBody, []byte(rawToken), []byte(persistedHash), []byte("/ui/invites/accept?token="), []byte("token="), []byte("Copy invite link"))
+	assertNoSecretField(t, detailBody, []byte(rawToken), []byte(digestHex), []byte("/ui/invites/accept?token="), []byte("token="), []byte("Copy invite link"))
 	// Pending-invite public metadata must remain visible.
 	if !bytes.Contains(detailBody, []byte("bob@example.com")) {
 		t.Fatalf("expected pending invite email visible in detail page, body: %s", detailBody)

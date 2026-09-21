@@ -2,11 +2,13 @@ package controlplane
 
 import (
 	"encoding/json"
+	"errors"
 	"html/template"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const sessionCookieName = "uncloud_session"
@@ -620,6 +622,9 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 	if r.URL.Query().Get("invite_stored") == "1" {
 		message = "Invite created. The one-time share link could not be prepared; please create a new invite to share it."
 	}
+	if r.URL.Query().Get("invite_revoked") == "1" {
+		message = "Invite revoked. The collaborator can no longer accept it."
+	}
 	if flashID := r.URL.Query().Get("invite_flash"); flashID != "" {
 		// Consume the one-time flash atomically: only the authenticated creator of
 		// THIS registry may retrieve it, once. Unknown, expired, wrong-user, and
@@ -689,12 +694,20 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       <th>Email</th>
       <th>Access</th>
       <th>Status</th>
+      <th>Expires (UTC)</th>
+      <th></th>
     </tr>
     {{range .Invites}}
     <tr>
       <td>{{.Email}}</td>
       <td>{{.Permissions}}</td>
       <td>{{.Status}}</td>
+      <td>{{.ExpiresAt}}</td>
+      <td>
+        <form method="post" action="/ui/registries/{{$.Dashboard.Registry.ID}}/invites/{{.ID}}/revoke" style="display:inline;">
+          <button class="secondary" type="submit">Revoke</button>
+        </form>
+      </td>
     </tr>
     {{end}}
   </table>
@@ -837,6 +850,32 @@ func (s *HTTPServer) handleUICreateInvite(w http.ResponseWriter, r *http.Request
 	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_flash="+url.QueryEscape(flashID), http.StatusSeeOther)
 }
 
+// handleUIRevokeInvite is the UI revocation boundary: owner/admin only (the
+// service enforces it), pending invites only, atomic and idempotent for the
+// same authorized request. Every unauthorized/terminal/unknown case redirects
+// through a generic result — a revoked invite disappears from the pending
+// list; nothing about token or digest material is ever rendered.
+func (s *HTTPServer) handleUIRevokeInvite(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.requireSessionUser(w, r)
+	if !ok {
+		return
+	}
+	registryID, inviteID, ok := parseInviteRevokePath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := s.Service.RevokeInvite(r.Context(), userID, registryID, inviteID); err != nil {
+		if errors.Is(err, errInviteNotFound) || errors.Is(err, errInviteCannotRevoke) {
+			http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10), http.StatusSeeOther)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_revoked=1", http.StatusSeeOther)
+}
+
 func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter, r *http.Request) {
 	userID, ok := s.requireSessionUser(w, r)
 	if !ok {
@@ -885,7 +924,13 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 	}
 	invite, registry, err := s.Service.GetInvite(r.Context(), token)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		// Revoked, expired, accepted, unknown, and malformed tokens all render
+		// the same generic page; nothing distinguishes invite states.
+		if errors.Is(err, errInviteNotFound) {
+			http.Error(w, "This invite link is not valid or has expired.", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	switch r.Method {
@@ -934,6 +979,10 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 	case http.MethodPost:
 		if userID, ok := s.requireSessionUserID(r); ok {
 			if _, err := s.Service.AcceptInvite(r.Context(), token, userID); err != nil {
+				if errors.Is(err, errInviteNotFound) {
+					http.Error(w, "This invite link is not valid or has expired.", http.StatusNotFound)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
@@ -946,6 +995,10 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 		}
 		_, _, sessionToken, err := s.Service.RegisterAndAcceptInvite(r.Context(), token, r.FormValue("email"), r.FormValue("password"))
 		if err != nil {
+			if errors.Is(err, errInviteNotFound) {
+				http.Error(w, "This invite link is not valid or has expired.", http.StatusNotFound)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -1003,9 +1056,11 @@ func renderPage(w http.ResponseWriter, page pageData) {
 }
 
 type inviteViewModel struct {
+	ID          string
 	Email       string
 	Permissions string
 	Status      string
+	ExpiresAt   string
 }
 
 type inviteModalView struct {
@@ -1017,9 +1072,11 @@ type inviteModalView struct {
 }
 
 // inviteViewModels builds owner-facing pending-invite rows from public invite
-// DTOs only. It intentionally never reads the persistence Invite.TokenHash: the
-// one-time raw invite token is returned once in the invite-creation response and
-// must not be reconstructed for the detail page.
+// DTOs only. It intentionally never reads the persistence Invite.TokenDigest:
+// the one-time raw invite token is returned once in the invite-creation
+// response and the digest must never be reconstructed for the detail page.
+// Each pending row exposes only recipient, permissions, state, and expiry —
+// the revoke button uses the invite ID, never any credential material.
 func inviteViewModels(invites []PublicInvite) []inviteViewModel {
 	models := make([]inviteViewModel, 0, len(invites))
 	for _, invite := range invites {
@@ -1027,9 +1084,11 @@ func inviteViewModels(invites []PublicInvite) []inviteViewModel {
 			continue
 		}
 		models = append(models, inviteViewModel{
+			ID:          strconv.FormatInt(invite.ID, 10),
 			Email:       invite.Email,
 			Permissions: permissionLabel(invite.CanPull, invite.CanPush),
 			Status:      invite.Status,
+			ExpiresAt:   invite.ExpiresAt.UTC().Format(time.RFC3339),
 		})
 	}
 	return models

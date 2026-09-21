@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -73,6 +74,42 @@ var migrations = []migration{
 	{
 		Version: 3,
 		Apply:   installFeedKeyEnvelopeInvariant,
+	},
+	// Version 4 converts invite credentials to a one-way, recipient-bound,
+	// revocable lifecycle. The legacy token_hash TEXT column (which the
+	// pre-task-7 control plane populated with hex(token text) — a REVERSIBLE
+	// encoding — and which some deployments already carry as SHA-256 lowercase
+	// hex) is rebuilt as token_digest BLOB: exactly 32 bytes, unique,
+	// never reversible. The rebuild VALIDATES every existing row first:
+	//
+	//   - token_hash must be 64 lowercase-hex characters whose bytes are
+	//     either a canonical legacy token TEXT (hex of the 32-char base64url
+	//     token → converted deterministically to SHA-256 over that text) or a
+	//     SHA-256 digest (hex of exactly 32 bytes → stored verbatim). Anything
+	//     else is malformed and FAILS the migration (fully rolled back) —
+	//     plaintext-like values are never accepted as valid digests, and
+	//     pending invites are preserved ONLY when their digest is demonstrably
+	//     canonical;
+	//   - status must be pending or accepted (revoked did not exist in v1-v3;
+	//     any other value fails);
+	//   - an accepted invite must have a derivable acceptor: the
+	//     registry_memberships join on the normalized recipient email (the old
+	//     flow created the membership atomically with acceptance), otherwise
+	//     the row is corrupt and fails the migration;
+	//   - expiry must parse as RFC3339 and the invite must grant pull or push;
+	//   - converted digests must be unique (duplicate/colliding rows fail).
+	//
+	// The rebuilt table adds accepted_by_user_id (FK → users, backfilled from
+	// the member join for legacy accepted invites), accepted_at/revoked_at,
+	// status/accepted_by/revocation CHECK constraints, a status index, and
+	// state-transition triggers (invites are born pending; terminal states are
+	// immutable), closing the direct-SQL gap the way migration 3 did for feed
+	// keys. The rebuild itself runs inside the migration transaction, so any
+	// malformed/duplicate/corrupt row rolls the whole upgrade back with the
+	// legacy data untouched.
+	{
+		Version: 4,
+		Apply:   installInviteDigestSchema,
 	},
 }
 
@@ -192,6 +229,12 @@ func CurrentSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 // busy_timeout) short-circuited the function and left foreign-key enforcement
 // silently disabled across every pooled connection. Plain paths, `file:` URIs
 // and their existing query parameters are preserved.
+//
+// A busy_timeout is also guaranteed: an EXPLICIT `_pragma=busy_timeout(...)`
+// in the caller's DSN is preserved verbatim, but when none is present an
+// effective `_pragma=busy_timeout(5000)` is appended. Concurrent writes (e.g.
+// the guarded invite-acceptance transition) then wait up to 5s for the write
+// lock instead of failing immediately with SQLITE_BUSY.
 func withForeignKeys(dsn string) string {
 	// Split off any query string (first '?').
 	base, query := dsn, ""
@@ -200,6 +243,7 @@ func withForeignKeys(dsn string) string {
 	}
 
 	var kept []string
+	hasBusyTimeout := false
 	if query != "" {
 		for _, param := range strings.Split(query, "&") {
 			if param == "" {
@@ -209,6 +253,9 @@ func withForeignKeys(dsn string) string {
 			if isForeignKeyPragmaParam(param) {
 				continue
 			}
+			if isBusyTimeoutPragmaParam(param) {
+				hasBusyTimeout = true
+			}
 			kept = append(kept, param)
 		}
 	}
@@ -217,8 +264,27 @@ func withForeignKeys(dsn string) string {
 	// string doesn't matter for pragma application since our conflicting ones
 	// were removed above; keeping it last is deterministic and readable.
 	kept = append(kept, "_pragma=foreign_keys(1)")
+	// Guarantee a busy timeout only when the caller did not configure one.
+	if !hasBusyTimeout {
+		kept = append(kept, "_pragma=busy_timeout(5000)")
+	}
 
 	return base + "?" + strings.Join(kept, "&")
+}
+
+// isBusyTimeoutPragmaParam reports whether a single query parameter is a
+// `_pragma=busy_timeout(...)` DSN option.
+func isBusyTimeoutPragmaParam(param string) bool {
+	const prefix = "_pragma="
+	if !strings.HasPrefix(param, prefix) {
+		return false
+	}
+	val := param[len(prefix):]
+	name := val
+	if i := strings.Index(val, "("); i >= 0 {
+		name = val[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(name), "busy_timeout")
 }
 
 // isForeignKeyPragmaParam reports whether a single query parameter is a
@@ -448,6 +514,226 @@ func installFeedKeyEnvelopeInvariant(ctx context.Context, tx *sql.Tx) error {
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("create feed key envelope invariant trigger: %w", err)
+		}
+	}
+	return nil
+}
+
+// legacyInviteHashHexLen pin the two supported legacy token_hash encodings:
+// both are exactly 64 lowercase hex characters (uint8 hex of a 32-char
+// canonical token text in the historical format, or hex of the 32-byte SHA-256
+// digest in the newer format).
+const legacyInviteHashHexLen = 64
+
+// convertLegacyInviteHash deterministically converts one legacy token_hash
+// TEXT value into the canonical 32-byte SHA-256 digest BLOB:
+//
+//   - If the hex-decoded bytes form a canonical invite token TEXT (32
+//     base64url chars decoding to 24 bytes), the value is the historical
+//     reversible format hex(token text): the digest is SHA-256 over that
+//     recovered token text — the same digest the acceptance path computes, so
+//     existing pending invites remain acceptable after the upgrade.
+//   - Otherwise the bytes are treated as an already-SHA-256 digest (lowercase
+//     hex) and stored verbatim.
+//
+// A real SHA-256 digest coincidentally decoding to a canonical token text is
+// cryptographically negligible (the bytes would have to land in the base64url
+// alphabet AND re-encode exactly), so the historical interpretation wins
+// deterministically. Any value that is not 64 lowercase-hex characters (or
+// does not decode to exactly 32 bytes) is malformed: the migration FAILS
+// rather than treating plaintext as a valid digest.
+func convertLegacyInviteHash(stored string) ([]byte, error) {
+	if len(stored) != legacyInviteHashHexLen {
+		return nil, fmt.Errorf("invite token hash is not 64 hex characters")
+	}
+	for i := 0; i < len(stored); i++ {
+		c := stored[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return nil, fmt.Errorf("invite token hash is not lowercase hex")
+		}
+	}
+	raw, err := hex.DecodeString(stored)
+	if err != nil || len(raw) != 32 {
+		return nil, fmt.Errorf("invite token hash is not a 32-byte hex value")
+	}
+	// Historical reversible format: the bytes ARE the canonical token text.
+	if isCanonicalInviteTokenText(string(raw)) {
+		return DigestInviteToken(string(raw)), nil
+	}
+	// Newer format: the bytes ARE the digest.
+	return raw, nil
+}
+
+// legacyInviteRow is the fully validated, converted form of one legacy
+// registry_invites row, ready to be inserted into the rebuilt table.
+type legacyInviteRow struct {
+	id         int64
+	registryID int64
+	email      string
+	role       string
+	canPull    int
+	canPush    int
+	digest     []byte
+	status     string
+	acceptedBy sql.NullInt64
+	expiresAt  string
+	acceptedAt *string
+	revokedAt  *string
+	createdAt  string
+}
+
+// installInviteDigestSchema rebuilds registry_invites around the one-way
+// digest lifecycle and installs its constraints and triggers, all inside the
+// migration transaction (rolled back atomically on any error). Steps:
+//
+//  1. Validate EVERY existing row and compute its converted digest, accepted_by
+//     backfill, and audit timestamps (see convertLegacyInviteHash and the
+//     migration comment for the acceptance rules). Duplicate converted digests
+//     and any malformed/corrupt row fail the migration with the legacy data
+//     untouched.
+//  2. Create the constrained clone (digest BLOB unique, accepted_by FK,
+//     status/accepted_by/revocation CHECKs).
+//  3. Copy the converted rows into the clone by explicit column name (physical
+//     column order of legacy ALTER-appended schemas must not matter).
+//  4. Drop the legacy table and rename the clone into place.
+//  5. Install the state-transition triggers and the status index.
+func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites order by id asc`)
+	if err != nil {
+		return fmt.Errorf("enumerate legacy invites: %w", err)
+	}
+	var legacy []legacyInviteRow
+	seenDigests := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			row                  legacyInviteRow
+			canPull, canPush     int
+			tokenHash, status    string
+			expiresAt, createdAt string
+		)
+		if err := rows.Scan(&row.id, &row.registryID, &row.email, &row.role,
+			&canPull, &canPush, &tokenHash, &status, &expiresAt, &createdAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("read legacy invite row: %w", err)
+		}
+		row.canPull, row.canPush = canPull, canPush
+		row.status = status
+		row.expiresAt, row.createdAt = expiresAt, createdAt
+
+		// Digest must be demonstrably canonical.
+		digest, err := convertLegacyInviteHash(tokenHash)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("invite %d: %w", row.id, err)
+		}
+		row.digest = digest
+		digestKey := string(digest)
+		if _, dup := seenDigests[digestKey]; dup {
+			rows.Close()
+			return fmt.Errorf("invite %d: duplicate token digest after conversion", row.id)
+		}
+		seenDigests[digestKey] = struct{}{}
+
+		// Status: only the states that existed before revocation.
+		if status != "pending" && status != "accepted" {
+			rows.Close()
+			return fmt.Errorf("invite %d: unsupported legacy status %q", row.id, status)
+		}
+		// Expiry must parse (RFC3339) and the grant must be non-empty.
+		if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("invite %d: unparseable expiry %q", row.id, expiresAt)
+		}
+		if (canPull == 1 || canPush == 1) == false {
+			rows.Close()
+			return fmt.Errorf("invite %d: invite grants neither pull nor push", row.id)
+		}
+		// Accepted invites must have a derivable acceptor (the legacy flow
+		// created the membership atomically with acceptance).
+		if status == "accepted" {
+			var acceptorID int64
+			err := tx.QueryRowContext(ctx, `select u.id
+				from registry_memberships m
+				join users u on u.id = m.user_id
+				where m.registry_id = ? and lower(u.email) = lower(?)`,
+				row.registryID, row.email).Scan(&acceptorID)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("invite %d: accepted invite has no matching membership for recipient %q", row.id, row.email)
+			}
+			row.acceptedBy = sql.NullInt64{Int64: acceptorID, Valid: true}
+		}
+		legacy = append(legacy, row)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate legacy invites: %w", err)
+	}
+
+	// 2. Create the constrained clone. The CHECK constraints encode the
+	// lifecycle consistency rules; the triggers (installed after the copy)
+	// enforce the state machine for every future write, including direct SQL.
+	for _, stmt := range []string{
+		`create table registry_invites_new (
+			id integer primary key autoincrement,
+			registry_id integer not null references registries(id) on delete cascade,
+			email text not null,
+			role text not null,
+			can_pull integer not null,
+			can_push integer not null,
+			token_digest blob not null unique,
+			status text not null check (status in ('pending','accepted','revoked')),
+			accepted_by_user_id integer references users(id),
+			expires_at text not null,
+			accepted_at text,
+			revoked_at text,
+			created_at text not null,
+			check (can_pull = 1 or can_push = 1),
+			check ((status = 'revoked') = (revoked_at is not null)),
+			check (status <> 'accepted' or accepted_by_user_id is not null),
+			check (accepted_at is null or status = 'accepted')
+		)`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create invite digest clone: %w", err)
+		}
+	}
+
+	// 3. Copy converted rows by explicit column name (legacy ALTER-appended
+	// schema has a different PHYSICAL column order; names must match).
+	for _, row := range legacy {
+		if _, err := tx.ExecContext(ctx, `insert into registry_invites_new
+			(id, registry_id, email, role, can_pull, can_push, token_digest, status,
+			 accepted_by_user_id, expires_at, accepted_at, revoked_at, created_at)
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			row.id, row.registryID, row.email, row.role, row.canPull, row.canPush,
+			row.digest, row.status, row.acceptedBy, row.expiresAt,
+			row.acceptedAt, row.revokedAt, row.createdAt); err != nil {
+			return fmt.Errorf("copy invite %d into digest schema: %w", row.id, err)
+		}
+	}
+
+	// 4. Drop the legacy table and rename the clone into place.
+	if _, err := tx.ExecContext(ctx, `drop table registry_invites`); err != nil {
+		return fmt.Errorf("drop legacy registry_invites: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `alter table registry_invites_new rename to registry_invites`); err != nil {
+		return fmt.Errorf("rename registry_invites_new: %w", err)
+	}
+
+	// 5. State-transition triggers + the listing index. Triggers are installed
+	// AFTER the copy so backfilled (non-pending) rows are not rejected.
+	for _, stmt := range []string{
+		`create trigger registry_invites_born_pending before insert on registry_invites
+			for each row when NEW.status != 'pending'
+			begin select raise(abort, 'invites must be created with pending status'); end`,
+		`create trigger registry_invites_terminal_status before update of status on registry_invites
+			for each row when OLD.status != 'pending' and NEW.status != OLD.status
+			begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+		`create index idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create invite lifecycle trigger/index: %w", err)
 		}
 	}
 	return nil

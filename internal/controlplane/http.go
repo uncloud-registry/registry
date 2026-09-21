@@ -3,6 +3,7 @@ package controlplane
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,6 +54,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleUIUpdateRegistrySettings(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/ui/registries/") && strings.HasSuffix(r.URL.Path, "/invites"):
 		s.handleUICreateInvite(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/ui/registries/") && strings.HasSuffix(r.URL.Path, "/revoke"):
+		s.handleUIRevokeInvite(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/ui/registries/") && strings.HasSuffix(r.URL.Path, "/permissions"):
 		s.handleUIUpdateCollaboratorPermissions(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == "/ui/invites/accept":
@@ -69,6 +72,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleCreateRegistry(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/registries/") && strings.HasSuffix(r.URL.Path, "/invites"):
 		s.handleCreateInvite(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/registries/") && strings.HasSuffix(r.URL.Path, "/revoke"):
+		s.handleRevokeInvite(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/invites/accept":
 		s.handleAcceptInvite(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/token":
@@ -197,10 +202,67 @@ func (s *HTTPServer) handleAcceptInvite(w http.ResponseWriter, r *http.Request) 
 	}
 	invite, err := s.Service.AcceptInvite(r.Context(), req.Token, userID)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		// Every acceptance failure — malformed token, unknown invite, wrong
+		// recipient, expired, revoked, accepted by someone else — maps to the
+		// SAME generic response so no invite state is ever enumerated.
+		if errors.Is(err, errInviteNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "invite is not valid or has expired"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, NewPublicInvite(invite))
+}
+
+// parseInviteRevokePath extracts registryID and inviteID from the revoke routes
+// /api/registries/{registryID}/invites/{inviteID}/revoke and
+// /ui/registries/{registryID}/invites/{inviteID}/revoke.
+func parseInviteRevokePath(path string) (int64, int64, bool) {
+	rest := path
+	switch {
+	case strings.HasPrefix(path, "/api/registries/"):
+		rest = strings.TrimPrefix(path, "/api/registries/")
+	case strings.HasPrefix(path, "/ui/registries/"):
+		rest = strings.TrimPrefix(path, "/ui/registries/")
+	default:
+		return 0, 0, false
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 4 || parts[1] != "invites" || parts[3] != "revoke" {
+		return 0, 0, false
+	}
+	registryID, err1 := strconv.ParseInt(parts[0], 10, 64)
+	inviteID, err2 := strconv.ParseInt(parts[2], 10, 64)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return registryID, inviteID, true
+}
+
+// handleRevokeInvite is the API revocation boundary. Revocation is owner-
+// authorized (service layer); every failure — unknown registry/invite, non-
+// owner caller, already-accepted invite — becomes the same generic not-found
+// response, and neither the token nor the digest is ever involved or exposed.
+func (s *HTTPServer) handleRevokeInvite(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.requireSessionUser(w, r)
+	if !ok {
+		return
+	}
+	registryID, inviteID, ok := parseInviteRevokePath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := s.Service.RevokeInvite(r.Context(), userID, registryID, inviteID); err != nil {
+		if errors.Is(err, errInviteNotFound) || errors.Is(err, errInviteCannotRevoke) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "invite not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
 func (s *HTTPServer) handleRegistryToken(w http.ResponseWriter, r *http.Request) {

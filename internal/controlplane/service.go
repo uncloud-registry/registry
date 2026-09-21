@@ -189,6 +189,14 @@ func (s *Service) UpdateRegistrySettings(ctx context.Context, userID int64, regi
 	return s.GetRegistryDashboard(ctx, userID, registryID)
 }
 
+// CreateInvite validates an inviter-authorized, recipient-bound invite and
+// persists ONLY the digest. The recipient address is normalized with the
+// shared identity semantics (NormalizeEmail); the expiry is a bounded future
+// window (inviteDefaultTTL from the store clock, capped by inviteMaxTTL at the
+// persistence boundary); the permission invariant (pull and/or push, never
+// neither) is enforced here and again at the store. The raw one-time token is
+// returned exactly once — to this caller (API create response or the UI
+// flash) — and can never be recovered from storage afterwards.
 func (s *Service) CreateInvite(ctx context.Context, registryID int64, inviterUserID int64, email string, canPull bool, canPush bool) (Invite, string, error) {
 	membership, err := s.Store.FindMembership(ctx, registryID, inviterUserID)
 	if err != nil {
@@ -196,6 +204,10 @@ func (s *Service) CreateInvite(ctx context.Context, registryID int64, inviterUse
 	}
 	if membership.Role != "owner" && membership.Role != "admin" {
 		return Invite{}, "", fmt.Errorf("user is not allowed to invite collaborators")
+	}
+	email = NormalizeEmail(email)
+	if email == "" {
+		return Invite{}, "", errInviteRecipientRequired
 	}
 	if !canPull && !canPush {
 		return Invite{}, "", fmt.Errorf("invite must grant pull or push access")
@@ -206,28 +218,64 @@ func (s *Service) CreateInvite(ctx context.Context, registryID int64, inviterUse
 		Role:       "member",
 		CanPull:    canPull || canPush,
 		CanPush:    canPush,
-		ExpiresAt:  time.Now().UTC().Add(7 * 24 * time.Hour),
+		ExpiresAt:  time.Now().UTC().Add(inviteDefaultTTL),
 	})
 }
 
+// AcceptInvite binds the session user (by ID) to the invitation, recipient-
+// bound and atomically. The user is loaded fresh from the database and the
+// store re-loads it inside the acceptance transaction by ID; the caller-
+// supplied email/role are never trusted. Every failure mode maps to the
+// single generic errInviteNotFound so no caller can distinguish invite states.
 func (s *Service) AcceptInvite(ctx context.Context, token string, userID int64) (Invite, error) {
-	invite, err := s.Store.AcceptInvite(ctx, token, userID)
+	user, err := s.Store.FindUserByID(ctx, userID)
 	if err != nil {
-		return Invite{}, err
+		// Unknown/invalid session principal: same generic story as any other
+		// acceptance failure.
+		return Invite{}, errInviteNotFound
 	}
-	return invite, nil
+	return s.Store.AcceptInvite(ctx, token, user)
 }
 
+// GetInvite resolves the public acceptance page for a canonical raw token:
+// the invite must still be pending and unexpired, otherwise the generic
+// errInviteNotFound applies (revoked, expired, accepted, unknown, or malformed
+// tokens are indistinguishable). Only public fields of the invite are used by
+// callers; the digest is never returned.
 func (s *Service) GetInvite(ctx context.Context, token string) (Invite, Registry, error) {
-	invite, err := s.Store.FindInviteByToken(ctx, token)
+	canonical, err := ParseInviteToken(token)
 	if err != nil {
-		return Invite{}, Registry{}, err
+		return Invite{}, Registry{}, errInviteNotFound
+	}
+	invite, err := s.Store.FindInviteByDigest(ctx, DigestInviteToken(canonical))
+	if err != nil {
+		return Invite{}, Registry{}, errInviteNotFound
+	}
+	if invite.Status != "pending" || !time.Now().UTC().Before(invite.ExpiresAt) {
+		return Invite{}, Registry{}, errInviteNotFound
 	}
 	registry, err := s.Store.FindRegistryByID(ctx, invite.RegistryID)
 	if err != nil {
 		return Invite{}, Registry{}, err
 	}
 	return invite, registry, nil
+}
+
+// RevokeInvite revokes a pending invite. Authorization is OWNER-LEVEL: only an
+// owner/admin of the registry may revoke; every other principal (non-member,
+// plain member, unknown registry) receives the generic errInviteNotFound so
+// invite existence is never enumerated. The invite must be pending — an
+// accepted invite cannot be revoked, and an already-revoked invite is an
+// idempotent success for the same authorized request.
+func (s *Service) RevokeInvite(ctx context.Context, callerUserID int64, registryID int64, inviteID int64) (Invite, error) {
+	membership, err := s.Store.FindMembership(ctx, registryID, callerUserID)
+	if err != nil {
+		return Invite{}, errInviteNotFound
+	}
+	if membership.Role != "owner" && membership.Role != "admin" {
+		return Invite{}, errInviteNotFound
+	}
+	return s.Store.RevokeInvite(ctx, registryID, inviteID)
 }
 
 func (s *Service) requireRegistryAdmin(ctx context.Context, userID int64, registryID int64) (Registry, error) {

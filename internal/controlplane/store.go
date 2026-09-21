@@ -2,13 +2,9 @@ package controlplane
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -21,6 +17,22 @@ type Store struct {
 	// prove a committed owner/plaintext change is observed transactionally.
 	// Production code never sets it.
 	migrateRowHook func(id int64)
+	// now is a TEST-ONLY injectable clock used by every invite-expiry and
+	// revocation timestamp decision (nowUTC). Production code never sets it,
+	// so time.Now().UTC() applies everywhere.
+	now func() time.Time
+}
+
+// nowUTC returns the store's effective current UTC time: the injected test
+// clock when set (deterministic expiry-boundary tests), time.Now().UTC()
+// otherwise. Every invite lifecycle decision (creation expiry validation,
+// acceptance expiry boundary, revocation timestamps) goes through this single
+// seam so tests can drive it without parsing ambiguity.
+func (s *Store) nowUTC() time.Time {
+	if s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 type User struct {
@@ -63,17 +75,66 @@ type Membership struct {
 	CreatedAt  time.Time
 }
 
+// Invite is the persistence record for a collaborator invite. Only the
+// one-way TokenDigest (SHA-256 of the canonical raw token) is ever stored or
+// read by this struct: there is deliberately no raw-token field, and no code
+// path reconstructs the token from the digest. AcceptedByUserID / AcceptedAt /
+// RevokedAt are audit/consistency fields (nullable); status transitions are
+// additionally guarded by schema CHECK constraints and triggers (migration 4).
 type Invite struct {
-	ID         int64
-	RegistryID int64
-	Email      string
-	Role       string
-	CanPull    bool
-	CanPush    bool
-	TokenHash  string
-	Status     string
-	ExpiresAt  time.Time
-	CreatedAt  time.Time
+	ID               int64
+	RegistryID       int64
+	Email            string
+	Role             string
+	CanPull          bool
+	CanPush          bool
+	TokenDigest      []byte
+	Status           string
+	AcceptedByUserID *int64
+	ExpiresAt        time.Time
+	AcceptedAt       *time.Time
+	RevokedAt        *time.Time
+	CreatedAt        time.Time
+}
+
+// inviteColumns is the canonical read column list for registry_invites.
+const inviteColumns = `id, registry_id, email, role, can_pull, can_push, token_digest, status,
+	accepted_by_user_id, expires_at, accepted_at, revoked_at, created_at`
+
+// scanInviteRow scans the canonical invite column list into invite. The
+// digest is picked up as raw bytes (BLOB); it is never stringified.
+func scanInviteRow(s scanRow, invite *Invite) error {
+	var (
+		canPull, canPush      int
+		createdAt, expiresAt  string
+		acceptedBy            sql.NullInt64
+		acceptedAt, revokedAt sql.NullString
+	)
+	err := s.Scan(&invite.ID, &invite.RegistryID, &invite.Email, &invite.Role,
+		&canPull, &canPush, &invite.TokenDigest, &invite.Status, &acceptedBy,
+		&expiresAt, &acceptedAt, &revokedAt, &createdAt)
+	if err != nil {
+		return err
+	}
+	invite.CanPull = canPull == 1
+	invite.CanPush = canPush == 1
+	if acceptedBy.Valid {
+		id := acceptedBy.Int64
+		invite.AcceptedByUserID = &id
+	}
+	invite.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	invite.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
+	if acceptedAt.Valid {
+		if t, err := time.Parse(time.RFC3339, acceptedAt.String); err == nil {
+			invite.AcceptedAt = &t
+		}
+	}
+	if revokedAt.Valid {
+		if t, err := time.Parse(time.RFC3339, revokedAt.String); err == nil {
+			invite.RevokedAt = &t
+		}
+	}
+	return nil
 }
 
 func OpenSQLite(path string) (*Store, error) {
@@ -90,18 +151,32 @@ func OpenSQLite(path string) (*Store, error) {
 
 func (s *Store) CreateUser(ctx context.Context, email string, passwordHash string) (User, error) {
 	now := time.Now().UTC()
-	result, err := s.DB.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`, strings.ToLower(email), passwordHash, now.Format(time.RFC3339))
+	// Account identity is the canonical normalized email; the unique index
+	// then enforces one account per normalized address.
+	email = NormalizeEmail(email)
+	result, err := s.DB.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`, email, passwordHash, now.Format(time.RFC3339))
 	if err != nil {
 		return User{}, err
 	}
 	id, _ := result.LastInsertId()
-	return User{ID: id, Email: strings.ToLower(email), PasswordHash: passwordHash, CreatedAt: now}, nil
+	return User{ID: id, Email: email, PasswordHash: passwordHash, CreatedAt: now}, nil
 }
 
 func (s *Store) FindUserByEmail(ctx context.Context, email string) (User, error) {
+	return s.findUser(ctx, `select id, email, password_hash, created_at from users where email = ?`, NormalizeEmail(email))
+}
+
+// FindUserByID loads a user by primary key. Acceptance uses this to load the
+// accepting user fresh from the database before binding an invite, so the
+// caller-supplied email/role are never trusted.
+func (s *Store) FindUserByID(ctx context.Context, userID int64) (User, error) {
+	return s.findUser(ctx, `select id, email, password_hash, created_at from users where id = ?`, userID)
+}
+
+func (s *Store) findUser(ctx context.Context, query string, arg any) (User, error) {
 	var user User
 	var createdAt string
-	err := s.DB.QueryRowContext(ctx, `select id, email, password_hash, created_at from users where email = ?`, strings.ToLower(email)).
+	err := s.DB.QueryRowContext(ctx, query, arg).
 		Scan(&user.ID, &user.Email, &user.PasswordHash, &createdAt)
 	if err != nil {
 		return User{}, err
@@ -361,7 +436,7 @@ func (s *Store) ListMembershipsForRegistry(ctx context.Context, registryID int64
 }
 
 func (s *Store) ListInvitesForRegistry(ctx context.Context, registryID int64) ([]Invite, error) {
-	rows, err := s.DB.QueryContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites where registry_id = ? order by id desc`, registryID)
+	rows, err := s.DB.QueryContext(ctx, `select `+inviteColumns+` from registry_invites where registry_id = ? order by id desc`, registryID)
 	if err != nil {
 		return nil, err
 	}
@@ -370,117 +445,239 @@ func (s *Store) ListInvitesForRegistry(ctx context.Context, registryID int64) ([
 	var invites []Invite
 	for rows.Next() {
 		var invite Invite
-		var createdAt, expiresAt string
-		var canPull, canPush int
-		if err := rows.Scan(&invite.ID, &invite.RegistryID, &invite.Email, &invite.Role, &canPull, &canPush, &invite.TokenHash, &invite.Status, &expiresAt, &createdAt); err != nil {
+		if err := scanInviteRow(rows, &invite); err != nil {
 			return nil, err
 		}
-		invite.CanPull = canPull == 1
-		invite.CanPush = canPush == 1
-		invite.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-		invite.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
 		invites = append(invites, invite)
 	}
 	return invites, rows.Err()
 }
 
+// CreateInvite persists a new pending invite. Only the one-way SHA-256 digest
+// of a fresh canonical raw token is stored; the raw token is returned to the
+// caller EXACTLY ONCE. The caller-supplied Invite must already carry the
+// normalized recipient email, role, permission flags, and an expiry that is
+// strictly in the future and bounded by inviteMaxTTL — all validated here at
+// the persistence boundary (expiry is validated against the store clock).
 func (s *Store) CreateInvite(ctx context.Context, invite Invite) (Invite, string, error) {
-	now := time.Now().UTC()
-	token, tokenHash, err := makeInviteToken()
+	now := s.nowUTC()
+	invite.Email = NormalizeEmail(invite.Email)
+	if invite.Email == "" {
+		return Invite{}, "", fmt.Errorf("create invite: %w", errInviteRecipientRequired)
+	}
+	if !invite.CanPull && !invite.CanPush {
+		return Invite{}, "", fmt.Errorf("create invite: invite must grant pull or push access")
+	}
+	if !now.Before(invite.ExpiresAt) {
+		return Invite{}, "", fmt.Errorf("create invite: expiry must be in the future")
+	}
+	if invite.ExpiresAt.After(now.Add(inviteMaxTTL)) {
+		return Invite{}, "", fmt.Errorf("create invite: expiry exceeds %s", inviteMaxTTL)
+	}
+	token, digest, err := NewInviteToken()
 	if err != nil {
 		return Invite{}, "", err
 	}
-	result, err := s.DB.ExecContext(ctx, `insert into registry_invites (registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		invite.RegistryID, strings.ToLower(invite.Email), invite.Role, boolToInt(invite.CanPull), boolToInt(invite.CanPush), tokenHash, "pending", invite.ExpiresAt.Format(time.RFC3339), now.Format(time.RFC3339))
+	result, err := s.DB.ExecContext(ctx, `insert into registry_invites (registry_id, email, role, can_pull, can_push, token_digest, status, expires_at, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		invite.RegistryID, invite.Email, invite.Role, boolToInt(invite.CanPull), boolToInt(invite.CanPush), digest, "pending", invite.ExpiresAt.Format(time.RFC3339), now.Format(time.RFC3339))
 	if err != nil {
 		return Invite{}, "", err
 	}
 	id, _ := result.LastInsertId()
 	invite.ID = id
-	invite.Email = strings.ToLower(invite.Email)
-	invite.TokenHash = tokenHash
+	invite.TokenDigest = digest
 	invite.Status = "pending"
 	invite.CreatedAt = now
 	return invite, token, nil
 }
 
-func (s *Store) AcceptInvite(ctx context.Context, token string, userID int64) (Invite, error) {
-	tokenHash := hashInviteToken(token)
+// AcceptInvite binds a pending invite to the accepting user, atomically: the
+// caller-supplied User's identity (email/role) is NEVER trusted — the user
+// row is re-loaded by User.ID inside the same transaction, the invite is
+// looked up by the one-way digest of the CANONICAL raw token (malformed or
+// non-canonical tokens are rejected before any hashing or querying), and the
+// normalized stored emails must match. The state transition is a guarded
+// UPDATE (pending/unrevoked/unexpired → accepted, with accepted_by): exactly
+// one concurrent transition wins; a retry by the SAME database-loaded user
+// observes the accepted state and its atomic membership and returns the same
+// successful Invite (no duplicate membership), while any other principal or a
+// terminal state gets the generic failure. Membership is merged permission-
+// safely: an existing stronger membership is never downgraded (see
+// mergeMembershipTx).
+func (s *Store) AcceptInvite(ctx context.Context, rawToken string, accepting User) (Invite, error) {
+	canonical, err := ParseInviteToken(rawToken)
+	if err != nil {
+		return Invite{}, err // malformed/noncanonical: rejected before hashing/querying
+	}
+	digest := DigestInviteToken(canonical)
+	now := s.nowUTC()
+
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Invite{}, err
 	}
 	defer tx.Rollback()
 
+	// Load the accepting user fresh by ID; the caller-supplied email is not
+	// trusted for the binding comparison.
+	var user User
+	var createdAt string
+	if err := tx.QueryRowContext(ctx, `select id, email, password_hash, created_at from users where id = ?`, accepting.ID).
+		Scan(&user.ID, &user.Email, &user.PasswordHash, &createdAt); err != nil {
+		return Invite{}, errInviteNotFound
+	}
+
 	var invite Invite
-	var createdAt, expiresAt string
-	var canPull, canPush int
-	err = tx.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites where token_hash = ?`, tokenHash).
-		Scan(&invite.ID, &invite.RegistryID, &invite.Email, &invite.Role, &canPull, &canPush, &invite.TokenHash, &invite.Status, &expiresAt, &createdAt)
+	if err := scanInviteRow(tx.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where token_digest = ?`, digest), &invite); err != nil {
+		return Invite{}, errInviteNotFound // includes unknown digest: same generic story
+	}
+	if NormalizeEmail(user.Email) != NormalizeEmail(invite.Email) {
+		return Invite{}, errInviteNotFound // wrong recipient
+	}
+	// Explicit boundary semantics: at expires_at the invite IS expired.
+	if !now.Before(invite.ExpiresAt) {
+		return Invite{}, errInviteNotFound
+	}
+
+	// Claim the transition atomically. Expiry is rechecked in SQL against the
+	// same RFC3339-UTC text (lexicographic == chronological) so a race cannot
+	// accept an invite that expired mid-flight.
+	res, err := tx.ExecContext(ctx, `update registry_invites
+		set status = 'accepted', accepted_by_user_id = ?, accepted_at = ?
+		where id = ? and status = 'pending' and revoked_at is null and expires_at > ?`,
+		accepting.ID, now.Format(time.RFC3339), invite.ID, now.Format(time.RFC3339))
 	if err != nil {
 		return Invite{}, err
 	}
-	invite.CanPull = canPull == 1
-	invite.CanPush = canPush == 1
-	invite.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	invite.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
-	if invite.ExpiresAt.Before(time.Now().UTC()) {
-		return Invite{}, errors.New("invite is not valid")
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return Invite{}, err
 	}
-	if invite.Status == "accepted" {
-		var existingID int64
-		err = tx.QueryRowContext(ctx, `select id from registry_memberships where registry_id = ? and user_id = ?`, invite.RegistryID, userID).Scan(&existingID)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return Invite{}, errors.New("invite is not valid")
-			}
+	if affected == 1 {
+		if err := s.mergeMembershipTx(ctx, tx, invite.RegistryID, invite.Role, invite.CanPull, invite.CanPush, accepting.ID, now); err != nil {
 			return Invite{}, err
 		}
 		if err := tx.Commit(); err != nil {
 			return Invite{}, err
 		}
+		invite.Status = "accepted"
+		invite.AcceptedByUserID = &accepting.ID
 		return invite, nil
 	}
-	if invite.Status != "pending" {
-		return Invite{}, errors.New("invite is not valid")
-	}
 
-	var existingID int64
-	err = tx.QueryRowContext(ctx, `select id from registry_memberships where registry_id = ? and user_id = ?`, invite.RegistryID, userID).Scan(&existingID)
-	switch {
-	case err == nil:
-	case err == sql.ErrNoRows:
-		if _, err := tx.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?, ?, ?, ?, ?, ?)`,
-			invite.RegistryID, userID, invite.Role, boolToInt(invite.CanPull), boolToInt(invite.CanPush), time.Now().UTC().Format(time.RFC3339)); err != nil {
+	// The guarded update changed nothing: another transaction transitioned the
+	// invite first (or it became expired/revoked). Only an idempotent retry by
+	// the SAME user against the accepted invite with its atomic membership can
+	// succeed; everything else is the generic failure.
+	var reload Invite
+	if err := scanInviteRow(tx.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ?`, invite.ID), &reload); err != nil {
+		return Invite{}, errInviteNotFound
+	}
+	if reload.Status == "accepted" && reload.AcceptedByUserID != nil && *reload.AcceptedByUserID == accepting.ID {
+		var membershipID int64
+		err := tx.QueryRowContext(ctx, `select id from registry_memberships where registry_id = ? and user_id = ?`, reload.RegistryID, accepting.ID).Scan(&membershipID)
+		if err != nil {
+			return Invite{}, errInviteNotFound // accepted without its membership: anomalous, fail generically
+		}
+		if err := tx.Commit(); err != nil {
 			return Invite{}, err
 		}
-	default:
-		return Invite{}, err
+		return reload, nil
 	}
-	if _, err := tx.ExecContext(ctx, `update registry_invites set status = ? where id = ?`, "accepted", invite.ID); err != nil {
-		return Invite{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Invite{}, err
-	}
-	invite.Status = "accepted"
-	return invite, nil
+	return Invite{}, errInviteNotFound
 }
 
-func (s *Store) FindInviteByToken(ctx context.Context, token string) (Invite, error) {
-	tokenHash := hashInviteToken(token)
-	var invite Invite
-	var createdAt, expiresAt string
-	var canPull, canPush int
-	err := s.DB.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites where token_hash = ?`, tokenHash).
-		Scan(&invite.ID, &invite.RegistryID, &invite.Email, &invite.Role, &canPull, &canPush, &invite.TokenHash, &invite.Status, &expiresAt, &createdAt)
+// mergeMembershipTx inserts or merges the acceptance membership inside the
+// acceptance transaction. Permission merge semantics are deliberately
+// permission-safe: an invite acceptance must NEVER downgrade an existing
+// stronger membership, so the merged membership takes the permission-wise OR
+// of the existing row and the invite grant, and a pre-existing owner/admin
+// role is preserved (the invite role only applies when the existing role is
+// not a senior one).
+func (s *Store) mergeMembershipTx(ctx context.Context, tx *sql.Tx, registryID int64, role string, canPull, canPush bool, userID int64, now time.Time) error {
+	var existingID int64
+	var existingRole string
+	var existingPull, existingPush int
+	err := tx.QueryRowContext(ctx, `select id, role, can_pull, can_push from registry_memberships where registry_id = ? and user_id = ?`, registryID, userID).
+		Scan(&existingID, &existingRole, &existingPull, &existingPush)
+	switch {
+	case err == sql.ErrNoRows:
+		_, err := tx.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?, ?, ?, ?, ?, ?)`,
+			registryID, userID, role, boolToInt(canPull), boolToInt(canPush), now.Format(time.RFC3339))
+		return err
+	case err != nil:
+		return err
+	default:
+		mergedRole := existingRole
+		if existingRole != "owner" && existingRole != "admin" {
+			mergedRole = role
+		}
+		_, err := tx.ExecContext(ctx, `update registry_memberships set role = ?, can_pull = ?, can_push = ? where id = ?`,
+			mergedRole, boolToInt(existingPull == 1 || canPull), boolToInt(existingPush == 1 || canPush), existingID)
+		return err
+	}
+}
+
+// RevokeInvite transitions a PENDING invite to revoked, atomically and
+// idempotently for repeated revocations of the same invite: only pending
+// invites can be revoked; an accepted invite cannot be revoked (terminal) and
+// returns the generic failure; an already-revoked invite is reported as a
+// successful revocation (no state change, no duplicate). The raw token is
+// never consulted and the digest is never exposed.
+func (s *Store) RevokeInvite(ctx context.Context, registryID int64, inviteID int64) (Invite, error) {
+	now := s.nowUTC()
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Invite{}, err
 	}
-	invite.CanPull = canPull == 1
-	invite.CanPush = canPush == 1
-	invite.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-	invite.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAt)
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx, `update registry_invites
+		set status = 'revoked', revoked_at = ?
+		where id = ? and registry_id = ? and status = 'pending'`,
+		now.Format(time.RFC3339), inviteID, registryID)
+	if err != nil {
+		return Invite{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return Invite{}, err
+	}
+	if affected == 1 {
+		if err := tx.Commit(); err != nil {
+			return Invite{}, err
+		}
+		var invite Invite
+		if err := scanInviteRow(s.DB.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ?`, inviteID), &invite); err != nil {
+			return Invite{}, err
+		}
+		return invite, nil
+	}
+
+	// Nothing changed: either the invite does not exist (generic not-found) or
+	// it already left pending. Already-revoked is an idempotent success;
+	// anything else (accepted) is terminal and cannot be revoked.
+	var invite Invite
+	if err := scanInviteRow(tx.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ? and registry_id = ?`, inviteID, registryID), &invite); err != nil {
+		return Invite{}, errInviteNotFound
+	}
+	if invite.Status == "revoked" {
+		if err := tx.Commit(); err != nil {
+			return Invite{}, err
+		}
+		return invite, nil
+	}
+	return Invite{}, errInviteCannotRevoke
+}
+
+// FindInviteByDigest looks up an invite by the one-way digest of a canonical
+// token. It returns the generic errInviteNotFound for unknown digests. The
+// digest itself is never exposed by callers.
+func (s *Store) FindInviteByDigest(ctx context.Context, digest []byte) (Invite, error) {
+	var invite Invite
+	if err := scanInviteRow(s.DB.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where token_digest = ?`, digest), &invite); err != nil {
+		return Invite{}, errInviteNotFound
+	}
 	return invite, nil
 }
 
@@ -712,17 +909,4 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
-}
-
-func makeInviteToken() (string, string, error) {
-	raw := make([]byte, 24)
-	if _, err := rand.Read(raw); err != nil {
-		return "", "", err
-	}
-	token := base64.RawURLEncoding.EncodeToString(raw)
-	return token, hashInviteToken(token), nil
-}
-
-func hashInviteToken(token string) string {
-	return hex.EncodeToString([]byte(token))
 }

@@ -61,21 +61,23 @@ func TestPublicMembershipJSONPreservesPublicFields(t *testing.T) {
 	}
 }
 
-func TestPublicInviteJSONHasNoTokenHash(t *testing.T) {
+func TestPublicInviteJSONHasNoTokenDigest(t *testing.T) {
 	t.Parallel()
 
 	raw, err := json.Marshal(NewPublicInvite(Invite{
 		ID: 5, RegistryID: 1, Email: "carol@example.com", Role: "member",
-		CanPull: true, CanPush: true, TokenHash: "raw-token-hex", Status: "pending",
+		CanPull: true, CanPush: true, TokenDigest: []byte("raw-token-digest-bytes"), Status: "pending",
 		ExpiresAt: time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC),
 		CreatedAt: time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC),
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(raw, []byte("raw-token-hex")) ||
+	if bytes.Contains(raw, []byte("raw-token-digest-bytes")) ||
 		bytes.Contains(raw, []byte("TokenHash")) ||
-		bytes.Contains(raw, []byte("tokenHash")) {
-		t.Fatalf("token hash leaked: %s", raw)
+		bytes.Contains(raw, []byte("tokenHash")) ||
+		bytes.Contains(raw, []byte("TokenDigest")) ||
+		bytes.Contains(raw, []byte("tokenDigest")) {
+		t.Fatalf("token digest leaked: %s", raw)
 	}
 }

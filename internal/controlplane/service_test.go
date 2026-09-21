@@ -134,42 +134,83 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 	}
 }
 
-func TestInviteExpires(t *testing.T) {
+// TestInviteExpiryBoundary pins the explicit expiry semantics with a
+// deterministic injectable clock: creation must reject a non-future expiry,
+// acceptance at exactly expires_at must fail ("at expires_at is expired"),
+// and acceptance strictly before it must succeed.
+func TestInviteExpiryBoundary(t *testing.T) {
 	t.Parallel()
 
 	store, err := OpenSQLite("file:controlplane_test_three?mode=memory&cache=shared")
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	owner, err := store.CreateUser(context.Background(), "alice@example.com", "hash")
+	ctx := context.Background()
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
 	if err != nil {
 		t.Fatalf("create owner: %v", err)
 	}
-	registry, err := store.CreateRegistry(context.Background(), Registry{
-		Slug:                "alice",
-		Host:                "alice.uncloud-registry.com",
-		ENSName:             "alice.eth",
-		OwnerUserID:         owner.ID,
-		FeedOwnerAddress:    "0xfeed",
-		DefaultStampBatchID: "batch-1",
-		AnonymousPull:       true,
+	registry, err := store.CreateRegistry(ctx, Registry{
+		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
+		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed", DefaultStampBatchID: "batch-1",
+		AnonymousPull: true,
 	}, nil, nil)
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
-	invite, token, err := store.CreateInvite(context.Background(), Invite{
-		RegistryID: registry.ID,
-		Email:      "test@example.com",
-		Role:       "member",
-		CanPull:    true,
-		CanPush:    true,
-		ExpiresAt:  time.Now().UTC().Add(-time.Hour),
+	bob, err := store.CreateUser(ctx, "bob@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create bob: %v", err)
+	}
+
+	fixed := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	store.now = func() time.Time { return fixed }
+
+	// Creation with an expiry in the past (or exactly at now) must be rejected.
+	if _, _, err := store.CreateInvite(ctx, Invite{
+		RegistryID: registry.ID, Email: "bob@example.com", Role: "member",
+		CanPull: true, CanPush: true, ExpiresAt: fixed.Add(-time.Hour),
+	}); err == nil {
+		t.Fatal("expected creation with past expiry to be rejected")
+	}
+	if _, _, err := store.CreateInvite(ctx, Invite{
+		RegistryID: registry.ID, Email: "bob@example.com", Role: "member",
+		CanPull: true, CanPush: true, ExpiresAt: fixed,
+	}); err == nil {
+		t.Fatal("expected creation with at-now expiry to be rejected")
+	}
+
+	// Expiry strictly inside the future window: acceptable at now...
+	invite, token, err := store.CreateInvite(ctx, Invite{
+		RegistryID: registry.ID, Email: "bob@example.com", Role: "member",
+		CanPull: true, CanPush: true, ExpiresAt: fixed.Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("create invite: %v", err)
 	}
 	if invite.Status != "pending" || token == "" {
 		t.Fatalf("unexpected invite creation result")
+	}
+	accepted, err := store.AcceptInvite(ctx, token, bob)
+	if err != nil {
+		t.Fatalf("accept before expiry: %v", err)
+	}
+	if accepted.Status != "accepted" {
+		t.Fatalf("unexpected accepted status: %s", accepted.Status)
+	}
+
+	// ...and a SECOND invite expiring at exactly fixed+1h fails AT the boundary:
+	// the clock advances to expires_at; "at expires_at is expired".
+	_, token2, err := store.CreateInvite(ctx, Invite{
+		RegistryID: registry.ID, Email: "bob@example.com", Role: "member",
+		CanPull: true, CanPush: true, ExpiresAt: fixed.Add(2 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create second invite: %v", err)
+	}
+	store.now = func() time.Time { return fixed.Add(2 * time.Hour) }
+	if _, err := store.AcceptInvite(ctx, token2, bob); err == nil {
+		t.Fatal("expected acceptance exactly at expires_at to fail")
 	}
 }
 

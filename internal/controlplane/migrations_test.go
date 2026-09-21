@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -36,8 +37,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("expected schema version 3, got %d", version)
+	if version != 4 {
+		t.Fatalf("expected schema version 4, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -45,6 +46,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	assertConstrainedFKs(t, db)
 	// The feed-key envelope invariant triggers must be physically installed.
 	assertFeedKeyEnvelopeTriggers(t, db)
+	// The invite digest lifecycle schema must be physically installed.
+	assertInviteDigestSchema(t, db)
 
 	// registry_id/user_id 999 do not exist, so the constrained schema must
 	// reject this insert via the foreign keys declared in migration 1.
@@ -72,8 +75,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 3 {
-		t.Fatalf("expected 3 migration rows, got %d", rows)
+	if rows != 4 {
+		t.Fatalf("expected 4 migration rows, got %d", rows)
 	}
 }
 
@@ -136,8 +139,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("expected schema version 3 after upgrade, got %d", version)
+	if version != 4 {
+		t.Fatalf("expected schema version 4 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -228,7 +231,7 @@ func TestUpgradePreservesAlterAppendedPermissionFields(t *testing.T) {
 	membershipCreated := now.Add(-2 * time.Hour).Format(time.RFC3339)
 	inviteCreated := now.Add(-1 * time.Hour).Format(time.RFC3339)
 	expires := now.Add(24 * time.Hour).Format(time.RFC3339)
-	inviteToken := "alt-token-hash-special"
+	inviteToken := legacyInviteHashV1
 
 	seedAlterUpgradedLegacyDB(t, db, now, membershipCreated, inviteCreated, expires, inviteToken)
 
@@ -263,15 +266,20 @@ func TestUpgradePreservesAlterAppendedPermissionFields(t *testing.T) {
 	}
 
 	// Invites: the shift is larger (token_hash, status, expires_at, created_at
-	// all move relative to the appended can_pull/can_push). Assert every field.
+	// all move relative to the appended can_pull/can_push). Assert every field,
+	// including the migration-4 conversion: the legacy hex(token text) hash
+	// must become the one-way SHA-256 digest BLOB and the accepted-by record
+	// must be backfilled from the member join.
 	var (
-		iID, iReg                       int64
-		iEmail, iRole                   string
-		iPull, iPush                    int
-		iToken, iStatus, iExp, iCreated string
+		iID, iReg               int64
+		iEmail, iRole           string
+		iPull, iPush            int
+		iDigest                 []byte
+		iStatus, iExp, iCreated string
+		iAcceptedBy             int64
 	)
-	if err := db.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites where id = 1`).
-		Scan(&iID, &iReg, &iEmail, &iRole, &iPull, &iPush, &iToken, &iStatus, &iExp, &iCreated); err != nil {
+	if err := db.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, expires_at, created_at from registry_invites where id = 1`).
+		Scan(&iID, &iReg, &iEmail, &iRole, &iPull, &iPush, &iDigest, &iStatus, &iAcceptedBy, &iExp, &iCreated); err != nil {
 		t.Fatalf("read migrated invite: %v", err)
 	}
 	if iID != 1 || iReg != 1 {
@@ -283,11 +291,15 @@ func TestUpgradePreservesAlterAppendedPermissionFields(t *testing.T) {
 	if iPull != 1 || iPush != 1 {
 		t.Fatalf("invite permission fields corrupted: can_pull=%d can_push=%d (want 1,1)", iPull, iPush)
 	}
-	if iToken != inviteToken {
-		t.Fatalf("invite token_hash corrupted: got %q want %q", iToken, inviteToken)
+	wantDigest := DigestInviteToken(legacyInviteTokenTextV1)
+	if len(iDigest) != 32 || !bytes.Equal(iDigest, wantDigest) {
+		t.Fatalf("invite token digest not converted to SHA-256 of the legacy token text: got %x want %x", iDigest, wantDigest)
 	}
 	if iStatus != "accepted" {
 		t.Fatalf("invite status corrupted: got %q", iStatus)
+	}
+	if iAcceptedBy != 2 {
+		t.Fatalf("expected accepted_by backfilled to bob (user 2), got %d", iAcceptedBy)
 	}
 	if iExp != expires {
 		t.Fatalf("invite expires_at corrupted: got %q want %q", iExp, expires)
@@ -376,6 +388,12 @@ func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membersh
 		"alice@example.com", "hash", now.Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed alter-upgraded user: %v", err)
 	}
+	// bob is the invitee of the legacy ACCEPTED invite; his membership is what
+	// migration 4 must backfill accepted_by_user_id from.
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"bob@example.com", "hash", now.Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed alter-upgraded bob: %v", err)
+	}
 	if _, err := db.ExecContext(ctx, `insert into registries
 		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
 		values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -387,6 +405,13 @@ func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membersh
 		(registry_id, user_id, role, created_at, can_pull, can_push) values (?, ?, ?, ?, ?, ?)`,
 		1, 1, "owner", membershipCreated, 0, 1); err != nil {
 		t.Fatalf("seed alter-upgraded membership: %v", err)
+	}
+	// bob's membership (the accepted invitee): migration 4 backfills the
+	// invite's accepted_by_user_id from this row.
+	if _, err := db.ExecContext(ctx, `insert into registry_memberships
+		(registry_id, user_id, role, created_at, can_pull, can_push) values (?, ?, ?, ?, ?, ?)`,
+		1, 2, "member", membershipCreated, 1, 1); err != nil {
+		t.Fatalf("seed alter-upgraded bob membership: %v", err)
 	}
 	// Invite: can_pull=1 can_push=1 (non-default), distinct token/status/times.
 	if _, err := db.ExecContext(ctx, `insert into registry_invites
@@ -689,11 +714,14 @@ func assertConstrainedFKs(t *testing.T, db *sql.DB) {
 	}
 
 	invites := foreignKeyList(t, db, "registry_invites")
-	if len(invites) != 1 {
-		t.Fatalf("registry_invites must declare exactly 1 foreign key, found %d", len(invites))
+	if len(invites) != 2 {
+		t.Fatalf("registry_invites must declare exactly 2 foreign keys (registry cascade + accepted_by), found %d", len(invites))
 	}
 	if f, ok := find(invites, "registries", "registry_id"); !ok || f.to != "id" || f.onDelete != "CASCADE" {
 		t.Fatalf("registry_invites.registry_id missing/invalid: %+v", invites)
+	}
+	if f, ok := find(invites, "users", "accepted_by_user_id"); !ok || f.to != "id" {
+		t.Fatalf("registry_invites.accepted_by_user_id missing/invalid: %+v", invites)
 	}
 
 	// A physically constrained schema must reject an orphan insert.
@@ -802,11 +830,65 @@ func seedLegacyRow(t *testing.T, db *sql.DB, kind, now string, a, b string) {
 		if _, err := db.ExecContext(ctx, `insert into registry_invites
 			(registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
 			values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			1, strings.ToLower(a), "member", 1, 0, "tokhash", "pending", expires, now); err != nil {
+			1, strings.ToLower(a), "member", 1, 0, legacyInviteHashV1, "pending", expires, now); err != nil {
 			t.Fatalf("seed invite: %v", err)
 		}
 	default:
 		t.Fatalf("unknown legacy row kind %q", kind)
+	}
+}
+
+// legacyInviteTokenTextV1 is a canonical legacy invite token TEXT (32
+// base64url chars decoding to 24 zero bytes), used by legacy seed helpers so
+// migration 4 can deterministically convert the historical hex(token text)
+// token_hash into the SHA-256 digest.
+const legacyInviteTokenTextV1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// legacyInviteHashV1 is the historical reversible token_hash encoding of
+// legacyInviteTokenTextV1: hex(token text), 64 lowercase hex chars.
+const legacyInviteHashV1 = "4141414141414141414141414141414141414141414141414141414141414141"
+
+// assertInviteDigestSchema proves the migration-4 lifecycle schema is
+// physically installed: token_digest BLOB unique, the accepted_by FK, the
+// consistency CHECKs (via a rejected direct-SQL insert), and the two
+// state-transition triggers.
+func assertInviteDigestSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+
+	// token_digest must exist as the unique credential column.
+	var digestType string
+	if err := db.QueryRowContext(ctx, `select type from pragma_table_info('registry_invites') where name = 'token_digest'`).Scan(&digestType); err != nil {
+		t.Fatalf("token_digest column missing: %v", err)
+	}
+	if !strings.Contains(strings.ToUpper(digestType), "BLOB") {
+		t.Fatalf("token_digest must be a BLOB, got %q", digestType)
+	}
+
+	// Invites are born pending only: a direct insert with another status must
+	// be aborted by the trigger.
+	if _, err := db.ExecContext(ctx, `insert into registry_invites
+		(registry_id, email, role, can_pull, can_push, token_digest, status, expires_at, created_at)
+		values (999, 'x@example.com', 'member', 1, 0, zeroblob(32), 'accepted', ?, ?)`,
+		time.Now().UTC().Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); err == nil {
+		t.Fatal("expected born-pending trigger to reject a non-pending insert")
+	}
+
+	var fks int
+	if err := db.QueryRowContext(ctx, `select count(*) from pragma_foreign_key_list('registry_invites')`).Scan(&fks); err != nil {
+		t.Fatalf("count invite fks: %v", err)
+	}
+	if fks != 2 {
+		t.Fatalf("expected 2 foreign keys on registry_invites (registry cascade + accepted_by), got %d", fks)
+	}
+	for _, name := range []string{"registry_invites_born_pending", "registry_invites_terminal_status"} {
+		var n int
+		if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = ?`, name).Scan(&n); err != nil {
+			t.Fatalf("count trigger %s: %v", name, err)
+		}
+		if n != 1 {
+			t.Fatalf("expected trigger %s to be installed, found %d", name, n)
+		}
 	}
 }
 
@@ -1019,10 +1101,11 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
-		t.Fatalf("expected version 3, got %d", version)
+	if version != 4 {
+		t.Fatalf("expected version 4, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
+	assertInviteDigestSchema(t, db)
 }
 
 // TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema drives migration 3
@@ -1037,10 +1120,11 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 3 {
-			t.Fatalf("expected version 3, got %d", version)
+		if version != 4 {
+			t.Fatalf("expected version 4, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
+		assertInviteDigestSchema(t, db)
 	})
 	t.Run("legacy plaintext through v1 v2", func(t *testing.T) {
 		db := openRawTestDB(t)
@@ -1051,8 +1135,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 3 {
-			t.Fatalf("expected version 3, got %d", version)
+		if version != 4 {
+			t.Fatalf("expected version 4, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1094,8 +1178,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 3 {
-			t.Fatalf("expected version 3, got %d", version)
+		if version != 4 {
+			t.Fatalf("expected version 4, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})
