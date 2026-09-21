@@ -207,6 +207,360 @@ func TestUpgradeRejectsOrphanedLegacyData(t *testing.T) {
 	}
 }
 
+// TestUpgradePreservesAlterAppendedPermissionFields builds a legacy database the
+// way the HISTORICAL pre-versioning control plane actually produced it: the
+// membership and invite tables were originally created WITHOUT the can_pull /
+// can_push columns, and a later in-place migration appended them via
+// ALTER TABLE ADD COLUMN, so they physically sit at the END of each table
+// (AFTER created_at). The rebuild must not depend on positional `select *`
+// (which assumes the clone's physical column order, not the legacy table's),
+// so every field value — not just row counts — must survive with its exact
+// value and ID.
+func TestUpgradePreservesAlterAppendedPermissionFields(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	membershipCreated := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	inviteCreated := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	expires := now.Add(24 * time.Hour).Format(time.RFC3339)
+	inviteToken := "alt-token-hash-special"
+
+	seedAlterUpgradedLegacyDB(t, db, now, membershipCreated, inviteCreated, expires, inviteToken)
+
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations over ALTER-upgraded legacy schema: %v", err)
+	}
+
+	// Memberships: both permission columns shifted position relative to the
+	// clone's order, and created_at moved from position 5 to 7. Every field must
+	// be byte-for-byte identical to what was seeded.
+	var (
+		mID, mReg, mUsr int64
+		mRole           string
+		mPull, mPush    int
+		mCreated        string
+	)
+	if err := db.QueryRowContext(ctx, `select id, registry_id, user_id, role, can_pull, can_push, created_at from registry_memberships where id = 1`).
+		Scan(&mID, &mReg, &mUsr, &mRole, &mPull, &mPush, &mCreated); err != nil {
+		t.Fatalf("read migrated membership: %v", err)
+	}
+	if mID != 1 || mReg != 1 || mUsr != 1 {
+		t.Fatalf("membership ids corrupted: id=%d registry=%d user=%d", mID, mReg, mUsr)
+	}
+	if mRole != "owner" {
+		t.Fatalf("membership role corrupted: got %q", mRole)
+	}
+	if mPull != 0 || mPush != 1 {
+		t.Fatalf("membership permission fields corrupted: can_pull=%d can_push=%d (want 0,1)", mPull, mPush)
+	}
+	if mCreated != membershipCreated {
+		t.Fatalf("membership created_at corrupted: got %q want %q", mCreated, membershipCreated)
+	}
+
+	// Invites: the shift is larger (token_hash, status, expires_at, created_at
+	// all move relative to the appended can_pull/can_push). Assert every field.
+	var (
+		iID, iReg                       int64
+		iEmail, iRole                   string
+		iPull, iPush                    int
+		iToken, iStatus, iExp, iCreated string
+	)
+	if err := db.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites where id = 1`).
+		Scan(&iID, &iReg, &iEmail, &iRole, &iPull, &iPush, &iToken, &iStatus, &iExp, &iCreated); err != nil {
+		t.Fatalf("read migrated invite: %v", err)
+	}
+	if iID != 1 || iReg != 1 {
+		t.Fatalf("invite ids corrupted: id=%d registry=%d", iID, iReg)
+	}
+	if iEmail != "bob@example.com" || iRole != "member" {
+		t.Fatalf("invite email/role corrupted: email=%q role=%q", iEmail, iRole)
+	}
+	if iPull != 1 || iPush != 1 {
+		t.Fatalf("invite permission fields corrupted: can_pull=%d can_push=%d (want 1,1)", iPull, iPush)
+	}
+	if iToken != inviteToken {
+		t.Fatalf("invite token_hash corrupted: got %q want %q", iToken, inviteToken)
+	}
+	if iStatus != "accepted" {
+		t.Fatalf("invite status corrupted: got %q", iStatus)
+	}
+	if iExp != expires {
+		t.Fatalf("invite expires_at corrupted: got %q want %q", iExp, expires)
+	}
+	if iCreated != inviteCreated {
+		t.Fatalf("invite created_at corrupted: got %q want %q", iCreated, inviteCreated)
+	}
+}
+
+// seedAlterUpgradedLegacyDB builds a legacy schema the way the HISTORICAL
+// pre-versioning control plane produced it: users/registries as today, but
+// membership and invite tables WITHOUT the can_pull/can_push permission columns
+// (they were appended later via ALTER TABLE ADD COLUMN, so they physically sit
+// AFTER created_at). Representative rows are seeded with NON-DEFAULT permission
+// values (so a positional copy would corrupt them) and non-default created_at /
+// token / status values so every field's survival is independently observable.
+func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membershipCreated, inviteCreated, expires, inviteToken string) {
+	t.Helper()
+	ctx := context.Background()
+
+	// No schema_migrations table, no foreign keys — matching a pre-versioning DB.
+	alterSchema := []string{
+		`create table users (
+			id integer primary key autoincrement,
+			email text not null unique,
+			password_hash text not null,
+			created_at text not null
+		)`,
+		`create table registries (
+			id integer primary key autoincrement,
+			slug text not null unique,
+			host text not null unique,
+			ens_name text not null,
+			owner_user_id integer not null,
+			feed_owner_address text not null,
+			encrypted_feed_private_key text not null,
+			default_stamp_batch_id text not null,
+			anonymous_pull integer not null,
+			created_at text not null
+		)`,
+		// Memberships WITHOUT permission columns: id, registry_id, user_id,
+		// role, created_at (the historical order before can_pull/can_push were
+		// appended).
+		`create table registry_memberships (
+			id integer primary key autoincrement,
+			registry_id integer not null,
+			user_id integer not null,
+			role text not null,
+			created_at text not null,
+			unique(registry_id, user_id)
+		)`,
+		// Invites WITHOUT permission columns: id, registry_id, email, role,
+		// token_hash, status, expires_at, created_at.
+		`create table registry_invites (
+			id integer primary key autoincrement,
+			registry_id integer not null,
+			email text not null,
+			role text not null,
+			token_hash text not null unique,
+			status text not null,
+			expires_at text not null,
+			created_at text not null
+		)`,
+	}
+	for _, stmt := range alterSchema {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("build ALTER-upgraded legacy schema: %v", err)
+		}
+	}
+
+	// Historical ALTER step: append the permission columns at the END, in the
+	// order the original migration added them.
+	for _, stmt := range []string{
+		`alter table registry_memberships add column can_pull integer not null default 1`,
+		`alter table registry_memberships add column can_push integer not null default 0`,
+		`alter table registry_invites add column can_pull integer not null default 1`,
+		`alter table registry_invites add column can_push integer not null default 0`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("apply historical ALTER ADD COLUMN: %v", err)
+		}
+	}
+
+	// Seed parents and child rows with representative, NON-DEFAULT values.
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"alice@example.com", "hash", now.Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed alter-upgraded user: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"alice", "alice.example.test", "alice.eth", 1, "0xfeed", "ciphertext", "batch-1", 1, now.Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed alter-upgraded registry: %v", err)
+	}
+	// Membership: can_pull=0 can_push=1 (non-default), created_at distinct.
+	if _, err := db.ExecContext(ctx, `insert into registry_memberships
+		(registry_id, user_id, role, created_at, can_pull, can_push) values (?, ?, ?, ?, ?, ?)`,
+		1, 1, "owner", membershipCreated, 0, 1); err != nil {
+		t.Fatalf("seed alter-upgraded membership: %v", err)
+	}
+	// Invite: can_pull=1 can_push=1 (non-default), distinct token/status/times.
+	if _, err := db.ExecContext(ctx, `insert into registry_invites
+		(registry_id, email, role, token_hash, status, expires_at, created_at, can_pull, can_push)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		1, "bob@example.com", "member", inviteToken, "accepted", expires, inviteCreated, 1, 1); err != nil {
+		t.Fatalf("seed alter-upgraded invite: %v", err)
+	}
+}
+
+// TestWithForeignKeysNormalizesDSN proves that withForeignKeys must NOT short-
+// circuit on any existing _pragma= (the defect: unrelated pragmas previously
+// disabled FK enforcement entirely). The unrelated pragma must be preserved,
+// conflicting foreign_keys values must be removed/replaced regardless of their
+// order, and an effective foreign_keys(1) must always be present.
+func TestWithForeignKeysNormalizesDSN(t *testing.T) {
+	cases := []struct {
+		name         string
+		in           string
+		wantContains []string
+		wantOmit     []string
+	}{
+		{
+			name:         "plain path",
+			in:           "controlplane.db",
+			wantContains: []string{"_pragma=foreign_keys(1)"},
+		},
+		{
+			name:         "file: uri",
+			in:           "file:/abs/path/controlplane.db",
+			wantContains: []string{"_pragma=foreign_keys(1)"},
+		},
+		{
+			name:         "file: with existing query params",
+			in:           "file:mem1?mode=memory&cache=shared",
+			wantContains: []string{"mode=memory&cache=shared&_pragma=foreign_keys(1)"},
+		},
+		{
+			name:         "unrelated pragma preserved",
+			in:           "file:x.db?_pragma=busy_timeout(10000)",
+			wantContains: []string{"busy_timeout(10000)", "foreign_keys(1)"},
+		},
+		{
+			name:         "explicit foreign_keys(0) replaced",
+			in:           "file:x.db?_pragma=foreign_keys(0)",
+			wantContains: []string{"foreign_keys(1)"},
+			wantOmit:     []string{"foreign_keys(0)"},
+		},
+		{
+			name:         "unrelated before conflicting, ordering-independent",
+			in:           "file:x.db?_pragma=busy_timeout(5000)&_pragma=foreign_keys(0)",
+			wantContains: []string{"busy_timeout(5000)", "foreign_keys(1)"},
+			wantOmit:     []string{"foreign_keys(0)"},
+		},
+		{
+			name:         "unrelated after conflicting, ordering-independent",
+			in:           "file:x.db?_pragma=foreign_keys(0)&_pragma=busy_timeout(5000)",
+			wantContains: []string{"busy_timeout(5000)", "foreign_keys(1)"},
+			wantOmit:     []string{"foreign_keys(0)"},
+		},
+		{
+			name:         "multiple unrelated pragmas preserved",
+			in:           "file:x.db?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)",
+			wantContains: []string{"busy_timeout(10000)", "journal_mode(WAL)", "foreign_keys(1)"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := withForeignKeys(tc.in)
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got, want) {
+					t.Fatalf("withForeignKeys(%q) = %q; want it to contain %q", tc.in, got, want)
+				}
+			}
+			for _, omit := range tc.wantOmit {
+				if strings.Contains(got, omit) {
+					t.Fatalf("withForeignKeys(%q) = %q; expected to not contain %q", tc.in, got, omit)
+				}
+			}
+			// The base path / query params must be preserved.
+			for _, keep := range []string{"file:x.db", "file:mem1", "file:/abs/path/controlplane.db", "controlplane.db"} {
+				if strings.Contains(tc.in, keep) && !strings.Contains(got, keep) {
+					t.Fatalf("withForeignKeys(%q) = %q; lost base %q", tc.in, got, keep)
+				}
+			}
+		})
+	}
+}
+
+// TestForeignKeysEnforcedAcrossPooledConnectionsWithCustomDSN opens a database
+// whose DSN carries an unrelated pragma (_pragma=busy_timeout) and an explicit
+// foreign_keys(0), passes it through withForeignKeys, and proves (a) the
+// unrelated busy_timeout pragma still applies to the opened connections and
+// (b) foreign-key enforcement is active on MULTIPLE independently acquired
+// *sql.Conn connections from the pool — not just the first.
+func TestForeignKeysEnforcedAcrossPooledConnectionsWithCustomDSN(t *testing.T) {
+	customDSN := "file:fkpool_test?mode=memory&cache=shared&_pragma=busy_timeout(7000)&_pragma=foreign_keys(0)"
+
+	db, err := sql.Open("sqlite", withForeignKeys(customDSN))
+	if err != nil {
+		t.Fatalf("open sqlite with custom DSN: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	// Force the pool to be able to hand out several independent physical
+	// connections so the test genuinely exercises multiple acquisition points.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
+
+	ctx := context.Background()
+
+	// Build a constrained schema manually (mirrors the migration's DDL).
+	for _, stmt := range []string{
+		`create table users (id integer primary key autoincrement, email text not null unique, password_hash text not null, created_at text not null)`,
+		`create table registries (id integer primary key autoincrement, slug text not null unique, host text not null unique, ens_name text not null, owner_user_id integer not null references users(id), feed_owner_address text not null, encrypted_feed_private_key text not null, default_stamp_batch_id text not null, anonymous_pull integer not null, created_at text not null)`,
+		`create table registry_memberships (id integer primary key autoincrement, registry_id integer not null references registries(id) on delete cascade, user_id integer not null references users(id) on delete cascade, role text not null, can_pull integer not null, can_push integer not null, created_at text not null, unique(registry_id,user_id))`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("create constrained schema: %v", err)
+		}
+	}
+
+	// (a) The unrelated pragma must still apply on an acquired connection.
+	connA, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn A: %v", err)
+	}
+	var busyTimeout int
+	if err := connA.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		t.Fatalf("read busy_timeout on conn A: %v", err)
+	}
+	if busyTimeout == 0 {
+		t.Fatalf("unrelated busy_timeout pragma was not applied: got %d", busyTimeout)
+	}
+
+	// Seed valid parents so legitimate rows pass.
+	if _, err := connA.ExecContext(ctx, `insert into users (email,password_hash,created_at) values (?,?,?)`,
+		"alice@example.com", "hash", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := connA.ExecContext(ctx, `insert into registries
+		(slug,host,ens_name,owner_user_id,feed_owner_address,encrypted_feed_private_key,default_stamp_batch_id,anonymous_pull,created_at)
+		values (?,?,?,?,?,?,?,?,?)`,
+		"alice", "alice.test", "alice.eth", 1, "0xfeed", "cipher", "batch-1", 1, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+	connA.Close()
+
+	// (b) An orphan insert must be rejected by FK enforcement from an
+	// independently acquired connection, regardless of which physical conn the
+	// pool hands out.
+	for i := 0; i < 5; i++ {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("acquire conn for rejection probe %d: %v", i, err)
+		}
+		_, err = conn.ExecContext(ctx, `insert into registry_memberships
+			(registry_id,user_id,role,can_pull,can_push,created_at) values (?,?,?,?,?,?)`,
+			999, 1, "member", 1, 0, time.Now().UTC().Format(time.RFC3339))
+		conn.Close()
+		if err == nil {
+			t.Fatalf("rejection probe %d: expected foreign-key violation on independently acquired connection, got nil", i)
+		}
+	}
+
+	// A legitimate membership (real parents) must still succeed on a fresh
+	// pooled connection, proving enforcement didn't over-fire.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquire conn for valid insert: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, `insert into registry_memberships
+		(registry_id,user_id,role,can_pull,can_push,created_at) values (?,?,?,?,?,?)`,
+		1, 1, "owner", 1, 1, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("valid membership on pooled connection failed: %v", err)
+	}
+	conn.Close()
+}
+
 // fkRef describes one entry of PRAGMA foreign_key_list.
 type fkRef struct {
 	table    string

@@ -137,26 +137,72 @@ func CurrentSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
 }
 
 // withForeignKeys returns dsn with foreign-key enforcement enabled on every
-// connection the driver opens for it. It appends the modernc `_pragma` DSN
-// option, so enforcement is per-connection rather than a one-time pool-wide
+// connection the driver opens for it. It injects the modernc `_pragma` DSN
+// option so enforcement is per-connection rather than a one-time pool-wide
 // PRAGMA (which SQLite silently ignores inside a transaction).
+//
+// Unlike a naive append, this SAFELY normalizes: it parses the DSN's query
+// string, preserves any existing unrelated pragmas and query parameters, drops
+// any conflicting `_pragma=foreign_keys(...)` regardless of its order or value,
+// and guarantees an effective `_pragma=foreign_keys(1)` is present. This avoids
+// the historical defect where any pre-existing `_pragma=` (e.g.
+// busy_timeout) short-circuited the function and left foreign-key enforcement
+// silently disabled across every pooled connection. Plain paths, `file:` URIs
+// and their existing query parameters are preserved.
 func withForeignKeys(dsn string) string {
-	if strings.Contains(dsn, "_pragma=") {
-		return dsn
+	// Split off any query string (first '?').
+	base, query := dsn, ""
+	if i := strings.Index(dsn, "?"); i >= 0 {
+		base, query = dsn[:i], dsn[i+1:]
 	}
-	sep := "?"
-	if strings.Contains(dsn, "?") {
-		sep = "&"
+
+	var kept []string
+	if query != "" {
+		for _, param := range strings.Split(query, "&") {
+			if param == "" {
+				continue
+			}
+			// Drop any foreign-keys pragma; we always re-add the effective one.
+			if isForeignKeyPragmaParam(param) {
+				continue
+			}
+			kept = append(kept, param)
+		}
 	}
-	return dsn + sep + "_pragma=foreign_keys(1)"
+
+	// Append the effective foreign_keys(1) pragma last. Order in the query
+	// string doesn't matter for pragma application since our conflicting ones
+	// were removed above; keeping it last is deterministic and readable.
+	kept = append(kept, "_pragma=foreign_keys(1)")
+
+	return base + "?" + strings.Join(kept, "&")
+}
+
+// isForeignKeyPragmaParam reports whether a single query parameter is a
+// `_pragma=foreign_keys(...)` DSN option whose value must be normalized away in
+// favor of the effective on-state. It matches the pragma NAME (up to the first
+// '(' or end), so `_pragma=foreign_keys(0)`, `_pragma=foreign_keys(1)` and
+// `_pragma=foreign_keys` are all recognized while unrelated pragmas (e.g.
+// `_pragma=busy_timeout(10000)`) are left untouched.
+func isForeignKeyPragmaParam(param string) bool {
+	const prefix = "_pragma="
+	if !strings.HasPrefix(param, prefix) {
+		return false
+	}
+	val := param[len(prefix):]
+	name := val
+	if i := strings.Index(val, "("); i >= 0 {
+		name = val[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(name), "foreign_keys")
 }
 
 // Table names and the canonical constrained schema (migration version 1).
 const (
-	tableUsers     = "users"
-	tableRegistries = "registries"
+	tableUsers       = "users"
+	tableRegistries  = "registries"
 	tableMemberships = "registry_memberships"
-	tableInvites   = "registry_invites"
+	tableInvites     = "registry_invites"
 )
 
 // desiredSchema returns DDL statements for the fully constrained clone of every
@@ -240,20 +286,40 @@ func rebuildSchema(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	// 2. Copy existing rows, parent-first (drop/rename order is the reverse).
+	//    Column lists are EXPLICIT on both sides: `insert into <clone>(...) select
+	//    <same>(...) from <legacy>`. This is required because legacy databases
+	//    upgraded by the historical control-plane migration appended can_pull/
+	//    can_push via ALTER TABLE ADD COLUMN, so their PHYSICAL column order
+	//    (...,created_at,can_pull,can_push) differs from the clone's desired order
+	//    (...,can_pull,can_push,created_at). A positional `insert ... select *`
+	//    would silently shift values into the wrong columns; naming the columns
+	//    on both sides makes SQLite match by name and every field—and every
+	//    ID—survives exactly.
 	//    Table existence is checked so fresh databases (no legacy tables) skip
 	//    the copy and the drop without harming the outcome.
-	for _, t := range []string{tableUsers, tableRegistries, tableMemberships, tableInvites} {
-		exists, err := tableExists(ctx, tx, t)
+	type copyDef struct {
+		table string
+		cols  []string
+	}
+	copies := []copyDef{
+		{tableUsers, []string{"id", "email", "password_hash", "created_at"}},
+		{tableRegistries, []string{"id", "slug", "host", "ens_name", "owner_user_id", "feed_owner_address", "encrypted_feed_private_key", "default_stamp_batch_id", "anonymous_pull", "created_at"}},
+		{tableMemberships, []string{"id", "registry_id", "user_id", "role", "can_pull", "can_push", "created_at"}},
+		{tableInvites, []string{"id", "registry_id", "email", "role", "can_pull", "can_push", "token_hash", "status", "expires_at", "created_at"}},
+	}
+	for _, c := range copies {
+		exists, err := tableExists(ctx, tx, c.table)
 		if err != nil {
-			return fmt.Errorf("check legacy table %s: %w", t, err)
+			return fmt.Errorf("check legacy table %s: %w", c.table, err)
 		}
 		if !exists {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`insert into %s%s select * from %s`, t, suffix, t)); err != nil {
+		cols := strings.Join(c.cols, ", ")
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`insert into %s%s (%s) select %s from %s`, c.table, suffix, cols, cols, c.table)); err != nil {
 			// An orphaned row fails here (FK enforcement during the copy); the
 			// deferred rollback discards the clones and never records version 1.
-			return fmt.Errorf("copy legacy rows from %s: %w", t, err)
+			return fmt.Errorf("copy legacy rows from %s: %w", c.table, err)
 		}
 	}
 
