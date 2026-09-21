@@ -3,6 +3,8 @@ package registry
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,6 +18,25 @@ import (
 	"github.com/uncloud-registry/registry/internal/staging"
 )
 
+// testServiceHost is the canonical registry host the test handler serves and
+// the audience every valid test token is issued for.
+const testServiceHost = "alice.uncloud-registry.com"
+
+// testKeyID is the kid shared by the test key pairs.
+const testKeyID = "test-key-1"
+
+// testKeySet is an in-memory PublicKeySet (the strict JWKS loader is exercised
+// separately in internal/auth and cmd/registry).
+type testKeySet map[string]ed25519.PublicKey
+
+func (k testKeySet) Key(_ context.Context, keyID string) (ed25519.PublicKey, error) {
+	pk, ok := k[keyID]
+	if !ok {
+		return nil, errors.New("unknown kid")
+	}
+	return pk, nil
+}
+
 func TestManifestAndBlobPullViaRepoState(t *testing.T) {
 	t.Parallel()
 
@@ -25,7 +46,7 @@ func TestManifestAndBlobPullViaRepoState(t *testing.T) {
 	docs.Documents["manifest-ref"] = []byte(`{"schemaVersion":2}`)
 	docs.Documents["blob-ref"] = []byte("blob-bytes")
 
-	handler := newTestHandler(t, docs, feeds)
+	handler, _ := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -33,7 +54,7 @@ func TestManifestAndBlobPullViaRepoState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create manifest request: %v", err)
 	}
-	manifestReq.Host = "alice.uncloud-registry.com"
+	manifestReq.Host = testServiceHost
 
 	manifestResp, err := http.DefaultClient.Do(manifestReq)
 	if err != nil {
@@ -57,7 +78,7 @@ func TestManifestAndBlobPullViaRepoState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create blob request: %v", err)
 	}
-	blobReq.Host = "alice.uncloud-registry.com"
+	blobReq.Host = testServiceHost
 
 	blobResp, err := http.DefaultClient.Do(blobReq)
 	if err != nil {
@@ -82,7 +103,7 @@ func TestPullRequiresAuthWhenAnonymousNotAllowed(t *testing.T) {
 		"repos":{"backend/api":{"pull":["user:alice"],"push":["user:alice"]}}
 	}`)
 
-	handler := newTestHandler(t, docs, feeds)
+	handler, _ := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -90,7 +111,7 @@ func TestPullRequiresAuthWhenAnonymousNotAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
-	req.Host = "alice.uncloud-registry.com"
+	req.Host = testServiceHost
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -113,13 +134,8 @@ func TestAuthenticatedPullAllowedByPolicy(t *testing.T) {
 	docs := resolve.NewMemoryDocumentStore()
 	feeds := resolve.NewMemoryFeedStore()
 	seedRegistryDocuments(t, docs, feeds)
-	docs.Documents["auth-policy-ref"] = []byte(`{
-		"version":1,
-		"defaultAccess":"deny",
-		"repos":{"backend/api":{"pull":["user:alice"],"push":["user:alice"]}}
-	}`)
 
-	handler := newTestHandler(t, docs, feeds)
+	handler, issuer := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -127,8 +143,8 @@ func TestAuthenticatedPullAllowedByPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create request: %v", err)
 	}
-	req.Host = "alice.uncloud-registry.com"
-	req.Header.Set("Authorization", sessionBearer(t, "user:alice"))
+	req.Host = testServiceHost
+	req.Header.Set("Authorization", registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPull}, time.Hour))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -141,6 +157,278 @@ func TestAuthenticatedPullAllowedByPolicy(t *testing.T) {
 	}
 }
 
+// TestAnonymousPullIsEvaluatedByPolicy captures the principal handed to the
+// pull policy when no token is presented: it must be the anonymous subject,
+// and the policy (not the auth layer) makes the allow decision.
+func TestAnonymousPullIsEvaluatedByPolicy(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, _ := newTestHandler(t, docs, feeds)
+	handler.(*Handler).PullAuthorizer = &capturingPullAuthorizer{
+		allowed:  true,
+		onCall:   func(p auth.Principal) { t.Logf("policy saw principal %+v", p) },
+		recorded: &[]auth.Principal{},
+	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Host = testServiceHost
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous pull on public repo must be allowed, status=%d", resp.StatusCode)
+	}
+	// The auth layer must hand policy exactly the anonymous subject.
+	got := *handler.(*Handler).PullAuthorizer.(*capturingPullAuthorizer).recorded
+	if len(got) != 1 || got[0].Subject != auth.AnonymousSubject {
+		t.Fatalf("policy must be consulted with the anonymous principal, got %+v", got)
+	}
+}
+
+// TestPullRejectsInvalidCredentialsOnPublicRepo pins the never-downgrade rule:
+// on a repo whose policy explicitly allows anonymous pull, ANY presented but
+// invalid credential is still a hard 401 — invalid credentials are never
+// reclassified as anonymous on public repos.
+func TestPullRejectsInvalidCredentialsOnPublicRepo(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, issuer := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	headers := map[string]string{
+		"non-jwt garbage":         "Bearer not-a-jwt",
+		"unsigned role bearer":    "Bearer role:read",
+		"wrong scheme":            "Basic dXNlcjpwYXNz",
+		"missing token part":      "Bearer",
+		"empty bearer":            "Bearer ",
+		"double space":            "Bearer  xyz",
+		"expired token":           "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPull}, -time.Hour),
+		"wrong service claim":     "Bearer " + registryBearer(t, issuer, "user:alice", "evil.example.test", "backend/api", []auth.Action{auth.ActionPull}, time.Hour),
+		"wrong repository":        "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "other/repo", []auth.Action{auth.ActionPull}, time.Hour),
+		"push-only token on pull": "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, time.Hour),
+		"session token":           sessionBearerText(t, "user:alice"),
+		"invalid signature":       "Bearer " + registryBearerFromOtherKey(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPull}, time.Hour),
+	}
+
+	for name, header := range headers {
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
+		if err != nil {
+			t.Fatalf("%s: create request: %v", name, err)
+		}
+		req.Host = testServiceHost
+		req.Header.Set("Authorization", header)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: request failed: %v", name, err)
+		}
+		code := resp.StatusCode
+		challenge := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+
+		if code != http.StatusUnauthorized {
+			t.Errorf("%s: expected 401 on a public repo, got %d", name, code)
+		}
+		if challenge == "" {
+			t.Errorf("%s: expected WWW-Authenticate challenge", name)
+		}
+	}
+}
+
+// TestPushRejectsInvalidCredentials covers every invalid push credential
+// shape: no header, wrong scheme, malformed, unsigned, expired, wrong
+// service/repository, pull-only scope, session tokens, and forgeries.
+func TestPushRejectsInvalidCredentials(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, issuer := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	headers := map[string]string{
+		"no header":            "",
+		"non-jwt garbage":      "Bearer not-a-jwt",
+		"unsigned role bearer": "Bearer role:write",
+		"wrong scheme":         "Basic dXNlcjpwYXNz",
+		"missing token part":   "Bearer",
+		"empty bearer":         "Bearer ",
+		"double space":         "Bearer  xyz",
+		"expired token":        "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, -time.Hour),
+		"wrong service claim":  "Bearer " + registryBearer(t, issuer, "user:alice", "evil.example.test", "backend/api", []auth.Action{auth.ActionPush}, time.Hour),
+		"wrong repository":     "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "other/repo", []auth.Action{auth.ActionPush}, time.Hour),
+		"pull-only token":      "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPull}, time.Hour),
+		"session token":        sessionBearerText(t, "user:alice"),
+		"invalid signature":    "Bearer " + registryBearerFromOtherKey(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, time.Hour),
+	}
+
+	for name, header := range headers {
+		req, err := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
+		if err != nil {
+			t.Fatalf("%s: create request: %v", name, err)
+		}
+		req.Host = testServiceHost
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: request failed: %v", name, err)
+		}
+		code := resp.StatusCode
+		challenge := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+
+		if code != http.StatusUnauthorized {
+			t.Errorf("%s: expected 401, got %d", name, code)
+		}
+		if challenge == "" {
+			t.Errorf("%s: expected WWW-Authenticate challenge", name)
+		}
+	}
+}
+
+// TestPushRejectsTokenAtUnconfiguredRequestHost proves the request-side
+// service binding: a valid token for the configured audience presented at a
+// host that resolves to a DIFFERENT registry identity still fails closed.
+func TestPushRejectsTokenAtUnconfiguredRequestHost(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, issuer := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Host = "evil.example.test" // resolves in the test identity map
+	req.Header.Set("Authorization", registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, time.Hour))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("token for another service host must be rejected, status=%d", resp.StatusCode)
+	}
+}
+
+func TestPushRejectsUnsignedRoleBearer(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, _ := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
+	if err != nil {
+		t.Fatalf("create start upload request: %v", err)
+	}
+	req.Host = testServiceHost
+	req.Header.Set("Authorization", "Bearer role:write")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("start upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unsigned role bearer must be rejected, status=%d", resp.StatusCode)
+	}
+}
+
+func TestPullRejectsSessionTokenEvenOnPublicRepo(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, _ := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Host = testServiceHost
+	req.Header.Set("Authorization", sessionBearerText(t, "user:alice"))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("session token must not authorize or downgrade pull on a public repo, status=%d", resp.StatusCode)
+	}
+}
+
+func TestPushRejectsSessionToken(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, _ := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
+	if err != nil {
+		t.Fatalf("create start upload request: %v", err)
+	}
+	req.Host = testServiceHost
+	req.Header.Set("Authorization", sessionBearerText(t, "user:alice"))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("start upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("session token must never start a push, status=%d", resp.StatusCode)
+	}
+}
+
 func TestPushBlobAndPublishManifest(t *testing.T) {
 	t.Parallel()
 
@@ -148,16 +436,20 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	feeds := resolve.NewMemoryFeedStore()
 	seedRegistryDocuments(t, docs, feeds)
 
-	handler := newTestHandler(t, docs, feeds)
+	handler, issuer := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
+
+	pushAuth := func(req *http.Request) {
+		req.Host = testServiceHost
+		req.Header.Set("Authorization", registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, time.Hour))
+	}
 
 	startReq, err := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
 	if err != nil {
 		t.Fatalf("create start upload request: %v", err)
 	}
-	startReq.Host = "alice.uncloud-registry.com"
-	startReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
+	pushAuth(startReq)
 
 	startResp, err := http.DefaultClient.Do(startReq)
 	if err != nil {
@@ -177,8 +469,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create patch request: %v", err)
 	}
-	patchReq.Host = "alice.uncloud-registry.com"
-	patchReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
+	pushAuth(patchReq)
 
 	patchResp, err := http.DefaultClient.Do(patchReq)
 	if err != nil {
@@ -194,8 +485,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create finalize request: %v", err)
 	}
-	finalizeReq.Host = "alice.uncloud-registry.com"
-	finalizeReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
+	pushAuth(finalizeReq)
 	finalizeReq.Header.Set("Content-Type", "application/vnd.oci.image.config.v1+json")
 
 	finalizeResp, err := http.DefaultClient.Do(finalizeReq)
@@ -218,8 +508,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create manifest request: %v", err)
 	}
-	manifestReq.Host = "alice.uncloud-registry.com"
-	manifestReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
+	pushAuth(manifestReq)
 	manifestReq.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 
 	manifestResp, err := http.DefaultClient.Do(manifestReq)
@@ -232,11 +521,13 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 		t.Fatalf("unexpected manifest publish status: %d", manifestResp.StatusCode)
 	}
 
+	// Signed pull with the same principal works too.
 	getReq, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
 	if err != nil {
 		t.Fatalf("create get manifest request: %v", err)
 	}
-	getReq.Host = "alice.uncloud-registry.com"
+	getReq.Host = testServiceHost
+	getReq.Header.Set("Authorization", registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPull}, time.Hour))
 
 	getResp, err := http.DefaultClient.Do(getReq)
 	if err != nil {
@@ -249,42 +540,158 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	}
 }
 
-// registryTestSessionSecret is a strong, test-only HMAC secret (>=32 bytes).
-const registryTestSessionSecret = "registry-test-session-secret-0123456789abcdef"
+// TestInvalidPushCredentialsProduceNoSideEffects proves verification happens
+// BEFORE policy, staging, and publish: every blocked attempt leaves zero
+// staging sessions, zero policy consultations, and the repo-state feed
+// untouched.
+func TestInvalidPushCredentialsProduceNoSideEffects(t *testing.T) {
+	t.Parallel()
 
-// newTestSessionManager builds a session manager bound to the shared test
-// secret; any manager built from this secret can verify tokens it issues.
-func newTestSessionManager(t *testing.T) *auth.SessionTokenManager {
-	t.Helper()
-	m, err := auth.NewSessionTokenManager(registryTestSessionSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
-	if err != nil {
-		t.Fatalf("new session manager: %v", err)
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, issuer := newTestHandler(t, docs, feeds)
+	h := handler.(*Handler)
+	stage := &countingStaging{Store: staging.NewMemoryStore()}
+	h.Staging = stage
+	pushAuthz := &recordingPushAuthorizer{allowed: true, batchID: "batch-repo"}
+	h.PushAuthorizer = pushAuthz
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	attempts := map[string]string{
+		"no header":            "",
+		"unsigned role bearer": "Bearer role:write",
+		"expired token":        "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, -time.Hour),
+		"session token":        sessionBearerText(t, "user:alice"),
+		"wrong repository":     "Bearer " + registryBearer(t, issuer, "user:alice", testServiceHost, "other/repo", []auth.Action{auth.ActionPush}, time.Hour),
 	}
-	return m
+	for name, header := range attempts {
+		req, err := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
+		if err != nil {
+			t.Fatalf("%s: create request: %v", name, err)
+		}
+		req.Host = testServiceHost
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: request failed: %v", name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s: expected 401, got %d", name, resp.StatusCode)
+		}
+	}
+
+	if stage.created != 0 {
+		t.Fatalf("blocked pushes created %d staging sessions", stage.created)
+	}
+	if pushAuthz.calls != 0 {
+		t.Fatalf("blocked pushes consulted the push policy %d times", pushAuthz.calls)
+	}
+	// Manifest path never ran, so the repo-state feed must still point at the
+	// seeded document.
+	if got := feeds.Feeds[spec.RepoStateFeedRef("0xaliceowner", "backend/api")]; got != "repo-state-ref" {
+		t.Fatalf("repo-state feed changed to %q after blocked pushes", got)
+	}
 }
 
-// sessionBearer issues a valid session token for subject and returns the full
-// `Bearer <token>` Authorization header value the handler expects.
-func sessionBearer(t *testing.T, subject string) string {
-	t.Helper()
-	raw, err := newTestSessionManager(t).Issue(subject, time.Hour)
-	if err != nil {
-		t.Fatalf("issue session token: %v", err)
+// TestInvalidPullCredentialsProduceNoSideEffects proves blocked pulls never
+// reach the pull policy, the repo-state resolution, or the object store —
+// even on a public repo where anonymous would have been allowed.
+func TestInvalidPullCredentialsProduceNoSideEffects(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, _ := newTestHandler(t, docs, feeds)
+	h := handler.(*Handler)
+	objects := &countingObjects{ObjectStore: docs}
+	h.Objects = objects
+	pullAuthz := &recordingPullAuthorizer{allowed: true}
+	h.PullAuthorizer = pullAuthz
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	for name, header := range map[string]string{
+		"non-jwt garbage": "Bearer garbage",
+		"wrong scheme":    "Basic dXNlcjpwYXNz",
+	} {
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
+		if err != nil {
+			t.Fatalf("%s: create request: %v", name, err)
+		}
+		req.Host = testServiceHost
+		req.Header.Set("Authorization", header)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: request failed: %v", name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s: expected 401, got %d", name, resp.StatusCode)
+		}
 	}
-	return "Bearer " + raw
+
+	if pullAuthz.calls != 0 {
+		t.Fatalf("blocked pulls consulted the pull policy %d times", pullAuthz.calls)
+	}
+	if objects.gets != 0 {
+		t.Fatalf("blocked pulls fetched %d objects", objects.gets)
+	}
 }
 
-func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) http.Handler {
+func TestMemoryDocumentStoreRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	store := resolve.NewMemoryDocumentStore()
+	ref, err := store.Put(context.Background(), []byte("hello"), "batch")
+	if err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	got, err := store.Get(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("get failed: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("unexpected stored data: %q", got)
+	}
+}
+
+// --- fixtures and helpers ---
+
+// newTestHandler builds a handler wired to a freshly generated Ed25519 test
+// key pair. The verifier is bound to the test issuer and the testServiceHost
+// audience. It returns the handler plus the issuer used to sign fixtures.
+func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) (http.Handler, *auth.RegistryTokenIssuer) {
 	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	keys := testKeySet{testKeyID: pub}
+	issuer, err := auth.NewRegistryTokenIssuer(priv, auth.RegistryIssuer, testKeyID)
+	if err != nil {
+		t.Fatalf("new registry token issuer: %v", err)
+	}
+	verifier := auth.NewRegistryTokenVerifier(keys, auth.RegistryIssuer, testServiceHost)
 	stageStore := staging.NewMemoryStore()
-	subjects := auth.SubjectResolver{Tokens: newTestSessionManager(t)}
-	return NewHandler(
+	handler := NewHandler(
 		resolve.RegistryResolver{
 			Registries: resolve.StaticRegistryIdentityResolver{
 				Hosts: map[string]resolve.RegistryIdentity{
-					"alice.uncloud-registry.com": {
-						Host:  "alice.uncloud-registry.com",
+					testServiceHost: {
+						Host:  testServiceHost,
 						Owner: "0xaliceowner",
+					},
+					"evil.example.test": {
+						Host:  "evil.example.test",
+						Owner: "0xevilowner",
 					},
 				},
 			},
@@ -293,13 +700,12 @@ func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *reso
 		},
 		docs,
 		docs,
-		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}, Subjects: subjects},
+		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}},
 		policy.PushAuthorizer{
 			AuthPolicies:  policy.AuthPolicyResolver{Docs: docs, Feeds: feeds},
 			StampPolicies: policy.StampPolicyResolver{Docs: docs, Feeds: feeds},
-			Subjects:      subjects,
 		},
-		subjects,
+		BearerAuthenticator{Tokens: verifier},
 		stageStore,
 		publish.Publisher{
 			Builder: publish.DefaultBuilder{},
@@ -308,6 +714,65 @@ func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *reso
 		},
 		"https://auth.uncloud-registry.com/token",
 	)
+	return handler, issuer
+}
+
+// registryBearer issues a signed registry token through the given issuer and
+// returns the full `Bearer <token>` header value.
+func registryBearer(t *testing.T, issuer *auth.RegistryTokenIssuer, subject, service, repository string, actions []auth.Action, ttl time.Duration) string {
+	t.Helper()
+	raw, err := issuer.Issue(context.Background(), auth.RegistryTokenRequest{
+		Subject:    subject,
+		Service:    service,
+		Repository: repository,
+		Actions:    actions,
+		TTL:        ttl,
+	})
+	if err != nil {
+		t.Fatalf("issue registry token: %v", err)
+	}
+	return "Bearer " + raw
+}
+
+// registryBearerFromOtherKey signs a structurally identical token with a
+// DIFFERENT private key under the same kid, producing a forged signature.
+func registryBearerFromOtherKey(t *testing.T, _ *auth.RegistryTokenIssuer, subject, service, repository string, actions []auth.Action, ttl time.Duration) string {
+	t.Helper()
+	_, otherPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate other key: %v", err)
+	}
+	forger, err := auth.NewRegistryTokenIssuer(otherPriv, auth.RegistryIssuer, testKeyID)
+	if err != nil {
+		t.Fatalf("new forger issuer: %v", err)
+	}
+	raw, err := forger.Issue(context.Background(), auth.RegistryTokenRequest{
+		Subject:    subject,
+		Service:    service,
+		Repository: repository,
+		Actions:    actions,
+		TTL:        ttl,
+	})
+	if err != nil {
+		t.Fatalf("forge token: %v", err)
+	}
+	return raw
+}
+
+// sessionBearerText issues a control-plane session token (HMAC, a different
+// purpose) and returns the full `Bearer <token>` header value. Such tokens
+// are NOT registry credentials and must be rejected everywhere.
+func sessionBearerText(t *testing.T, subject string) string {
+	t.Helper()
+	m, err := auth.NewSessionTokenManager("handler-test-session-secret-0123456789abcdef", auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	if err != nil {
+		t.Fatalf("new session manager: %v", err)
+	}
+	raw, err := m.Issue(subject, time.Hour)
+	if err != nil {
+		t.Fatalf("issue session token: %v", err)
+	}
+	return "Bearer " + raw
 }
 
 func seedRegistryDocuments(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) {
@@ -343,19 +808,62 @@ func seedRegistryDocuments(t *testing.T, docs *resolve.MemoryDocumentStore, feed
 	feeds.Feeds[spec.StampPolicyFeedRef("0xaliceowner")] = "stamp-policy-ref"
 }
 
-func TestMemoryDocumentStoreRoundTrip(t *testing.T) {
-	t.Parallel()
+// --- side-effect instrumentation ---
 
-	store := resolve.NewMemoryDocumentStore()
-	ref, err := store.Put(context.Background(), []byte("hello"), "batch")
-	if err != nil {
-		t.Fatalf("put failed: %v", err)
+type capturingPullAuthorizer struct {
+	allowed  bool
+	recorded *[]auth.Principal
+	onCall   func(auth.Principal)
+}
+
+func (c *capturingPullAuthorizer) Authorize(_ context.Context, _ resolve.RegistryIdentity, _ string, p auth.Principal) (bool, error) {
+	if c.recorded != nil {
+		*c.recorded = append(*c.recorded, p)
 	}
-	got, err := store.Get(context.Background(), ref)
-	if err != nil {
-		t.Fatalf("get failed: %v", err)
+	if c.onCall != nil {
+		c.onCall(p)
 	}
-	if string(got) != "hello" {
-		t.Fatalf("unexpected stored data: %q", got)
-	}
+	return c.allowed, nil
+}
+
+type recordingPullAuthorizer struct {
+	calls   int
+	allowed bool
+	err     error
+}
+
+func (r *recordingPullAuthorizer) Authorize(_ context.Context, _ resolve.RegistryIdentity, _ string, _ auth.Principal) (bool, error) {
+	r.calls++
+	return r.allowed, r.err
+}
+
+type recordingPushAuthorizer struct {
+	calls   int
+	batchID string
+	allowed bool
+}
+
+func (r *recordingPushAuthorizer) Authorize(_ context.Context, _ resolve.RegistryIdentity, _ string, _ auth.Principal) (string, bool, error) {
+	r.calls++
+	return r.batchID, r.allowed, nil
+}
+
+type countingStaging struct {
+	staging.Store
+	created int
+}
+
+func (c *countingStaging) CreateSession(ctx context.Context, repo string, actor string, ttl time.Duration) (spec.UploadSession, error) {
+	c.created++
+	return c.Store.CreateSession(ctx, repo, actor, ttl)
+}
+
+type countingObjects struct {
+	ObjectStore
+	gets int
+}
+
+func (c *countingObjects) Get(ctx context.Context, ref string) ([]byte, error) {
+	c.gets++
+	return c.ObjectStore.Get(ctx, ref)
 }

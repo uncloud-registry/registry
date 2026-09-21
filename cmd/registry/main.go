@@ -44,14 +44,10 @@ func buildHandler() (http.Handler, error) {
 func buildMemoryHandler() (http.Handler, error) {
 	docs := resolve.NewMemoryDocumentStore()
 	feeds := resolve.NewMemoryFeedStore()
-	subjects := auth.SubjectResolver{}
 	authRealm := envOrDefault("REGISTRY_AUTH_REALM", "https://auth.uncloud-registry.com/token")
-	manager, err := tokenManagerFromEnv()
+	authenticator, err := buildAuthenticator()
 	if err != nil {
 		return nil, err
-	}
-	if manager != nil {
-		subjects = auth.SubjectResolver{Tokens: manager}
 	}
 
 	return registry.NewHandler(
@@ -62,13 +58,12 @@ func buildMemoryHandler() (http.Handler, error) {
 		},
 		docs,
 		docs,
-		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}, Subjects: subjects},
+		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}},
 		policy.PushAuthorizer{
 			AuthPolicies:  policy.AuthPolicyResolver{Docs: docs, Feeds: feeds},
 			StampPolicies: policy.StampPolicyResolver{Docs: docs, Feeds: feeds},
-			Subjects:      subjects,
 		},
-		subjects,
+		authenticator,
 		staging.NewMemoryStore(),
 		publish.Publisher{
 			Builder: publish.DefaultBuilder{},
@@ -87,14 +82,10 @@ func buildBeeHandler() (http.Handler, error) {
 	docs := swarm.NewBeeDocumentStore(beeURL, http.DefaultClient)
 	objects := swarm.NewBeeObjectStore(beeURL, http.DefaultClient)
 	feeds := swarm.IdentityFeedResolver{}
-	subjects := auth.SubjectResolver{}
 	authRealm := envOrDefault("REGISTRY_AUTH_REALM", "https://auth.uncloud-registry.com/token")
-	manager, err := tokenManagerFromEnv()
+	authenticator, err := buildAuthenticator()
 	if err != nil {
 		return nil, err
-	}
-	if manager != nil {
-		subjects = auth.SubjectResolver{Tokens: manager}
 	}
 	registryResolver, err := buildRegistryIdentityResolver()
 	if err != nil {
@@ -120,13 +111,12 @@ func buildBeeHandler() (http.Handler, error) {
 		},
 		objects,
 		objects,
-		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}, Subjects: subjects},
+		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}},
 		policy.PushAuthorizer{
 			AuthPolicies:  policy.AuthPolicyResolver{Docs: docs, Feeds: feeds},
 			StampPolicies: policy.StampPolicyResolver{Docs: docs, Feeds: feeds},
-			Subjects:      subjects,
 		},
-		subjects,
+		authenticator,
 		staging.NewMemoryStore(),
 		publish.Publisher{
 			Builder: publish.DefaultBuilder{},
@@ -144,23 +134,51 @@ func envOrDefault(name string, fallback string) string {
 	return fallback
 }
 
-// tokenManagerFromEnv builds a session manager from REGISTRY_TOKEN_SECRET. When
-// the variable is absent the resolver fails closed (no session subjects are
-// authorized). When present but empty/weak, NewSessionTokenManager rejects it
-// and the error is returned so startup config construction fails rather than
-// silently falling back to a nil manager.
-//
-// Whitespace is used only to detect a missing/all-whitespace value; any
-// nonblank secret is preserved byte-for-byte as the HMAC key. This mirrors
-// cmd/controlplane's envRequiredSecret so the two processes derive the
-// identical key from the same shared env value (secrets are opaque bytes, not
-// human text to be trimmed).
-func tokenManagerFromEnv() (*auth.SessionTokenManager, error) {
-	secret := os.Getenv("REGISTRY_TOKEN_SECRET")
-	if strings.TrimSpace(secret) == "" {
-		return nil, nil
+// envRequired returns a nonblank env value or an error. It is used for
+// settings whose absence must fail startup: fail-closed registry
+// authentication never falls back to an optional or shared-secret mode.
+func envRequired(name string) (string, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return "", fmt.Errorf("%s must be set", name)
 	}
-	return auth.NewSessionTokenManager(secret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	return value, nil
+}
+
+// buildAuthenticator constructs the fail-closed registry token verifier from
+// REQUIRED production configuration:
+//
+//   - REGISTRY_TOKEN_PUBLIC_KEYS_FILE: strict JWKS file (Ed25519 OKP keys
+//     only; see auth.LoadJWKSFromFile). Startup fails when absent, unreadable,
+//     malformed, empty, or containing anything but Ed25519 public keys.
+//   - REGISTRY_TOKEN_ISSUER: the exact issuer every registry token must carry.
+//   - REGISTRY_TOKEN_AUDIENCE: the exact audience/service every token must
+//     carry AND the registry host requests must be made against. It binds
+//     verification: tokens issued for any other service fail, and requests to
+//     hosts other than the configured audience fail closed.
+//
+// The three settings are consumed by the verifier — they are not parsed and
+// ignored. Key material is never logged or included in errors.
+func buildAuthenticator() (registry.Authenticator, error) {
+	jwksPath, err := envRequired("REGISTRY_TOKEN_PUBLIC_KEYS_FILE")
+	if err != nil {
+		return nil, fmt.Errorf("registry token verification configuration: %w", err)
+	}
+	issuer, err := envRequired("REGISTRY_TOKEN_ISSUER")
+	if err != nil {
+		return nil, fmt.Errorf("registry token verification configuration: %w", err)
+	}
+	audience, err := envRequired("REGISTRY_TOKEN_AUDIENCE")
+	if err != nil {
+		return nil, fmt.Errorf("registry token verification configuration: %w", err)
+	}
+	keys, err := auth.LoadJWKSFromFile(jwksPath)
+	if err != nil {
+		return nil, err
+	}
+	return registry.BearerAuthenticator{
+		Tokens: auth.NewRegistryTokenVerifier(keys, issuer, audience),
+	}, nil
 }
 
 func parseRegistryOwners(raw string) map[string]string {

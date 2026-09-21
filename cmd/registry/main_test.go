@@ -1,114 +1,214 @@
 package main
 
 import (
+	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/registry"
 )
 
-// INVARIANT (shared with cmd/controlplane's envRequiredSecret): whitespace is
-// used only to detect a missing/all-whitespace value; any nonblank configured
-// secret is preserved byte-for-byte in BOTH processes. Session secrets are
-// opaque bytes (the HMAC key), not human text. The registry mirrors the
-// control plane so a token issued against the shared env value verifies here.
-func TestTokenManagerFromEnvPreservesSecretBytes(t *testing.T) {
-	// 32+ byte secret carrying leading and trailing whitespace as a legitimate
-	// part of the key bytes.
-	const pad = " \t\n"
-	raw := pad + strings.Repeat("x", 32) + pad
-	t.Setenv("REGISTRY_TOKEN_SECRET", raw)
+const (
+	configIssuer   = "uncloud-registry/registry"
+	configAudience = "alice.uncloud-registry.com"
+	configKeyID    = "config-key-1"
+	configSubject  = "user:alice"
+	configRepo     = "backend/api"
+)
 
-	registryMgr, err := tokenManagerFromEnv()
-	if err != nil {
-		t.Fatalf("tokenManagerFromEnv: %v", err)
-	}
-	if registryMgr == nil {
-		t.Fatal("a nonblank secret must produce a manager, not nil")
-	}
+// configTestKey holds a generated Ed25519 pair plus the JWKS document that
+// carries its public half.
+type configTestKey struct {
+	priv ed25519.PrivateKey
+	doc  []byte
+}
 
-	// A control-plane issuer built from the IDENTICAL raw env value (as
-	// envRequiredSecret -> NewSessionTokenManager does) must issue a token this
-	// registry-side manager verifies.
-	cpIssuer, err := auth.NewSessionTokenManager(raw, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+func newConfigTestKey(t *testing.T) configTestKey {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
-		t.Fatalf("control-plane issuer on raw secret: %v", err)
+		t.Fatalf("generate key: %v", err)
 	}
-	tok, err := cpIssuer.Issue("alice@example.test", time.Minute)
-	if err != nil {
-		t.Fatalf("issue: %v", err)
-	}
-	claims, err := registryMgr.Verify(tok)
-	if err != nil || claims.Subject != "alice@example.test" {
-		t.Fatalf("registry manager must verify a token signed with the identical raw secret; got err=%v", err)
-	}
+	x := base64.RawURLEncoding.EncodeToString(pub)
+	doc := []byte(`{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"` + configKeyID + `","x":"` + x + `"}]}`)
+	return configTestKey{priv: priv, doc: doc}
+}
 
-	// A manager built from a TrimSpace'd (mutated) variant of the secret must
-	// NOT verify the same token — precisely the divergence this closes.
-	trimmedMgr, err := auth.NewSessionTokenManager(strings.TrimSpace(raw), auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
-	if err != nil {
-		t.Fatalf("trimmed manager: %v", err)
+func writeConfigJWKS(t *testing.T, key configTestKey) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "registry-keys.json")
+	if err := os.WriteFile(path, key.doc, 0o644); err != nil {
+		t.Fatalf("write jwks: %v", err)
 	}
-	if _, err := trimmedMgr.Verify(tok); err == nil {
-		t.Fatal("a trimmed-secret manager must NOT verify a token signed with the padded secret")
+	return path
+}
+
+func clearRegistryAuthEnv() {
+	for _, name := range []string{"REGISTRY_TOKEN_PUBLIC_KEYS_FILE", "REGISTRY_TOKEN_ISSUER", "REGISTRY_TOKEN_AUDIENCE"} {
+		os.Unsetenv(name)
 	}
 }
 
-func TestTokenManagerFromEnvMissingTreatedAbsent(t *testing.T) {
-	t.Setenv("REGISTRY_TOKEN_SECRET", "")
-	mgr, err := tokenManagerFromEnv()
+// TestEnvRequired enforces the required-setting contract: a blank or
+// whitespace-only value is an error, never a silent fallback.
+func TestEnvRequired(t *testing.T) {
+	t.Setenv("REQ_TEST_VAR", "")
+	if _, err := envRequired("REQ_TEST_VAR"); err == nil {
+		t.Fatal("blank value must fail")
+	}
+	t.Setenv("REQ_TEST_VAR", "   \t\n")
+	if _, err := envRequired("REQ_TEST_VAR"); err == nil {
+		t.Fatal("whitespace-only value must fail")
+	}
+	t.Setenv("REQ_TEST_VAR", "configured")
+	v, err := envRequired("REQ_TEST_VAR")
+	if err != nil || v != "configured" {
+		t.Fatalf("got %q err %v", v, err)
+	}
+}
+
+// TestBuildAuthenticatorFailsWhenConfigMissing pins fail-closed startup: every
+// verification setting is required; absent file, issuer, or audience all fail
+// construction.
+func TestBuildAuthenticatorFailsWhenConfigMissing(t *testing.T) {
+	clearRegistryAuthEnv()
+	if _, err := buildAuthenticator(); err == nil {
+		t.Fatal("no config at all must fail")
+	}
+	key := newConfigTestKey(t)
+	jwksPath := writeConfigJWKS(t, key)
+
+	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", jwksPath)
+	if _, err := buildAuthenticator(); err == nil {
+		t.Fatal("missing issuer must fail")
+	}
+	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
+	if _, err := buildAuthenticator(); err == nil {
+		t.Fatal("missing audience must fail")
+	}
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", configAudience)
+	if _, err := buildAuthenticator(); err != nil {
+		t.Fatalf("complete config must build: %v", err)
+	}
+}
+
+// TestBuildAuthenticatorRejectsInvalidKeysFile proves the strict loader is
+// wired into startup: a malformed or non-Ed25519 keys file fails construction.
+func TestBuildAuthenticatorRejectsInvalidKeysFile(t *testing.T) {
+	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", configAudience)
+
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"keys":[]}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", bad)
+	if _, err := buildAuthenticator(); err == nil {
+		t.Fatal("empty key set must fail construction")
+	}
+
+	if err := os.WriteFile(bad, []byte(`{"keys":[{"kty":"RSA","kid":"r"}]}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := buildAuthenticator(); err == nil {
+		t.Fatal("non-OKP key must fail construction")
+	}
+}
+
+// TestBuildAuthenticatorBindsIssuerAndAudience proves the configured issuer
+// and audience actually bind verification: a token signed by the configured
+// key for the configured issuer+audience verifies; tokens for a different
+// issuer OR audience fail, and requests against a host other than the
+// configured audience fail.
+func TestBuildAuthenticatorBindsIssuerAndAudience(t *testing.T) {
+	key := newConfigTestKey(t)
+	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", writeConfigJWKS(t, key))
+	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", configAudience)
+
+	authen, err := buildAuthenticator()
 	if err != nil {
-		t.Fatalf("missing secret must be treated as absent, got err=%v", err)
+		t.Fatalf("buildAuthenticator: %v", err)
 	}
-	if mgr != nil {
-		t.Fatal("missing secret must yield a nil manager (resolver fails closed)")
+	bearer, ok := authen.(registry.BearerAuthenticator)
+	if !ok {
+		t.Fatalf("unexpected authenticator type %T", authen)
+	}
+
+	issue := func(t *testing.T, issuer, service, subject, repo string, ttl time.Duration) string {
+		t.Helper()
+		iss, err := auth.NewRegistryTokenIssuer(key.priv, issuer, configKeyID)
+		if err != nil {
+			t.Fatalf("new issuer: %v", err)
+		}
+		raw, err := iss.Issue(context.Background(), auth.RegistryTokenRequest{
+			Subject:    subject,
+			Service:    service,
+			Repository: repo,
+			Actions:    []auth.Action{auth.ActionPull},
+			TTL:        ttl,
+		})
+		if err != nil {
+			t.Fatalf("issue: %v", err)
+		}
+		return raw
+	}
+
+	good := issue(t, configIssuer, configAudience, configSubject, configRepo, time.Hour)
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+good, configAudience, configRepo, auth.ActionPull); err != nil {
+		t.Fatalf("token for configured issuer/audience must verify: %v", err)
+	}
+
+	wrongIssuer := issue(t, "someone-else", configAudience, configSubject, configRepo, time.Hour)
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+wrongIssuer, configAudience, configRepo, auth.ActionPull); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("wrong issuer must fail closed, got %v", err)
+	}
+
+	wrongAudience := issue(t, configIssuer, "evil.example.test", configSubject, configRepo, time.Hour)
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+wrongAudience, configAudience, configRepo, auth.ActionPull); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("wrong audience must fail closed, got %v", err)
+	}
+
+	// Request-side host binding: a request against a host other than the
+	// configured audience fails even with a valid token.
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+good, "other-host.example.test", configRepo, auth.ActionPull); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("request host outside the configured audience must fail closed, got %v", err)
 	}
 }
 
-func TestTokenManagerFromEnvAllWhitespaceTreatedAbsent(t *testing.T) {
-	t.Setenv("REGISTRY_TOKEN_SECRET", " \t\n  ")
-	mgr, err := tokenManagerFromEnv()
-	if err != nil {
-		t.Fatalf("all-whitespace secret must be treated as absent, got err=%v", err)
+// TestBuildMemoryHandlerRequiresVerificationConfig pins that the production
+// handler cannot be built without registry token verification configuration —
+// there is no optional or shared-secret fallback anymore.
+func TestBuildMemoryHandlerRequiresVerificationConfig(t *testing.T) {
+	clearRegistryAuthEnv()
+	t.Setenv("REGISTRY_BACKEND", "memory")
+	if _, err := buildHandler(); err == nil {
+		t.Fatal("memory handler without verification config must fail")
 	}
-	if mgr != nil {
-		t.Fatal("all-whitespace secret must yield a nil manager (never a valid key)")
-	}
-}
-
-func TestTokenManagerFromEnvWeakSecretFailsConsistently(t *testing.T) {
-	// 20 raw bytes (< HS256 minimum of 32) even including whitespace padding:
-	// weak under the raw-byte policy, and must fail exactly as the control
-	// plane rejects the identical raw value.
-	padded := "\t" + strings.Repeat("w", 16) + "\n\t"
-	t.Setenv("REGISTRY_TOKEN_SECRET", padded)
-
-	if _, err := tokenManagerFromEnv(); err == nil {
-		t.Fatal("registry must reject a weak (<32 byte) secret")
-	}
-	if _, err := auth.NewSessionTokenManager(padded, auth.DefaultSessionIssuer, auth.DefaultSessionAudience); err == nil {
-		t.Fatal("control-plane constructor must reject the same weak raw secret")
+	key := newConfigTestKey(t)
+	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", writeConfigJWKS(t, key))
+	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", configAudience)
+	if _, err := buildHandler(); err != nil {
+		t.Fatalf("memory handler with full config must build: %v", err)
 	}
 }
 
-func TestTokenManagerFromEnvPaddedCoreLengthPolicyMatchesControlPlane(t *testing.T) {
-	// A 30-byte core secret padded with whitespace to 38 raw bytes. Whitespace
-	// is part of the opaque key, so the raw key is >=32 bytes and MUST be
-	// accepted — exactly as the control plane accepts it. The old registry code
-	// TrimSpace'd this to 30 bytes and wrongly rejected it, diverging from the
-	// control plane's length validation.
-	core := strings.Repeat("p", 30)
-	raw := "  " + core + "\t\n"
-	if len([]byte(raw)) < 32 {
-		t.Fatal("test precondition: raw secret must be >= 32 bytes")
-	}
-	t.Setenv("REGISTRY_TOKEN_SECRET", raw)
-
-	if _, err := tokenManagerFromEnv(); err != nil {
-		t.Fatalf("a >=32-byte raw secret padded with whitespace must be accepted (matching control plane), got err=%v", err)
-	}
-	if _, err := auth.NewSessionTokenManager(raw, auth.DefaultSessionIssuer, auth.DefaultSessionAudience); err != nil {
-		t.Fatalf("control plane must accept the identical raw value: %v", err)
+// TestRegistryNoLongerUsesSharedHmacSecret proves the registry process no
+// longer reads REGISTRY_TOKEN_SECRET anywhere in its config path: the shared
+// HMAC registry wiring was retired in favor of verified Ed25519 principals.
+func TestRegistryNoLongerUsesSharedHmacSecret(t *testing.T) {
+	clearRegistryAuthEnv()
+	t.Setenv("REGISTRY_BACKEND", "memory")
+	t.Setenv("REGISTRY_TOKEN_SECRET", strings.Repeat("x", 32))
+	if _, err := buildHandler(); err == nil {
+		t.Fatal("REGISTRY_TOKEN_SECRET must not substitute for registry verification config")
 	}
 }

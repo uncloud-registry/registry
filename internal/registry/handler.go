@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,11 +28,11 @@ type ObjectUploader interface {
 }
 
 type PullAuthorizer interface {
-	Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, authHeader string) (bool, error)
+	Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, principal auth.Principal) (bool, error)
 }
 
 type PushAuthorizer interface {
-	Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, actor string) (string, bool, error)
+	Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, principal auth.Principal) (batchID string, allowed bool, err error)
 }
 
 type Handler struct {
@@ -40,21 +41,21 @@ type Handler struct {
 	Uploader       ObjectUploader
 	PullAuthorizer PullAuthorizer
 	PushAuthorizer PushAuthorizer
-	Subjects       auth.SubjectResolver
+	Authenticator  Authenticator
 	Staging        staging.Store
 	Publisher      publish.Publisher
 	SessionTTL     time.Duration
 	AuthRealm      string
 }
 
-func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, subjects auth.SubjectResolver, stageStore staging.Store, publisher publish.Publisher, authRealm string) http.Handler {
+func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.Store, publisher publish.Publisher, authRealm string) http.Handler {
 	return &Handler{
 		Resolver:       resolver,
 		Objects:        objects,
 		Uploader:       uploader,
 		PullAuthorizer: pullAuthorizer,
 		PushAuthorizer: pushAuthorizer,
-		Subjects:       subjects,
+		Authenticator:  authenticator,
 		Staging:        stageStore,
 		Publisher:      publisher,
 		SessionTTL:     15 * time.Minute,
@@ -62,6 +63,12 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 	}
 }
 
+// ServeHTTP authenticates every repo-scoped request BEFORE any policy
+// resolution, storage read, Bee call, or staging side effect. The service
+// bound into verification is the canonical host of the resolved registry
+// identity; repository and action come from the matched route. Only a missing
+// token on pull may degrade to the anonymous principal, and only so the auth
+// policy can then explicitly allow or deny it.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/v2" || r.URL.Path == "/v2/" {
 		w.WriteHeader(http.StatusOK)
@@ -80,24 +87,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch resource {
-	case "uploads":
-		h.handleUpload(w, r, registryIdentity, repo, reference)
-	case "manifests":
-		if r.Method == http.MethodPut {
-			h.handleManifestPut(w, r, registryIdentity, repo, reference)
+	action, ok := routeAction(resource, r.Method)
+	if !ok {
+		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "unknown path")
+		return
+	}
+
+	principal, err := h.Authenticator.Authenticate(r.Context(), r.Header.Get("Authorization"), registryIdentity.Host, repo, action)
+	if err != nil {
+		if errors.Is(err, auth.ErrMissingToken) && action == auth.ActionPull {
+			principal = auth.Principal{Subject: auth.AnonymousSubject}
+		} else {
+			w.Header().Set("WWW-Authenticate", bearerChallenge(h.AuthRealm, registryIdentity.Host, repo, string(action)))
+			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", string(action)+" access denied")
 			return
 		}
-		h.handlePullManifest(w, r, registryIdentity, repo, reference)
+	}
+
+	switch resource {
+	case "uploads":
+		h.handleUpload(w, r, registryIdentity, repo, reference, principal)
+	case "manifests":
+		if r.Method == http.MethodPut {
+			h.handleManifestPut(w, r, registryIdentity, repo, reference, principal)
+			return
+		}
+		h.handlePullManifest(w, r, registryIdentity, repo, reference, principal)
 	case "blobs":
-		h.handlePullBlob(w, r, registryIdentity, repo, reference)
+		h.handlePullBlob(w, r, registryIdentity, repo, reference, principal)
 	default:
 		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "unknown path")
 	}
 }
 
-func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string) {
-	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, r.Header.Get("Authorization"))
+// routeAction maps a matched route resource to the registry action its
+// authorization scope demands. Uploads (all methods) and manifest PUT are
+// push; manifest reads and blob reads are pull. The action is derived before
+// any handler work so method-specific dispatch inside handlers never runs
+// before authentication.
+func routeAction(resource string, method string) (auth.Action, bool) {
+	switch resource {
+	case "uploads":
+		return auth.ActionPush, true
+	case "manifests":
+		if method == http.MethodPut {
+			return auth.ActionPush, true
+		}
+		return auth.ActionPull, true
+	case "blobs":
+		return auth.ActionPull, true
+	default:
+		return "", false
+	}
+}
+
+func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string, principal auth.Principal) {
+	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
 		return
@@ -154,8 +199,8 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 	_, _ = w.Write(data)
 }
 
-func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, digest string) {
-	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, r.Header.Get("Authorization"))
+func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, digest string, principal auth.Principal) {
+	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
 		return
@@ -204,15 +249,10 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 	_, _ = w.Write(data)
 }
 
-func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, uploadID string) {
-	actor := h.Subjects.Subject(r.Header.Get("Authorization"))
-	if actor == "" {
-		w.Header().Set("WWW-Authenticate", bearerChallenge(h.AuthRealm, registryIdentity.Host, repo, "push"))
-		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "push access denied")
-		return
-	}
+func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, uploadID string, principal auth.Principal) {
+	actor := principal.Subject
 
-	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, actor)
+	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
 		return
@@ -332,20 +372,15 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 	}
 }
 
-func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string) {
+func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string, principal auth.Principal) {
 	if strings.HasPrefix(reference, "sha256:") {
 		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "manifest publish by digest is not supported in v1")
 		return
 	}
 
-	actor := h.Subjects.Subject(r.Header.Get("Authorization"))
-	if actor == "" {
-		w.Header().Set("WWW-Authenticate", bearerChallenge(h.AuthRealm, registryIdentity.Host, repo, "push"))
-		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "push access denied")
-		return
-	}
+	actor := principal.Subject
 
-	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, actor)
+	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
 		return
