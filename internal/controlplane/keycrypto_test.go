@@ -2,7 +2,10 @@ package controlplane
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -127,7 +130,7 @@ func TestFeedKeyCipherRejectsTampering(t *testing.T) {
 	}
 }
 
-func TestFeedKeyCipherRejectsTamperedNonceAndEmptyCiphertext(t *testing.T) {
+func TestFeedKeyCipherRejectsTamperedNonce(t *testing.T) {
 	t.Parallel()
 	c := newTestFeedKeyCipher(t)
 	enc, err := c.Encrypt(1, "0xfeed", []byte("private-key"))
@@ -135,18 +138,129 @@ func TestFeedKeyCipherRejectsTamperedNonceAndEmptyCiphertext(t *testing.T) {
 		t.Fatal(err)
 	}
 	enc.Nonce[0] ^= 0xff
+	// A tampered nonce of the CORRECT length is an authentication failure.
 	if _, err := c.Decrypt(1, "0xfeed", enc); !errors.Is(err, ErrKeyDecrypt) {
 		t.Fatalf("nonce tampering: got %v", err)
 	}
+}
 
-	enc2, err := c.Encrypt(1, "0xfeed", []byte("private-key"))
+// TestFeedKeyCipherRejectsMalformedEnvelopes pins the complete-envelope shape
+// contract: before any GCM operation the envelope must carry a nonce of
+// EXACTLY gcm.NonceSize(), a ciphertext of at least gcm.Overhead() bytes (the
+// empty-plaintext minimum — every shorter ciphertext can never be authentic),
+// and these checks must never panic regardless of input. A ciphertext of
+// exactly Overhead() is structurally valid (empty plaintext) and therefore
+// fails with ErrKeyDecrypt (authentication), not the malformed sentinel.
+func TestFeedKeyCipherRejectsMalformedEnvelopes(t *testing.T) {
+	t.Parallel()
+	c := newTestFeedKeyCipher(t)
+	valid, err := c.Encrypt(1, "0xfeed", []byte("private-key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	enc2.Ciphertext = nil
-	if _, err := c.Decrypt(1, "0xfeed", enc2); !errors.Is(err, ErrKeyDecrypt) {
-		t.Fatalf("missing ciphertext: got %v", err)
+	gcm, err := cipher.NewGCM(mustAESBlock(t, c, 1))
+	if err != nil {
+		t.Fatal(err)
 	}
+	shortCT := make([]byte, gcm.Overhead()-1)
+	exactTagCT := make([]byte, gcm.Overhead())
+
+	cases := []struct {
+		name    string
+		value   EncryptedFeedKey
+		wantErr error // nil = decryption must succeed
+	}{
+		{"nil nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"empty nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: []byte{}, KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"short nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce[:gcm.NonceSize()-1], KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"long nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: append(append([]byte(nil), valid.Nonce...), 0x00), KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"nil ciphertext", EncryptedFeedKey{Nonce: valid.Nonce, KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"empty ciphertext", EncryptedFeedKey{Ciphertext: []byte{}, Nonce: valid.Nonce, KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"ciphertext below GCM overhead", EncryptedFeedKey{Ciphertext: shortCT, Nonce: valid.Nonce, KeyVersion: 1}, ErrFeedKeyEnvelopeMalformed},
+		{"ciphertext at GCM overhead (empty plaintext shape)", EncryptedFeedKey{Ciphertext: exactTagCT, Nonce: valid.Nonce, KeyVersion: 1}, ErrKeyDecrypt},
+		{"ciphertext one past overhead", EncryptedFeedKey{Ciphertext: make([]byte, gcm.Overhead()+1), Nonce: valid.Nonce, KeyVersion: 1}, ErrKeyDecrypt},
+		{"zero version", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: 0}, ErrFeedKeyVersionUnloaded},
+		{"negative version", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: -1}, ErrFeedKeyVersionUnloaded},
+		{"valid envelope", valid, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := c.Decrypt(1, "0xfeed", tc.value)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("valid envelope must decrypt: %v", err)
+				}
+				if !bytes.Equal(got, []byte("private-key")) {
+					t.Fatalf("round trip mismatch: %q", got)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("expected %v, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+// TestFeedKeyCipherMalformedEnvelopesNeverPanic proves that no malformed
+// stored envelope — nil/short/long nonce, nil/short/empty ciphertext, or
+// non-positive version — can panic the decrypt path (gcm.Open panics on a
+// wrong-size nonce unless the envelope is validated first). A recover guard
+// wraps every case; a panic fails the test.
+func TestFeedKeyCipherMalformedEnvelopesNeverPanic(t *testing.T) {
+	t.Parallel()
+	c := newTestFeedKeyCipher(t)
+	valid, err := c.Encrypt(1, "0xfeed", []byte("private-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []EncryptedFeedKey{
+		{Ciphertext: valid.Ciphertext, KeyVersion: 1},                                   // nil nonce
+		{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce[:7], KeyVersion: 1},           // short nonce
+		{Ciphertext: valid.Ciphertext, Nonce: append(valid.Nonce, 0x00), KeyVersion: 1}, // long nonce
+		{Nonce: valid.Nonce, KeyVersion: 1},                                             // nil ciphertext
+		{Ciphertext: []byte{}, Nonce: valid.Nonce, KeyVersion: 1},                       // empty ciphertext
+		{Ciphertext: make([]byte, 3), Nonce: valid.Nonce, KeyVersion: 1},                // short ciphertext
+		{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: 0},               // zero version
+		{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: -3},              // negative version
+	}
+	for i, tc := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("case %d: decrypt panicked: %v", i, r)
+				}
+			}()
+			_, err := c.Decrypt(1, "0xfeed", tc)
+			if err == nil {
+				t.Fatalf("case %d: malformed envelope must fail, got nil", i)
+			}
+			switch {
+			case errors.Is(err, ErrFeedKeyEnvelopeMalformed),
+				errors.Is(err, ErrKeyDecrypt),
+				errors.Is(err, ErrFeedKeyVersionUnloaded):
+			default:
+				t.Fatalf("case %d: unclassified error %v", i, err)
+			}
+		}()
+	}
+}
+
+func mustAESBlock(t *testing.T, c *FeedKeyCipher, version int) (block interface {
+	BlockSize() int
+	Encrypt(dst, src []byte)
+	Decrypt(dst, src []byte)
+}) {
+	t.Helper()
+	key := c.keys[version]
+	aesBlock, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes new cipher: %v", err)
+	}
+	return aesBlock
 }
 
 func TestFeedKeyCipherRejectsWrongMasterKey(t *testing.T) {
@@ -234,6 +348,95 @@ func TestFeedKeyCipherRejectsEmptyContext(t *testing.T) {
 	}
 	if _, err := c.Decrypt(1, "", enc); err == nil {
 		t.Fatal("decrypt with empty owner must fail")
+	}
+	// A non-positive registry ID is also an invalid binding context: the AAD
+	// contract is canonical positive decimal ID bytes, so zero/negative IDs
+	// can never be sealed under.
+	if _, err := c.Encrypt(0, "0xfeed", []byte("private-key")); err == nil {
+		t.Fatal("encrypt with zero registry ID must fail")
+	}
+	if _, err := c.Encrypt(-7, "0xfeed", []byte("private-key")); err == nil {
+		t.Fatal("encrypt with negative registry ID must fail")
+	}
+	if _, err := c.Decrypt(0, "0xfeed", enc); err == nil {
+		t.Fatal("decrypt with zero registry ID must fail")
+	}
+}
+
+// TestFeedKeyAADFixedVectors pins the EXACT canonical AAD bytes: a fixed
+// 32-byte domain-separator prefix ("uncloud-registry-feedkey-aad:v1" + NUL),
+// an 8-byte big-endian length prefix for the canonical positive decimal
+// registry-ID bytes, those bytes, an 8-byte big-endian length prefix for the
+// LITERAL owner bytes, then those bytes. Both variable-length fields are
+// length-prefixed, so the representation is self-delimiting no matter what the
+// owner string contains. The vectors are literal hex so any accidental change
+// to the wire format fails here.
+func TestFeedKeyAADFixedVectors(t *testing.T) {
+	t.Parallel()
+	if len(feedKeyAADPrefix) != 32 {
+		t.Fatalf("AAD domain prefix must be exactly 32 bytes, got %d", len(feedKeyAADPrefix))
+	}
+	const prefixHex = "756e636c6f75642d72656769737472792d666565646b65792d6161643a763100"
+
+	cases := []struct {
+		name    string
+		id      int64
+		owner   string
+		wantHex string
+		wantLen int
+	}{
+		{"id 42 owner 0xfeed", 42, "0xfeed",
+			prefixHex + "0000000000000002" + "3432" + "0000000000000006" + "307866656564", 56},
+		{"id 1 owner a", 1, "a",
+			prefixHex + "0000000000000001" + "31" + "0000000000000001" + "61", 50},
+		{"id 7 owner 0xfeed0001", 7, "0xfeed0001",
+			prefixHex + "0000000000000001" + "37" + "000000000000000a" + "30786665656430303031", 59},
+		{"id 999999999999 owner empty-adjacent bytes", 999999999999, "0x",
+			prefixHex + "000000000000000c" + "393939393939393939393939" + "0000000000000002" + "3078", 62},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			aad, err := feedKeyAAD(tc.id, tc.owner)
+			if err != nil {
+				t.Fatalf("feedKeyAAD: %v", err)
+			}
+			if got := hex.EncodeToString(aad); got != tc.wantHex {
+				t.Fatalf("AAD bytes mismatch:\n got  %s\n want %s", got, tc.wantHex)
+			}
+			if len(aad) != tc.wantLen {
+				t.Fatalf("AAD length mismatch: got %d want %d", len(aad), tc.wantLen)
+			}
+		})
+	}
+
+	// The length prefixes make the concatenation unambiguous: contexts whose
+	// naive id||owner concatenation collides ("1"+"23" == "12"+"3") must
+	// produce different AADs, and neither can authenticate the other's
+	// envelope.
+	ambiguousA, err := feedKeyAAD(1, "23")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ambiguousB, err := feedKeyAAD(12, "3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(ambiguousA, ambiguousB) {
+		t.Fatal("length-prefixed AAD must disambiguate id/owner boundary collisions")
+	}
+	if string(ambiguousA) == "123" || string(ambiguousB) == "123" {
+		t.Fatal("AAD must never be a bare id||owner concatenation")
+	}
+	c := newTestFeedKeyCipher(t)
+	enc, err := c.Encrypt(12, "3", []byte("private-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Decrypt(1, "23", enc); !errors.Is(err, ErrKeyDecrypt) {
+		t.Fatalf("boundary-collision substitution must fail authentication: %v", err)
+	}
+	if _, err := c.Decrypt(12, "3", enc); err != nil {
+		t.Fatalf("true context must decrypt: %v", err)
 	}
 }
 

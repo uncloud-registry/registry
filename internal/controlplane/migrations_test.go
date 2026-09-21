@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -35,13 +36,15 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("expected schema version 2, got %d", version)
+	if version != 3 {
+		t.Fatalf("expected schema version 3, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
 	// the same column layout.
 	assertConstrainedFKs(t, db)
+	// The feed-key envelope invariant triggers must be physically installed.
+	assertFeedKeyEnvelopeTriggers(t, db)
 
 	// registry_id/user_id 999 do not exist, so the constrained schema must
 	// reject this insert via the foreign keys declared in migration 1.
@@ -69,8 +72,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 2 {
-		t.Fatalf("expected 2 migration rows, got %d", rows)
+	if rows != 3 {
+		t.Fatalf("expected 3 migration rows, got %d", rows)
 	}
 }
 
@@ -133,8 +136,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("expected schema version 2 after upgrade, got %d", version)
+	if version != 3 {
+		t.Fatalf("expected schema version 3 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -804,5 +807,232 @@ func seedLegacyRow(t *testing.T, db *sql.DB, kind, now string, a, b string) {
 		}
 	default:
 		t.Fatalf("unknown legacy row kind %q", kind)
+	}
+}
+
+// applyMigrationsThrough runs only the migrations up to and including version
+// upto, mirroring ApplyMigrations (same per-migration transaction and
+// recording semantics). Used to build an intermediate schema version (e.g. a
+// v2-only database) so tests can exercise the upgrade from THAT version.
+func applyMigrationsThrough(ctx context.Context, db *sql.DB, upto int) error {
+	if _, err := db.ExecContext(ctx, `create table if not exists schema_migrations (version integer primary key, applied_at text not null)`); err != nil {
+		return fmt.Errorf("ensure schema_migrations exists: %w", err)
+	}
+	current, err := CurrentSchemaVersion(ctx, db)
+	if err != nil {
+		return err
+	}
+	for _, m := range migrations {
+		if m.Version <= current || m.Version > upto {
+			continue
+		}
+		if err := applyMigration(ctx, db, m); err != nil {
+			return fmt.Errorf("apply migration %d: %w", m.Version, err)
+		}
+		current = m.Version
+	}
+	return nil
+}
+
+// assertFeedKeyEnvelopeTriggers proves the two schema-level envelope triggers
+// are physically installed on the registries table.
+func assertFeedKeyEnvelopeTriggers(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, name := range []string{"registries_feed_key_complete_insert", "registries_feed_key_complete_update"} {
+		var n int
+		if err := db.QueryRow(`select count(*) from sqlite_master where type = 'trigger' and name = ?`, name).Scan(&n); err != nil {
+			t.Fatalf("count trigger %s: %v", name, err)
+		}
+		if n != 1 {
+			t.Fatalf("expected trigger %s to be installed, found %d", name, n)
+		}
+	}
+}
+
+// TestFeedKeyEnvelopeMigrationRejectsMalformedRows pins migration 3's data
+// validation: a database already at v2 whose registries rows carry a PARTIAL
+// feed-key envelope fails the upgrade, rolls back completely (version stays 2,
+// no triggers installed, the malformed row untouched), and never silently
+// accepts or "repairs" the inconsistent data.
+func TestFeedKeyEnvelopeMigrationRejectsMalformedRows(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Build a v2 database (feed-key columns exist, triggers do not).
+	if err := applyMigrationsThrough(ctx, db, 2); err != nil {
+		t.Fatalf("apply through v2: %v", err)
+	}
+	// Seed a user + registry with a PARTIAL envelope (version set, no nonce).
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"alice@example.com", "hash", now); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+		values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"alice", "alice.uncloud-registry.com", "alice.eth", 1, "0xfeed", "",
+		"batch-1", 1, now, []byte("0123456789abcdef"), nil, 1); err != nil {
+		t.Fatalf("seed partial row: %v", err)
+	}
+
+	err := ApplyMigrations(ctx, db)
+	if err == nil {
+		t.Fatal("migration must fail on existing partial envelopes")
+	}
+	// Rolled back: version still 2, no triggers, row untouched, no v3 record.
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Fatalf("version must stay 2 after rejected migration, got %d", version)
+	}
+	var n int
+	if err := db.QueryRow(`select count(*) from sqlite_master where type = 'trigger' and name like 'registries_feed_key_complete_%'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("no triggers may remain after rollback, found %d", n)
+	}
+	var migRows int
+	if err := db.QueryRow(`select count(*) from schema_migrations`).Scan(&migRows); err != nil {
+		t.Fatal(err)
+	}
+	if migRows != 2 {
+		t.Fatalf("expected 2 recorded migrations after rejection, got %d", migRows)
+	}
+	var ciphertext []byte
+	var versionCol sql.NullInt64
+	if err := db.QueryRow(`select feed_key_ciphertext, feed_key_version from registries where id = 1`).Scan(&ciphertext, &versionCol); err != nil {
+		t.Fatal(err)
+	}
+	if !versionCol.Valid || len(ciphertext) == 0 {
+		t.Fatal("malformed row must be left untouched")
+	}
+}
+
+// TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema drives migration 3
+// from each supported starting point: a fresh database (v0), a legacy
+// plaintext database upgraded through v1+v2, and an already-current v2
+// database whose rows carry valid all-null or complete envelopes. All must
+// reach v3 with the triggers installed and no data disturbance.
+func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
+	t.Run("fresh v0", func(t *testing.T) {
+		db := openRawTestDB(t)
+		if err := ApplyMigrations(context.Background(), db); err != nil {
+			t.Fatalf("apply migrations: %v", err)
+		}
+		version, _ := CurrentSchemaVersion(context.Background(), db)
+		if version != 3 {
+			t.Fatalf("expected version 3, got %d", version)
+		}
+		assertFeedKeyEnvelopeTriggers(t, db)
+	})
+	t.Run("legacy plaintext through v1 v2", func(t *testing.T) {
+		db := openRawTestDB(t)
+		ctx := context.Background()
+		now := time.Now().UTC().Format(time.RFC3339)
+		seedLegacyDB(t, db, now, now, true)
+		if err := ApplyMigrations(ctx, db); err != nil {
+			t.Fatalf("apply migrations: %v", err)
+		}
+		version, _ := CurrentSchemaVersion(ctx, db)
+		if version != 3 {
+			t.Fatalf("expected version 3, got %d", version)
+		}
+		assertFeedKeyEnvelopeTriggers(t, db)
+		// Legacy plaintext untouched by the schema migration (opt-in only).
+		var legacy string
+		if err := db.QueryRowContext(ctx, `select encrypted_feed_private_key from registries where id = 1`).Scan(&legacy); err != nil {
+			t.Fatal(err)
+		}
+		if legacy != "ciphertext" {
+			t.Fatalf("schema migration must not clear legacy plaintext, got %q", legacy)
+		}
+	})
+	t.Run("current v2 with valid rows", func(t *testing.T) {
+		db := openRawTestDB(t)
+		ctx := context.Background()
+		now := time.Now().UTC().Format(time.RFC3339)
+		if err := applyMigrationsThrough(ctx, db, 2); err != nil {
+			t.Fatalf("apply through v2: %v", err)
+		}
+		// One all-null row and one complete-envelope row (both valid).
+		if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+			"alice@example.com", "hash", now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+			values (?,?,?,?,?,?,?,?,?)`,
+			"nokey", "nokey.uncloud-registry.com", "nokey.eth", 1, "0xfeed", "",
+			"batch-1", 1, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			"full", "full.uncloud-registry.com", "full.eth", 1, "0xfeed", "",
+			"batch-1", 1, now, []byte("0123456789abcdef"), []byte("0123456789ab"), 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := ApplyMigrations(ctx, db); err != nil {
+			t.Fatalf("apply migrations from v2: %v", err)
+		}
+		version, _ := CurrentSchemaVersion(ctx, db)
+		if version != 3 {
+			t.Fatalf("expected version 3, got %d", version)
+		}
+		assertFeedKeyEnvelopeTriggers(t, db)
+	})
+}
+
+// TestMigrateLegacyFeedKeysFromV2CurrentSchema covers the supported upgrade
+// path for a deployment that ALREADY ran the released schema migration (v2
+// recorded) and still carries legacy plaintext: advancing to v3 installs the
+// invariant without touching the plaintext, and the opt-in legacy migration
+// then encrypts and clears it per row.
+func TestMigrateLegacyFeedKeysFromV2CurrentSchema(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if err := applyMigrationsThrough(ctx, db, 2); err != nil {
+		t.Fatalf("apply through v2: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"alice@example.com", "hash", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+		values (?,?,?,?,?,?,?,?,?)`,
+		"alice", "alice.uncloud-registry.com", "alice.eth", 1, "0xfeed", "ciphertext",
+		"batch-1", 1, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations from v2: %v", err)
+	}
+
+	service := newStoreService(t, db)
+	migrated, err := service.MigrateLegacyFeedKeys(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if migrated != 1 {
+		t.Fatalf("expected 1 migrated row, got %d", migrated)
+	}
+	var legacy string
+	var ciphertext, nonce []byte
+	var version sql.NullInt64
+	if err := db.QueryRowContext(ctx, `select encrypted_feed_private_key, feed_key_ciphertext, feed_key_nonce, feed_key_version from registries where id = 1`).Scan(&legacy, &ciphertext, &nonce, &version); err != nil {
+		t.Fatal(err)
+	}
+	if legacy != "" || len(ciphertext) == 0 || len(nonce) == 0 || !version.Valid {
+		t.Fatalf("row must be migrated and cleared: legacy=%q", legacy)
+	}
+	if _, err := service.FeedKeys.Decrypt(1, "0xfeed", EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}); err != nil {
+		t.Fatalf("migrated ciphertext must decrypt under the row's owner: %v", err)
 	}
 }

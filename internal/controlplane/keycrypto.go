@@ -57,6 +57,30 @@ var errFeedKeyCipherNotConfigured = errors.New("feed key cipher is not configure
 // (registry ID / owner) is missing; an unbound envelope cannot be created.
 var errFeedKeyEmptyContext = errors.New("feed key encryption context cannot be empty")
 
+// errFeedKeyInvalidRegistryID is returned when the AES-GCM associated-data
+// registry ID is not a positive integer (the canonical AAD carries positive
+// decimal ID bytes). An envelope bound to a non-positive ID can never be
+// created or opened.
+var errFeedKeyInvalidRegistryID = errors.New("feed key encryption context requires a positive registry ID")
+
+// ErrFeedKeyEnvelopeMalformed is the stable sentinel for a structurally
+// invalid feed-key envelope: a nonce that is not exactly gcm.NonceSize(), a
+// ciphertext shorter than gcm.Overhead() (the empty-plaintext minimum — such
+// a value can never be authentic), or a missing/empty field. Shape checks run
+// BEFORE any GCM operation so a malformed stored envelope can never panic
+// gcm.Open (which panics on wrong-size nonces) and is never handed to the
+// cipher unvalidated. Store write guards reuse the same sentinel.
+var ErrFeedKeyEnvelopeMalformed = errors.New("feed key envelope is malformed")
+
+// ErrFeedKeyEnvelopeInconsistent is the stable sentinel for a registries row
+// whose three feed-key columns violate the schema-level invariant (the
+// columns are neither all NULL nor all present with non-empty ciphertext,
+// non-empty nonce, and a strictly positive version). Scan/list, legacy
+// migration, and rotation REJECT such rows with this sentinel — they are
+// never silently skipped, scanned as plausible-looking values, or treated as
+// "already encrypted".
+var ErrFeedKeyEnvelopeInconsistent = errors.New("feed key envelope columns are inconsistent")
+
 // ErrMasterKeyFileLoadingUnsupported is the stable, data-free sentinel
 // returned by the master-key loader on every GOOS other than darwin and
 // linux. The master-key security contract — open the file exactly ONCE
@@ -173,12 +197,19 @@ func (c *FeedKeyCipher) EncryptWith(version int, registryID int64, owner string,
 }
 
 // Decrypt opens value under the master key named by value.KeyVersion,
-// authenticating the associated data (registry ID + literal owner). Any
-// authentication failure — tampering, wrong key, or context substitution —
-// returns an error wrapping ErrKeyDecrypt without echoing key material.
+// authenticating the associated data (registry ID + literal owner). The
+// envelope is validated for complete shape BEFORE any GCM operation: a wrong
+// nonce length would make gcm.Open panic and a ciphertext below the GCM
+// overhead can never be authentic, so both fail fast with
+// ErrFeedKeyEnvelopeMalformed. Any authentication failure — tampering, wrong
+// key, or context substitution — returns an error wrapping ErrKeyDecrypt
+// without echoing key material.
 func (c *FeedKeyCipher) Decrypt(registryID int64, owner string, value EncryptedFeedKey) ([]byte, error) {
 	key, ok := c.keys[value.KeyVersion]
 	if !ok {
+		// A version that is not loaded (including zero/negative, which can
+		// never be loaded) is an unsupported-version failure, not a shape
+		// failure: the caller must load the right master-key file.
 		return nil, fmt.Errorf("%w: %d", ErrFeedKeyVersionUnloaded, value.KeyVersion)
 	}
 	aad, err := feedKeyAAD(registryID, owner)
@@ -193,6 +224,9 @@ func (c *FeedKeyCipher) Decrypt(registryID int64, owner string, value EncryptedF
 	if err != nil {
 		return nil, err
 	}
+	if err := validateFeedKeyEnvelope(value, gcm); err != nil {
+		return nil, err
+	}
 	plaintext, err := gcm.Open(nil, value.Nonce, value.Ciphertext, aad)
 	if err != nil {
 		// The GCM error text is fixed stdlib material (never ciphertext,
@@ -202,22 +236,65 @@ func (c *FeedKeyCipher) Decrypt(registryID int64, owner string, value EncryptedF
 	return plaintext, nil
 }
 
-// feedKeyAAD builds the AES-GCM associated data binding an envelope to its
-// registry: an unambiguous 8-byte big-endian length prefix of the registry ID,
-// a colon separator, then the LITERAL feed-owner address bytes (never
-// normalized, trimmed, or case-folded — the store always persists the same
-// canonical lowercase address it encrypts under, so identical bytes are used
-// at both ends). The fixed-width ID prefix makes the concatenation self
-// delimiting regardless of owner content. An empty owner is rejected: an
-// envelope without a bound owner would be a silent context downgrade.
+// validateFeedKeyEnvelope checks the complete-envelope shape contract: the
+// nonce must be exactly gcm.NonceSize() and the ciphertext at least
+// gcm.Overhead() bytes (the empty-plaintext minimum). Every malformed input
+// maps to ErrFeedKeyEnvelopeMalformed. Because gcm.Open panics on a
+// wrong-size nonce, this MUST run before every Open.
+func validateFeedKeyEnvelope(value EncryptedFeedKey, gcm cipher.AEAD) error {
+	if len(value.Nonce) != gcm.NonceSize() {
+		return fmt.Errorf("%w: nonce must be exactly %d bytes, got %d", ErrFeedKeyEnvelopeMalformed, gcm.NonceSize(), len(value.Nonce))
+	}
+	if len(value.Ciphertext) < gcm.Overhead() {
+		return fmt.Errorf("%w: ciphertext must be at least %d bytes (GCM overhead), got %d", ErrFeedKeyEnvelopeMalformed, gcm.Overhead(), len(value.Ciphertext))
+	}
+	return nil
+}
+
+// feedKeyAADPrefix is the fixed domain-separator/version prefix of every
+// feed-key envelope's associated data: the 31-byte ASCII domain string
+// "uncloud-registry-feedkey-aad:v1" followed by a NUL byte (32 bytes total).
+// It distinguishes feed-key AAD from any other authenticated context in the
+// system and version-stamps the wire format so a future format change is
+// detected, not silently mis-parsed.
+const feedKeyAADPrefix = "uncloud-registry-feedkey-aad:v1\x00"
+
+// feedKeyAAD builds the canonical AES-GCM associated data binding an envelope
+// to its registry. The exact bytes are:
+//
+//	[0,32)    feedKeyAADPrefix (fixed domain separator/version, 32 bytes)
+//	[32,40)   8-byte big-endian length of the registry-ID text bytes
+//	[40,40+n) canonical positive decimal ASCII of registryID (no sign,
+//	          no leading zeros — strconv.FormatInt)
+//	[40+n,48+n) 8-byte big-endian length of the OWNER bytes
+//	[48+n,...)   the LITERAL feed-owner address bytes (never normalized,
+//	             trimmed, or case-folded)
+//
+// Both variable-length fields are length-prefixed, so the concatenation is
+// self-delimiting no matter what the owner bytes contain — contexts whose
+// naive id||owner concatenation would collide (e.g. (1,"23") vs (12,"3"))
+// produce distinct AADs and cannot authenticate each other's envelopes. The
+// domain prefix prevents cross-protocol confusion and fixes the format for
+// any future migration. An empty owner and a non-positive registry ID are
+// rejected: an envelope without a fully-bound context would be a silent
+// context downgrade.
 func feedKeyAAD(registryID int64, owner string) ([]byte, error) {
 	if owner == "" {
 		return nil, errFeedKeyEmptyContext
 	}
-	aad := make([]byte, 8+1+len(owner))
-	binary.BigEndian.PutUint64(aad, uint64(registryID))
-	aad[8] = ':'
-	copy(aad[9:], owner)
+	if registryID <= 0 {
+		return nil, errFeedKeyInvalidRegistryID
+	}
+	idText := strconv.FormatInt(registryID, 10)
+	aad := make([]byte, 0, len(feedKeyAADPrefix)+16+len(idText)+len(owner))
+	aad = append(aad, feedKeyAADPrefix...)
+	var lenBuf [8]byte
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(idText)))
+	aad = append(aad, lenBuf[:]...)
+	aad = append(aad, idText...)
+	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(owner)))
+	aad = append(aad, lenBuf[:]...)
+	aad = append(aad, owner...)
 	return aad, nil
 }
 

@@ -200,7 +200,23 @@ func NewBeeSequenceFeedUpdater(baseURL string, client *http.Client, privateKeyHe
 	if privateKeyHex == "" {
 		return nil, fmt.Errorf("feed signer private key is required")
 	}
-	key, err := ethcrypto.HexToECDSA(privateKeyHex)
+	raw, err := hex.DecodeString(privateKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("parse feed signer private key: %w", err)
+	}
+	return NewBeeSequenceFeedUpdaterBytes(baseURL, client, raw)
+}
+
+// NewBeeSequenceFeedUpdaterBytes builds the feed updater directly from the raw
+// 32-byte private key. This is the signer constructor the control plane uses:
+// decrypted feed keys never become hex strings — the bytes flow from the
+// decrypt boundary straight into the signer (any intermediate hex/text copy
+// would be an extra immutable plaintext the operation could not wipe).
+func NewBeeSequenceFeedUpdaterBytes(baseURL string, client *http.Client, privateKeyBytes []byte) (*BeeSequenceFeedUpdater, error) {
+	if len(privateKeyBytes) == 0 {
+		return nil, fmt.Errorf("feed signer private key is required")
+	}
+	key, err := ethcrypto.ToECDSA(privateKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse feed signer private key: %w", err)
 	}

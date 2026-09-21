@@ -51,16 +51,22 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 
 	// Seed a registry with a deterministic marker so any leak is detectable.
 	// The marker lives in the at-rest ciphertext slot (never a plaintext key);
-	// the store writes it verbatim because no cipher is configured here.
+	// the envelope is structurally complete (ciphertext, nonce, positive
+	// version) so the store's envelope guards accept it even though no cipher
+	// is configured to authenticate it here.
 	created, err := store.CreateRegistry(context.Background(), Registry{
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
-		OwnerUserID:         alice.ID,
-		FeedOwnerAddress:    "0xfeed",
-		FeedKey:             EncryptedFeedKey{Ciphertext: []byte(knownRegistryPrivateKey)},
+		OwnerUserID:      alice.ID,
+		FeedOwnerAddress: "0xfeed",
+		FeedKey: EncryptedFeedKey{
+			Ciphertext: []byte(knownRegistryPrivateKey),
+			Nonce:      []byte("0123456789ab"),
+			KeyVersion: 1,
+		},
 		FeedKeySet:          true,
 		DefaultStampBatchID: "batch-1",
 		AnonymousPull:       false,
-	}, nil, "")
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("create registry via store: %v", err)
 	}
@@ -151,7 +157,7 @@ func TestUIRegistryDetailDoesNotReconstructInviteToken(t *testing.T) {
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: alice.ID, FeedOwnerAddress: "0xfeed", DefaultStampBatchID: "batch-1",
 		AnonymousPull: false,
-	}, nil, "")
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -72,11 +71,14 @@ func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug st
 	if s.FeedKeys == nil {
 		return CreatedRegistry{}, errFeedKeyCipherNotConfigured
 	}
-	privateKey, err := generatePrivateKeyHex()
+	// The signing key is born as mutable bytes owned by this frame; it is
+	// wiped (defer) after the store has sealed it. It is never stringified.
+	priv, err := generatePrivateKeyBytes()
 	if err != nil {
 		return CreatedRegistry{}, err
 	}
-	key, err := ethcrypto.HexToECDSA(privateKey)
+	defer zeroBytes(priv)
+	key, err := ethcrypto.ToECDSA(priv)
 	if err != nil {
 		return CreatedRegistry{}, err
 	}
@@ -91,11 +93,11 @@ func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug st
 		AnonymousPull:       anonymousPull,
 	}
 
-	// The key is encrypted at rest by the store, inside the insert
+	// The key bytes are encrypted at rest by the store, inside the insert
 	// transaction, bound with AES-GCM AAD to the row's own ID and owner. The
-	// transient plaintext lives only in this frame (the hex string) and in the
-	// store's encryption call; nothing is ever persisted in plaintext.
-	registry, err = s.Store.CreateRegistry(ctx, registry, s.FeedKeys, privateKey)
+	// transient plaintext lives only in this frame's priv slice (wiped on
+	// return); nothing is ever persisted or stringified in plaintext.
+	registry, err = s.Store.CreateRegistry(ctx, registry, s.FeedKeys, priv)
 	if err != nil {
 		return CreatedRegistry{}, err
 	}
@@ -328,7 +330,10 @@ func (s *Service) ReencryptFeedKeys(ctx context.Context, fromVersion, toVersion 
 	}
 	res := FeedKeyReencryptResult{}
 	for _, registry := range registries {
-		ok, err := s.Store.ReencryptRegistryFeedKey(ctx, registry.ID, registry.FeedOwnerAddress, fromVersion, toVersion, s.FeedKeys)
+		// Only the ID is passed: the row's owner and envelope are re-read
+		// inside the per-row transaction, so rotation never uses (or can be
+		// skewed by) a stale enumerated owner.
+		ok, err := s.Store.ReencryptRegistryFeedKey(ctx, registry.ID, fromVersion, toVersion, s.FeedKeys)
 		if err != nil {
 			return res, err
 		}
@@ -341,29 +346,33 @@ func (s *Service) ReencryptFeedKeys(ctx context.Context, fromVersion, toVersion 
 	return res, nil
 }
 
-// DecryptFeedKey resolves the transient plaintext signing key for a registry
-// from the row's OWN current stored context (fresh read), authenticating the
-// envelope with the row's ID and owner. The returned hex string is the
-// direct input for feed signing (Task 9/10 consume this boundary); the
-// intermediate byte buffer is zeroed before returning. Errors never contain
-// key or owner material.
-func (s *Service) DecryptFeedKey(ctx context.Context, registry Registry) (string, error) {
+// WithDecryptedFeedKey resolves the transient plaintext signing key for a
+// registry from the row's OWN current stored context (fresh read that also
+// validates the envelope invariant) and hands it to fn as mutable bytes OWNED
+// by this operation. The bytes are valid only inside fn (the callback is the
+// immediate signing boundary); the buffer is zeroed after fn returns, on both
+// success and error paths, and is never stringified or persisted. Errors
+// never contain key or owner material.
+func (s *Service) WithDecryptedFeedKey(ctx context.Context, registryID int64, fn func([]byte) error) error {
 	if s.FeedKeys == nil {
-		return "", errFeedKeyCipherNotConfigured
+		return errFeedKeyCipherNotConfigured
 	}
-	row, err := s.Store.FindRegistryByID(ctx, registry.ID)
+	if fn == nil {
+		return errors.New("resolve feed key: nil callback")
+	}
+	row, err := s.Store.FindRegistryByID(ctx, registryID)
 	if err != nil {
-		return "", fmt.Errorf("resolve feed key: %w", err)
+		return fmt.Errorf("resolve feed key: %w", err)
 	}
 	if !row.FeedKeySet {
-		return "", errors.New("registry has no stored encrypted feed key")
+		return errors.New("registry has no stored encrypted feed key")
 	}
 	plaintext, err := s.FeedKeys.Decrypt(row.ID, row.FeedOwnerAddress, row.FeedKey)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer zeroBytes(plaintext)
-	return string(plaintext), nil
+	return fn(plaintext)
 }
 
 func (s *Service) RegisterAndAcceptInvite(ctx context.Context, token string, email string, password string) (User, Invite, string, error) {
@@ -498,10 +507,13 @@ func buildStampPolicyDocument(registry Registry, _ []MembershipSubject) spec.Sta
 	}
 }
 
-func generatePrivateKeyHex() (string, error) {
+// generatePrivateKeyBytes returns 32 fresh cryptographically random bytes:
+// the raw feed-owner signing key. The caller owns the slice and MUST wipe it
+// (zeroBytes) once the immediate operation is done; it is never stringified.
+func generatePrivateKeyBytes() ([]byte, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
-		return "", err
+		return nil, err
 	}
-	return hex.EncodeToString(raw), nil
+	return raw, nil
 }

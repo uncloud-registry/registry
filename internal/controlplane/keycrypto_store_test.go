@@ -91,7 +91,7 @@ func TestStoreRegistryPersistsEncryptedKeyAtRest(t *testing.T) {
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
 		AnonymousPull: false,
-	}, cipher, plaintext)
+	}, cipher, []byte(plaintext))
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestStoreCreateRegistryRejectsMissingPlaintextWithCipher(t *testing.T) {
 	_, err = store.CreateRegistry(context.Background(), Registry{
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
-	}, newTestFeedKeyCipher(t), "")
+	}, newTestFeedKeyCipher(t), nil)
 	if err == nil {
 		t.Fatal("cipher configured with empty plaintext must be rejected")
 	}
@@ -357,7 +357,7 @@ func TestReencryptFeedKeysRotatesRows(t *testing.T) {
 	regA, err := store.CreateRegistry(ctx, Registry{
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
-	}, cipher, ptA)
+	}, cipher, []byte(ptA))
 	if err != nil {
 		t.Fatalf("create registry A: %v", err)
 	}
@@ -367,7 +367,7 @@ func TestReencryptFeedKeysRotatesRows(t *testing.T) {
 	regB, err := store.CreateRegistry(ctx, Registry{
 		Slug: "bob", Host: "bob.uncloud-registry.com", ENSName: "bob.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0002", DefaultStampBatchID: "batch-1",
-	}, nil, "")
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("create registry B: %v", err)
 	}
@@ -476,7 +476,7 @@ func TestReencryptFeedKeysTamperedRowFailsAndRollsBack(t *testing.T) {
 	reg, err := store.CreateRegistry(ctx, Registry{
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
-	}, service.FeedKeys, testFeedKeyPlaintext())
+	}, service.FeedKeys, []byte(testFeedKeyPlaintext()))
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestReencryptFeedKeysSkipsRowsWithoutKey(t *testing.T) {
 		if _, err := store.CreateRegistry(ctx, Registry{
 			Slug: slug, Host: slug + ".uncloud-registry.com", ENSName: slug + ".eth",
 			OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
-		}, nil, ""); err != nil {
+		}, nil, nil); err != nil {
 			t.Fatalf("create registry %s: %v", slug, err)
 		}
 	}
@@ -536,7 +536,7 @@ func TestReencryptFeedKeysSkipsRowsWithoutKey(t *testing.T) {
 	}
 }
 
-func TestServiceDecryptFeedKeyBoundary(t *testing.T) {
+func TestServiceWithDecryptedFeedKeyBoundary(t *testing.T) {
 	t.Parallel()
 	store, err := OpenSQLite("file:keycrypto_decryptfeed?mode=memory&cache=shared")
 	if err != nil {
@@ -545,10 +545,15 @@ func TestServiceDecryptFeedKeyBoundary(t *testing.T) {
 	ctx := context.Background()
 	service := newStoreService(t, store.DB)
 
-	// No cipher configured: fail closed.
+	// No cipher configured: fail closed before any callback.
 	noCipher := &Service{Store: store, RegistryDomain: "uncloud-registry.com"}
-	if _, err := noCipher.DecryptFeedKey(ctx, Registry{ID: 999}); !errors.Is(err, errFeedKeyCipherNotConfigured) {
+	if err := noCipher.WithDecryptedFeedKey(ctx, 999, func([]byte) error { return nil }); !errors.Is(err, errFeedKeyCipherNotConfigured) {
 		t.Fatalf("nil cipher must fail closed: %v", err)
+	}
+	// Nil callback: rejected outright (the decrypted bytes must never be
+	// dropped on the floor unhandled).
+	if err := service.WithDecryptedFeedKey(ctx, 999, nil); err == nil {
+		t.Fatal("nil callback must be rejected")
 	}
 
 	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
@@ -559,44 +564,556 @@ func TestServiceDecryptFeedKeyBoundary(t *testing.T) {
 	reg, err := store.CreateRegistry(ctx, Registry{
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
-	}, service.FeedKeys, plaintext)
+	}, service.FeedKeys, []byte(plaintext))
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
 
-	got, err := service.DecryptFeedKey(ctx, Registry{ID: reg.ID})
+	// The callback receives the exact decrypted plaintext bytes.
+	var got []byte
+	err = service.WithDecryptedFeedKey(ctx, reg.ID, func(key []byte) error {
+		got = append(got, key...)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("decrypt feed key: %v", err)
+		t.Fatalf("with decrypted feed key: %v", err)
 	}
-	if got != plaintext {
+	if string(got) != plaintext {
 		t.Fatalf("decrypted key mismatch: %q", got)
+	}
+
+	// A callback error must propagate (it is the operation's error), and the
+	// key must still be wiped (defer) — asserted by the wipe test below.
+	sentinel := errors.New("callback failure")
+	if err := service.WithDecryptedFeedKey(ctx, reg.ID, func([]byte) error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("callback error must propagate: %v", err)
 	}
 
 	// A registry with no stored key fails closed.
 	noKey, err := store.CreateRegistry(ctx, Registry{
 		Slug: "bob", Host: "bob.uncloud-registry.com", ENSName: "bob.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0002", DefaultStampBatchID: "batch-1",
-	}, nil, "")
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.DecryptFeedKey(ctx, Registry{ID: noKey.ID}); err == nil {
+	if err := service.WithDecryptedFeedKey(ctx, noKey.ID, func([]byte) error { return nil }); err == nil {
 		t.Fatal("registry without a stored key must fail closed")
+	}
+}
+
+// TestWithDecryptedFeedKeyWipesAfterCallback pins the plaintext lifecycle
+// behaviorally: the service owns the decrypted byte slice, hands it to the
+// callback for the immediate operation only, and zeroes the SAME backing
+// array before returning. The callback snapshot (a copy made inside fn)
+// proves the contents were the plaintext; the test additionally ALIASES the
+// slice (borrowed, never copied) and, after WithDecryptedFeedKey returns,
+// reading through that alias must observe zeroed bytes. This is an honest
+// behavioral assertion on the owned buffer — no claim that unrelated copies
+// (which Go does not let us control) are wiped.
+func TestWithDecryptedFeedKeyWipesAfterCallback(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_wipe?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	service := newStoreService(t, store.DB)
+
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	plaintext := testFeedKeyPlaintext()
+	reg, err := store.CreateRegistry(ctx, Registry{
+		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
+		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
+	}, service.FeedKeys, []byte(plaintext))
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+
+	var snapshot []byte
+	var borrowed []byte
+	err = service.WithDecryptedFeedKey(ctx, reg.ID, func(key []byte) error {
+		snapshot = append(snapshot, key...) // copy INSIDE the callback: proves contents
+		borrowed = key                      // alias: proves post-call wipe of the same array
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("with decrypted feed key: %v", err)
+	}
+	if string(snapshot) != plaintext {
+		t.Fatalf("callback must have seen the plaintext: %q", snapshot)
+	}
+	for i, b := range borrowed {
+		if b != 0 {
+			t.Fatalf("owned plaintext buffer not wiped after callback (byte %d = %d)", i, b)
+		}
+	}
+
+	// The same guarantee holds on the error path.
+	snapshot = nil
+	borrowed = nil
+	err = service.WithDecryptedFeedKey(ctx, reg.ID, func(key []byte) error {
+		snapshot = append(snapshot, key...)
+		borrowed = key
+		return errors.New("boom")
+	})
+	if err == nil {
+		t.Fatal("expected callback error")
+	}
+	if string(snapshot) != plaintext {
+		t.Fatalf("error path callback must have seen the plaintext: %q", snapshot)
+	}
+	for i, b := range borrowed {
+		if b != 0 {
+			t.Fatalf("error path left plaintext un-wiped (byte %d = %d)", i, b)
+		}
+	}
+}
+
+// TestStoreCreateRegistryRejectsIncompleteEnvelope pins the store write guard:
+// the direct-craft path (FeedKeySet) must refuse an envelope that is not
+// exactly all-present with non-empty ciphertext/nonce and a positive version —
+// the schema-level invariant mirrored at the application boundary.
+func TestStoreCreateRegistryRejectsIncompleteEnvelope(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_envguard?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	base := Registry{
+		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
+		OwnerUserID: owner.ID, FeedOwnerAddress: "0xfeed0001", DefaultStampBatchID: "batch-1",
+	}
+	valid := EncryptedFeedKey{Ciphertext: []byte("0123456789abcdef"), Nonce: []byte("0123456789ab"), KeyVersion: 1}
+	cases := []struct {
+		name  string
+		value EncryptedFeedKey
+	}{
+		{"ciphertext only", EncryptedFeedKey{Ciphertext: valid.Ciphertext}},
+		{"nonce only", EncryptedFeedKey{Nonce: valid.Nonce}},
+		{"ciphertext and nonce, no version", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce}},
+		{"ciphertext and version, no nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, KeyVersion: 1}},
+		{"nonce and version, no ciphertext", EncryptedFeedKey{Nonce: valid.Nonce, KeyVersion: 1}},
+		{"zero version", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: 0}},
+		{"negative version", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: -1}},
+		{"empty ciphertext", EncryptedFeedKey{Ciphertext: []byte{}, Nonce: valid.Nonce, KeyVersion: 1}},
+		{"empty nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: []byte{}, KeyVersion: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := base
+			reg.FeedKey = tc.value
+			reg.FeedKeySet = true
+			if _, err := store.CreateRegistry(ctx, reg, nil, nil); err == nil {
+				t.Fatal("incomplete envelope must be rejected by the store write guard")
+			} else if !errors.Is(err, ErrFeedKeyEnvelopeMalformed) {
+				t.Fatalf("expected ErrFeedKeyEnvelopeMalformed, got %v", err)
+			}
+		})
+	}
+	// The complete envelope still passes.
+	reg := base
+	reg.FeedKey = valid
+	reg.FeedKeySet = true
+	if _, err := store.CreateRegistry(ctx, reg, nil, nil); err != nil {
+		t.Fatalf("complete envelope must be accepted: %v", err)
+	}
+}
+
+// TestFeedKeyEnvelopeTriggerEnforcesCompleteness drives the schema-level
+// invariant through DIRECT SQL on the migrated schema: the triggers reject
+// every partial combination of the three feed-key columns on INSERT and
+// UPDATE, and accept exactly all-NULL and all-present-nonempty-positive.
+func TestFeedKeyEnvelopeTriggerEnforcesCompleteness(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_triggers?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	insertCols := `(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key,
+		default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)`
+	insertBase := func(slug string, ct, nonce, ver any) error {
+		_, err := store.DB.ExecContext(ctx, `insert into registries `+insertCols+` values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", owner.ID, "0xfeed", "",
+			"batch-1", 0, now, ct, nonce, ver)
+		return err
+	}
+
+	// All NULL: the no-key state, accepted.
+	if err := insertBase("nokey", nil, nil, nil); err != nil {
+		t.Fatalf("all-NULL envelope must be accepted: %v", err)
+	}
+	// All present, non-empty, positive: accepted.
+	ct := []byte("0123456789abcdef")
+	nonce := []byte("0123456789ab")
+	if err := insertBase("full", ct, nonce, 1); err != nil {
+		t.Fatalf("complete envelope must be accepted: %v", err)
+	}
+
+	partial := []struct {
+		name  string
+		ct    any
+		nonce any
+		ver   any
+	}{
+		{"version only", nil, nil, 1},
+		{"ciphertext only", ct, nil, nil},
+		{"nonce only", nil, nonce, nil},
+		{"ciphertext and nonce, no version", ct, nonce, nil},
+		{"ciphertext and version, no nonce", ct, nil, 1},
+		{"nonce and version, no ciphertext", nil, nonce, 1},
+		{"zero version", ct, nonce, 0},
+		{"negative version", ct, nonce, -1},
+		{"empty ciphertext", []byte{}, nonce, 1},
+		{"empty nonce", ct, []byte{}, 1},
+	}
+	for i, tc := range partial {
+		if err := insertBase("partial"+strconv.Itoa(i), tc.ct, tc.nonce, tc.ver); err == nil {
+			t.Fatalf("%s: partial envelope INSERT must be rejected by the trigger", tc.name)
+		}
+	}
+
+	// UPDATE is guarded the same way: a complete row cannot be mutated into a
+	// partial envelope, and a partial envelope cannot be written into one.
+	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_version = 1 where host = ?`, "nokey.uncloud-registry.com"); err == nil {
+		t.Fatal("UPDATE to a partial envelope must be rejected by the trigger")
+	}
+	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_version = null where host = ?`, "full.uncloud-registry.com"); err == nil {
+		t.Fatal("UPDATE to a partial envelope must be rejected by the trigger")
+	}
+	// Valid UPDATEs still pass.
+	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_version = 2 where host = ?`, "full.uncloud-registry.com"); err != nil {
+		t.Fatalf("valid envelope UPDATE must be accepted: %v", err)
+	}
+}
+
+// dropFeedKeyTriggers removes the schema-level envelope triggers so tests can
+// seed malformed rows (which the triggers otherwise refuse) and prove the
+// application layers — scan/list, migration, rotation — reject them on read.
+func dropFeedKeyTriggers(t *testing.T, store *Store) {
+	t.Helper()
+	for _, name := range []string{"registries_feed_key_complete_insert", "registries_feed_key_complete_update"} {
+		if _, err := store.DB.Exec(`drop trigger if exists ` + name); err != nil {
+			t.Fatalf("drop trigger %s: %v", name, err)
+		}
+	}
+}
+
+// TestScanRejectsPartialEnvelopes proves every registry read path validates
+// the envelope invariant: a row whose three feed-key columns disagree is
+// rejected with ErrFeedKeyEnvelopeInconsistent instead of being silently
+// scanned (a partial envelope would otherwise be handed to the cipher as a
+// plausible-looking or nil-panicking value, or a plaintext-preserving row
+// would be skipped as "no key").
+func TestScanRejectsPartialEnvelopes(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_scanpartial?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	dropFeedKeyTriggers(t, store)
+
+	seed := func(slug string, ct, nonce, ver any) {
+		if _, err := store.DB.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", owner.ID, "0xfeed", "",
+			"batch-1", 0, now, ct, nonce, ver); err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+	}
+	seed("veronly", nil, nil, 1)
+	seed("ctonly", []byte("0123456789abcdef"), nil, nil)
+	seed("nonceonly", nil, []byte("0123456789ab"), nil)
+	seed("ctnonce", []byte("0123456789abcdef"), []byte("0123456789ab"), nil)
+	seed("emptyct", []byte{}, []byte("0123456789ab"), 1)
+	seed("zerover", []byte("0123456789abcdef"), []byte("0123456789ab"), 0)
+	// Memberships make every seeded row reachable through the user JOIN (the
+	// JOIN query must also exercise scan validation, not silently return zero
+	// rows).
+	for i := 1; i <= 6; i++ {
+		if _, err := store.DB.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?,?,?,?,?,?)`,
+			int64(i), owner.ID, "owner", 1, 1, now); err != nil {
+			t.Fatalf("seed membership %d: %v", i, err)
+		}
+	}
+
+	if _, err := store.ListRegistries(ctx); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("ListRegistries must reject partial envelopes: %v", err)
+	}
+	if _, err := store.ListRegistriesForUser(ctx, owner.ID); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("ListRegistriesForUser must reject partial envelopes: %v", err)
+	}
+	if _, err := store.FindRegistryByID(ctx, 1); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("FindRegistryByID must reject partial envelopes: %v", err)
+	}
+	if _, err := store.FindRegistryByHost(ctx, "veronly.uncloud-registry.com"); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("FindRegistryByHost must reject partial envelopes: %v", err)
+	}
+}
+
+// TestMigrateLegacyFeedKeysRejectsInconsistentRows pins that the opt-in
+// legacy migration rejects (never silently skips) a row whose envelope state
+// is partial — such a row must not be left half-encrypted or treated as
+// "already migrated".
+func TestMigrateLegacyFeedKeysRejectsInconsistentRows(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedLegacyDB(t, db, now, now, true)
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	store := &Store{DB: db}
+	dropFeedKeyTriggers(t, store)
+	// Row 1: version set but ciphertext/nonce NULL — partial envelope.
+	if _, err := db.ExecContext(ctx, `update registries set feed_key_version = 1 where id = 1`); err != nil {
+		t.Fatalf("seed partial row: %v", err)
+	}
+
+	service := newStoreService(t, db)
+	_, err := service.MigrateLegacyFeedKeys(ctx)
+	if !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("migration must reject the inconsistent row: %v", err)
+	}
+	// The row is untouched: legacy plaintext still at rest, partial envelope
+	// unchanged.
+	var legacy string
+	var version sql.NullInt64
+	if err := db.QueryRowContext(ctx, `select encrypted_feed_private_key, feed_key_version from registries where id = 1`).Scan(&legacy, &version); err != nil {
+		t.Fatal(err)
+	}
+	if legacy != "ciphertext" || !version.Valid {
+		t.Fatalf("inconsistent row must be left fully untouched: legacy=%q version set=%v", legacy, version.Valid)
+	}
+}
+
+// TestMigrateLegacyFeedKeysReencryptsRowWithBothEnvelopeAndLegacy pins that a
+// row carrying BOTH a complete envelope and legacy plaintext is re-encrypted
+// from the legacy value and cleared — plaintext is never preserved alongside
+// an envelope, and the row is never silently skipped.
+func TestMigrateLegacyFeedKeysReencryptsRowWithBothEnvelopeAndLegacy(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedLegacyDB(t, db, now, now, true)
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	store := &Store{DB: db}
+	dropFeedKeyTriggers(t, store)
+	// Row 1 already "encrypted" (complete shape) but the legacy plaintext was
+	// never cleared — the migration must re-encrypt and clear it.
+	if _, err := db.ExecContext(ctx, `update registries set
+		feed_key_ciphertext = ?, feed_key_nonce = ?, feed_key_version = ? where id = 1`,
+		[]byte("0123456789abcdef"), []byte("0123456789ab"), 1); err != nil {
+		t.Fatalf("seed envelope+legacy row: %v", err)
+	}
+
+	service := newStoreService(t, db)
+	migrated, err := service.MigrateLegacyFeedKeys(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if migrated != 1 {
+		t.Fatalf("expected 1 migrated row, got %d", migrated)
+	}
+	var legacy string
+	var ciphertext, nonce []byte
+	var version sql.NullInt64
+	if err := db.QueryRowContext(ctx, `select encrypted_feed_private_key, feed_key_ciphertext, feed_key_nonce, feed_key_version from registries where id = 1`).Scan(&legacy, &ciphertext, &nonce, &version); err != nil {
+		t.Fatal(err)
+	}
+	if legacy != "" {
+		t.Fatalf("legacy plaintext must be cleared, got %q", legacy)
+	}
+	if len(ciphertext) == 0 || len(nonce) == 0 || !version.Valid {
+		t.Fatal("envelope must be present")
+	}
+	got, err := service.FeedKeys.Decrypt(1, "0xfeed", EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)})
+	if err != nil {
+		t.Fatalf("decrypt re-encrypted key: %v", err)
+	}
+	if string(got) != "ciphertext" {
+		t.Fatalf("re-encrypted plaintext mismatch: %q", got)
+	}
+	// Idempotent afterwards.
+	migrated, err = service.MigrateLegacyFeedKeys(ctx)
+	if err != nil || migrated != 0 {
+		t.Fatalf("second migration must be a no-op: migrated=%d err=%v", migrated, err)
+	}
+}
+
+// TestMigrateLegacyFeedKeysUsesTransactionalOwner pins the stale-owner fix:
+// the legacy migration must re-read owner, plaintext, and envelope state
+// INSIDE the same per-row transaction and bind the AAD to THAT owner. A
+// committed owner change between enumeration and the transactional read must
+// be reflected in the resulting ciphertext; the stale enumerated owner must
+// not authenticate it. The deterministic hook sits exactly between the two.
+func TestMigrateLegacyFeedKeysUsesTransactionalOwner(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedLegacyDB(t, db, now, now, true)
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	service := newStoreService(t, db)
+	// Between enumeration (IDs only) and the per-row transaction, commit an
+	// owner change on a separate connection.
+	service.Store.migrateRowHook = func(id int64) {
+		if _, err := db.ExecContext(context.Background(), `update registries set feed_owner_address = ? where id = ?`, "0xnewowner", id); err != nil {
+			t.Fatalf("hook owner change: %v", err)
+		}
+	}
+
+	migrated, err := service.MigrateLegacyFeedKeys(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if migrated != 1 {
+		t.Fatalf("expected 1 migrated row, got %d", migrated)
+	}
+
+	var owner string
+	var ciphertext, nonce []byte
+	var version sql.NullInt64
+	var legacy string
+	if err := db.QueryRowContext(ctx, `select feed_owner_address, encrypted_feed_private_key, feed_key_ciphertext, feed_key_nonce, feed_key_version from registries where id = 1`).Scan(&owner, &legacy, &ciphertext, &nonce, &version); err != nil {
+		t.Fatal(err)
+	}
+	if owner != "0xnewowner" {
+		t.Fatalf("owner update must be committed: %q", owner)
+	}
+	if legacy != "" || !version.Valid {
+		t.Fatalf("row must be migrated: legacy=%q version set=%v", legacy, version.Valid)
+	}
+	env := EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}
+	if _, err := service.FeedKeys.Decrypt(1, "0xnewowner", env); err != nil {
+		t.Fatalf("ciphertext must decrypt under the COMMITTED owner: %v", err)
+	}
+	if _, err := service.FeedKeys.Decrypt(1, "0xfeed", env); !errors.Is(err, ErrKeyDecrypt) {
+		t.Fatalf("ciphertext must NOT decrypt under the stale enumerated owner: %v", err)
+	}
+}
+
+// TestReencryptRegistryFeedKeyRejectsInconsistentRows pins that rotation
+// rejects (never silently skips) rows whose envelope is partial: a version
+// without ciphertext/nonce, ciphertext/nonce without a version, empty blobs,
+// or a non-positive version all abort the row transaction.
+func TestReencryptRegistryFeedKeyRejectsInconsistentRows(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_rotpartial?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	service := newStoreService(t, store.DB)
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	dropFeedKeyTriggers(t, store)
+	seed := func(slug string, ct, nonce, ver any) int64 {
+		res, err := store.DB.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", owner.ID, "0xfeed", "",
+			"batch-1", 0, time.Now().UTC().Format(time.RFC3339), ct, nonce, ver)
+		if err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	ct := []byte("0123456789abcdef")
+	nonce := []byte("0123456789ab")
+	rows := map[string]int64{
+		"veronly":   seed("veronly", nil, nil, 1),
+		"ctonly":    seed("ctonly", ct, nil, nil),
+		"nonceonly": seed("nonceonly", nil, nonce, nil),
+		"emptyct":   seed("emptyct", []byte{}, nonce, 1),
+		"zerover":   seed("zerover", ct, nonce, 0),
+	}
+	for name, id := range rows {
+		_, err := service.Store.ReencryptRegistryFeedKey(ctx, id, 1, 2, service.FeedKeys)
+		if !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+			t.Fatalf("%s: rotation must reject the inconsistent row: %v", name, err)
+		}
+	}
+	// A no-key row (all NULL) is still skipped, not rejected.
+	noKey := seed("nokey", nil, nil, nil)
+	ok, err := service.Store.ReencryptRegistryFeedKey(ctx, noKey, 1, 2, service.FeedKeys)
+	if err != nil || ok {
+		t.Fatalf("all-NULL row must be skipped: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestReencryptFeedKeysFailsOnPartialRow pins the service-level rotation: an
+// inconsistent row fails the whole pass with the envelope sentinel — it is
+// never silently skipped.
+func TestReencryptFeedKeysFailsOnPartialRow(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_rotfail?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	service := newStoreService(t, store.DB)
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	dropFeedKeyTriggers(t, store)
+	if _, err := store.DB.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_version)
+		values (?,?,?,?,?,?,?,?,?,?)`,
+		"partial", "partial.uncloud-registry.com", "partial.eth", owner.ID, "0xfeed", "",
+		"batch-1", 0, time.Now().UTC().Format(time.RFC3339), 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReencryptFeedKeys(ctx, 1, 2); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("rotation pass must fail on the partial row: %v", err)
 	}
 }
 
 // TestBeeRegistryFeedUpdaterBoundary pins the publisher boundary: the Bee
 // updater must never hand stored ciphertext to the signer. Without a
-// configured decryptor it refuses outright; with one, the decryptor's key
-// material is what reaches the signer (proven by the signer accepting the
-// key and proceeding past parsing to the feed operation).
+// configured decryptor it refuses outright; with one, the decryptor's raw
+// key BYTES reach the signer (proven by the signer accepting the bytes and
+// proceeding past key parsing to the feed operation).
 type stubFeedKeyDecryptor struct {
-	key string
+	key []byte
 	err error
 }
 
-func (s stubFeedKeyDecryptor) DecryptFeedKey(_ context.Context, _ Registry) (string, error) {
-	return s.key, s.err
+func (s stubFeedKeyDecryptor) WithDecryptedFeedKey(_ context.Context, _ int64, fn func([]byte) error) error {
+	if s.err != nil {
+		return s.err
+	}
+	return fn(s.key)
 }
 
 func TestBeeRegistryFeedUpdaterBoundary(t *testing.T) {
@@ -612,17 +1129,25 @@ func TestBeeRegistryFeedUpdaterBoundary(t *testing.T) {
 		t.Fatalf("expected the fail-closed decryptor error, got: %v", err)
 	}
 
-	// With a decryptor: the supplied key reaches the signer — the signer
-	// parses it (no ciphertext-parse error) and fails on the feed operation.
+	// With a decryptor: the supplied 32-byte key reaches the signer — the
+	// signer parses it (no byte-parse error) and fails on the feed operation
+	// (owner mismatch with the arbitrary test key).
+	key := bytes.Repeat([]byte{0x11}, 32)
 	updater = BeeRegistryFeedUpdater{
 		BaseURL: "http://bee.invalid",
-		Keys:    stubFeedKeyDecryptor{key: strings.Repeat("ab", 32)},
+		Keys:    stubFeedKeyDecryptor{key: key},
 	}
 	err = updater.UpdateRegistryFeed(ctx, Registry{ID: 1, FeedOwnerAddress: "0xfeed"}, "feed", "ref")
 	if err == nil {
 		t.Fatal("expected the signer to fail on the unreachable bee endpoint")
 	}
 	if strings.Contains(err.Error(), "parse feed signer private key") {
-		t.Fatalf("the signer must have received the DECRYPTED key, not ciphertext: %v", err)
+		t.Fatalf("the signer must have received the DECRYPTED bytes, not garbage/ciphertext: %v", err)
+	}
+	// The decryptor's error propagates untouched.
+	decErr := errors.New("decryptor failure")
+	updater.Keys = stubFeedKeyDecryptor{err: decErr}
+	if err := updater.UpdateRegistryFeed(ctx, Registry{ID: 1}, "feed", "ref"); !errors.Is(err, decErr) {
+		t.Fatalf("decryptor error must propagate: %v", err)
 	}
 }

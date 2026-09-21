@@ -160,3 +160,40 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 		t.Fatal("expected soc signature query")
 	}
 }
+
+// TestNewBeeSequenceFeedUpdaterBytes pins the raw-bytes signer constructor:
+// it accepts exactly the 32 private-key bytes (no hex-string intermediate)
+// and rejects nil, short, and long inputs without leaking key material.
+func TestNewBeeSequenceFeedUpdaterBytes(t *testing.T) {
+	t.Parallel()
+	key, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	raw := ethcrypto.FromECDSA(key)
+	if len(raw) != 32 {
+		t.Fatalf("expected 32 raw key bytes, got %d", len(raw))
+	}
+	updater, err := NewBeeSequenceFeedUpdaterBytes("http://bee.invalid", nil, raw)
+	if err != nil {
+		t.Fatalf("bytes constructor with valid key: %v", err)
+	}
+	wantOwner := strings.ToLower(ethcrypto.PubkeyToAddress(key.PublicKey).Hex())
+	if got := strings.ToLower(ethcrypto.PubkeyToAddress(updater.PrivateKey.PublicKey).Hex()); got != wantOwner {
+		t.Fatalf("signer owner mismatch: got %s want %s", got, wantOwner)
+	}
+
+	for _, tc := range []struct {
+		name string
+		key  []byte
+	}{
+		{"nil", nil},
+		{"empty", []byte{}},
+		{"too short", raw[:31]},
+		{"too long", append(append([]byte(nil), raw...), 0x00)},
+	} {
+		if _, err := NewBeeSequenceFeedUpdaterBytes("http://bee.invalid", nil, tc.key); err == nil {
+			t.Fatalf("%s key must be rejected", tc.name)
+		}
+	}
+}

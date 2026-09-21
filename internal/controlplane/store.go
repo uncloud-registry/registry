@@ -16,6 +16,11 @@ import (
 
 type Store struct {
 	DB *sql.DB
+	// migrateRowHook is a TEST-ONLY deterministic hook invoked between legacy
+	// row enumeration and each per-row migration transaction, so tests can
+	// prove a committed owner/plaintext change is observed transactionally.
+	// Production code never sets it.
+	migrateRowHook func(id int64)
 }
 
 type User struct {
@@ -117,8 +122,13 @@ type scanRow interface {
 }
 
 // scanRegistryRow scans the canonical registry column list into reg,
-// materializing the encrypted feed-key envelope (FeedKeySet reflects whether
-// a version is stored).
+// materializing the encrypted feed-key envelope. It also enforces the
+// schema-level envelope invariant on READ: the three feed-key columns must be
+// either ALL absent or ALL present with non-empty ciphertext/nonce and a
+// strictly positive version. A partial envelope (version without ciphertext,
+// ciphertext without version, zero-length blobs, non-positive version) is
+// rejected with ErrFeedKeyEnvelopeInconsistent — it is never silently scanned
+// as a plausible-looking value or as "no key".
 func scanRegistryRow(s scanRow, reg *Registry) error {
 	var createdAt string
 	var anonymous int
@@ -128,22 +138,35 @@ func scanRegistryRow(s scanRow, reg *Registry) error {
 		&ciphertext, &nonce, &version, &reg.DefaultStampBatchID, &anonymous, &createdAt); err != nil {
 		return err
 	}
-	reg.FeedKey = EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}
-	reg.FeedKeySet = version.Valid
+	ctSet := len(ciphertext) > 0 // NULL and zero-length blobs are both "absent"
+	nonceSet := len(nonce) > 0
+	if version.Valid {
+		if !ctSet || !nonceSet || version.Int64 <= 0 {
+			return ErrFeedKeyEnvelopeInconsistent
+		}
+		reg.FeedKey = EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}
+		reg.FeedKeySet = true
+	} else {
+		if ctSet || nonceSet {
+			return ErrFeedKeyEnvelopeInconsistent
+		}
+		reg.FeedKeySet = false
+	}
 	reg.AnonymousPull = anonymous == 1
 	reg.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	return nil
 }
 
 // CreateRegistry inserts a new registry row. When keyCipher is non-nil, the
-// row is inserted with empty key columns and feedKeyHex (the hex-encoded
-// signing key material) is encrypted inside the SAME transaction with the
-// row's own ID and owner as AES-GCM AAD, so a created registry can never
-// exist without its encrypted key and the envelope is bound to the row from
-// birth. When keyCipher is nil, registry.FeedKey is persisted verbatim if
-// FeedKeySet (test-only crafting); no plaintext is ever written to the
-// database.
-func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher *FeedKeyCipher, feedKeyHex string) (Registry, error) {
+// row is inserted with empty key columns and feedKey (the raw mutable signing
+// key bytes) is encrypted inside the SAME transaction with the row's own ID
+// and owner as AES-GCM AAD, so a created registry can never exist without its
+// encrypted key and the envelope is bound to the row from birth. feedKey is
+// owned by the CALLER (the service wipes it after the call); the plaintext is
+// never written to the database. When keyCipher is nil, registry.FeedKey is
+// persisted verbatim if FeedKeySet (test-only crafting) after the complete-
+// envelope shape guard accepts it; no plaintext is ever written.
+func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher *FeedKeyCipher, feedKey []byte) (Registry, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return Registry{}, err
@@ -162,10 +185,10 @@ func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher
 
 	switch {
 	case keyCipher != nil:
-		if feedKeyHex == "" {
+		if len(feedKey) == 0 {
 			return Registry{}, errors.New("create registry: feed key plaintext is required when a cipher is configured")
 		}
-		enc, err := keyCipher.Encrypt(id, registry.FeedOwnerAddress, []byte(feedKeyHex))
+		enc, err := keyCipher.Encrypt(id, registry.FeedOwnerAddress, feedKey)
 		if err != nil {
 			return Registry{}, err
 		}
@@ -176,6 +199,12 @@ func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher
 		registry.FeedKey = enc
 		registry.FeedKeySet = true
 	case registry.FeedKeySet:
+		// The schema-level invariant mirrored at the write boundary: a
+		// crafted envelope must be exactly all-present (non-empty ciphertext
+		// and nonce, positive version) before it can be persisted.
+		if err := validateFeedKeyEnvelopeShape(registry.FeedKey); err != nil {
+			return Registry{}, fmt.Errorf("create registry: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `update registries set feed_key_ciphertext = ?, feed_key_nonce = ?, feed_key_version = ? where id = ?`,
 			registry.FeedKey.Ciphertext, registry.FeedKey.Nonce, registry.FeedKey.KeyVersion, id); err != nil {
 			return Registry{}, err
@@ -190,6 +219,17 @@ func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher
 	registry.ID = id
 	registry.CreatedAt = now
 	return registry, nil
+}
+
+// validateFeedKeyEnvelopeShape is the store-level (nonce-length-agnostic)
+// completeness guard used wherever an envelope is about to be persisted: all
+// three fields present and non-empty, version strictly positive. It shares
+// the ErrFeedKeyEnvelopeMalformed sentinel with the cipher-level shape check.
+func validateFeedKeyEnvelopeShape(enc EncryptedFeedKey) error {
+	if len(enc.Ciphertext) == 0 || len(enc.Nonce) == 0 || enc.KeyVersion <= 0 {
+		return fmt.Errorf("%w: envelope must be all-present with non-empty ciphertext, non-empty nonce, and a positive version", ErrFeedKeyEnvelopeMalformed)
+	}
+	return nil
 }
 
 func (s *Store) CreateMembership(ctx context.Context, membership Membership) (Membership, error) {
@@ -460,53 +500,56 @@ func (s *Store) UpdateMembershipPermissions(ctx context.Context, registryID int6
 	return tx.Commit()
 }
 
-// legacyFeedKeyRow is the migration-only read shape. It is the ONLY place the
-// legacy encrypted_feed_private_key column is ever selected, and the caller
-// (MigrateLegacyFeedKeys) is only reachable when the operator explicitly opts
-// in (CONTROLPLANE_MIGRATE_LEGACY_KEYS=true).
-type legacyFeedKeyRow struct {
-	ID         int64
-	Owner      string
-	LegacyKey  string
-	KeyVersion sql.NullInt64
-}
-
-// ListLegacyFeedKeyRows reads every registry's legacy plaintext feed key and
-// its current encrypted state. MUST only be called from the opt-in-gated
-// MigrateLegacyFeedKeys path.
-func (s *Store) ListLegacyFeedKeyRows(ctx context.Context) ([]legacyFeedKeyRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `select id, feed_owner_address, encrypted_feed_private_key, feed_key_version from registries order by id asc`)
+// ListLegacyFeedKeyIDs enumerates ONLY the registry IDs eligible for the
+// opt-in legacy migration. No owner, plaintext, or envelope state is read
+// here: every one of those is re-read INSIDE the per-row transaction, so the
+// AAD context (owner) and the material being encrypted are always the SAME
+// committed version of the row — never a stale enumeration snapshot. MUST
+// only be called from the opt-in-gated MigrateLegacyFeedKeys path.
+func (s *Store) ListLegacyFeedKeyIDs(ctx context.Context) ([]int64, error) {
+	rows, err := s.DB.QueryContext(ctx, `select id from registries order by id asc`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []legacyFeedKeyRow
+	var out []int64
 	for rows.Next() {
-		var row legacyFeedKeyRow
-		if err := rows.Scan(&row.ID, &row.Owner, &row.LegacyKey, &row.KeyVersion); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		out = append(out, row)
+		out = append(out, id)
 	}
 	return out, rows.Err()
 }
 
 // MigrateLegacyFeedKeys encrypts every legacy plaintext feed key with the
-// row's own ID/owner AAD and clears the plaintext in the same per-row
-// transaction. Rows that are already encrypted (version set) or carry no
-// legacy plaintext are skipped. A row whose encryption fails rolls back fully
-// and aborts the operation; errors never contain key or owner material.
+// row's own ID and the TRANSACTIONALLY re-read owner as AAD and clears the
+// plaintext in the same per-row transaction. Rows that are already encrypted
+// (complete envelope, legacy cleared) or carry no legacy plaintext are
+// skipped. A row whose envelope state is PARTIAL is rejected with
+// ErrFeedKeyEnvelopeInconsistent (never silently skipped), and a row carrying
+// BOTH a complete envelope and legacy plaintext is re-encrypted from the
+// legacy value so no plaintext is preserved alongside an envelope. A row
+// whose encryption fails rolls back fully and aborts the operation; errors
+// never contain key or owner material.
 func (s *Store) MigrateLegacyFeedKeys(ctx context.Context, cipher *FeedKeyCipher) (int, error) {
 	if cipher == nil {
 		return 0, errFeedKeyCipherNotConfigured
 	}
-	rows, err := s.ListLegacyFeedKeyRows(ctx)
+	ids, err := s.ListLegacyFeedKeyIDs(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("migrate legacy feed keys: %w", err)
 	}
 	migrated := 0
-	for _, row := range rows {
-		ok, err := s.migrateLegacyFeedKey(ctx, row, cipher)
+	for _, id := range ids {
+		// Test-only deterministic hook between enumeration and the per-row
+		// transaction, so tests can prove a committed owner/plaintext change
+		// is observed transactionally. Production never sets it.
+		if s.migrateRowHook != nil {
+			s.migrateRowHook(id)
+		}
+		ok, err := s.migrateLegacyFeedKey(ctx, id, cipher)
 		if err != nil {
 			return migrated, err
 		}
@@ -517,31 +560,49 @@ func (s *Store) MigrateLegacyFeedKeys(ctx context.Context, cipher *FeedKeyCipher
 	return migrated, nil
 }
 
-func (s *Store) migrateLegacyFeedKey(ctx context.Context, row legacyFeedKeyRow, cipher *FeedKeyCipher) (bool, error) {
-	if row.LegacyKey == "" {
-		return false, nil
-	}
-	if row.KeyVersion.Valid {
-		return false, nil // already encrypted; the encrypted state is authoritative
-	}
+// migrateLegacyFeedKey encrypts ONE row's legacy plaintext inside its own
+// transaction. Owner, plaintext, AND envelope state are all re-read from the
+// row inside the transaction (the enumeration carries only the ID), so the
+// AAD is bound to the committed owner and the encrypted bytes match the
+// committed plaintext even if either changed after enumeration. The plaintext
+// is scanned into a mutable []byte and zeroed after encryption; it never
+// becomes a string.
+func (s *Store) migrateLegacyFeedKey(ctx context.Context, id int64, cipher *FeedKeyCipher) (bool, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("migrate legacy feed key: %w", err)
 	}
 	defer tx.Rollback()
 
-	// Re-read inside the transaction so the plaintext that gets encrypted and
-	// the row that gets updated are the same version of the row.
-	var legacy string
+	// Full transactional re-read: owner, legacy plaintext, envelope state.
+	var owner string
+	var legacy []byte
+	var ciphertext, nonce []byte
 	var version sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `select encrypted_feed_private_key, feed_key_version from registries where id = ?`, row.ID).Scan(&legacy, &version); err != nil {
+	if err := tx.QueryRowContext(ctx, `select feed_owner_address, encrypted_feed_private_key, feed_key_ciphertext, feed_key_nonce, feed_key_version from registries where id = ?`, id).
+		Scan(&owner, &legacy, &ciphertext, &nonce, &version); err != nil {
 		return false, fmt.Errorf("migrate legacy feed key: %w", err)
 	}
-	if legacy == "" || version.Valid {
+	ctSet := len(ciphertext) > 0
+	nonceSet := len(nonce) > 0
+	switch {
+	case version.Valid && (!ctSet || !nonceSet || version.Int64 <= 0):
+		// Partial envelope: never treat as "already encrypted"; reject.
+		return false, fmt.Errorf("migrate legacy feed key for registry %d: %w", id, ErrFeedKeyEnvelopeInconsistent)
+	case !version.Valid && (ctSet || nonceSet):
+		// Envelope material without a version: inconsistent; reject.
+		return false, fmt.Errorf("migrate legacy feed key for registry %d: %w", id, ErrFeedKeyEnvelopeInconsistent)
+	case len(legacy) == 0:
+		// Nothing at rest to migrate (with or without an envelope):
+		// already-migrated rows (complete envelope, cleared legacy) and
+		// plaintext-free rows are both clean.
 		return false, tx.Commit()
 	}
+	defer zeroBytes(legacy)
 
-	enc, err := cipher.Encrypt(row.ID, row.Owner, []byte(legacy))
+	// Encrypt under the TRANSACTIONALLY read owner; owner is the committed
+	// value even if it changed after enumeration.
+	enc, err := cipher.Encrypt(id, owner, legacy)
 	if err != nil {
 		return false, fmt.Errorf("migrate legacy feed key: %w", err)
 	}
@@ -550,7 +611,7 @@ func (s *Store) migrateLegacyFeedKey(ctx context.Context, row legacyFeedKeyRow, 
 	// state where the row is encrypted but the plaintext still sits at rest.
 	if _, err := tx.ExecContext(ctx, `update registries
 		set feed_key_ciphertext = ?, feed_key_nonce = ?, feed_key_version = ?, encrypted_feed_private_key = ''
-		where id = ?`, enc.Ciphertext, enc.Nonce, enc.KeyVersion, row.ID); err != nil {
+		where id = ?`, enc.Ciphertext, enc.Nonce, enc.KeyVersion, id); err != nil {
 		return false, fmt.Errorf("migrate legacy feed key: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -561,12 +622,14 @@ func (s *Store) migrateLegacyFeedKey(ctx context.Context, row legacyFeedKeyRow, 
 
 // ReencryptRegistryFeedKey rotates one registry's feed key from fromVersion to
 // toVersion, one row per transaction. The old ciphertext is authenticated with
-// the row's OWN current owner/ID context (tampering aborts), the decrypted
-// plaintext is re-sealed under the explicitly requested toVersion with the
-// same owner, and the row is updated atomically. Returns ok=false when the row
-// is skipped (no stored key, or its stored version != fromVersion); a skipped
-// row is never touched. The temporary plaintext is zeroed after use.
-func (s *Store) ReencryptRegistryFeedKey(ctx context.Context, registryID int64, owner string, fromVersion, toVersion int, cipher *FeedKeyCipher) (bool, error) {
+// the row's OWN current owner/ID context re-read inside the transaction
+// (tampering or context drift aborts), the decrypted plaintext is re-sealed
+// under the explicitly requested toVersion with the same owner, and the row is
+// updated atomically. Envelope state is validated first: a PARTIAL envelope
+// rejects with ErrFeedKeyEnvelopeInconsistent; only an all-NULL row is
+// skipped (no stored key), and a row whose stored version != fromVersion is
+// skipped untouched. The temporary plaintext is zeroed after use.
+func (s *Store) ReencryptRegistryFeedKey(ctx context.Context, registryID int64, fromVersion, toVersion int, cipher *FeedKeyCipher) (bool, error) {
 	if cipher == nil {
 		return false, errFeedKeyCipherNotConfigured
 	}
@@ -584,10 +647,18 @@ func (s *Store) ReencryptRegistryFeedKey(ctx context.Context, registryID int64, 
 	if err != nil {
 		return false, err
 	}
-	if !version.Valid {
+	ctSet := len(ciphertext) > 0
+	nonceSet := len(nonce) > 0
+	switch {
+	case version.Valid && (!ctSet || !nonceSet || version.Int64 <= 0):
+		// Partial envelope: reject — never silently skip, never rotate a
+		// half-encrypted row.
+		return false, fmt.Errorf("re-encrypt feed key for registry %d: %w", registryID, ErrFeedKeyEnvelopeInconsistent)
+	case !version.Valid && (ctSet || nonceSet):
+		return false, fmt.Errorf("re-encrypt feed key for registry %d: %w", registryID, ErrFeedKeyEnvelopeInconsistent)
+	case !version.Valid:
 		return false, tx.Commit() // no stored key: skip
-	}
-	if int(version.Int64) != fromVersion {
+	case int(version.Int64) != fromVersion:
 		return false, tx.Commit() // not at fromVersion: skip untouched
 	}
 

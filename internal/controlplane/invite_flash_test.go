@@ -35,7 +35,7 @@ func TestUIInviteFlashIsOneTimeAndBound(t *testing.T) {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	tokens := newTestSessionManager(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
 	client := &http.Client{

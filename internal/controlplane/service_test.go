@@ -153,7 +153,7 @@ func TestInviteExpires(t *testing.T) {
 		FeedOwnerAddress:    "0xfeed",
 		DefaultStampBatchID: "batch-1",
 		AnonymousPull:       true,
-	}, nil, "")
+	}, nil, nil)
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}

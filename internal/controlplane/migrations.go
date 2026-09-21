@@ -53,6 +53,21 @@ var migrations = []migration{
 			`alter table registries add column feed_key_version integer`,
 		},
 	},
+	// Version 3 installs the schema-level feed-key envelope invariant: the
+	// three feed-key columns must be either ALL NULL (no key) or ALL present
+	// with non-empty ciphertext and nonce and a strictly positive version.
+	// The migration first VALIDATES every existing row — any partial envelope
+	// fails the migration (fully rolled back, version 2 stays recorded) rather
+	// than being silently accepted — then installs BEFORE INSERT/UPDATE
+	// triggers that enforce the invariant for every future write, including
+	// direct SQL. Application layers (scan/list, store write guards, legacy
+	// migration, rotation) enforce the same invariant on read and write; the
+	// triggers close the direct-SQL gap so no code path can persist or mutate
+	// a partial envelope.
+	{
+		Version: 3,
+		Apply:   installFeedKeyEnvelopeInvariant,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only
@@ -375,4 +390,49 @@ func tableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// feedKeyEnvelopeInvariantCond is the boolean predicate shared by the
+// schema-level triggers: the three feed-key columns violate the invariant
+// when any two disagree on presence, or the version is non-positive, or a
+// present ciphertext/nonce is empty (length() on a BLOB is its byte length).
+const feedKeyEnvelopeInvariantCond = `(NEW.feed_key_ciphertext IS NULL) != (NEW.feed_key_nonce IS NULL)
+	OR (NEW.feed_key_ciphertext IS NULL) != (NEW.feed_key_version IS NULL)
+	OR (NEW.feed_key_version IS NOT NULL AND NEW.feed_key_version <= 0)
+	OR (NEW.feed_key_ciphertext IS NOT NULL AND length(NEW.feed_key_ciphertext) = 0)
+	OR (NEW.feed_key_nonce IS NOT NULL AND length(NEW.feed_key_nonce) = 0)`
+
+// installFeedKeyEnvelopeInvariant validates every existing registries row
+// against the feed-key envelope invariant, then installs BEFORE INSERT and
+// BEFORE UPDATE triggers enforcing it for all future writes. If any EXISTING
+// row violates the invariant the migration fails (the whole transaction is
+// rolled back by applyMigration — the schema version stays 2 and no triggers
+// are installed) instead of silently accepting or "repairing" inconsistent
+// rows. The error message names the invariant; it carries no key material.
+func installFeedKeyEnvelopeInvariant(ctx context.Context, tx *sql.Tx) error {
+	var bad int
+	if err := tx.QueryRowContext(ctx, `select count(*) from registries where
+		(feed_key_ciphertext is null) != (feed_key_nonce is null)
+		or (feed_key_ciphertext is null) != (feed_key_version is null)
+		or (feed_key_version is not null and feed_key_version <= 0)
+		or (feed_key_ciphertext is not null and length(feed_key_ciphertext) = 0)
+		or (feed_key_nonce is not null and length(feed_key_nonce) = 0)`).Scan(&bad); err != nil {
+		return fmt.Errorf("validate feed key envelope invariant: %w", err)
+	}
+	if bad != 0 {
+		return fmt.Errorf("feed key envelope invariant violated by %d existing rows; refusing to migrate", bad)
+	}
+	for _, stmt := range []string{
+		`create trigger registries_feed_key_complete_insert before insert on registries
+			for each row when ` + feedKeyEnvelopeInvariantCond + `
+			begin select raise(abort, 'feed key envelope must be all null or complete (non-empty ciphertext and nonce, positive version)'); end`,
+		`create trigger registries_feed_key_complete_update before update on registries
+			for each row when ` + feedKeyEnvelopeInvariantCond + `
+			begin select raise(abort, 'feed key envelope must be all null or complete (non-empty ciphertext and nonce, positive version)'); end`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create feed key envelope invariant trigger: %w", err)
+		}
+	}
+	return nil
 }

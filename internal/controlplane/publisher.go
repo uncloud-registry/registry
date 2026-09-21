@@ -170,17 +170,21 @@ func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Regi
 // FeedKeyDecryptor resolves the transient decrypted feed-owner signing key for
 // a registry. It is the boundary between at-rest encryption and the signer:
 // stored ciphertext must never be handed to a signer, and decrypted key
-// material must never be persisted or logged. Service implements it via
-// Service.DecryptFeedKey; the constrained signing consumer (Task 9/10)
-// replaces this with the feed-signing service.
+// material must never be persisted, logged, or stringified. The decrypted
+// bytes are owned by the operation and handed to fn for the immediate signing
+// call only; the implementer wipes them after fn returns. Service implements
+// it via Service.WithDecryptedFeedKey; the constrained signing consumer
+// (Task 9/10) builds on the same contract.
 type FeedKeyDecryptor interface {
-	DecryptFeedKey(ctx context.Context, registry Registry) (string, error)
+	WithDecryptedFeedKey(ctx context.Context, registryID int64, fn func([]byte) error) error
 }
 
 // BeeRegistryFeedUpdater signs sequence-feed updates with the registry's
 // feed-owner key. The key is obtained ONLY through a FeedKeyDecryptor — never
-// from storage directly; without one configured, updates fail closed rather
-// than handing stored ciphertext to the signer.
+// from storage directly and never by stringifying decrypted bytes; without
+// one configured, updates fail closed rather than handing stored ciphertext
+// to the signer. The signer is constructed from the raw key bytes inside the
+// callback, so the plaintext is wiped as soon as the signing call returns.
 type BeeRegistryFeedUpdater struct {
 	BaseURL    string
 	HTTPClient *http.Client
@@ -191,13 +195,11 @@ func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry
 	if b.Keys == nil {
 		return errors.New("registry feed key decryptor is not configured; refusing to sign feed updates with stored ciphertext")
 	}
-	keyHex, err := b.Keys.DecryptFeedKey(ctx, registry)
-	if err != nil {
-		return err
-	}
-	updater, err := swarm.NewBeeSequenceFeedUpdater(b.BaseURL, b.HTTPClient, keyHex)
-	if err != nil {
-		return err
-	}
-	return updater.UpdateFeed(ctx, feed, ref)
+	return b.Keys.WithDecryptedFeedKey(ctx, registry.ID, func(key []byte) error {
+		updater, err := swarm.NewBeeSequenceFeedUpdaterBytes(b.BaseURL, b.HTTPClient, key)
+		if err != nil {
+			return err
+		}
+		return updater.UpdateFeed(ctx, feed, ref)
+	})
 }
