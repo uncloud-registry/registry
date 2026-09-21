@@ -76,7 +76,7 @@ func (s *HTTPServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"user": user, "token": token})
+	writeJSON(w, http.StatusCreated, map[string]any{"user": NewPublicUser(user), "token": token})
 }
 
 func (s *HTTPServer) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -90,7 +90,7 @@ func (s *HTTPServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": user, "token": token})
+	writeJSON(w, http.StatusOK, map[string]any{"user": NewPublicUser(user), "token": token})
 }
 
 type createRegistryRequest struct {
@@ -115,7 +115,10 @@ func (s *HTTPServer) handleCreateRegistry(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, registry)
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"registry":  NewPublicRegistry(registry.Registry),
+		"bootstrap": registry.Bootstrap,
+	})
 }
 
 func (s *HTTPServer) handleListRegistries(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +131,7 @@ func (s *HTTPServer) handleListRegistries(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"registries": registries})
+	writeJSON(w, http.StatusOK, map[string]any{"registries": newPublicRegistries(registries)})
 }
 
 type createInviteRequest struct {
@@ -159,7 +162,7 @@ func (s *HTTPServer) handleCreateInvite(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"invite": invite, "token": token})
+	writeJSON(w, http.StatusCreated, map[string]any{"invite": NewPublicInvite(invite), "token": token})
 }
 
 func (s *HTTPServer) handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +182,7 @@ func (s *HTTPServer) handleAcceptInvite(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, invite)
+	writeJSON(w, http.StatusOK, NewPublicInvite(invite))
 }
 
 func (s *HTTPServer) handleRegistryToken(w http.ResponseWriter, r *http.Request) {

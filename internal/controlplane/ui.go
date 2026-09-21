@@ -520,7 +520,7 @@ func (s *HTTPServer) handleUIRegistries(w http.ResponseWriter, r *http.Request) 
   {{end}}
 </div>
 {{end}}`,
-		Data: map[string]any{"Registries": registries},
+		Data: map[string]any{"Registries": newPublicRegistries(registries)},
 	})
 }
 
@@ -754,7 +754,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
   </dialog>
 {{end}}`,
 		Data: map[string]any{
-			"Dashboard":   dashboard,
+			"Dashboard":   NewPublicRegistryDashboard(dashboard),
 			"Invites":     inviteViewModels(r, dashboard.Invites),
 			"InviteModal": inviteModal,
 		},
@@ -910,9 +910,9 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 			Authenticated: signedIn,
 			Body:          body,
 			Data: map[string]any{
-				"Invite":            invite,
+				"Invite":            NewPublicInvite(invite),
 				"InvitePermissions": permissionLabel(invite.CanPull, invite.CanPush),
-				"Registry":          registry,
+				"Registry":          NewPublicRegistry(registry),
 				"Token":             token,
 				"SignedIn":          signedIn,
 			},
