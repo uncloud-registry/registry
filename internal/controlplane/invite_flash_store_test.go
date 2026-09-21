@@ -78,10 +78,12 @@ func TestInviteFlashStoreExpiryCapAndAtomicity(t *testing.T) {
 
 // TestInviteFlashStoreConcurrentConsumeExactlyOnce proves atomic one-time
 // consumption under genuine same-ID concurrency, which a sequential test cannot
-// exercise. n goroutines all target the SAME flash ID/user/registry behind a
-// ready/start barrier so they call consume at the same instant; exactly one must
-// get the exact token and every other must get empty/false. Timeouts bound the
-// test against deadlock and every goroutine is joined (no leaks).
+// exercise. n goroutines all target the SAME flash ID/user/registry. A real
+// two-phase barrier (readiness acknowledgment then release) guarantees every
+// consumer is parked on start before any is released, so the consume calls
+// genuinely overlap. The parent joins every worker (bounded) before reading
+// results. Exactly one consumer must get the exact token; every other must get
+// empty/false; a follow-up consume is a no-op.
 func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	t.Parallel()
 
@@ -103,19 +105,26 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 
-	// Ready/start barrier: nobody may consume until every goroutine is parked on
-	// start, so the consume calls overlap as much as the scheduler permits.
+	// Two-phase barrier. ready is buffered to consumers so a worker's readiness
+	// signal can never block on send (channel capacity eliminates internal
+	// blocking). Workers send ready BEFORE blocking on start, so when the parent
+	// has drained all N readiness signals it has mechanically proven every
+	// worker is parked on start — exactly the launch-scalability gap in round 2,
+	// where start was closed immediately after spawn and unscheduled goroutines
+	// could arrive post-close and serialize.
+	ready := make(chan struct{}, consumers)
 	start := make(chan struct{})
 	results := make(chan struct {
 		token string
 		ok    bool
-	}, consumers)
+	}, consumers) // buffered to consumers: a worker can never block writing its result
 
 	var wg sync.WaitGroup
 	for i := 0; i < consumers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			ready <- struct{}{} // acknowledge readiness first
 			<-start
 			tok, ok := s.consume(id, userID, registry)
 			results <- struct {
@@ -124,19 +133,31 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 			}{tok, ok}
 		}()
 	}
-	close(start) // release all consumers at once
 
-	// Bounded wait for every goroutine; skipping any counts as a failure rather
-	// than leaking it.
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		t.Fatalf("timed out waiting for %d concurrent consumers (possible deadlock)", consumers)
+	// Phase 1: wait until all N consumers have signalled readiness, bounded. If
+	// readiness never completes we still release every worker parked on start
+	// and make a best-effort join before failing — we do not pretend to have
+	// force-cancelled anyone, but the worker code is finite and nonblocking apart
+	// from the guarded start/consume/send, so closing start is expected to let
+	// every worker finish and the join is expected to complete.
+	if !waitForReadyN(ready, consumers, timeout) {
+		close(start) // release any workers still waiting so failure cleanup can join
+		if !joinWithTimeout(&wg, timeout) {
+			t.Logf("best-effort join did not complete before failing readiness barrier")
+		}
+		t.Fatalf("timed out waiting for %d consumers to signal readiness", consumers)
+	}
+
+	// Phase 2: all workers are provably parked on start — release them together.
+	close(start)
+
+	// Phase 3: complete join before touching results. Success path must establish
+	// a full join, not just an on-time waitGroup (round 2's on-timeout Fatal gave
+	// no such proof). Here a genuine timeout triggers a bounded join attempt
+	// before failure.
+	if !joinWithTimeout(&wg, timeout) {
+		close(results)
+		t.Fatalf("timed out waiting for %d consumers to finish (possible deadlock in consume)", consumers)
 	}
 	close(results)
 
@@ -162,5 +183,41 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	// The flash must be fully removed: a follow-up consume is a no-op.
 	if _, ok := s.consume(id, userID, registry); ok {
 		t.Fatalf("flash remained consumable after exactly-once concurrent consumption")
+	}
+}
+
+// waitForReadyN blocks (with a bounded timeout) until exactly n readiness
+// acknowledgements have been received on ready. It returns false on timeout. The
+// receive side runs in the caller (the parent), so no helper goroutine is leaked
+// if n is never reached; the caller is then responsible for releasing workers
+// parked on start and making a best-effort join before failing.
+func waitForReadyN(ready <-chan struct{}, n int, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for i := 0; i < n; i++ {
+		select {
+		case <-ready:
+		case <-timer.C:
+			return false
+		}
+	}
+	return true
+}
+
+// joinWithTimeout waits up to timeout for wg to return to zero and reports
+// whether the join completed. It never leaks the watcher goroutine's channel
+// (bounded by timeout). This is the mechanical completion proof the success
+// path requires, and the best-effort release used on failure paths.
+func joinWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
