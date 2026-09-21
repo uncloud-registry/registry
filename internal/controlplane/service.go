@@ -18,7 +18,8 @@ import (
 
 type Service struct {
 	Store          *Store
-	Tokens         *auth.TokenManager
+	Tokens         *auth.SessionTokenManager
+	RegistryTokens *auth.RegistryTokenIssuer
 	RegistryDomain string
 	Publisher      *Publisher
 }
@@ -45,7 +46,7 @@ func (s *Service) RegisterUser(ctx context.Context, email string, password strin
 	if err != nil {
 		return User{}, "", err
 	}
-	token, err := s.Tokens.IssueSessionToken(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
+	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
 	return user, token, err
 }
 
@@ -57,7 +58,7 @@ func (s *Service) Login(ctx context.Context, email string, password string) (Use
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return User{}, "", err
 	}
-	token, err := s.Tokens.IssueSessionToken(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
+	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
 	return user, token, err
 }
 
@@ -287,24 +288,60 @@ func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope str
 	if err != nil {
 		return "", err
 	}
-	membership, err := s.Store.FindMembership(ctx, registry.ID, user.ID)
+
+	repository, actions, err := auth.ParseDockerScope(scope)
 	if err != nil {
-		if err == sql.ErrNoRows && strings.Contains(scope, ":pull") && registry.AnonymousPull {
-			return s.Tokens.IssueRegistryToken("anonymous", host, scope, time.Hour)
-		}
 		return "", err
 	}
-	if strings.Contains(scope, ":push") && !membership.CanPush {
-		return "", fmt.Errorf("user is not allowed to push to this registry")
+
+	membership, err := s.Store.FindMembership(ctx, registry.ID, user.ID)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			return "", err
+		}
+		// No membership: only anonymous pull is possible.
+		for _, a := range actions {
+			if a == auth.ActionPush {
+				return "", fmt.Errorf("user is not allowed to push to this registry")
+			}
+			if a == auth.ActionPull && !registry.AnonymousPull {
+				return "", fmt.Errorf("user is not allowed to pull from this registry")
+			}
+		}
+		return s.issueRegistryToken(host, "anonymous", repository, actions)
 	}
-	if strings.Contains(scope, ":pull") && !membership.CanPull && !registry.AnonymousPull {
-		return "", fmt.Errorf("user is not allowed to pull from this registry")
+
+	for _, a := range actions {
+		switch a {
+		case auth.ActionPush:
+			if !membership.CanPush && !registry.AnonymousPull {
+				return "", fmt.Errorf("user is not allowed to push to this registry")
+			}
+		case auth.ActionPull:
+			if !membership.CanPull && !registry.AnonymousPull {
+				return "", fmt.Errorf("user is not allowed to pull from this registry")
+			}
+		}
 	}
+
 	subject := "role:read"
 	if membership.CanPush {
 		subject = "role:write"
 	}
-	return s.Tokens.IssueRegistryToken(subject, host, scope, time.Hour)
+	return s.issueRegistryToken(host, subject, repository, actions)
+}
+
+func (s *Service) issueRegistryToken(service, subject, repository string, actions []auth.Action) (string, error) {
+	if s.RegistryTokens == nil {
+		return "", fmt.Errorf("registry token issuer is not configured")
+	}
+	return s.RegistryTokens.Issue(context.Background(), auth.RegistryTokenRequest{
+		Subject:    subject,
+		Service:    service,
+		Repository: repository,
+		Actions:    actions,
+		TTL:        time.Hour,
+	})
 }
 
 func UserIDFromSubject(subject string) (int64, error) {

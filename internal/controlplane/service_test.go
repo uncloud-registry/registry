@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -18,13 +19,12 @@ func TestServiceRegisterLoginCreateRegistryAndInvite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	manager, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	manager := newTestSessionManager(t)
+	registryTokens, _ := newTestRegistryPair(t)
 	service := &Service{
 		Store:          store,
 		Tokens:         manager,
+		RegistryTokens: registryTokens,
 		RegistryDomain: "uncloud-registry.com",
 		Publisher: &Publisher{
 			Documents: &memoryUploader{refs: map[string][]byte{}},
@@ -90,10 +90,7 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	manager, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	manager := newTestSessionManager(t)
 	uploader := &memoryUploader{refs: map[string][]byte{}}
 	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
 	service := &Service{
@@ -182,10 +179,7 @@ func TestAcceptInviteIsIdempotentForExistingMembership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	manager, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	manager := newTestSessionManager(t)
 	uploader := &memoryUploader{refs: map[string][]byte{}}
 	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
 	service := &Service{
@@ -241,15 +235,14 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	manager, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	manager := newTestSessionManager(t)
+	registryTokens, pubKeys := newTestRegistryPair(t)
 	uploader := &memoryUploader{refs: map[string][]byte{}}
 	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
 	service := &Service{
 		Store:          store,
 		Tokens:         manager,
+		RegistryTokens: registryTokens,
 		RegistryDomain: "uncloud-registry.com",
 		Publisher: &Publisher{
 			Documents: uploader,
@@ -293,12 +286,13 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected pull token issuance to succeed: %v", err)
 	}
-	claims, err := manager.Parse(registryToken)
+	verifier := auth.NewRegistryTokenVerifier(staticTestKeySet(pubKeys), auth.RegistryIssuer, created.Registry.Host)
+	principal, err := verifier.Verify(registryToken, created.Registry.Host, "backend/api", auth.ActionPull)
 	if err != nil {
-		t.Fatalf("parse registry token: %v", err)
+		t.Fatalf("verify registry token: %v", err)
 	}
-	if claims.Subject != "role:read" {
-		t.Fatalf("expected read role subject, got %q", claims.Subject)
+	if principal.Subject != "role:read" {
+		t.Fatalf("expected read role subject, got %q", principal.Subject)
 	}
 }
 
@@ -351,4 +345,40 @@ func TestPublisherBuildsBootstrapDocuments(t *testing.T) {
 		raw, _ := json.Marshal(authDoc)
 		t.Fatalf("unexpected auth document: %s", raw)
 	}
+}
+
+// newTestSessionManager builds a control-plane session token manager with the
+// default issuer/audience and a fixed test-only secret.
+func newTestSessionManager(t *testing.T) *auth.SessionTokenManager {
+	t.Helper()
+	m, err := auth.NewSessionTokenManager("secret", auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	if err != nil {
+		t.Fatalf("new session token manager: %v", err)
+	}
+	return m
+}
+
+// newTestRegistryPair returns a per-test Ed25519 registry issuer and the set of
+// public verification keys a matching verifier can use.
+func newTestRegistryPair(t *testing.T) (*auth.RegistryTokenIssuer, map[string]ed25519.PublicKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate registry key: %v", err)
+	}
+	issuer, err := auth.NewRegistryTokenIssuer(priv, auth.RegistryIssuer, "test-key-1")
+	if err != nil {
+		t.Fatalf("new registry issuer: %v", err)
+	}
+	return issuer, map[string]ed25519.PublicKey{"test-key-1": pub}
+}
+
+type staticTestKeySet map[string]ed25519.PublicKey
+
+func (s staticTestKeySet) Key(_ context.Context, keyID string) (ed25519.PublicKey, error) {
+	pk, ok := s[keyID]
+	if !ok {
+		return nil, fmt.Errorf("unknown kid %q", keyID)
+	}
+	return pk, nil
 }

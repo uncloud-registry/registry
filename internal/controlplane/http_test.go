@@ -20,10 +20,7 @@ func TestUIRegistryCreationFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	tokens, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	tokens := newTestSessionManager(t)
 	server := httptest.NewServer(NewHTTPServer(&Service{
 		Store:          store,
 		Tokens:         tokens,
@@ -86,10 +83,7 @@ func TestUIInviteAcceptanceFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	tokens, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	tokens := newTestSessionManager(t)
 	service := &Service{
 		Store:          store,
 		Tokens:         tokens,
@@ -152,10 +146,7 @@ func TestUIRegistryDetailShowsAcceptedUserEmails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	tokens, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	tokens := newTestSessionManager(t)
 	service := &Service{
 		Store:          store,
 		Tokens:         tokens,

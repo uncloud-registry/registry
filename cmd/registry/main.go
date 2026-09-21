@@ -136,12 +136,12 @@ func envOrDefault(name string, fallback string) string {
 	return fallback
 }
 
-func tokenManagerFromEnv() (*auth.TokenManager, error) {
+func tokenManagerFromEnv() (*auth.SessionTokenManager, error) {
 	secret := strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_SECRET"))
 	if secret == "" {
 		return nil, nil
 	}
-	return auth.NewTokenManager(secret)
+	return auth.NewSessionTokenManager(secret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
 }
 
 func parseRegistryOwners(raw string) map[string]string {
