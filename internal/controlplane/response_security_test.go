@@ -3,6 +3,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -116,6 +117,85 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 	acceptBody := postJSON(t, client, server.URL, "/api/invites/accept",
 		map[string]string{"token": rawToken}, bobSession)
 	assertNoSecretField(t, acceptBody, []byte("TokenHash"), []byte("tokenHash"))
+}
+
+// TestUIRegistryDetailDoesNotReconstructInviteToken proves the one-time raw
+// invite token is exposed exactly once (in the invite-creation response) and is
+// never reconstructed from the persisted TokenHash on any subsequent registry
+// detail request. The detail page must render pending-invite public metadata
+// (email/permissions/status) but no reusable accept link or token.
+func TestUIRegistryDetailDoesNotReconstructInviteToken(t *testing.T) {
+	t.Parallel()
+
+	store, err := OpenSQLite("file:controlplane_invboundary_test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	tokens, err := auth.NewTokenManager("secret")
+	if err != nil {
+		t.Fatalf("new token manager: %v", err)
+	}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
+	defer server.Close()
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	if _, _, err := service.RegisterUser(context.Background(), "alice@example.com", "password123"); err != nil {
+		t.Fatalf("register alice: %v", err)
+	}
+	alice, aliceSession, err := service.Login(context.Background(), "alice@example.com", "password123")
+	if err != nil {
+		t.Fatalf("login alice: %v", err)
+	}
+
+	created, err := store.CreateRegistry(context.Background(), Registry{
+		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
+		OwnerUserID: alice.ID, FeedOwnerAddress: "0xfeed", DefaultStampBatchID: "batch-1",
+		AnonymousPull: false,
+	})
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	if _, err := store.CreateMembership(context.Background(), Membership{
+		RegistryID: created.ID, UserID: alice.ID, Role: "owner", CanPull: true, CanPush: true,
+	}); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
+
+	// Create an invite through the API boundary and capture the separate one-time raw token.
+	inviteBody := postJSON(t, client, server.URL, "/api/registries/"+strconv.FormatInt(created.ID, 10)+"/invites",
+		map[string]any{"email": "bob@example.com", "canPull": true, "canPush": true}, aliceSession)
+	var invited map[string]any
+	if err := json.Unmarshal(inviteBody, &invited); err != nil {
+		t.Fatalf("decode invite response: %v", err)
+	}
+	rawToken, _ := invited["token"].(string)
+	if rawToken == "" {
+		t.Fatalf("expected one-time raw token in creation response, body: %s", inviteBody)
+	}
+
+	// Persisted TokenHash is hex(raw token); capture it from the store.
+	pending, err := store.ListInvitesForRegistry(context.Background(), created.ID)
+	if err != nil || len(pending) == 0 {
+		t.Fatalf("no persisted invite found: %v", err)
+	}
+	persistedHash := pending[0].TokenHash
+	if persistedHash == "" || hex.EncodeToString([]byte(rawToken)) != persistedHash {
+		t.Fatalf("expected persisted TokenHash to be hex(raw token), got %q", persistedHash)
+	}
+
+	// Request the registry-detail UI and prove the one-time token is not re-exposed.
+	detailBody := getWithCookie(t, client, server.URL, "/ui/registries/"+strconv.FormatInt(created.ID, 10), aliceSession)
+	assertNoSecretField(t, detailBody, []byte(rawToken), []byte(persistedHash), []byte("/ui/invites/accept?token="), []byte("token="), []byte("Copy invite link"))
+	// Pending-invite public metadata must remain visible.
+	if !bytes.Contains(detailBody, []byte("bob@example.com")) {
+		t.Fatalf("expected pending invite email visible in detail page, body: %s", detailBody)
+	}
+	if !bytes.Contains(detailBody, []byte("Read &#43; Write")) {
+		t.Fatalf("expected pending invite permissions visible in detail page, body: %s", detailBody)
+	}
 }
 
 func postJSON(t *testing.T, client *http.Client, base string, path string, body any, bearer string) []byte {

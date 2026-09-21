@@ -269,15 +269,11 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register bob: %v", err)
 	}
-	if _, _, err := service.CreateInvite(context.Background(), created.Registry.ID, alice.ID, "bob@example.com", true, true); err != nil {
+	_, rawToken, err := service.CreateInvite(context.Background(), created.Registry.ID, alice.ID, "bob@example.com", true, true)
+	if err != nil {
 		t.Fatalf("create invite: %v", err)
 	}
-	invites, err := store.ListInvitesForRegistry(context.Background(), created.Registry.ID)
-	if err != nil {
-		t.Fatalf("list invites: %v", err)
-	}
-	token := tokenFromHash(invites[0].TokenHash)
-	if _, err := service.AcceptInvite(context.Background(), token, bob.ID); err != nil {
+	if _, err := service.AcceptInvite(context.Background(), rawToken, bob.ID); err != nil {
 		t.Fatalf("accept invite: %v", err)
 	}
 

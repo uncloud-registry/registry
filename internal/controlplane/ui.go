@@ -1,7 +1,6 @@
 package controlplane
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"html/template"
 	"net/http"
@@ -623,6 +622,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 		message = "Invite created. Share this link with the collaborator: " + absoluteURL(r, link)
 	}
 	inviteModal := inviteModalState(r)
+	dashboardDTO := NewPublicRegistryDashboard(dashboard)
 	renderPage(w, pageData{
 		Title:         dashboard.Registry.Slug,
 		Heading:       dashboard.Registry.Slug + " settings",
@@ -680,16 +680,12 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       <th>Email</th>
       <th>Access</th>
       <th>Status</th>
-      <th>Link</th>
     </tr>
     {{range .Invites}}
     <tr>
       <td>{{.Email}}</td>
       <td>{{.Permissions}}</td>
       <td>{{.Status}}</td>
-      <td>
-        <button class="secondary" type="button" data-copy="{{.Link}}">Copy invite link</button>
-      </td>
     </tr>
     {{end}}
   </table>
@@ -754,8 +750,8 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
   </dialog>
 {{end}}`,
 		Data: map[string]any{
-			"Dashboard":   NewPublicRegistryDashboard(dashboard),
-			"Invites":     inviteViewModels(r, dashboard.Invites),
+			"Dashboard":   dashboardDTO,
+			"Invites":     inviteViewModels(dashboardDTO.Invites),
 			"InviteModal": inviteModal,
 		},
 	})
@@ -992,7 +988,6 @@ type inviteViewModel struct {
 	Email       string
 	Permissions string
 	Status      string
-	Link        string
 }
 
 type inviteModalView struct {
@@ -1003,19 +998,21 @@ type inviteModalView struct {
 	CanPush bool
 }
 
-func inviteViewModels(r *http.Request, invites []Invite) []inviteViewModel {
+// inviteViewModels builds owner-facing pending-invite rows from public invite
+// DTOs only. It intentionally never reads the persistence Invite.TokenHash: the
+// one-time raw invite token is returned once in the invite-creation response and
+// must not be reconstructed for the detail page.
+func inviteViewModels(invites []PublicInvite) []inviteViewModel {
 	models := make([]inviteViewModel, 0, len(invites))
 	for _, invite := range invites {
 		if invite.Status != "pending" {
 			continue
 		}
-		model := inviteViewModel{
+		models = append(models, inviteViewModel{
 			Email:       invite.Email,
 			Permissions: permissionLabel(invite.CanPull, invite.CanPush),
 			Status:      invite.Status,
-		}
-		model.Link = absoluteURL(r, "/ui/invites/accept?token="+url.QueryEscape(tokenFromHash(invite.TokenHash)))
-		models = append(models, model)
+		})
 	}
 	return models
 }
@@ -1040,13 +1037,6 @@ func inviteModalState(r *http.Request) inviteModalView {
 		CanPull: query.Get("invite_can_pull") == "1",
 		CanPush: query.Get("invite_can_push") == "1",
 	}
-}
-
-func tokenFromHash(tokenHash string) string {
-	if decoded, err := hex.DecodeString(tokenHash); err == nil {
-		return string(decoded)
-	}
-	return ""
 }
 
 func absoluteURL(r *http.Request, path string) string {
