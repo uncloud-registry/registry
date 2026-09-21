@@ -4,7 +4,6 @@ package auth
 
 import (
 	"errors"
-	"fmt"
 	"os"
 )
 
@@ -21,11 +20,16 @@ import (
 var ErrJWKSFileLoadingUnsupported = errors.New("secure JWKS file loading is unsupported on this platform (requires macOS or Linux); refusing to fall back to an insecure open")
 
 // openJWKSFile never opens, stats, or reads path on unsupported platforms. It
-// returns the stable ErrJWKSFileLoadingUnsupported sentinel so
-// LoadJWKSFromFile and production startup fail closed: because no Lstat, no
-// open, and no read of the path happens here, there is no symlink-check/open
-// TOCTOU window and no special file can ever block the process. The public
-// signature is identical to the darwin/linux implementation.
+// returns the bare ErrJWKSFileLoadingUnsupported sentinel — NEVER wrapped with
+// the supplied path or any other caller-controlled data — so LoadJWKSFromFile
+// and production startup fail closed: because no Lstat, no open, and no read
+// of the path happens here, there is no symlink-check/open TOCTOU window and
+// no special file can ever block the process. The error is returned unwrapped
+// because it is propagated unchanged all the way to cmd/registry startup
+// (log.Fatal): formatting the path into it would leak the operator's
+// REGISTRY_TOKEN_PUBLIC_KEYS_FILE value into logs on every non-macOS/Linux
+// host. errors.Is still matches the sentinel exactly. The public signature is
+// identical to the darwin/linux implementation.
 func openJWKSFile(path string) (*os.File, error) {
-	return nil, fmt.Errorf("%w: %q", ErrJWKSFileLoadingUnsupported, path)
+	return nil, ErrJWKSFileLoadingUnsupported
 }

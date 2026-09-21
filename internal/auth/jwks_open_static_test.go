@@ -45,6 +45,35 @@ func TestOpenJWKSFileOtherSourceHasNoRacyPathUse(t *testing.T) {
 	}
 }
 
+// TestOpenJWKSFileOtherErrorNeverEmbedsCallerData pins, at source level, that
+// the unsupported-platform error is EXACTLY the data-free sentinel — never a
+// fmt-wrapped copy that could echo the caller-controlled path. The error
+// propagates unwrapped through LoadJWKSFromFile and reaches cmd/registry
+// startup (log.Fatal), so any formatting of the path into it would leak the
+// operator's REGISTRY_TOKEN_PUBLIC_KEYS_FILE value into logs on every
+// non-macOS/Linux host. GOOS-tagged implementations cannot be executed on
+// every host, so the data-free property is pinned structurally here; the
+// runtime tests in jwks_open_other_test.go assert the ACTUAL returned errors
+// on the unsupported GOOSes and are validated by cross-compilation.
+func TestOpenJWKSFileOtherErrorNeverEmbedsCallerData(t *testing.T) {
+	src, err := os.ReadFile(jwksSourcePath(t, "jwks_open_other.go"))
+	if err != nil {
+		t.Fatalf("read source: %v", err)
+	}
+	s := string(src)
+	// Any fmt-based error construction in this file is the path-embedding
+	// mechanism: the bare sentinel needs no formatting at all.
+	for _, token := range []string{"fmt.Errorf", "%w", "%q"} {
+		if strings.Contains(s, token) {
+			t.Errorf("jwks_open_other.go must return the bare data-free sentinel, never a formatted wrapper that could echo the supplied path; found %q", token)
+		}
+	}
+	// The exact bare return must be present: the sentinel, unwrapped.
+	if !strings.Contains(s, "return nil, ErrJWKSFileLoadingUnsupported") {
+		t.Error("jwks_open_other.go must return exactly ErrJWKSFileLoadingUnsupported, unwrapped and data-free")
+	}
+}
+
 // TestOpenJWKSFileUnixSourceKeepsSecureSingleDescriptorOpen pins that the
 // darwin/linux implementation remains the single-descriptor O_NOFOLLOW open:
 // no path re-open, no Lstat-then-open, and the O_NOFOLLOW|O_NONBLOCK flags
