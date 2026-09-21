@@ -173,43 +173,34 @@ func (b *testBarrier) waitAllArrived(timeout time.Duration) bool {
 }
 
 // consumeResult is one worker's completion record. Every worker sends exactly one
-// result, whether it was released or aborted, so the parent can account for all N.
+// result, whether it was released or aborted, so after the WaitGroup join the
+// parent can account for all N. The completion proof is the join itself, not
+// these records: a worker sends its record *before* it returns, so counting
+// records alone would not prove the goroutine exited (see the test's
+// close-after-join ordering).
 type consumeResult struct {
 	token     string
 	ok        bool
 	proceeded bool // true if the barrier released this worker to consume; false if aborted
 }
 
-// collectN receives exactly n results from resultsCh, bounded by timeout.
-// Receiving all n proves every worker has sent its single completion record, i.e.
-// the join is complete, without any WaitGroup or a channel close. resultsCh is
-// never closed by the test: it is buffered to the worker count, so a worker can
-// always deliver even if the parent has stopped reading, and a timed-out parent
-// simply fails while the (bounded-by-abort) workers finish in the background.
-// On timeout it returns whatever it collected so the caller can fail honestly.
-func collectN(resultsCh <-chan consumeResult, n int, timeout time.Duration) []consumeResult {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	got := make([]consumeResult, 0, n)
-	for len(got) < n {
-		select {
-		case r := <-resultsCh:
-			got = append(got, r)
-		case <-timer.C:
-			return got
-		}
-	}
-	return got
-}
-
 // TestInviteFlashStoreConcurrentConsumeExactlyOnce proves atomic one-time
 // consumption under genuine same-ID concurrency, which a sequential test cannot
 // exercise: n goroutines all target the SAME flash ID/user/registry. A true
 // condition-variable barrier establishes that every consumer is parked in a
-// blocking wait before any is released, so the consume calls genuinely overlap,
-// and completion is proven by collecting exactly n results (each worker sends one)
-// with a bounded select. Exactly one consumer must get the exact token; every
-// other must get empty/false; a follow-up consume is a no-op.
+// blocking wait before any is released, so the consume calls genuinely overlap.
+//
+// Termination is proven by a real WaitGroup join, not by counting results: a
+// worker sends its completion record *before* it returns, so receiving n records
+// would not by itself prove the goroutines exited. Each worker therefore defers
+// wg.Done() and sends exactly one record into a channel buffered to n; the parent
+// calls wg.Wait() synchronously, which returns only after every worker's deferred
+// Done has run — i.e. after every worker has sent — and only then closes the
+// results channel and drains exactly n records. Close-after-join is race-free by
+// construction (no worker can send to a closed channel), and the barrier-abort
+// (readiness-timeout) path joins and drains all n aborted records too. Exactly
+// one consumer must get the exact token; every other must get empty/false; a
+// follow-up consume is a no-op.
 func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	t.Parallel()
 
@@ -232,15 +223,22 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	}
 
 	barrier := newTestBarrier(consumers)
-	// Buffered to the consumer count so a worker's completion send can never
-	// block, even if the parent has stopped reading after a timeout. Never closed.
+	// Buffered to the worker count so a worker's completion send can never
+	// block, even before the parent begins draining. Closed only after the
+	// WaitGroup join, so the close is never observed by any worker.
 	results := make(chan consumeResult, consumers)
 
+	// wg tracks goroutine lifecycle only. Each worker defers Done, and because
+	// the deferred call runs on function return — after that worker's send —
+	// wg.Wait() returning implies every worker has sent its single record.
+	var wg sync.WaitGroup
+	wg.Add(consumers)
 	for i := 0; i < consumers; i++ {
 		go func() {
+			defer wg.Done()
 			if !barrier.arrive() {
-				// Barrier aborted (readiness timeout): do not consume, but still send
-				// a distinct completion record so cleanup can account for all N.
+				// Barrier aborted (readiness timeout): do not consume, but still
+				// send a distinct completion record so cleanup accounts for all N.
 				results <- consumeResult{proceeded: false}
 				return
 			}
@@ -250,25 +248,54 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	}
 
 	// Phase 1: prove every worker is parked in cond.Wait before releasing any.
-	if !barrier.waitAllArrived(timeout) {
-		t.Fatalf("timed out waiting for all %d consumers to park on the barrier", consumers)
+	// On success waitAllArrived commits the release (broadcast) under the mutex,
+	// so the provably-parked cohort proceeds together and the consumes genuinely
+	// overlap. On readiness timeout it aborts and broadcasts instead, so every
+	// parked and future worker observes aborted and skips the consume; no worker
+	// is left parked indefinitely. The readiness timeout is kept because barrier
+	// abort is cancellable.
+	ready := barrier.waitAllArrived(timeout)
+
+	// Phase 2: real goroutine join, synchronous, no watchdog/timer goroutine.
+	// wg.Wait cannot block here: the barrier has either released or aborted every
+	// worker, so each worker's only potentially-blocking step (cond.Wait) is
+	// unblocked, and its send into the buffer-`consumers` channel can never
+	// block. When Wait returns, every worker has exited and sent exactly one
+	// record. A deadlocked production consume could NOT be joined this way and
+	// is not force-cancelled here; the honest hard bound is `go test -timeout`
+	// (process level), which terminates the test and dumps goroutine stacks.
+	wg.Wait()
+
+	// Phase 3: only now, with every worker joined (all sends finished), close and
+	// drain. No worker can write to a closed channel by construction.
+	close(results)
+	records := make([]consumeResult, 0, consumers)
+	for r := range results {
+		records = append(records, r)
+	}
+	if len(records) != consumers {
+		t.Fatalf("joined and drained %d/%d consumer records; a worker failed to account", len(records), consumers)
 	}
 
-	// Phase 2: waitAllArrived committed the release, so every provably-parked
-	// worker is now released together and the consume calls genuinely overlap.
-
-	// Phase 3: bounded completion collection. Receiving exactly consumers results
-	// proves every worker finished (each sent exactly one record); no WaitGroup
-	// watcher and, crucially, no close of a channel workers might still write to.
-	got := collectN(results, consumers, timeout)
-	if len(got) != consumers {
-		t.Fatalf("joined only %d/%d consumers before timeout", len(got), consumers)
+	if !ready {
+		// Readiness timeout. The abort path still fully accounts for all N:
+		// each worker was joined above and sent a proceeded:false no-op. Verify
+		// that no worker consumed, then fail honestly.
+		for _, r := range records {
+			if r.proceeded {
+				t.Fatalf("aborted barrier but a worker reported proceeded")
+			}
+			if r.ok || r.token != "" {
+				t.Fatalf("aborted worker must not have consumed (ok=%v token=%q)", r.ok, r.token)
+			}
+		}
+		t.Fatalf("timed out waiting for all %d consumers to park on the barrier", consumers)
 	}
 
 	successes := 0
 	proceeded := 0
 	gotToken := ""
-	for _, r := range got {
+	for _, r := range records {
 		if r.proceeded {
 			proceeded++
 		}
