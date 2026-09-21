@@ -291,6 +291,7 @@ This repository is intentionally still early-stage. Important current limitation
 - manifest publish by digest is not supported
 - concurrent multi-writer publish is not handled yet
 - staging is still in-memory even in Bee mode
+- secure JWKS key-file loading for registry token verification (kernel `O_NOFOLLOW`/`O_NONBLOCK` single-descriptor open) is implemented on macOS and Linux only; on any other platform the registry fails closed at startup rather than loading keys through a weaker fallback — there is no Windows (or other non-macOS/Linux) keys-file loading support
 - ENS resolution is currently subdomain-to-ENS naming convention, not a full external ENS resolver integration
 - OCI validation is still minimal
 - no GC or retention policy yet

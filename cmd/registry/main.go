@@ -162,6 +162,12 @@ func envRequired(name string) (string, error) {
 //     service in its service claim and single audience. This supports at least
 //     two owner-map hosts in one process with host-specific tokens.
 //
+// Supported production platforms for keys-file loading: macOS and Linux. On
+// every other platform auth.LoadJWKSFromFile fails closed with
+// auth.ErrJWKSFileLoadingUnsupported (it never opens or reads the keys file
+// through a weaker fallback), so startup aborts here — the registry does not
+// silently run with a racy Lstat-then-open load on any GOOS.
+//
 // The three settings are consumed by the verifier — they are not parsed and
 // ignored. Key material is never logged or included in errors.
 func buildAuthenticator() (registry.Authenticator, error) {

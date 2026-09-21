@@ -66,10 +66,14 @@ func (s *JWKSKeySet) Key(_ context.Context, keyID string) (ed25519.PublicKey, er
 // Because the same descriptor that was validated is the descriptor that is
 // read and parsed, a path swap between open and read cannot redirect parsing:
 // the stat→open→read TOCTOU window is closed by construction. Platform
-// constraint: O_NOFOLLOW is used on macOS/Linux (the kernels the registry
-// targets); on other platforms a best-effort Lstat-then-open fallback is used
-// whose symlink race cannot be fully closed (see jwks_open_other.go). The
-// returned errors never include key bytes.
+// constraint: the secure single-descriptor open requires kernel O_NOFOLLOW and
+// O_NONBLOCK, available on macOS and Linux — the supported production
+// platforms for keys-file loading. On ALL other platforms secure loading is
+// unsupported, so LoadJWKSFromFile fails closed with
+// ErrJWKSFileLoadingUnsupported and never opens or reads the path (see
+// jwks_open_other.go): there is no racy Lstat-then-open fallback on any GOOS.
+// cmd/registry propagates the error so startup fails rather than running with
+// weaker guarantees. The returned errors never include key bytes.
 func LoadJWKSFromFile(path string) (*JWKSKeySet, error) {
 	f, err := openJWKSFile(path)
 	if err != nil {

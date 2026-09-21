@@ -3,28 +3,29 @@
 package auth
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
 
-// openJWKSFile is the best-effort fallback for platforms whose kernels lack
-// O_NOFOLLOW (neither macOS nor Linux). It Lstat-checks the path for a symlink
-// before opening and readJWKSDescriptor re-validates the opened descriptor
-// (regular file, mode, size), but the symlink TOCTOU window between Lstat and
-// open cannot be fully closed without kernel O_NOFOLLOW support. This
-// repository targets macOS and Linux; on other platforms the weaker guarantee
-// is documented rather than silently hidden.
+// ErrJWKSFileLoadingUnsupported is the stable, data-free sentinel returned by
+// openJWKSFile on every GOOS other than darwin and linux. The registry's JWKS
+// security contract — open the keys file exactly ONCE without following a
+// trailing symlink (O_NOFOLLOW) and without blocking on special files
+// (O_NONBLOCK) — requires kernel support that only macOS and Linux provide. A
+// Lstat-then-open fallback would still carry a symlink-swap TOCTOU window and
+// could block on special files, so loading is REFUSED outright: the sentinel
+// propagates through LoadJWKSFromFile to cmd/registry startup, which fails
+// closed instead of running with weaker guarantees. The message carries no
+// path and no key material.
+var ErrJWKSFileLoadingUnsupported = errors.New("secure JWKS file loading is unsupported on this platform (requires macOS or Linux); refusing to fall back to an insecure open")
+
+// openJWKSFile never opens, stats, or reads path on unsupported platforms. It
+// returns the stable ErrJWKSFileLoadingUnsupported sentinel so
+// LoadJWKSFromFile and production startup fail closed: because no Lstat, no
+// open, and no read of the path happens here, there is no symlink-check/open
+// TOCTOU window and no special file can ever block the process. The public
+// signature is identical to the darwin/linux implementation.
 func openJWKSFile(path string) (*os.File, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, fmt.Errorf("stat registry token public keys file: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("registry token public keys file %q must not be a symlink", path)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open registry token public keys file: %w", err)
-	}
-	return f, nil
+	return nil, fmt.Errorf("%w: %q", ErrJWKSFileLoadingUnsupported, path)
 }
