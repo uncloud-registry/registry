@@ -23,3 +23,6 @@ coverage.out
 
 # Local brainstorming companion artifacts
 .superpowers/
+
+# Isolated implementation worktrees
+.worktrees/
