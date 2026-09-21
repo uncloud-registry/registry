@@ -76,14 +76,140 @@ func TestInviteFlashStoreExpiryCapAndAtomicity(t *testing.T) {
 	}
 }
 
+// testBarrier is a strict N-worker rendezvous used to prove that a fixed set of
+// goroutines has all passed into a blocking wait before any is released. It uses
+// a sync.Cond so that "arrived" and "parked" are the same state: each worker
+// records its arrival and immediately falls into cond.Wait, whose unlock-and-park
+// is atomic. This is what makes the barrier a mechanical proof rather than a
+// scheduling coincidence — see waitAllArrived's happens-before argument.
+//
+// A single bounded cancellation path exists: waiting aborts the barrier (marks it
+// aborted and broadcasts) so every parked and future worker exits instead of
+// parking forever. Abort can never undercut a success decision, because success
+// commits the released state under the same mutex before any late timer callback
+// can observe it (the callback only aborts while the barrier is still waiting).
+type testBarrier struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	arrived  int
+	target   int
+	released bool
+	aborted  bool
+}
+
+func newTestBarrier(n int) *testBarrier {
+	b := &testBarrier{target: n}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+// arrive is called by each worker. It records the arrival, wakes the parent the
+// moment the target is reached, then blocks in cond.Wait until the barrier is
+// released or aborted. It returns true if the worker is released normally (it
+// should proceed) and false if the barrier was aborted (it must not consume).
+func (b *testBarrier) arrive() bool {
+	b.mu.Lock()
+	b.arrived++
+	if b.arrived == b.target {
+		b.cond.Broadcast() // wake the parent blocked in waitAllArrived
+	}
+	for !b.released && !b.aborted {
+		b.cond.Wait()
+	}
+	proceed := b.released && !b.aborted
+	b.mu.Unlock()
+	return proceed
+}
+
+// waitAllArrived blocks, bounded by timeout, until every target worker has
+// arrived and is parked in cond.Wait. It returns true on success, having already
+// committed the release (and broadcast) under the mutex so the parked workers all
+// proceed; it returns false on timeout, having aborted the barrier so no worker
+// is left parked indefinitely.
+//
+// happens-before proof that success implies all N workers parked:
+// a worker's increment and its cond.Wait are contiguous statements executed
+// under b.mu. A worker can release that mutex only by passing through
+// cond.Wait's atomic unlock-and-park. Therefore no party can observe
+// arrived == target — which requires reacquiring the mutex from the final
+// arriving worker — without that final worker having already parked; every
+// earlier worker parked when it released the mutex after its own increment. So
+// once waitAllArrived sees arrived == target, all N workers are parked in
+// cond.Wait, and the subsequent broadcast releases a provably-complete cohort.
+//
+// Bound/cancellation: a time.AfterFunc callback locks the same mutex, and — only
+// if the barrier has not yet been released — marks it aborted and broadcasts so
+// every parked and future worker exits. It cannot run while waitAllArrived holds
+// the mutex, and the callback no-ops once released is committed, so a timer that
+// fires on the success boundary never undercuts a committed release.
+func (b *testBarrier) waitAllArrived(timeout time.Duration) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.arrived == b.target {
+		b.released = true
+		b.cond.Broadcast()
+		return true
+	}
+	timer := time.AfterFunc(timeout, func() {
+		b.mu.Lock()
+		if !b.released {
+			b.aborted = true
+			b.cond.Broadcast()
+		}
+		b.mu.Unlock()
+	})
+	defer timer.Stop()
+	for b.arrived < b.target && !b.aborted {
+		b.cond.Wait()
+	}
+	if b.aborted {
+		return false
+	}
+	// Commit release before releasing the mutex, so no racing timer can inject an
+	// abort once we have established that all workers are parked.
+	b.released = true
+	b.cond.Broadcast()
+	return true
+}
+
+// consumeResult is one worker's completion record. Every worker sends exactly one
+// result, whether it was released or aborted, so the parent can account for all N.
+type consumeResult struct {
+	token     string
+	ok        bool
+	proceeded bool // true if the barrier released this worker to consume; false if aborted
+}
+
+// collectN receives exactly n results from resultsCh, bounded by timeout.
+// Receiving all n proves every worker has sent its single completion record, i.e.
+// the join is complete, without any WaitGroup or a channel close. resultsCh is
+// never closed by the test: it is buffered to the worker count, so a worker can
+// always deliver even if the parent has stopped reading, and a timed-out parent
+// simply fails while the (bounded-by-abort) workers finish in the background.
+// On timeout it returns whatever it collected so the caller can fail honestly.
+func collectN(resultsCh <-chan consumeResult, n int, timeout time.Duration) []consumeResult {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	got := make([]consumeResult, 0, n)
+	for len(got) < n {
+		select {
+		case r := <-resultsCh:
+			got = append(got, r)
+		case <-timer.C:
+			return got
+		}
+	}
+	return got
+}
+
 // TestInviteFlashStoreConcurrentConsumeExactlyOnce proves atomic one-time
 // consumption under genuine same-ID concurrency, which a sequential test cannot
-// exercise. n goroutines all target the SAME flash ID/user/registry. A real
-// two-phase barrier (readiness acknowledgment then release) guarantees every
-// consumer is parked on start before any is released, so the consume calls
-// genuinely overlap. The parent joins every worker (bounded) before reading
-// results. Exactly one consumer must get the exact token; every other must get
-// empty/false; a follow-up consume is a no-op.
+// exercise: n goroutines all target the SAME flash ID/user/registry. A true
+// condition-variable barrier establishes that every consumer is parked in a
+// blocking wait before any is released, so the consume calls genuinely overlap,
+// and completion is proven by collecting exactly n results (each worker sends one)
+// with a bounded select. Exactly one consumer must get the exact token; every
+// other must get empty/false; a follow-up consume is a no-op.
 func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	t.Parallel()
 
@@ -105,65 +231,47 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 
-	// Two-phase barrier. ready is buffered to consumers so a worker's readiness
-	// signal can never block on send (channel capacity eliminates internal
-	// blocking). Workers send ready BEFORE blocking on start, so when the parent
-	// has drained all N readiness signals it has mechanically proven every
-	// worker is parked on start — exactly the launch-scalability gap in round 2,
-	// where start was closed immediately after spawn and unscheduled goroutines
-	// could arrive post-close and serialize.
-	ready := make(chan struct{}, consumers)
-	start := make(chan struct{})
-	results := make(chan struct {
-		token string
-		ok    bool
-	}, consumers) // buffered to consumers: a worker can never block writing its result
+	barrier := newTestBarrier(consumers)
+	// Buffered to the consumer count so a worker's completion send can never
+	// block, even if the parent has stopped reading after a timeout. Never closed.
+	results := make(chan consumeResult, consumers)
 
-	var wg sync.WaitGroup
 	for i := 0; i < consumers; i++ {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			ready <- struct{}{} // acknowledge readiness first
-			<-start
+			if !barrier.arrive() {
+				// Barrier aborted (readiness timeout): do not consume, but still send
+				// a distinct completion record so cleanup can account for all N.
+				results <- consumeResult{proceeded: false}
+				return
+			}
 			tok, ok := s.consume(id, userID, registry)
-			results <- struct {
-				token string
-				ok    bool
-			}{tok, ok}
+			results <- consumeResult{token: tok, ok: ok, proceeded: true}
 		}()
 	}
 
-	// Phase 1: wait until all N consumers have signalled readiness, bounded. If
-	// readiness never completes we still release every worker parked on start
-	// and make a best-effort join before failing — we do not pretend to have
-	// force-cancelled anyone, but the worker code is finite and nonblocking apart
-	// from the guarded start/consume/send, so closing start is expected to let
-	// every worker finish and the join is expected to complete.
-	if !waitForReadyN(ready, consumers, timeout) {
-		close(start) // release any workers still waiting so failure cleanup can join
-		if !joinWithTimeout(&wg, timeout) {
-			t.Logf("best-effort join did not complete before failing readiness barrier")
-		}
-		t.Fatalf("timed out waiting for %d consumers to signal readiness", consumers)
+	// Phase 1: prove every worker is parked in cond.Wait before releasing any.
+	if !barrier.waitAllArrived(timeout) {
+		t.Fatalf("timed out waiting for all %d consumers to park on the barrier", consumers)
 	}
 
-	// Phase 2: all workers are provably parked on start — release them together.
-	close(start)
+	// Phase 2: waitAllArrived committed the release, so every provably-parked
+	// worker is now released together and the consume calls genuinely overlap.
 
-	// Phase 3: complete join before touching results. Success path must establish
-	// a full join, not just an on-time waitGroup (round 2's on-timeout Fatal gave
-	// no such proof). Here a genuine timeout triggers a bounded join attempt
-	// before failure.
-	if !joinWithTimeout(&wg, timeout) {
-		close(results)
-		t.Fatalf("timed out waiting for %d consumers to finish (possible deadlock in consume)", consumers)
+	// Phase 3: bounded completion collection. Receiving exactly consumers results
+	// proves every worker finished (each sent exactly one record); no WaitGroup
+	// watcher and, crucially, no close of a channel workers might still write to.
+	got := collectN(results, consumers, timeout)
+	if len(got) != consumers {
+		t.Fatalf("joined only %d/%d consumers before timeout", len(got), consumers)
 	}
-	close(results)
 
 	successes := 0
+	proceeded := 0
 	gotToken := ""
-	for r := range results {
+	for _, r := range got {
+		if r.proceeded {
+			proceeded++
+		}
 		if !r.ok {
 			if r.token != "" {
 				t.Fatalf("failed consume returned a non-empty token %q", r.token)
@@ -172,6 +280,9 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 		}
 		successes++
 		gotToken = r.token
+	}
+	if proceeded != consumers {
+		t.Fatalf("barrier aborted %d worker(s) unexpectedly; all %d should have proceeded", consumers-proceeded, consumers)
 	}
 	if successes != 1 {
 		t.Fatalf("expected exactly 1 successful consume, got %d", successes)
@@ -183,41 +294,5 @@ func TestInviteFlashStoreConcurrentConsumeExactlyOnce(t *testing.T) {
 	// The flash must be fully removed: a follow-up consume is a no-op.
 	if _, ok := s.consume(id, userID, registry); ok {
 		t.Fatalf("flash remained consumable after exactly-once concurrent consumption")
-	}
-}
-
-// waitForReadyN blocks (with a bounded timeout) until exactly n readiness
-// acknowledgements have been received on ready. It returns false on timeout. The
-// receive side runs in the caller (the parent), so no helper goroutine is leaked
-// if n is never reached; the caller is then responsible for releasing workers
-// parked on start and making a best-effort join before failing.
-func waitForReadyN(ready <-chan struct{}, n int, timeout time.Duration) bool {
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	for i := 0; i < n; i++ {
-		select {
-		case <-ready:
-		case <-timer.C:
-			return false
-		}
-	}
-	return true
-}
-
-// joinWithTimeout waits up to timeout for wg to return to zero and reports
-// whether the join completed. It never leaks the watcher goroutine's channel
-// (bounded by timeout). This is the mechanical completion proof the success
-// path requires, and the best-effort release used on failure paths.
-func joinWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
 	}
 }
