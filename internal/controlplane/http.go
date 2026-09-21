@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/uncloud-registry/registry/internal/auth"
 )
@@ -13,10 +14,27 @@ import (
 type HTTPServer struct {
 	Service  *Service
 	Subjects auth.SubjectResolver
+
+	// inviteFlashStore is lazily initialised on first use so a zero-value
+	// *HTTPServer is safe before any flash traffic arrives.
+	flashInitMu sync.Mutex
+	flashes     *inviteFlashStore
 }
 
 func NewHTTPServer(service *Service, subjects auth.SubjectResolver) http.Handler {
 	return &HTTPServer{Service: service, Subjects: subjects}
+}
+
+// inviteFlash returns the server's one-time invite flash store, lazily creating it
+// on first use so a zero-value *HTTPServer is safe and no flash memory is allocated
+// on servers that never create invites.
+func (s *HTTPServer) inviteFlash() *inviteFlashStore {
+	s.flashInitMu.Lock()
+	defer s.flashInitMu.Unlock()
+	if s.flashes == nil {
+		s.flashes = newInviteFlashStore()
+	}
+	return s.flashes
 }
 
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {

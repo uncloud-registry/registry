@@ -617,9 +617,18 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 	if r.URL.Query().Get("permissions_updated") == "1" {
 		message = "Collaborator permissions updated and policies republished."
 	}
-	if token := r.URL.Query().Get("invite_token"); token != "" {
-		link := "/ui/invites/accept?token=" + url.QueryEscape(token)
-		message = "Invite created. Share this link with the collaborator: " + absoluteURL(r, link)
+	if r.URL.Query().Get("invite_stored") == "1" {
+		message = "Invite created. The one-time share link could not be prepared; please create a new invite to share it."
+	}
+	if flashID := r.URL.Query().Get("invite_flash"); flashID != "" {
+		// Consume the one-time flash atomically: only the authenticated creator of
+		// THIS registry may retrieve it, once. Unknown, expired, wrong-user, and
+		// wrong-registry requests reveal nothing. The raw token never appears in the
+		// redirect URL, a cookie, a log, or an error.
+		if token, ok := s.inviteFlash().consume(flashID, userID, registryID); ok {
+			link := "/ui/invites/accept?token=" + url.QueryEscape(token)
+			message = "Invite created. Share this link with the collaborator: " + absoluteURL(r, link)
+		}
 	}
 	inviteModal := inviteModalState(r)
 	dashboardDTO := NewPublicRegistryDashboard(dashboard)
@@ -816,7 +825,16 @@ func (s *HTTPServer) handleUICreateInvite(w http.ResponseWriter, r *http.Request
 		http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?"+query.Encode(), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_token="+url.QueryEscape(token), http.StatusSeeOther)
+	// Store the one-time raw token in a transient, principal/registry-bound flash and
+	// carry only a random opaque flash ID in the 303 redirect URL. If the store fails
+	// safely (e.g. at capacity) we still 303-redirect but render no token; the invite
+	// itself is already persisted and remains visible in the pending list.
+	flashID, flashErr := s.inviteFlash().store(token, userID, registryID)
+	if flashErr != nil {
+		http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_stored=1", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_flash="+url.QueryEscape(flashID), http.StatusSeeOther)
 }
 
 func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter, r *http.Request) {
