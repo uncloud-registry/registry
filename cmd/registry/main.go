@@ -152,10 +152,15 @@ func envRequired(name string) (string, error) {
 //     only; see auth.LoadJWKSFromFile). Startup fails when absent, unreadable,
 //     malformed, empty, or containing anything but Ed25519 public keys.
 //   - REGISTRY_TOKEN_ISSUER: the exact issuer every registry token must carry.
-//   - REGISTRY_TOKEN_AUDIENCE: the exact audience/service every token must
-//     carry AND the registry host requests must be made against. It binds
-//     verification: tokens issued for any other service fail, and requests to
-//     hosts other than the configured audience fail closed.
+//   - REGISTRY_TOKEN_AUDIENCE: a STRICT comma-separated allowlist of exact
+//     registry hosts (auth.ParseAudienceAllowlist). Blank elements, surrounding
+//     or interior whitespace, duplicates, wildcards, and malformed hosts fail
+//     startup, as does an empty list. Each allowed host gets exact
+//     singleton-audience verification via auth.MultiServiceVerifier: the
+//     resolved request service must be in the allowlist (hosts outside it fail
+//     before any token verification), and a token must carry exactly that
+//     service in its service claim and single audience. This supports at least
+//     two owner-map hosts in one process with host-specific tokens.
 //
 // The three settings are consumed by the verifier — they are not parsed and
 // ignored. Key material is never logged or included in errors.
@@ -168,7 +173,10 @@ func buildAuthenticator() (registry.Authenticator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry token verification configuration: %w", err)
 	}
-	audience, err := envRequired("REGISTRY_TOKEN_AUDIENCE")
+	// Read the RAW value: envRequired would trim surrounding whitespace, which
+	// must instead reach ParseAudienceAllowlist so it can be rejected (the
+	// strict list contract also covers the empty/blank cases).
+	audiences, err := auth.ParseAudienceAllowlist(os.Getenv("REGISTRY_TOKEN_AUDIENCE"))
 	if err != nil {
 		return nil, fmt.Errorf("registry token verification configuration: %w", err)
 	}
@@ -176,9 +184,11 @@ func buildAuthenticator() (registry.Authenticator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return registry.BearerAuthenticator{
-		Tokens: auth.NewRegistryTokenVerifier(keys, issuer, audience),
-	}, nil
+	verifier, err := auth.NewMultiServiceVerifier(keys, issuer, audiences)
+	if err != nil {
+		return nil, fmt.Errorf("registry token verification configuration: %w", err)
+	}
+	return registry.BearerAuthenticator{Tokens: verifier}, nil
 }
 
 func parseRegistryOwners(raw string) map[string]string {

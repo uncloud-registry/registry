@@ -197,3 +197,121 @@ func TestPolicyErrorsPropagate(t *testing.T) {
 		t.Fatal("missing policy document must error on push as well")
 	}
 }
+
+// --- Fix round 1 RED: anonymous pull requires an EXPLICIT PullSubjects grant ---
+
+// TestPullAnonymousNeverImplicitlyAllowed pins the fail-closed anonymous rule:
+// DefaultAccess "allow", a missing repo entry, a nil DefaultRepo, or the
+// authenticated default path must NEVER implicitly authorize the anonymous
+// principal. Anonymous is allowed only when the effective repository/default
+// entry explicitly lists "anonymous" in Pull. Authenticated subjects keep the
+// existing default-allow behavior for missing repos.
+func TestPullAnonymousNeverImplicitlyAllowed(t *testing.T) {
+	t.Parallel()
+	owner := "0xanon-allow"
+	docs := resolve.NewMemoryDocumentStore()
+	authData, err := json.Marshal(spec.AuthPolicyDocument{
+		Version:       1,
+		DefaultAccess: "allow",
+		Repos:         map[string]spec.RepoAuthPolicyEntry{},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	docs.Documents[spec.AuthPolicyFeedRef(owner)] = authData
+	registry := resolve.RegistryIdentity{Host: "anon-allow.example.test", Owner: owner}
+	pull := PullAuthorizer{Policies: AuthPolicyResolver{Docs: docs, Feeds: nil}}
+
+	// Missing repo entry + DefaultAccess allow + nil DefaultRepo: anonymous denied.
+	ok, err := pull.Authorize(context.Background(), registry, "missing/repo", principal(auth.AnonymousSubject))
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if ok {
+		t.Fatal("DefaultAccess allow must never implicitly authorize anonymous")
+	}
+	// Empty subject is never a verified principal; default allow must not grant it.
+	ok, err = pull.Authorize(context.Background(), registry, "missing/repo", principal(""))
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if ok {
+		t.Fatal("empty subject must not be granted by DefaultAccess allow")
+	}
+	// Authenticated principal retains the existing default-allow behavior.
+	ok, err = pull.Authorize(context.Background(), registry, "missing/repo", principal("user:alice"))
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if !ok {
+		t.Fatal("authenticated subject must keep DefaultAccess allow for missing repos")
+	}
+
+	// DefaultAccess deny + missing entry: anonymous denied (and authenticated denied).
+	denyOwner := "0xanon-deny"
+	denyDocs := resolve.NewMemoryDocumentStore()
+	denyData, err := json.Marshal(spec.AuthPolicyDocument{
+		Version:       1,
+		DefaultAccess: "deny",
+		Repos:         map[string]spec.RepoAuthPolicyEntry{},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	denyDocs.Documents[spec.AuthPolicyFeedRef(denyOwner)] = denyData
+	denyPull := PullAuthorizer{Policies: AuthPolicyResolver{Docs: denyDocs, Feeds: nil}}
+	if ok, err := denyPull.Authorize(context.Background(), resolve.RegistryIdentity{Host: "anon-deny.example.test", Owner: denyOwner}, "missing/repo", principal(auth.AnonymousSubject)); err != nil || ok {
+		t.Fatalf("deny default must reject anonymous (ok=%v err=%v)", ok, err)
+	}
+}
+
+// TestPullAnonymousViaDefaultRepo pins that a DefaultRepo entry is the ONLY
+// default-path way to allow anonymous: the entry must explicitly list
+// "anonymous" in Pull; a DefaultRepo without it denies, and an entry WITH it
+// allows. A nil DefaultRepo never allows anonymous regardless of DefaultAccess.
+func TestPullAnonymousViaDefaultRepo(t *testing.T) {
+	t.Parallel()
+	allowOwner := "0xdef-allow"
+	allowDocs := resolve.NewMemoryDocumentStore()
+	allowData, err := json.Marshal(spec.AuthPolicyDocument{
+		Version:       1,
+		DefaultAccess: "deny",
+		DefaultRepo: &spec.RepoAuthPolicyEntry{
+			Pull: []string{"anonymous", "role:read"},
+			Push: []string{"role:write"},
+		},
+		Repos: map[string]spec.RepoAuthPolicyEntry{},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	allowDocs.Documents[spec.AuthPolicyFeedRef(allowOwner)] = allowData
+	allowPull := PullAuthorizer{Policies: AuthPolicyResolver{Docs: allowDocs, Feeds: nil}}
+	allowReg := resolve.RegistryIdentity{Host: "def-allow.example.test", Owner: allowOwner}
+
+	if ok, err := allowPull.Authorize(context.Background(), allowReg, "missing/repo", principal(auth.AnonymousSubject)); err != nil || !ok {
+		t.Fatalf("DefaultRepo listing anonymous must allow anonymous (ok=%v err=%v)", ok, err)
+	}
+
+	closedOwner := "0xdef-closed"
+	closedDocs := resolve.NewMemoryDocumentStore()
+	closedData, err := json.Marshal(spec.AuthPolicyDocument{
+		Version:       1,
+		DefaultAccess: "allow", // allow must NOT leak into DefaultRepo-less anonymous
+		DefaultRepo: &spec.RepoAuthPolicyEntry{
+			Pull: []string{"role:read"},
+			Push: []string{"role:write"},
+		},
+		Repos: map[string]spec.RepoAuthPolicyEntry{},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	closedDocs.Documents[spec.AuthPolicyFeedRef(closedOwner)] = closedData
+	closedPull := PullAuthorizer{Policies: AuthPolicyResolver{Docs: closedDocs, Feeds: nil}}
+	closedReg := resolve.RegistryIdentity{Host: "def-closed.example.test", Owner: closedOwner}
+
+	if ok, err := closedPull.Authorize(context.Background(), closedReg, "missing/repo", principal(auth.AnonymousSubject)); err != nil || ok {
+		t.Fatalf("DefaultRepo without anonymous must deny anonymous (ok=%v err=%v)", ok, err)
+	}
+}

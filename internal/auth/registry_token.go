@@ -140,12 +140,28 @@ func NewRegistryTokenVerifier(keys PublicKeySet, issuer, service string) *Regist
 }
 
 // Verify validates raw and returns the verified Principal iff the token is a
-// well-formed Ed25519 registry token issued for the exact service and grants the
-// requested repository+action. Every structural, key, claim, or scope violation
-// fails closed with wrapped context; errors never leak key material.
+// well-formed Ed25519 registry token issued for the exact bound service and
+// grants the requested repository+action. Every structural, key, claim, or
+// scope violation fails closed with wrapped context; errors never leak key
+// material. A request service other than the bound service is rejected before
+// any token parsing or key resolution.
 func (v *RegistryTokenVerifier) Verify(raw, service, repository string, action Action) (Principal, error) {
 	var empty Principal
-	if v.keys == nil {
+	if service != v.service {
+		return empty, errors.New("registry token service mismatch")
+	}
+	return verifyRegistryToken(v.keys, v.issuer, service, raw, repository, action)
+}
+
+// verifyRegistryToken validates raw as an Ed25519 registry token issued for
+// EXACTLY the given service: the token must carry that service in its service
+// claim and as its single audience, and must grant the requested
+// repository+action. It is the shared core for the single-service verifier and
+// the multi-service (allowlist) verifier, so every allowed host gets identical
+// exact-singleton-audience validation.
+func verifyRegistryToken(keys PublicKeySet, issuer, service, raw, repository string, action Action) (Principal, error) {
+	var empty Principal
+	if keys == nil {
 		return empty, errors.New("registry token verifier requires a public key set")
 	}
 	if service == "" || repository == "" {
@@ -170,7 +186,7 @@ func (v *RegistryTokenVerifier) Verify(raw, service, repository string, action A
 		return empty, fmt.Errorf("registry token algorithm must be EdDSA (got %q)", alg)
 	}
 
-	key, err := v.keys.Key(context.Background(), kid)
+	key, err := keys.Key(context.Background(), kid)
 	if err != nil {
 		return empty, fmt.Errorf("resolve registry token key: %w", err)
 	}
@@ -194,10 +210,10 @@ func (v *RegistryTokenVerifier) Verify(raw, service, repository string, action A
 	if claims.TokenType != RegistryTokenType {
 		return empty, fmt.Errorf("registry token type mismatch: %q", claims.TokenType)
 	}
-	if claims.Issuer != v.issuer {
+	if claims.Issuer != issuer {
 		return empty, errors.New("registry token issuer mismatch")
 	}
-	if claims.Service != service || claims.Service != v.service {
+	if claims.Service != service {
 		return empty, errors.New("registry token service mismatch")
 	}
 	// Require exactly one audience equal to the requested service; extra

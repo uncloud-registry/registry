@@ -867,3 +867,142 @@ func (c *countingObjects) Get(ctx context.Context, ref string) ([]byte, error) {
 	c.gets++
 	return c.ObjectStore.Get(ctx, ref)
 }
+
+// TestAnonymousPullDeniedWhenDefaultAllowOnly pins the handler-visible
+// behavior of the anonymous rule: an auth policy whose only grant is
+// DefaultAccess "allow" (no repo entry, no DefaultRepo, no "anonymous"
+// anywhere) must reject an anonymous manifest pull with 401 — default-allow
+// must never implicitly turn a repo public.
+func TestAnonymousPullDeniedWhenDefaultAllowOnly(t *testing.T) {
+	t.Parallel()
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+	// Overwrite the seeded policy: no entry for backend/api, defaultAccess
+	// allow, and no anonymous listing anywhere.
+	docs.Documents["auth-policy-ref"] = []byte(`{
+		"version":1,
+		"defaultAccess":"allow",
+		"repos":{}
+	}`)
+
+	handler, _ := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Host = testServiceHost
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("anonymous pull with default-allow only must be 401, got %d", resp.StatusCode)
+	}
+	if challenge := resp.Header.Get("WWW-Authenticate"); challenge == "" {
+		t.Fatal("expected WWW-Authenticate header")
+	}
+}
+
+// TestHandlerServesTwoHostsWithHostSpecificTokens pins the multi-namespace
+// audience behavior at the HTTP boundary: one handler process serving two
+// owner-map hosts verifies each host's token independently (200), rejects a
+// host A token presented at host B (401), and rejects any host outside the
+// configured allowlist (401) before policy is consulted.
+func TestHandlerServesTwoHostsWithHostSpecificTokens(t *testing.T) {
+	t.Parallel()
+
+	const hostB = "bob.uncloud-registry.com"
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	keys := testKeySet{testKeyID: pub}
+	issuer, err := auth.NewRegistryTokenIssuer(priv, auth.RegistryIssuer, testKeyID)
+	if err != nil {
+		t.Fatalf("new issuer: %v", err)
+	}
+	verifier, err := auth.NewMultiServiceVerifier(keys, auth.RegistryIssuer, []string{testServiceHost, hostB})
+	if err != nil {
+		t.Fatalf("new multi verifier: %v", err)
+	}
+	handler := NewHandler(
+		resolve.RegistryResolver{
+			Registries: resolve.StaticRegistryIdentityResolver{
+				Hosts: map[string]resolve.RegistryIdentity{
+					testServiceHost:     {Host: testServiceHost, Owner: "0xaliceowner"},
+					hostB:               {Host: hostB, Owner: "0xaliceowner"},
+					"evil.example.test": {Host: "evil.example.test", Owner: "0xevilowner"},
+				},
+			},
+			Docs:  docs,
+			Feeds: feeds,
+		},
+		docs,
+		docs,
+		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}},
+		policy.PushAuthorizer{
+			AuthPolicies:  policy.AuthPolicyResolver{Docs: docs, Feeds: feeds},
+			StampPolicies: policy.StampPolicyResolver{Docs: docs, Feeds: feeds},
+		},
+		BearerAuthenticator{Tokens: verifier},
+		staging.NewMemoryStore(),
+		publish.Publisher{
+			Builder: publish.DefaultBuilder{},
+			Objects: docs,
+			Feeds:   feeds,
+		},
+		"https://auth.uncloud-registry.com/token",
+	)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	getManifest := func(host, bearer string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/manifests/latest", nil)
+		if err != nil {
+			t.Fatalf("create request: %v", err)
+		}
+		req.Host = host
+		if bearer != "" {
+			req.Header.Set("Authorization", bearer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	tokenA := registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPull}, time.Hour)
+	tokenB := registryBearer(t, issuer, "user:alice", hostB, "backend/api", []auth.Action{auth.ActionPull}, time.Hour)
+
+	if got := getManifest(testServiceHost, tokenA); got != http.StatusOK {
+		t.Fatalf("host A token at host A: status %d, want 200", got)
+	}
+	if got := getManifest(hostB, tokenB); got != http.StatusOK {
+		t.Fatalf("host B token at host B: status %d, want 200", got)
+	}
+	if got := getManifest(hostB, tokenA); got != http.StatusUnauthorized {
+		t.Fatalf("host A token at host B: status %d, want 401", got)
+	}
+	if got := getManifest(testServiceHost, tokenB); got != http.StatusUnauthorized {
+		t.Fatalf("host B token at host A: status %d, want 401", got)
+	}
+	if got := getManifest("evil.example.test", tokenA); got != http.StatusUnauthorized {
+		t.Fatalf("valid token at a host outside the allowlist: status %d, want 401", got)
+	}
+}

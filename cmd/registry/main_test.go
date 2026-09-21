@@ -212,3 +212,111 @@ func TestRegistryNoLongerUsesSharedHmacSecret(t *testing.T) {
 		t.Fatal("REGISTRY_TOKEN_SECRET must not substitute for registry verification config")
 	}
 }
+
+// --- Fix round 1 RED: REGISTRY_TOKEN_AUDIENCE strict allowlist ---
+
+// TestBuildAuthenticatorRejectsMalformedAudienceList pins that
+// REGISTRY_TOKEN_AUDIENCE is a strict comma-separated allowlist of exact
+// registry hosts: blank elements, surrounding/interior whitespace, duplicates,
+// wildcards, and malformed hosts all fail startup.
+func TestBuildAuthenticatorRejectsMalformedAudienceList(t *testing.T) {
+	key := newConfigTestKey(t)
+	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", writeConfigJWKS(t, key))
+	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
+
+	cases := []string{
+		"a,,b",          // blank element
+		" a,b",          // leading whitespace in element
+		"a, b",          // trailing whitespace in element
+		"a,b,a",         // duplicate
+		"a,a",           // duplicate pair
+		"*",             // wildcard
+		"a,b:evil:8080", // malformed host (multiple colons)
+		"a://evil",      // scheme-like
+		"bad host",      // interior whitespace
+		"Evil.Example",  // non-lowercase host
+		",a",            // leading blank
+		"a,",            // trailing blank
+		"a, a",          // whitespace + blank mix
+	}
+	for _, tc := range cases {
+		t.Setenv("REGISTRY_TOKEN_AUDIENCE", tc)
+		if _, err := buildAuthenticator(); err == nil {
+			t.Errorf("REGISTRY_TOKEN_AUDIENCE=%q must fail startup", tc)
+		}
+	}
+
+	// A valid multi-host allowlist must build.
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", "alice.uncloud-registry.com,bob.uncloud-registry.com")
+	if _, err := buildAuthenticator(); err != nil {
+		t.Fatalf("valid multi-host audience list must build: %v", err)
+	}
+	// Ports are legal registry hosts.
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", "localhost:8080")
+	if _, err := buildAuthenticator(); err != nil {
+		t.Fatalf("host with port must build: %v", err)
+	}
+}
+
+// TestBuildAuthenticatorServesTwoHostsWithHostSpecificTokens pins the
+// multi-namespace audience contract at the production wiring layer: one
+// process configured with a two-host allowlist verifies each host-specific
+// signed token independently, rejects cross-host presentation, and rejects
+// hosts outside the allowlist before verification.
+func TestBuildAuthenticatorServesTwoHostsWithHostSpecificTokens(t *testing.T) {
+	key := newConfigTestKey(t)
+	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", writeConfigJWKS(t, key))
+	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
+	t.Setenv("REGISTRY_TOKEN_AUDIENCE", "alice.uncloud-registry.com,bob.uncloud-registry.com")
+
+	authen, err := buildAuthenticator()
+	if err != nil {
+		t.Fatalf("buildAuthenticator: %v", err)
+	}
+	bearer, ok := authen.(registry.BearerAuthenticator)
+	if !ok {
+		t.Fatalf("unexpected authenticator type %T", authen)
+	}
+
+	issue := func(service string) string {
+		t.Helper()
+		iss, err := auth.NewRegistryTokenIssuer(key.priv, configIssuer, configKeyID)
+		if err != nil {
+			t.Fatalf("new issuer: %v", err)
+		}
+		raw, err := iss.Issue(context.Background(), auth.RegistryTokenRequest{
+			Subject:    configSubject,
+			Service:    service,
+			Repository: configRepo,
+			Actions:    []auth.Action{auth.ActionPull},
+			TTL:        time.Hour,
+		})
+		if err != nil {
+			t.Fatalf("issue: %v", err)
+		}
+		return raw
+	}
+
+	tokenAlice := issue("alice.uncloud-registry.com")
+	tokenBob := issue("bob.uncloud-registry.com")
+
+	// Each host verifies independently with its own host-specific token.
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+tokenAlice, "alice.uncloud-registry.com", configRepo, auth.ActionPull); err != nil {
+		t.Fatalf("alice token at alice host must verify: %v", err)
+	}
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+tokenBob, "bob.uncloud-registry.com", configRepo, auth.ActionPull); err != nil {
+		t.Fatalf("bob token at bob host must verify: %v", err)
+	}
+	// Cross-host presentation fails closed even though both hosts are configured.
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+tokenAlice, "bob.uncloud-registry.com", configRepo, auth.ActionPull); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("alice token at bob host must fail closed, got %v", err)
+	}
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+tokenBob, "alice.uncloud-registry.com", configRepo, auth.ActionPull); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("bob token at alice host must fail closed, got %v", err)
+	}
+	// Host outside the allowlist fails before verification, even with a valid
+	// token minted for an allowed host.
+	if _, err := bearer.Authenticate(context.Background(), "Bearer "+tokenAlice, "evil.example.test", configRepo, auth.ActionPull); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("host outside the allowlist must fail closed, got %v", err)
+	}
+}

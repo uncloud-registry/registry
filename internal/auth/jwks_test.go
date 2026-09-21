@@ -100,8 +100,8 @@ func TestParseJWKSRejectsMalformedSets(t *testing.T) {
 		{"ec kty", `{"keys":[{"kty":"EC","crv":"P-256","kid":"k"}]}`, "unsupported kty"},
 		{"okp wrong curve", `{"keys":[{"kty":"OKP","crv":"X25519","kid":"k","x":"a"}]}`, "unsupported crv"},
 		{"duplicate kids", string(jwksDocument(key.jwkJSON, key.jwkJSON)), "duplicate kid"},
-		{"missing kid", `{"keys":[{"kty":"OKP","crv":"Ed25519","x":"` + key.xBase64 + `"}]}`, "empty or missing kid"},
-		{"blank kid", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"  ","x":"` + key.xBase64 + `"}]}`, "empty or missing kid"},
+		{"missing kid", `{"keys":[{"kty":"OKP","crv":"Ed25519","x":"` + key.xBase64 + `"}]}`, "empty or non-literal kid"},
+		{"blank kid", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"  ","x":"` + key.xBase64 + `"}]}`, "empty or non-literal kid"},
 		{"missing x", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k"}]}`, "missing the x coordinate"},
 		{"malformed x", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","x":"!!not-base64url!!"}]}`, "malformed x"},
 		{"short x", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","x":"YWJj"}]}`, "decodes to 3 bytes"},
@@ -120,22 +120,6 @@ func TestParseJWKSRejectsMalformedSets(t *testing.T) {
 		} else if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: error %q does not contain %q", tc.name, err, tc.want)
 		}
-	}
-}
-
-func TestParseJWKSAcceptsPaddedBase64URL(t *testing.T) {
-	t.Parallel()
-	key := newJWKSTestKey(t, "padded")
-	// Pad the unpadded value to a multiple of 4.
-	padded := key.xBase64 + strings.Repeat("=", (4-len(key.xBase64)%4)%4)
-	doc := `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"padded","x":"` + padded + `"}]}`
-	set, err := ParseJWKS([]byte(doc))
-	if err != nil {
-		t.Fatalf("padded base64url must parse: %v", err)
-	}
-	got, err := set.Key(context.Background(), "padded")
-	if err != nil || !got.Equal(key.pub) {
-		t.Fatalf("padded key mismatch: got=%v err=%v", got, err)
 	}
 }
 
@@ -242,5 +226,169 @@ func TestJWKSKeyErrorsNeverLeakKeyMaterial(t *testing.T) {
 	set := mustParseJWKS(t, jwksDocument(key.jwkJSON))
 	if _, err := set.Key(context.Background(), "missing-kid"); err != nil && strings.Contains(err.Error(), key.xBase64) {
 		t.Fatalf("key lookup error leaks material: %v", err)
+	}
+}
+
+// --- Fix round 1 RED: strict duplicate/key/encoding/file-mode validation ---
+
+// nonCanonicalX returns a base64url string that decodes to the SAME bytes as
+// xBase64 but is NOT the canonical RawURLEncoding of those bytes (nonzero pad
+// bits in the final character). Go's decoder tolerates such encodings, which is
+// exactly the ambiguity a strict parser must reject.
+func nonCanonicalX(t *testing.T, xBase64 string) string {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(xBase64)
+	if err != nil {
+		t.Fatalf("decode canonical x: %v", err)
+	}
+	alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	for i := 0; i < len(alphabet); i++ {
+		c := alphabet[i]
+		if c == xBase64[len(xBase64)-1] {
+			continue
+		}
+		mod := xBase64[:len(xBase64)-1] + string(c)
+		got, err := base64.RawURLEncoding.DecodeString(mod)
+		if err == nil && string(got) == string(raw) {
+			return mod
+		}
+	}
+	t.Fatal("could not construct a non-canonical encoding")
+	return ""
+}
+
+// TestParseJWKSRejectsDuplicateObjectMembers pins that duplicate member names
+// inside ANY JSON object are rejected at the token level, before typed
+// decoding (encoding/json silently keeps only the LAST duplicate, which is
+// exactly the ambiguity a hostile document exploits).
+func TestParseJWKSRejectsDuplicateObjectMembers(t *testing.T) {
+	t.Parallel()
+	key := newJWKSTestKey(t, "dup-k1")
+	keys := jwksDocument(key.jwkJSON)
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{"duplicate kid member", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"a","kid":"b","x":"` + key.xBase64 + `"}]}`},
+		{"duplicate x member", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","x":"` + key.xBase64 + `","x":"` + key.xBase64 + `"}]}`},
+		{"duplicate kty member", `{"keys":[{"kty":"OKP","kty":"OKP","crv":"Ed25519","kid":"k","x":"` + key.xBase64 + `"}]}`},
+		{"duplicate crv member", `{"keys":[{"kty":"OKP","crv":"Ed25519","crv":"Ed25519","kid":"k","x":"` + key.xBase64 + `"}]}`},
+		{"duplicate keys member", `{"keys":[` + key.jwkJSON + `],"keys":[` + key.jwkJSON + `]}`},
+		{"duplicate unknown member", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","use":"sig","use":"sig","x":"` + key.xBase64 + `"}]}`},
+	}
+	for _, tc := range cases {
+		if _, err := ParseJWKS([]byte(tc.doc)); err == nil {
+			t.Errorf("%s: duplicate member names must be rejected, got nil", tc.name)
+		}
+	}
+	_ = keys
+}
+
+// TestParseJWKSRejectsAnyPrivateKeyMember pins that ANY occurrence of a "d"
+// member on any object is fatal — including empty-string occurrences and
+// duplicates that would otherwise overwrite a secret value into emptiness.
+func TestParseJWKSRejectsAnyPrivateKeyMember(t *testing.T) {
+	t.Parallel()
+	key := newJWKSTestKey(t, "dup-d")
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{"single empty d", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","d":"","x":"` + key.xBase64 + `"}]}`},
+		{"duplicate d with empty last value", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","d":"c2VjcmV0","d":"","x":"` + key.xBase64 + `"}]}`},
+		{"duplicate d with secret last value", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","d":"c2VjcmV0","d":"c2VjcmV0Mg","x":"` + key.xBase64 + `"}]}`},
+		{"whitespace d", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","d":"   ","x":"` + key.xBase64 + `"}]}`},
+	}
+	for _, tc := range cases {
+		if _, err := ParseJWKS([]byte(tc.doc)); err == nil {
+			t.Errorf("%s: any d member must be rejected, got nil", tc.name)
+		}
+	}
+}
+
+// TestParseJWKSRejectsPaddedOrNonCanonicalX pins the unpadded-only strict
+// encoding contract: any '=' padding and any non-canonical RawURLEncoding of
+// the same bytes are rejected.
+func TestParseJWKSRejectsPaddedOrNonCanonicalX(t *testing.T) {
+	t.Parallel()
+	key := newJWKSTestKey(t, "pad-x")
+	padded := key.xBase64 + strings.Repeat("=", (4-len(key.xBase64)%4)%4)
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{"padded x", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","x":"` + padded + `"}]}`},
+		{"non-canonical x", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","x":"` + nonCanonicalX(t, key.xBase64) + `"}]}`},
+		{"x with interior padding char", `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"k","x":"` + key.xBase64[:10] + `=` + key.xBase64[10:] + `"}]}`},
+	}
+	for _, tc := range cases {
+		if _, err := ParseJWKS([]byte(tc.doc)); err == nil {
+			t.Errorf("%s: must be rejected, got nil", tc.name)
+		}
+	}
+}
+
+// TestParseJWKSRejectsNonLiteralKid pins that a kid is never whitespace
+// normalized: it must be nonempty and equal to its own TrimSpace, and the
+// literal value is what gets registered.
+func TestParseJWKSRejectsNonLiteralKid(t *testing.T) {
+	t.Parallel()
+	key := newJWKSTestKey(t, "kid-k")
+	cases := []struct {
+		name string
+		kid  string
+	}{
+		{"leading space", " kid-1"},
+		{"trailing space", "kid-1 "},
+		{"both sides", " kid-1 "},
+		{"tab padded", "	kid-1	"},
+		{"newline padded", "\nkid-1\n"},
+	}
+	for _, tc := range cases {
+		doc := `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"` + tc.kid + `","x":"` + key.xBase64 + `"}]}`
+		if _, err := ParseJWKS([]byte(doc)); err == nil {
+			t.Errorf("%s: kid %q must be rejected, got nil", tc.name, tc.kid)
+		}
+	}
+	// A literal (unpadded) kid must still register under its exact value.
+	set := mustParseJWKS(t, jwksDocument(key.jwkJSON))
+	if _, err := set.Key(context.Background(), key.kid); err != nil {
+		t.Fatalf("literal kid must resolve: %v", err)
+	}
+}
+
+// TestLoadJWKSFromFileRejectsWritableMode pins the permission contract: a
+// group- or world-writable keys file is refused (perm & 022 != 0), while an
+// owner-only or owner/group-readable file loads.
+func TestLoadJWKSFromFileRejectsWritableMode(t *testing.T) {
+	t.Parallel()
+	key := newJWKSTestKey(t, "mode-k")
+
+	rejected := []os.FileMode{0o666, 0o660, 0o662, 0o606}
+	for _, mode := range rejected {
+		path := filepath.Join(t.TempDir(), "keys.json")
+		if err := os.WriteFile(path, jwksDocument(key.jwkJSON), mode); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := LoadJWKSFromFile(path); err == nil {
+			t.Errorf("mode %04o must be rejected", mode)
+		}
+	}
+
+	accepted := []os.FileMode{0o600, 0o640, 0o604, 0o644}
+	for _, mode := range accepted {
+		path := filepath.Join(t.TempDir(), "keys.json")
+		if err := os.WriteFile(path, jwksDocument(key.jwkJSON), mode); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := LoadJWKSFromFile(path); err != nil {
+			t.Errorf("mode %04o must load: %v", mode, err)
+		}
 	}
 }
