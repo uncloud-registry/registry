@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented sample values and test-only literals"
+paths = [
+  '''README\.md''',
+  '''docs/.*\.md''',
+  '''.*_test\.go'''
+]
