@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -166,13 +167,35 @@ func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Regi
 	return nil
 }
 
+// FeedKeyDecryptor resolves the transient decrypted feed-owner signing key for
+// a registry. It is the boundary between at-rest encryption and the signer:
+// stored ciphertext must never be handed to a signer, and decrypted key
+// material must never be persisted or logged. Service implements it via
+// Service.DecryptFeedKey; the constrained signing consumer (Task 9/10)
+// replaces this with the feed-signing service.
+type FeedKeyDecryptor interface {
+	DecryptFeedKey(ctx context.Context, registry Registry) (string, error)
+}
+
+// BeeRegistryFeedUpdater signs sequence-feed updates with the registry's
+// feed-owner key. The key is obtained ONLY through a FeedKeyDecryptor — never
+// from storage directly; without one configured, updates fail closed rather
+// than handing stored ciphertext to the signer.
 type BeeRegistryFeedUpdater struct {
 	BaseURL    string
 	HTTPClient *http.Client
+	Keys       FeedKeyDecryptor
 }
 
 func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string) error {
-	updater, err := swarm.NewBeeSequenceFeedUpdater(b.BaseURL, b.HTTPClient, registry.EncryptedFeedPrivateKey)
+	if b.Keys == nil {
+		return errors.New("registry feed key decryptor is not configured; refusing to sign feed updates with stored ciphertext")
+	}
+	keyHex, err := b.Keys.DecryptFeedKey(ctx, registry)
+	if err != nil {
+		return err
+	}
+	updater, err := swarm.NewBeeSequenceFeedUpdater(b.BaseURL, b.HTTPClient, keyHex)
 	if err != nil {
 		return err
 	}

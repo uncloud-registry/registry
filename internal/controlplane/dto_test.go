@@ -12,7 +12,7 @@ func TestPublicRegistryJSONHasNoSecretFields(t *testing.T) {
 
 	raw, err := json.Marshal(NewPublicRegistry(Registry{
 		ID: 1, Slug: "alice", Host: "alice.example.test",
-		EncryptedFeedPrivateKey: "ciphertext",
+		FeedKey: EncryptedFeedKey{Ciphertext: []byte("ciphertext")},
 	}))
 	if err != nil {
 		t.Fatal(err)

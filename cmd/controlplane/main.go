@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"errors"
@@ -32,6 +33,20 @@ func main() {
 	registryDomain := envOrDefault("CONTROLPLANE_REGISTRY_DOMAIN", "uncloud-registry.com")
 	beeAPIURL := strings.TrimSpace(os.Getenv("CONTROLPLANE_BEE_API_URL"))
 
+	// The master-key file is REQUIRED: without the current AES-256 master key
+	// no registry feed key can be stored encrypted (or decrypted for signing),
+	// so startup fails rather than running with plaintext-adjacent gaps. The
+	// path is an env value, never a command-line secret; loader errors contain
+	// no path or key material.
+	masterKeyPath, err := envRequiredSecret("CONTROLPLANE_MASTER_KEY_FILE")
+	if err != nil {
+		log.Fatal(err)
+	}
+	feedKeyCipher, err := controlplane.LoadMasterKeyFile(masterKeyPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	store, err := controlplane.OpenSQLite(dbPath)
 	if err != nil {
 		log.Fatal(err)
@@ -45,23 +60,42 @@ func main() {
 		log.Fatal(err)
 	}
 
+	service := &controlplane.Service{
+		Store:          store,
+		Tokens:         tokens,
+		RegistryTokens: registryTokens,
+		RegistryDomain: registryDomain,
+		FeedKeys:       feedKeyCipher,
+	}
+
+	// Legacy plaintext feed keys are read and encrypted ONLY under an explicit
+	// opt-in; the schema migration itself never touches them. Because the
+	// migrated ciphertext and the cleared legacy column are written in the
+	// same per-row transaction, an interrupted or failed migration never leaves
+	// a partially migrated row.
+	legacyMigration, err := legacyKeyMigrationEnabled()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if legacyMigration {
+		if _, err := service.MigrateLegacyFeedKeys(context.Background()); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 	var publisher *controlplane.Publisher
 	if beeAPIURL != "" {
 		publisher = &controlplane.Publisher{
 			Documents: swarm.NewBeeObjectStore(beeAPIURL, nil),
 			Feeds: controlplane.BeeRegistryFeedUpdater{
 				BaseURL: beeAPIURL,
+				Keys:    service,
 			},
 		}
 	}
+	service.Publisher = publisher
 
-	handler := controlplane.NewHTTPServer(&controlplane.Service{
-		Store:          store,
-		Tokens:         tokens,
-		RegistryTokens: registryTokens,
-		RegistryDomain: registryDomain,
-		Publisher:      publisher,
-	}, auth.SubjectResolver{Tokens: tokens})
+	handler := controlplane.NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens})
 
 	log.Printf("control plane listening on %s", addr)
 	if err := http.ListenAndServe(addr, handler); err != nil {
@@ -85,6 +119,31 @@ func envRequiredSecret(name string) (string, error) {
 		return "", fmt.Errorf("%s is required and must not be empty", name)
 	}
 	return value, nil
+}
+
+// masterKeyFileFromEnv resolves the required CONTROLPLANE_MASTER_KEY_FILE
+// path. The value is preserved byte-for-byte (whitespace is a legitimate part
+// of a path); only blank values are rejected, and the error names the variable
+// never its value, so no path material reaches logs.
+func masterKeyFileFromEnv() (string, error) {
+	return envRequiredSecret("CONTROLPLANE_MASTER_KEY_FILE")
+}
+
+// legacyKeyMigrationEnabled implements the explicit opt-in gate for reading
+// legacy plaintext feed keys: only the literal value "true" (after trimming)
+// enables migration before serving. Any other non-blank value fails startup —
+// a typo must neither silently skip the migration (leaving plaintext at rest)
+// nor silently run it. Unset means no migration.
+func legacyKeyMigrationEnabled() (bool, error) {
+	value := strings.TrimSpace(os.Getenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS"))
+	switch value {
+	case "":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("CONTROLPLANE_MIGRATE_LEGACY_KEYS must be exactly \"true\" to enable legacy feed-key migration, or unset to skip it")
+	}
 }
 
 // newRegistryTokenIssuerFromEnv builds the Ed25519 registry token signing key

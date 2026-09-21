@@ -5,8 +5,9 @@ import "time"
 // Public DTOs and explicit conversions are the single trust boundary through
 // which persistence records reach the HTTP API and UI. Persistence structs
 // (User, Registry, Membership, Invite) must never be marshaled or handed to a
-// template directly; secrets such as User.PasswordHash, Registry.
-// EncryptedFeedPrivateKey, and Invite.TokenHash have no public representation.
+// template directly; secrets such as User.PasswordHash, Registry.FeedKey
+// (the at-rest AES-GCM envelope for the feed-owner signing key), and
+// Invite.TokenHash have no public representation.
 
 type PublicUser struct {
 	ID        int64     `json:"id"`

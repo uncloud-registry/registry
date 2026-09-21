@@ -26,6 +26,7 @@ func TestServiceRegisterLoginCreateRegistryAndInvite(t *testing.T) {
 		Tokens:         manager,
 		RegistryTokens: registryTokens,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
 			Documents: &memoryUploader{refs: map[string][]byte{}},
 			Feeds:     &MemoryRegistryFeedUpdater{Feeds: map[string]string{}},
@@ -97,6 +98,7 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 		Store:          store,
 		Tokens:         manager,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
 			Documents: uploader,
 			Feeds:     feeds,
@@ -144,15 +146,14 @@ func TestInviteExpires(t *testing.T) {
 		t.Fatalf("create owner: %v", err)
 	}
 	registry, err := store.CreateRegistry(context.Background(), Registry{
-		Slug:                    "alice",
-		Host:                    "alice.uncloud-registry.com",
-		ENSName:                 "alice.eth",
-		OwnerUserID:             owner.ID,
-		FeedOwnerAddress:        "0xfeed",
-		EncryptedFeedPrivateKey: "cipher",
-		DefaultStampBatchID:     "batch-1",
-		AnonymousPull:           true,
-	})
+		Slug:                "alice",
+		Host:                "alice.uncloud-registry.com",
+		ENSName:             "alice.eth",
+		OwnerUserID:         owner.ID,
+		FeedOwnerAddress:    "0xfeed",
+		DefaultStampBatchID: "batch-1",
+		AnonymousPull:       true,
+	}, nil, "")
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -186,6 +187,7 @@ func TestAcceptInviteIsIdempotentForExistingMembership(t *testing.T) {
 		Store:          store,
 		Tokens:         manager,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
 			Documents: uploader,
 			Feeds:     feeds,
@@ -244,6 +246,7 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 		Tokens:         manager,
 		RegistryTokens: registryTokens,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
 			Documents: uploader,
 			Feeds:     feeds,
@@ -324,6 +327,7 @@ func TestAnonymousPullNeverBroadensMemberPush(t *testing.T) {
 		Tokens:         manager,
 		RegistryTokens: registryTokens,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
 	}
 
 	alice, _, err := service.RegisterUser(context.Background(), "alice@example.com", "password123")

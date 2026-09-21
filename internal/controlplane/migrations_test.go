@@ -35,8 +35,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("expected schema version 1, got %d", version)
+	if version != 2 {
+		t.Fatalf("expected schema version 2, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -69,8 +69,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 1 {
-		t.Fatalf("expected 1 migration row, got %d", rows)
+	if rows != 2 {
+		t.Fatalf("expected 2 migration rows, got %d", rows)
 	}
 }
 
@@ -133,8 +133,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 1 {
-		t.Fatalf("expected schema version 1 after upgrade, got %d", version)
+	if version != 2 {
+		t.Fatalf("expected schema version 2 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.

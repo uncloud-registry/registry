@@ -76,6 +76,53 @@ func TestEnvRequiredSecret(t *testing.T) {
 	}
 }
 
+// TestMasterKeyFilePathRequired pins that the control plane requires
+// CONTROLPLANE_MASTER_KEY_FILE: startup fails when it is absent or blank, and
+// the configured path is preserved byte-for-byte. The error names the variable
+// (not its value) so no path material ever reaches logs.
+func TestMasterKeyFilePathRequired(t *testing.T) {
+	t.Setenv("CONTROLPLANE_MASTER_KEY_FILE", "")
+	if _, err := masterKeyFileFromEnv(); err == nil {
+		t.Fatal("expected missing CONTROLPLANE_MASTER_KEY_FILE to be rejected")
+	} else if !strings.Contains(err.Error(), "CONTROLPLANE_MASTER_KEY_FILE") {
+		t.Fatalf("error must name the variable, never a path value: %v", err)
+	}
+	distinctive := " /tmp/master-key-file-9f17b2.json "
+	t.Setenv("CONTROLPLANE_MASTER_KEY_FILE", distinctive)
+	got, err := masterKeyFileFromEnv()
+	if err != nil {
+		t.Fatalf("present value must load: %v", err)
+	}
+	if got != distinctive {
+		t.Fatalf("master key path must be preserved byte-for-byte: got %q", got)
+	}
+}
+
+// TestLegacyKeyMigrationEnabled pins the explicit opt-in contract: only the
+// literal value "true" enables legacy feed-key migration; every other
+// non-blank value fails startup so a typo can neither silently skip the
+// migration (leaving plaintext at rest) nor silently run it.
+func TestLegacyKeyMigrationEnabled(t *testing.T) {
+	t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", "")
+	if enabled, err := legacyKeyMigrationEnabled(); err != nil || enabled {
+		t.Fatalf("unset must mean no migration, got enabled=%v err=%v", enabled, err)
+	}
+	t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", "true")
+	if enabled, err := legacyKeyMigrationEnabled(); err != nil || !enabled {
+		t.Fatalf("literal true must enable migration, got enabled=%v err=%v", enabled, err)
+	}
+	t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", "  true  ")
+	if enabled, err := legacyKeyMigrationEnabled(); err != nil || !enabled {
+		t.Fatalf("whitespace-padded true must enable migration, got enabled=%v err=%v", enabled, err)
+	}
+	for _, v := range []string{"false", "TRUE", "True", "1", "yes", "ture", "on"} {
+		t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", v)
+		if _, err := legacyKeyMigrationEnabled(); err == nil {
+			t.Errorf("value %q must be rejected, not silently accepted", v)
+		}
+	}
+}
+
 // INVARIANT (shared with cmd/registry's tokenManagerFromEnv): whitespace is
 // used only to detect a missing/all-whitespace value; any nonblank configured
 // secret is preserved byte-for-byte as the HMAC key. Whitespace is a

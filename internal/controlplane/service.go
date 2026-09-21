@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -22,6 +23,11 @@ type Service struct {
 	RegistryTokens *auth.RegistryTokenIssuer
 	RegistryDomain string
 	Publisher      *Publisher
+	// FeedKeys is the AES-GCM cipher wrapping registry feed-owner signing keys
+	// at rest. Production startup requires it (cmd/controlplane loads the
+	// master-key file and fails closed when it is missing); operations that
+	// would otherwise store or expose plaintext fail closed when it is nil.
+	FeedKeys *FeedKeyCipher
 }
 
 type CreatedRegistry struct {
@@ -63,6 +69,9 @@ func (s *Service) Login(ctx context.Context, email string, password string) (Use
 }
 
 func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug string, ensName string, anonymousPull bool, defaultStampBatchID string) (CreatedRegistry, error) {
+	if s.FeedKeys == nil {
+		return CreatedRegistry{}, errFeedKeyCipherNotConfigured
+	}
 	privateKey, err := generatePrivateKeyHex()
 	if err != nil {
 		return CreatedRegistry{}, err
@@ -73,17 +82,20 @@ func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug st
 	}
 	host := slug + "." + s.RegistryDomain
 	registry := Registry{
-		Slug:                    slug,
-		Host:                    host,
-		ENSName:                 ensName,
-		OwnerUserID:             ownerUserID,
-		FeedOwnerAddress:        strings.ToLower(ethcrypto.PubkeyToAddress(key.PublicKey).Hex()),
-		EncryptedFeedPrivateKey: privateKey,
-		DefaultStampBatchID:     defaultStampBatchID,
-		AnonymousPull:           anonymousPull,
+		Slug:                slug,
+		Host:                host,
+		ENSName:             ensName,
+		OwnerUserID:         ownerUserID,
+		FeedOwnerAddress:    strings.ToLower(ethcrypto.PubkeyToAddress(key.PublicKey).Hex()),
+		DefaultStampBatchID: defaultStampBatchID,
+		AnonymousPull:       anonymousPull,
 	}
 
-	registry, err = s.Store.CreateRegistry(ctx, registry)
+	// The key is encrypted at rest by the store, inside the insert
+	// transaction, bound with AES-GCM AAD to the row's own ID and owner. The
+	// transient plaintext lives only in this frame (the hex string) and in the
+	// store's encryption call; nothing is ever persisted in plaintext.
+	registry, err = s.Store.CreateRegistry(ctx, registry, s.FeedKeys, privateKey)
 	if err != nil {
 		return CreatedRegistry{}, err
 	}
@@ -262,6 +274,96 @@ func (s *Service) UpdateCollaboratorPermissions(ctx context.Context, userID int6
 		return RegistryDashboard{}, err
 	}
 	return s.GetRegistryDashboard(ctx, userID, registryID)
+}
+
+// MigrateLegacyFeedKeys encrypts every legacy plaintext feed key at rest using
+// the configured cipher and clears the plaintext in the same per-row
+// transaction. It is invoked ONLY by cmd/controlplane startup when the
+// operator explicitly opts in (CONTROLPLANE_MIGRATE_LEGACY_KEYS=true); the
+// schema migration itself never touches legacy plaintext. Returns the number
+// of rows migrated. Errors are data-free (no key or owner material).
+func (s *Service) MigrateLegacyFeedKeys(ctx context.Context) (int, error) {
+	if s.FeedKeys == nil {
+		return 0, errFeedKeyCipherNotConfigured
+	}
+	return s.Store.MigrateLegacyFeedKeys(ctx, s.FeedKeys)
+}
+
+// FeedKeyReencryptResult reports a ReencryptFeedKeys pass. Reencrypted counts
+// rows rotated to the target version; Skipped counts rows left untouched
+// (rows not at fromVersion — e.g. already rotated in an earlier pass — and
+// rows without a stored key).
+type FeedKeyReencryptResult struct {
+	Reencrypted int
+	Skipped     int
+}
+
+// ReencryptFeedKeys rotates every registry feed key from fromVersion to
+// toVersion, one registry transaction at a time. The target version must be
+// the explicitly requested LOADED version (not merely `current`), the source
+// version must also be loaded (it is what authenticates the old rows), and
+// every row's owner is preserved: each row is decrypted under its own
+// ID/owner AAD and re-sealed under the same owner with the target version.
+// Rows not at fromVersion and rows without a stored key are skipped untouched,
+// so a pass interrupted midway is safe to resume. A row whose old ciphertext
+// fails authentication aborts the pass (fail closed) and is left fully
+// unchanged. Errors carry no key or owner material.
+func (s *Service) ReencryptFeedKeys(ctx context.Context, fromVersion, toVersion int) (FeedKeyReencryptResult, error) {
+	if s.FeedKeys == nil {
+		return FeedKeyReencryptResult{}, errFeedKeyCipherNotConfigured
+	}
+	if fromVersion == toVersion {
+		return FeedKeyReencryptResult{}, errors.New("re-encrypt feed keys: fromVersion and toVersion must differ")
+	}
+	if !s.FeedKeys.HasVersion(fromVersion) {
+		return FeedKeyReencryptResult{}, fmt.Errorf("re-encrypt feed keys: source version %d is not loaded", fromVersion)
+	}
+	if !s.FeedKeys.HasVersion(toVersion) {
+		return FeedKeyReencryptResult{}, fmt.Errorf("re-encrypt feed keys: target version %d is not loaded", toVersion)
+	}
+
+	registries, err := s.Store.ListRegistries(ctx)
+	if err != nil {
+		return FeedKeyReencryptResult{}, fmt.Errorf("re-encrypt feed keys: %w", err)
+	}
+	res := FeedKeyReencryptResult{}
+	for _, registry := range registries {
+		ok, err := s.Store.ReencryptRegistryFeedKey(ctx, registry.ID, registry.FeedOwnerAddress, fromVersion, toVersion, s.FeedKeys)
+		if err != nil {
+			return res, err
+		}
+		if ok {
+			res.Reencrypted++
+		} else {
+			res.Skipped++
+		}
+	}
+	return res, nil
+}
+
+// DecryptFeedKey resolves the transient plaintext signing key for a registry
+// from the row's OWN current stored context (fresh read), authenticating the
+// envelope with the row's ID and owner. The returned hex string is the
+// direct input for feed signing (Task 9/10 consume this boundary); the
+// intermediate byte buffer is zeroed before returning. Errors never contain
+// key or owner material.
+func (s *Service) DecryptFeedKey(ctx context.Context, registry Registry) (string, error) {
+	if s.FeedKeys == nil {
+		return "", errFeedKeyCipherNotConfigured
+	}
+	row, err := s.Store.FindRegistryByID(ctx, registry.ID)
+	if err != nil {
+		return "", fmt.Errorf("resolve feed key: %w", err)
+	}
+	if !row.FeedKeySet {
+		return "", errors.New("registry has no stored encrypted feed key")
+	}
+	plaintext, err := s.FeedKeys.Decrypt(row.ID, row.FeedOwnerAddress, row.FeedKey)
+	if err != nil {
+		return "", err
+	}
+	defer zeroBytes(plaintext)
+	return string(plaintext), nil
 }
 
 func (s *Service) RegisterAndAcceptInvite(ctx context.Context, token string, email string, password string) (User, Invite, string, error) {

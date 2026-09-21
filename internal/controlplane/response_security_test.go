@@ -27,7 +27,7 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	tokens := newTestSessionManager(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
 	client := &http.Client{
@@ -49,15 +49,18 @@ func TestPublicResponsesDoNotExposeSecrets(t *testing.T) {
 		t.Fatalf("login: %v", err)
 	}
 
-	// Seed a registry with a deterministic private key so any leak is detectable.
+	// Seed a registry with a deterministic marker so any leak is detectable.
+	// The marker lives in the at-rest ciphertext slot (never a plaintext key);
+	// the store writes it verbatim because no cipher is configured here.
 	created, err := store.CreateRegistry(context.Background(), Registry{
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
-		OwnerUserID:             alice.ID,
-		FeedOwnerAddress:        "0xfeed",
-		EncryptedFeedPrivateKey: knownRegistryPrivateKey,
-		DefaultStampBatchID:     "batch-1",
-		AnonymousPull:           false,
-	})
+		OwnerUserID:         alice.ID,
+		FeedOwnerAddress:    "0xfeed",
+		FeedKey:             EncryptedFeedKey{Ciphertext: []byte(knownRegistryPrivateKey)},
+		FeedKeySet:          true,
+		DefaultStampBatchID: "batch-1",
+		AnonymousPull:       false,
+	}, nil, "")
 	if err != nil {
 		t.Fatalf("create registry via store: %v", err)
 	}
@@ -129,7 +132,7 @@ func TestUIRegistryDetailDoesNotReconstructInviteToken(t *testing.T) {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	tokens := newTestSessionManager(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
 	client := &http.Client{
@@ -148,7 +151,7 @@ func TestUIRegistryDetailDoesNotReconstructInviteToken(t *testing.T) {
 		Slug: "alice", Host: "alice.uncloud-registry.com", ENSName: "alice.eth",
 		OwnerUserID: alice.ID, FeedOwnerAddress: "0xfeed", DefaultStampBatchID: "batch-1",
 		AnonymousPull: false,
-	})
+	}, nil, "")
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}

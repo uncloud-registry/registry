@@ -31,6 +31,28 @@ var migrations = []migration{
 		Version: 1,
 		Apply:   rebuildSchema,
 	},
+	// Version 2 adds the at-rest feed-key envelope columns. ciphertext and
+	// nonce are binary (BLOB), version is integer, per the Task 6 boundary;
+	// they are NULL until a row is encrypted (fresh registries are encrypted
+	// at creation; legacy plaintext rows are encrypted by the opt-in-gated
+	// MigrateLegacyFeedKeys operation, which also clears the legacy column in
+	// the same transaction). This migration is pure DDL and never reads,
+	// touches, or clears the legacy encrypted_feed_private_key column: legacy
+	// plaintext must only ever be read when the operator explicitly opts in
+	// (CONTROLPLANE_MIGRATE_LEGACY_KEYS=true) and a cipher is configured.
+	// The legacy column therefore survives as an empty vestigial column on
+	// migrated and fresh databases alike, and no code path (other than the
+	// gated migration) references it. Dropping it is deliberately deferred:
+	// the same migration must run on databases whose legacy rows still carry
+	// plaintext, and SQLite DROP COLUMN would discard that data.
+	{
+		Version: 2,
+		SQL: []string{
+			`alter table registries add column feed_key_ciphertext blob`,
+			`alter table registries add column feed_key_nonce blob`,
+			`alter table registries add column feed_key_version integer`,
+		},
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

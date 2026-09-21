@@ -15,7 +15,7 @@ func createTestRegistry(t *testing.T, store *Store, ownerID int64, slug, host st
 		Slug: slug, Host: host, ENSName: slug + ".eth",
 		OwnerUserID: ownerID, FeedOwnerAddress: "0xfeed", DefaultStampBatchID: "batch-1",
 		AnonymousPull: false,
-	})
+	}, nil, "")
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
