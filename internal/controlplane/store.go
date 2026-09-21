@@ -62,77 +62,15 @@ type Invite struct {
 }
 
 func OpenSQLite(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", withForeignKeys(path))
 	if err != nil {
 		return nil, err
 	}
 	store := &Store{DB: db}
-	if err := store.Migrate(context.Background()); err != nil {
+	if err := ApplyMigrations(context.Background(), db); err != nil {
 		return nil, err
 	}
 	return store, nil
-}
-
-func (s *Store) Migrate(ctx context.Context) error {
-	stmts := []string{
-		`create table if not exists users (
-			id integer primary key autoincrement,
-			email text not null unique,
-			password_hash text not null,
-			created_at text not null
-		)`,
-		`create table if not exists registries (
-			id integer primary key autoincrement,
-			slug text not null unique,
-			host text not null unique,
-			ens_name text not null,
-			owner_user_id integer not null,
-			feed_owner_address text not null,
-			encrypted_feed_private_key text not null,
-			default_stamp_batch_id text not null,
-			anonymous_pull integer not null,
-			created_at text not null
-		)`,
-		`create table if not exists registry_memberships (
-			id integer primary key autoincrement,
-			registry_id integer not null,
-			user_id integer not null,
-			role text not null,
-			can_pull integer not null default 1,
-			can_push integer not null default 0,
-			created_at text not null,
-			unique(registry_id, user_id)
-		)`,
-		`create table if not exists registry_invites (
-			id integer primary key autoincrement,
-			registry_id integer not null,
-			email text not null,
-			role text not null,
-			can_pull integer not null default 1,
-			can_push integer not null default 0,
-			token_hash text not null unique,
-			status text not null,
-			expires_at text not null,
-			created_at text not null
-		)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := s.DB.ExecContext(ctx, stmt); err != nil {
-			return err
-		}
-	}
-	alterStmts := []string{
-		`alter table registry_memberships add column can_pull integer not null default 1`,
-		`alter table registry_memberships add column can_push integer not null default 0`,
-		`alter table registry_invites add column can_pull integer not null default 1`,
-		`alter table registry_invites add column can_push integer not null default 0`,
-	}
-	for _, stmt := range alterStmts {
-		if _, err := s.DB.ExecContext(ctx, stmt); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
-			return err
-		}
-	}
-	return nil
 }
 
 func (s *Store) CreateUser(ctx context.Context, email string, passwordHash string) (User, error) {

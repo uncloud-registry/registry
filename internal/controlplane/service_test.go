@@ -142,8 +142,25 @@ func TestInviteExpires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	owner, err := store.CreateUser(context.Background(), "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	registry, err := store.CreateRegistry(context.Background(), Registry{
+		Slug:                    "alice",
+		Host:                    "alice.uncloud-registry.com",
+		ENSName:                 "alice.eth",
+		OwnerUserID:             owner.ID,
+		FeedOwnerAddress:        "0xfeed",
+		EncryptedFeedPrivateKey: "cipher",
+		DefaultStampBatchID:     "batch-1",
+		AnonymousPull:           true,
+	})
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
 	invite, token, err := store.CreateInvite(context.Background(), Invite{
-		RegistryID: 1,
+		RegistryID: registry.ID,
 		Email:      "test@example.com",
 		Role:       "member",
 		CanPull:    true,
