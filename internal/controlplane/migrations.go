@@ -11,35 +11,42 @@ import (
 // migration describes one ordered, versioned schema change. Each migration is
 // applied atomically in a single transaction and recorded in schema_migrations
 // only after every statement succeeds.
+//
+// A migration either runs a list of discrete DDL statements (SQL) or an
+// arbitrary, self-validating transaction body (Apply). Version 1 uses Apply to
+// perform an atomic table rebuild that physically installs the foreign-key
+// constraints on databases that already carry the pre-versioning schema.
 type migration struct {
 	Version int
 	SQL     []string
+	Apply   func(ctx context.Context, tx *sql.Tx) error
 }
 
 // migrations is the ordered list of schema versions. Version 1 establishes the
-// base constrained schema. Statements use "create table if not exists" so that
-// databases already carrying the pre-versioning control-plane schema are left
-// untouched and simply have their version recorded (see TestUpgradeCurrentSchema).
-var migrations = []migration{{
-	Version: 1,
-	SQL: []string{
-		`create table if not exists schema_migrations (version integer primary key, applied_at text not null)`,
-		`create table if not exists users (id integer primary key autoincrement, email text not null unique, password_hash text not null, created_at text not null)`,
-		`create table if not exists registries (id integer primary key autoincrement, slug text not null unique, host text not null unique, ens_name text not null, owner_user_id integer not null references users(id), feed_owner_address text not null, encrypted_feed_private_key text not null, default_stamp_batch_id text not null, anonymous_pull integer not null, created_at text not null)`,
-		`create table if not exists registry_memberships (id integer primary key autoincrement, registry_id integer not null references registries(id) on delete cascade, user_id integer not null references users(id) on delete cascade, role text not null, can_pull integer not null, can_push integer not null, created_at text not null, unique(registry_id,user_id))`,
-		`create table if not exists registry_invites (id integer primary key autoincrement, registry_id integer not null references registries(id) on delete cascade, email text not null, role text not null, can_pull integer not null, can_push integer not null, token_hash text not null unique, status text not null, expires_at text not null, created_at text not null)`,
+// base constrained schema for brand-new databases and, via rebuildSchema, also
+// upgrades databases that already carry the pre-versioning control-plane schema
+// (same columns, no foreign keys) so the promised foreign keys PHYSICALLY exist.
+var migrations = []migration{
+	{
+		Version: 1,
+		Apply:   rebuildSchema,
 	},
-}}
+}
 
-// enableForeignKeys turns on foreign-key enforcement on the target connection.
-// SQLite only honors this pragma outside an active transaction, so every
-// connection that matters must set it via its DSN (see withForeignKeys); this
-// statement is emitted defensively on the migration transaction as well.
-const enableForeignKeys = `PRAGMA foreign_keys = ON`
+// enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only
+// honors this pragma when no transaction is active, so a no-op statement inside
+// a transaction is meaningless; foreign-key enforcement is instead enabled
+// per-connection via the DSN (_pragma=foreign_keys(1), see withForeignKeys),
+// which every pooled connection inherits at open. The atomic table rebuild relied
+// on in migration 1 therefore runs with FK enforcement active throughout and is
+// proven to behave correctly by TestUpgradeCurrentSchema and
+// TestUpgradeRejectsOrphanedLegacyData.
 
 // ApplyMigrations advances db to the latest schema version. Each migration is
 // applied in its own transaction; the migration row is committed only after all
-// of its statements succeed, so a partially applied migration is rolled back.
+// of its statements (and any post-apply foreign_key_check) succeed, so a failed
+// migration — including one rejected because the legacy data is orphaned — is
+// fully rolled back and never recorded.
 func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 	if _, err := db.ExecContext(ctx, `create table if not exists schema_migrations (version integer primary key, applied_at text not null)`); err != nil {
 		return fmt.Errorf("ensure schema_migrations exists: %w", err)
@@ -60,9 +67,9 @@ func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// applyMigration runs one migration's statements atomically inside a transaction,
-// enabling foreign keys on the transaction connection first, and records the
-// migration row only after every statement succeeds.
+// applyMigration runs one migration's body atomically inside a transaction and
+// records the migration row only after every statement and the post-apply
+// validation succeed.
 func applyMigration(ctx context.Context, db *sql.DB, m migration) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -70,14 +77,24 @@ func applyMigration(ctx context.Context, db *sql.DB, m migration) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, enableForeignKeys); err != nil {
-		return fmt.Errorf("enable foreign keys: %w", err)
-	}
-	for _, stmt := range m.SQL {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("execute statement %q: %w", stmt, err)
+	if m.Apply != nil {
+		if err := m.Apply(ctx, tx); err != nil {
+			return err
+		}
+	} else {
+		for _, stmt := range m.SQL {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("execute statement %q: %w", stmt, err)
+			}
 		}
 	}
+
+	// Post-apply validation: the schema must be fully consistent before the
+	// migration is recorded.
+	if err := assertNoForeignKeyViolations(ctx, tx); err != nil {
+		return fmt.Errorf("post-apply foreign key validation: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx, `insert into schema_migrations (version, applied_at) values (?, ?)`,
 		m.Version, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return fmt.Errorf("record migration %d: %w", m.Version, err)
@@ -86,6 +103,20 @@ func applyMigration(ctx context.Context, db *sql.DB, m migration) error {
 		return fmt.Errorf("commit migration %d: %w", m.Version, err)
 	}
 	return nil
+}
+
+// assertNoForeignKeyViolations fails if PRAGMA foreign_key_check reports any
+// row, i.e. the schema is not referentially consistent.
+func assertNoForeignKeyViolations(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return fmt.Errorf("foreign_key_check reported a constraint violation")
+	}
+	return rows.Err()
 }
 
 // CurrentSchemaVersion returns the highest applied schema version (0 when the
@@ -118,4 +149,142 @@ func withForeignKeys(dsn string) string {
 		sep = "&"
 	}
 	return dsn + sep + "_pragma=foreign_keys(1)"
+}
+
+// Table names and the canonical constrained schema (migration version 1).
+const (
+	tableUsers     = "users"
+	tableRegistries = "registries"
+	tableMemberships = "registry_memberships"
+	tableInvites   = "registry_invites"
+)
+
+// desiredSchema returns DDL statements for the fully constrained clone of every
+// control-plane table. Clones reference each other by their *_new names so that
+// the final RENAME (with foreign keys ON) rewrites those references to the final
+// table names automatically.
+func desiredSchema(suffix string) []string {
+	return []string{
+		fmt.Sprintf(`create table %s%s (
+			id integer primary key autoincrement,
+			email text not null unique,
+			password_hash text not null,
+			created_at text not null
+		)`, tableUsers, suffix),
+		fmt.Sprintf(`create table %s%s (
+			id integer primary key autoincrement,
+			slug text not null unique,
+			host text not null unique,
+			ens_name text not null,
+			owner_user_id integer not null references %s%s(id),
+			feed_owner_address text not null,
+			encrypted_feed_private_key text not null,
+			default_stamp_batch_id text not null,
+			anonymous_pull integer not null,
+			created_at text not null
+		)`, tableRegistries, suffix, tableUsers, suffix),
+		fmt.Sprintf(`create table %s%s (
+			id integer primary key autoincrement,
+			registry_id integer not null references %s%s(id) on delete cascade,
+			user_id integer not null references %s%s(id) on delete cascade,
+			role text not null,
+			can_pull integer not null,
+			can_push integer not null,
+			created_at text not null,
+			unique(registry_id, user_id)
+		)`, tableMemberships, suffix, tableRegistries, suffix, tableUsers, suffix),
+		fmt.Sprintf(`create table %s%s (
+			id integer primary key autoincrement,
+			registry_id integer not null references %s%s(id) on delete cascade,
+			email text not null,
+			role text not null,
+			can_pull integer not null,
+			can_push integer not null,
+			token_hash text not null unique,
+			status text not null,
+			expires_at text not null,
+			created_at text not null
+		)`, tableInvites, suffix, tableRegistries, suffix),
+	}
+}
+
+// rebuildSchema atomically converts the current schema (whether a fresh
+// database, or a legacy pre-versioning database carrying the same columns with
+// no foreign keys) into the physically constrained schema, preserving every
+// existing row and its ID.
+//
+// Procedure (all inside the migration transaction, foreign-key enforcement left
+// ON — inherited per-connection from the DSN pragma):
+//
+//  1. Create *_new clones whose foreign keys reference the *_new parents.
+//  2. Copy existing rows parent-first. Foreign-key enforcement during the copy
+//     is the validation: an orphaned legacy row (e.g. a registry_memberships row
+//     whose registry_id has no matching registries row) fails the INSERT and
+//     rolls the whole transaction back, so the orphaned legacy data is never
+//     deleted, mutated, or silently "repaired", and version 1 is never recorded.
+//  3. DROP the legacy tables (children before parents).
+//  4. RENAME the *_new clones onto the final table names. With foreign keys ON,
+//     SQLite rewrites each clone's *_new references to the final names.
+//
+// On a fresh database no legacy tables exist, so no rows are copied, nothing is
+// dropped, and the clones are simply renamed into place — yielding the identical
+// constrained schema.
+func rebuildSchema(ctx context.Context, tx *sql.Tx) error {
+	const suffix = "_new"
+
+	// 1. Create the fully-constrained clones.
+	for _, stmt := range desiredSchema(suffix) {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create constrained clone: %w", err)
+		}
+	}
+
+	// 2. Copy existing rows, parent-first (drop/rename order is the reverse).
+	//    Table existence is checked so fresh databases (no legacy tables) skip
+	//    the copy and the drop without harming the outcome.
+	for _, t := range []string{tableUsers, tableRegistries, tableMemberships, tableInvites} {
+		exists, err := tableExists(ctx, tx, t)
+		if err != nil {
+			return fmt.Errorf("check legacy table %s: %w", t, err)
+		}
+		if !exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`insert into %s%s select * from %s`, t, suffix, t)); err != nil {
+			// An orphaned row fails here (FK enforcement during the copy); the
+			// deferred rollback discards the clones and never records version 1.
+			return fmt.Errorf("copy legacy rows from %s: %w", t, err)
+		}
+	}
+
+	// 3. Drop legacy tables, children before parents.
+	for _, t := range []string{tableMemberships, tableInvites, tableRegistries, tableUsers} {
+		exists, err := tableExists(ctx, tx, t)
+		if err != nil {
+			return fmt.Errorf("check legacy table %s: %w", t, err)
+		}
+		if !exists {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`drop table %s`, t)); err != nil {
+			return fmt.Errorf("drop legacy table %s: %w", t, err)
+		}
+	}
+
+	// 4. Rename clones onto the final names (FK ON rewrites *_new references).
+	for _, t := range []string{tableUsers, tableRegistries, tableMemberships, tableInvites} {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`alter table %s%s rename to %s`, t, suffix, t)); err != nil {
+			return fmt.Errorf("rename %s%s to %s: %w", t, suffix, t, err)
+		}
+	}
+
+	return nil
+}
+
+func tableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'table' and name = ?`, name).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
