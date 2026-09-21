@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/golang-jwt/jwt/v4"
 )
@@ -19,8 +20,12 @@ import (
 // with session tokens.
 const (
 	RegistryTokenType = "registry"
-	RegistryIssuer    = "uncloud-registry/control-plane"
-	accessTypeRepo    = "repository"
+	// RegistryIssuer is the issuer namespace for Ed25519 registry tokens. It is
+	// intentionally distinct from DefaultSessionIssuer so a single token cannot
+	// be valid for both control-plane sessions and registry scope by issuer
+	// alone.
+	RegistryIssuer = "uncloud-registry/registry"
+	accessTypeRepo = "repository"
 )
 
 // RegistryAccess is one repository scope entry inside a registry token.
@@ -195,7 +200,9 @@ func (v *RegistryTokenVerifier) Verify(raw, service, repository string, action A
 	if claims.Service != service || claims.Service != v.service {
 		return empty, errors.New("registry token service mismatch")
 	}
-	if !hasAudience(claims.Audience, service) {
+	// Require exactly one audience equal to the requested service; extra
+	// audiences are rejected rather than tolerated.
+	if len(claims.Audience) != 1 || claims.Audience[0] != service {
 		return empty, errors.New("registry token audience mismatch")
 	}
 	if claims.Subject == "" {
@@ -206,6 +213,9 @@ func (v *RegistryTokenVerifier) Verify(raw, service, repository string, action A
 	}
 	if claims.ExpiresAt == nil {
 		return empty, errors.New("registry token missing expiry")
+	}
+	if claims.IssuedAt == nil {
+		return empty, errors.New("registry token missing issued-at")
 	}
 
 	// Parse the access list, failing closed on any malformed, unknown, or
@@ -268,8 +278,9 @@ func knownActions(actions []Action, repo string) (map[Action]struct{}, error) {
 
 // ParseDockerScope parses a Docker token scope exactly as
 // "repository:<name>:<comma-separated-actions>". It rejects missing/extra
-// fields, an empty repository, and empty, duplicate, or unknown actions, and it
-// normalizes nothing silently. Identifiers are preserved literally.
+// fields, an empty repository, whitespace anywhere inside the repository
+// component (leading, trailing, or interior — never normalized silently), and
+// empty, duplicate, or unknown actions. Identifiers are preserved literally.
 func ParseDockerScope(scope string) (repository string, actions []Action, err error) {
 	parts := strings.Split(scope, ":")
 	if len(parts) != 3 {
@@ -281,6 +292,9 @@ func ParseDockerScope(scope string) (repository string, actions []Action, err er
 	repository = parts[1]
 	if repository == "" {
 		return "", nil, fmt.Errorf("invalid scope %q: empty repository name", scope)
+	}
+	if i := firstSpaceIndex(repository); i >= 0 {
+		return "", nil, fmt.Errorf("invalid scope %q: repository name must not contain whitespace", scope)
 	}
 
 	rawActions := strings.Split(parts[2], ",")
@@ -309,4 +323,16 @@ func newJWTID() string {
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(raw)
+}
+
+// firstSpaceIndex returns the index of the first Unicode/ASCII whitespace rune
+// in s, or -1 if none exists. It catches leading, trailing, and interior
+// whitespace so no repository component is ever normalized silently.
+func firstSpaceIndex(s string) int {
+	for i, r := range s {
+		if unicode.IsSpace(r) {
+			return i
+		}
+	}
+	return -1
 }

@@ -310,6 +310,106 @@ func (m *memoryUploader) Put(_ context.Context, data []byte, _ string) (string, 
 	return ref, nil
 }
 
+func TestAnonymousPullNeverBroadensMemberPush(t *testing.T) {
+	t.Parallel()
+
+	store, err := OpenSQLite("file:controlplane_test_anon_matrix?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	manager := newTestSessionManager(t)
+	registryTokens, pubKeys := newTestRegistryPair(t)
+	service := &Service{
+		Store:          store,
+		Tokens:         manager,
+		RegistryTokens: registryTokens,
+		RegistryDomain: "uncloud-registry.com",
+	}
+
+	alice, _, err := service.RegisterUser(context.Background(), "alice@example.com", "password123")
+	if err != nil {
+		t.Fatalf("register alice: %v", err)
+	}
+	// anonymousPull=false initially.
+	created, err := service.CreateRegistry(context.Background(), alice.ID, "alice", "alice.eth", false, "batch-1")
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	host := created.Registry.Host
+
+	// bob is a member with pull-only permission (CanPush=false).
+	bob, _, err := service.RegisterUser(context.Background(), "bob@example.com", "password123")
+	if err != nil {
+		t.Fatalf("register bob: %v", err)
+	}
+	_, inviteToken, err := service.CreateInvite(context.Background(), created.Registry.ID, alice.ID, "bob@example.com", true, false)
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, err := service.AcceptInvite(context.Background(), inviteToken, bob.ID); err != nil {
+		t.Fatalf("accept invite: %v", err)
+	}
+
+	// carol has no membership.
+	carol, _, err := service.RegisterUser(context.Background(), "carol@example.com", "password123")
+	if err != nil {
+		t.Fatalf("register carol: %v", err)
+	}
+	_ = carol
+
+	issue := func(email, password, scope string) error {
+		_, err := service.IssueRegistryToken(context.Background(), host, scope, email, password)
+		return err
+	}
+
+	// Explicit matrix: member without push on a NON-anonymous registry.
+	if err := issue("bob@example.com", "password123", "repository:backend/api:push"); err == nil {
+		t.Fatal("expected pull-only member push to be denied on non-anonymous registry")
+	}
+	if err := issue("bob@example.com", "password123", "repository:backend/api:pull"); err != nil {
+		t.Fatalf("expected pull-only member pull to be allowed on non-anonymous registry: %v", err)
+	}
+	if err := issue("carol@example.com", "password123", "repository:backend/api:pull"); err == nil {
+		t.Fatal("expected non-member pull to be denied on non-anonymous registry")
+	}
+
+	// Turn on anonymous pull. Anonymous pull must NOT grant push to a member
+	// who lacks push permission.
+	if _, err := service.UpdateRegistrySettings(context.Background(), alice.ID, created.Registry.ID, true, "batch-1"); err != nil {
+		t.Fatalf("update to anonymous pull: %v", err)
+	}
+
+	if err := issue("bob@example.com", "password123", "repository:backend/api:push"); err == nil {
+		t.Fatal("expected pull-only member push to be denied even on anonymous-pull registry (anonymous pull authorizes pull only)")
+	}
+	if err := issue("bob@example.com", "password123", "repository:backend/api:pull"); err != nil {
+		t.Fatalf("expected pull-only member pull to be allowed on anonymous-pull registry: %v", err)
+	}
+	// Anonymous pull authorizes anonymous (non-member) pull.
+	if err := issue("carol@example.com", "password123", "repository:backend/api:pull"); err != nil {
+		t.Fatalf("expected anonymous non-member pull on anonymous-pull registry: %v", err)
+	}
+	// But never anonymous push, even on an anonymous-pull registry.
+	if err := issue("carol@example.com", "password123", "repository:backend/api:push"); err == nil {
+		t.Fatal("expected anonymous non-member push to be denied on anonymous-pull registry")
+	}
+
+	// The issued pull token for bob still verifies against the registry verifier
+	// with the pull action and a read subject.
+	regToken, err := service.IssueRegistryToken(context.Background(), host, "repository:backend/api:pull", "bob@example.com", "password123")
+	if err != nil {
+		t.Fatalf("issue bob pull token: %v", err)
+	}
+	verifier := auth.NewRegistryTokenVerifier(staticTestKeySet(pubKeys), auth.RegistryIssuer, host)
+	principal, err := verifier.Verify(regToken, host, "backend/api", auth.ActionPull)
+	if err != nil {
+		t.Fatalf("verify bob pull token: %v", err)
+	}
+	if principal.Subject != "role:read" {
+		t.Fatalf("expected read subject for pull-only member, got %q", principal.Subject)
+	}
+}
+
 func TestPublisherBuildsBootstrapDocuments(t *testing.T) {
 	t.Parallel()
 
@@ -347,11 +447,15 @@ func TestPublisherBuildsBootstrapDocuments(t *testing.T) {
 	}
 }
 
+// controlplaneTestSecret is a strong, test-only HMAC secret (>=32 bytes) used
+// by newTestSessionManager.
+const controlplaneTestSecret = "controlplane-test-session-secret-0123456789abcdef"
+
 // newTestSessionManager builds a control-plane session token manager with the
 // default issuer/audience and a fixed test-only secret.
 func newTestSessionManager(t *testing.T) *auth.SessionTokenManager {
 	t.Helper()
-	m, err := auth.NewSessionTokenManager("secret", auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	m, err := auth.NewSessionTokenManager(controlplaneTestSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
 	if err != nil {
 		t.Fatalf("new session token manager: %v", err)
 	}

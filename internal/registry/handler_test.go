@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/policy"
@@ -24,7 +25,7 @@ func TestManifestAndBlobPullViaRepoState(t *testing.T) {
 	docs.Documents["manifest-ref"] = []byte(`{"schemaVersion":2}`)
 	docs.Documents["blob-ref"] = []byte("blob-bytes")
 
-	handler := newTestHandler(docs, feeds)
+	handler := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -81,7 +82,7 @@ func TestPullRequiresAuthWhenAnonymousNotAllowed(t *testing.T) {
 		"repos":{"backend/api":{"pull":["user:alice"],"push":["user:alice"]}}
 	}`)
 
-	handler := newTestHandler(docs, feeds)
+	handler := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -118,7 +119,7 @@ func TestAuthenticatedPullAllowedByPolicy(t *testing.T) {
 		"repos":{"backend/api":{"pull":["user:alice"],"push":["user:alice"]}}
 	}`)
 
-	handler := newTestHandler(docs, feeds)
+	handler := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -127,7 +128,7 @@ func TestAuthenticatedPullAllowedByPolicy(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Host = "alice.uncloud-registry.com"
-	req.Header.Set("Authorization", "Bearer user:alice")
+	req.Header.Set("Authorization", sessionBearer(t, "user:alice"))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -147,7 +148,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	feeds := resolve.NewMemoryFeedStore()
 	seedRegistryDocuments(t, docs, feeds)
 
-	handler := newTestHandler(docs, feeds)
+	handler := newTestHandler(t, docs, feeds)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 
@@ -156,7 +157,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 		t.Fatalf("create start upload request: %v", err)
 	}
 	startReq.Host = "alice.uncloud-registry.com"
-	startReq.Header.Set("Authorization", "Bearer user:alice")
+	startReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
 
 	startResp, err := http.DefaultClient.Do(startReq)
 	if err != nil {
@@ -177,7 +178,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 		t.Fatalf("create patch request: %v", err)
 	}
 	patchReq.Host = "alice.uncloud-registry.com"
-	patchReq.Header.Set("Authorization", "Bearer user:alice")
+	patchReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
 
 	patchResp, err := http.DefaultClient.Do(patchReq)
 	if err != nil {
@@ -194,7 +195,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 		t.Fatalf("create finalize request: %v", err)
 	}
 	finalizeReq.Host = "alice.uncloud-registry.com"
-	finalizeReq.Header.Set("Authorization", "Bearer user:alice")
+	finalizeReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
 	finalizeReq.Header.Set("Content-Type", "application/vnd.oci.image.config.v1+json")
 
 	finalizeResp, err := http.DefaultClient.Do(finalizeReq)
@@ -218,7 +219,7 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 		t.Fatalf("create manifest request: %v", err)
 	}
 	manifestReq.Host = "alice.uncloud-registry.com"
-	manifestReq.Header.Set("Authorization", "Bearer user:alice")
+	manifestReq.Header.Set("Authorization", sessionBearer(t, "user:alice"))
 	manifestReq.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
 
 	manifestResp, err := http.DefaultClient.Do(manifestReq)
@@ -248,9 +249,35 @@ func TestPushBlobAndPublishManifest(t *testing.T) {
 	}
 }
 
-func newTestHandler(docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) http.Handler {
+// registryTestSessionSecret is a strong, test-only HMAC secret (>=32 bytes).
+const registryTestSessionSecret = "registry-test-session-secret-0123456789abcdef"
+
+// newTestSessionManager builds a session manager bound to the shared test
+// secret; any manager built from this secret can verify tokens it issues.
+func newTestSessionManager(t *testing.T) *auth.SessionTokenManager {
+	t.Helper()
+	m, err := auth.NewSessionTokenManager(registryTestSessionSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	if err != nil {
+		t.Fatalf("new session manager: %v", err)
+	}
+	return m
+}
+
+// sessionBearer issues a valid session token for subject and returns the full
+// `Bearer <token>` Authorization header value the handler expects.
+func sessionBearer(t *testing.T, subject string) string {
+	t.Helper()
+	raw, err := newTestSessionManager(t).Issue(subject, time.Hour)
+	if err != nil {
+		t.Fatalf("issue session token: %v", err)
+	}
+	return "Bearer " + raw
+}
+
+func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) http.Handler {
+	t.Helper()
 	stageStore := staging.NewMemoryStore()
-	subjects := auth.SubjectResolver{}
+	subjects := auth.SubjectResolver{Tokens: newTestSessionManager(t)}
 	return NewHandler(
 		resolve.RegistryResolver{
 			Registries: resolve.StaticRegistryIdentityResolver{

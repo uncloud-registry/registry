@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	testIssuer  = "uncloud-registry/control-plane"
+	testIssuer  = RegistryIssuer
 	testService = "alice.example.test"
 	testSubject = "role:write"
 	testRepo    = "backend/api"
@@ -85,6 +85,9 @@ func (p *testPair) rawSign(claims RegistryClaims, overrides *testRawOverrides) s
 	if claims.ExpiresAt == nil {
 		claims.ExpiresAt = jwt.NewNumericDate(t.Add(time.Hour))
 	}
+	if claims.IssuedAt == nil {
+		claims.IssuedAt = jwt.NewNumericDate(t)
+	}
 	if claims.Issuer == "" {
 		claims.Issuer = testIssuer
 	}
@@ -120,6 +123,19 @@ type testRawOverrides struct {
 	hmacSecret []byte
 }
 
+// signExact signs the given claims exactly as-is without filling any defaults,
+// using the pair's private key and the test kid. It is used to exercise claim
+// presence/absence checks that the default-filling rawSign cannot reproduce.
+func (p *testPair) signExact(claims RegistryClaims) string {
+	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = testKeyID
+	signed, err := token.SignedString(p.priv)
+	if err != nil {
+		panic(err)
+	}
+	return signed
+}
+
 func TestParseDockerScope(t *testing.T) {
 	t.Parallel()
 
@@ -152,6 +168,12 @@ func TestParseDockerScope(t *testing.T) {
 		// trailing/leading space is NOT normalized silently
 		{" repository:backend/api:pull", "", nil, "unsupported scope type"},
 		{"repository:backend/api:pull ", "", nil, "unknown action"},
+		// whitespace anywhere inside the repository component is rejected untouched
+		{"repository: backend/api:pull", "", nil, "whitespace"},
+		{"repository:backend/ api:pull", "", nil, "whitespace"},
+		{"repository:backend/api :pull", "", nil, "whitespace"},
+		{"repository: backend/api :pull,push", "", nil, "whitespace"},
+		{"repository:back	end/api:pull", "", nil, "whitespace"},
 	}
 	for _, tc := range cases {
 		repo, acts, err := ParseDockerScope(tc.scope)
@@ -328,7 +350,7 @@ func TestRegistryTokenVerifierRejectsWrongService(t *testing.T) {
 func TestRegistryTokenVerifierRejectsSessionToken(t *testing.T) {
 	t.Parallel()
 	p := newTestRegistryPair(t)
-	sess, err := NewSessionTokenManager("separate-session-secret", testIssuer, DefaultSessionAudience)
+	sess, err := NewSessionTokenManager(testSessionManagerSecret, testIssuer, DefaultSessionAudience)
 	if err != nil {
 		t.Fatalf("new session manager: %v", err)
 	}
@@ -409,4 +431,105 @@ func mustGeneratePrivateKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatalf("generate key: %v", err)
 	}
 	return priv
+}
+
+func TestRegistryTokenVerifierRejectsMissingExpiry(t *testing.T) {
+	t.Parallel()
+	p := newTestRegistryPair(t)
+	raw := p.signExact(RegistryClaims{
+		TokenType: RegistryTokenType,
+		Service:   testService,
+		Access:    []RegistryAccess{{Type: "repository", Name: testRepo, Actions: []Action{ActionPush}}},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:  testSubject,
+			Issuer:   testIssuer,
+			Audience: jwt.ClaimStrings{testService},
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+			ID:       "jti",
+		},
+	})
+	if _, err := p.verifier.Verify(raw, testService, testRepo, ActionPush); err == nil {
+		t.Fatal("expected registry token with missing expiry to be rejected")
+	}
+}
+
+func TestRegistryTokenVerifierRejectsMissingIssuedAt(t *testing.T) {
+	t.Parallel()
+	p := newTestRegistryPair(t)
+	raw := p.signExact(RegistryClaims{
+		TokenType: RegistryTokenType,
+		Service:   testService,
+		Access:    []RegistryAccess{{Type: "repository", Name: testRepo, Actions: []Action{ActionPush}}},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   testSubject,
+			Issuer:    testIssuer,
+			Audience:  jwt.ClaimStrings{testService},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			ID:        "jti",
+		},
+	})
+	if _, err := p.verifier.Verify(raw, testService, testRepo, ActionPush); err == nil {
+		t.Fatal("expected registry token with missing issued-at to be rejected")
+	}
+}
+
+func TestRegistryTokenVerifierRejectsFutureIssuedAt(t *testing.T) {
+	t.Parallel()
+	p := newTestRegistryPair(t)
+	raw := p.signExact(RegistryClaims{
+		TokenType: RegistryTokenType,
+		Service:   testService,
+		Access:    []RegistryAccess{{Type: "repository", Name: testRepo, Actions: []Action{ActionPush}}},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   testSubject,
+			Issuer:    testIssuer,
+			Audience:  jwt.ClaimStrings{testService},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now().Add(30 * time.Minute)),
+			ID:        "jti",
+		},
+	})
+	if _, err := p.verifier.Verify(raw, testService, testRepo, ActionPush); err == nil {
+		t.Fatal("expected registry token issued in the future to be rejected")
+	}
+}
+
+func TestRegistryTokenVerifierRejectsMultipleAudiences(t *testing.T) {
+	t.Parallel()
+	p := newTestRegistryPair(t)
+	// Expected service plus an extra audience must be rejected, not tolerated.
+	raw := p.signExact(RegistryClaims{
+		TokenType: RegistryTokenType,
+		Service:   testService,
+		Access:    []RegistryAccess{{Type: "repository", Name: testRepo, Actions: []Action{ActionPush}}},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   testSubject,
+			Issuer:    testIssuer,
+			Audience:  jwt.ClaimStrings{testService, "extra-audience"},
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ID:        "jti",
+		},
+	})
+	if _, err := p.verifier.Verify(raw, testService, testRepo, ActionPush); err == nil {
+		t.Fatal("expected registry token with multiple audiences to be rejected")
+	}
+}
+
+func TestRegistryTokenVerifierRejectsSessionIssuerNamespace(t *testing.T) {
+	t.Parallel()
+	p := newTestRegistryPair(t)
+	// A token otherwise structurally valid but claiming the session issuer
+	// namespace must be rejected: the registry verifier only trusts the registry
+	// issuer.
+	raw := p.rawSign(RegistryClaims{
+		Service: testService,
+		Access:  []RegistryAccess{{Type: "repository", Name: testRepo, Actions: []Action{ActionPush}}},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer: DefaultSessionIssuer,
+		},
+	}, nil)
+	if _, err := p.verifier.Verify(raw, testService, testRepo, ActionPush); err == nil {
+		t.Fatal("expected registry token stamped with the session issuer to be rejected")
+	}
 }

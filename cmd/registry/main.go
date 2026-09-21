@@ -33,7 +33,7 @@ func main() {
 func buildHandler() (http.Handler, error) {
 	switch envOrDefault("REGISTRY_BACKEND", "memory") {
 	case "memory":
-		return buildMemoryHandler(), nil
+		return buildMemoryHandler()
 	case "bee":
 		return buildBeeHandler()
 	default:
@@ -41,12 +41,16 @@ func buildHandler() (http.Handler, error) {
 	}
 }
 
-func buildMemoryHandler() http.Handler {
+func buildMemoryHandler() (http.Handler, error) {
 	docs := resolve.NewMemoryDocumentStore()
 	feeds := resolve.NewMemoryFeedStore()
 	subjects := auth.SubjectResolver{}
 	authRealm := envOrDefault("REGISTRY_AUTH_REALM", "https://auth.uncloud-registry.com/token")
-	if manager, err := tokenManagerFromEnv(); err == nil {
+	manager, err := tokenManagerFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	if manager != nil {
 		subjects = auth.SubjectResolver{Tokens: manager}
 	}
 
@@ -72,7 +76,7 @@ func buildMemoryHandler() http.Handler {
 			Feeds:   feeds,
 		},
 		authRealm,
-	)
+	), nil
 }
 
 func buildBeeHandler() (http.Handler, error) {
@@ -85,12 +89,16 @@ func buildBeeHandler() (http.Handler, error) {
 	feeds := swarm.IdentityFeedResolver{}
 	subjects := auth.SubjectResolver{}
 	authRealm := envOrDefault("REGISTRY_AUTH_REALM", "https://auth.uncloud-registry.com/token")
-	registryResolver, err := buildRegistryIdentityResolver()
+	manager, err := tokenManagerFromEnv()
 	if err != nil {
 		return nil, err
 	}
-	if manager, err := tokenManagerFromEnv(); err == nil {
+	if manager != nil {
 		subjects = auth.SubjectResolver{Tokens: manager}
+	}
+	registryResolver, err := buildRegistryIdentityResolver()
+	if err != nil {
+		return nil, err
 	}
 
 	var feedUpdater publish.FeedUpdater = swarm.DisabledFeedUpdater{
@@ -136,6 +144,11 @@ func envOrDefault(name string, fallback string) string {
 	return fallback
 }
 
+// tokenManagerFromEnv builds a session manager from REGISTRY_TOKEN_SECRET. When
+// the variable is absent the resolver fails closed (no session subjects are
+// authorized). When present but empty/weak, NewSessionTokenManager rejects it
+// and the error is returned so startup config construction fails rather than
+// silently falling back to a nil manager.
 func tokenManagerFromEnv() (*auth.SessionTokenManager, error) {
 	secret := strings.TrimSpace(os.Getenv("REGISTRY_TOKEN_SECRET"))
 	if secret == "" {

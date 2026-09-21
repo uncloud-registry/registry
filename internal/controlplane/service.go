@@ -314,7 +314,10 @@ func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope str
 	for _, a := range actions {
 		switch a {
 		case auth.ActionPush:
-			if !membership.CanPush && !registry.AnonymousPull {
+			// Anonymous pull authorizes pull only: a member (or any actor)
+			// without push permission must be denied push even when the
+			// registry allows anonymous pulls.
+			if !membership.CanPush {
 				return "", fmt.Errorf("user is not allowed to push to this registry")
 			}
 		case auth.ActionPull:
