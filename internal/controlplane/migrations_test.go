@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -474,10 +475,17 @@ func TestWithForeignKeysNormalizesDSN(t *testing.T) {
 
 // TestForeignKeysEnforcedAcrossPooledConnectionsWithCustomDSN opens a database
 // whose DSN carries an unrelated pragma (_pragma=busy_timeout) and an explicit
-// foreign_keys(0), passes it through withForeignKeys, and proves (a) the
-// unrelated busy_timeout pragma still applies to the opened connections and
-// (b) foreign-key enforcement is active on MULTIPLE independently acquired
-// *sql.Conn connections from the pool — not just the first.
+// foreign_keys(0), passes it through withForeignKeys, and proves, across
+// MULTIPLE simultaneously held *sql.Conn values (each a DISTINCT physical
+// connection, verified by driver pointer identity), that (a) foreign-key
+// enforcement is active on every one — not just the first pooled conn — while
+// (b) the unrelated busy_timeout pragma also still applies to every connection.
+//
+// The prior test acquired and closed each *sql.Conn sequentially, so the pool
+// reused one idle physical connection and could not prove cross-pool
+// enforcement. This version HOLDs poolSize connections at once; until one is
+// closed none returns to the pool, forcing database/sql to open poolSize
+// DISTINCT physical connections to the shared cache.
 func TestForeignKeysEnforcedAcrossPooledConnectionsWithCustomDSN(t *testing.T) {
 	customDSN := "file:fkpool_test?mode=memory&cache=shared&_pragma=busy_timeout(7000)&_pragma=foreign_keys(0)"
 
@@ -486,10 +494,15 @@ func TestForeignKeysEnforcedAcrossPooledConnectionsWithCustomDSN(t *testing.T) {
 		t.Fatalf("open sqlite with custom DSN: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	// Force the pool to be able to hand out several independent physical
-	// connections so the test genuinely exercises multiple acquisition points.
-	db.SetMaxOpenConns(8)
-	db.SetMaxIdleConns(8)
+
+	// We HOLD exactly poolSize *sql.Conn simultaneously, so every held Conn maps
+	// to its own physical connection. Acquiring exactly maxOpenConns never blocks
+	// a Conn(ctx), so there is no deadlock. SetMaxOpenConns alone is insufficient
+	// to prove multiple physical connections (the round-1 finding); the
+	// concurrent hold + driver-pointer distinctness assertion below is the proof.
+	const poolSize = 8
+	db.SetMaxOpenConns(poolSize)
+	db.SetMaxIdleConns(poolSize)
 
 	ctx := context.Background()
 
@@ -504,61 +517,103 @@ func TestForeignKeysEnforcedAcrossPooledConnectionsWithCustomDSN(t *testing.T) {
 		}
 	}
 
-	// (a) The unrelated pragma must still apply on an acquired connection.
-	connA, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("acquire conn A: %v", err)
-	}
-	var busyTimeout int
-	if err := connA.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
-		t.Fatalf("read busy_timeout on conn A: %v", err)
-	}
-	if busyTimeout == 0 {
-		t.Fatalf("unrelated busy_timeout pragma was not applied: got %d", busyTimeout)
+	// Acquire and HOLD poolSize connections at once. Register the release cleanup
+	// BEFORE any probe so every held connection is closed even if an assertion
+	// aborts the test (t.Cleanup runs before db.Close).
+	conns := make([]*sql.Conn, 0, poolSize)
+	t.Cleanup(func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	fps := make([]uintptr, 0, poolSize)
+	for i := 0; i < poolSize; i++ {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("acquire and hold conn %d: %v", i, err)
+		}
+		conns = append(conns, conn)
+		var fp uintptr
+		if err := conn.Raw(func(d any) error {
+			if rv := reflect.ValueOf(d); rv.Kind() == reflect.Ptr {
+				fp = rv.Pointer()
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("fingerprint conn %d: %v", i, err)
+		}
+		fps = append(fps, fp)
 	}
 
-	// Seed valid parents so legitimate rows pass.
-	if _, err := connA.ExecContext(ctx, `insert into users (email,password_hash,created_at) values (?,?,?)`,
+	// Prove the pool actually handed out DISTINCT physical connections — exactly
+	// what the old acquire/probe/close structure could not do. Without this the
+	// per-connection pragma probes below would only exercise one physical conn.
+	seen := make(map[uintptr]bool, poolSize)
+	for i, fp := range fps {
+		if fp == 0 {
+			t.Fatalf("conn %d: could not fingerprint physical connection", i)
+		}
+		if seen[fp] {
+			t.Fatalf("conn %d reused physical connection %x; not all held conns are distinct", i, fp)
+		}
+		seen[fp] = true
+	}
+
+	// (a) On EVERY held (distinct) physical connection, PRAGMA foreign_keys must
+	// equal 1 AND the unrelated busy_timeout pragma must still be active.
+	for i := 0; i < poolSize; i++ {
+		var fk, busy int
+		if err := conns[i].QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil {
+			t.Fatalf("read foreign_keys on held conn %d: %v", i, err)
+		}
+		if err := conns[i].QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busy); err != nil {
+			t.Fatalf("read busy_timeout on held conn %d: %v", i, err)
+		}
+		if fk != 1 {
+			t.Fatalf("held conn %d: PRAGMA foreign_keys = %d, want 1 (cross-pool enforcement missing)", i, fk)
+		}
+		if busy == 0 {
+			t.Fatalf("held conn %d: unrelated busy_timeout pragma inactive (got 0)", i)
+		}
+	}
+
+	// Seed valid parents via the first held connection.
+	seedConn := conns[0]
+	if _, err := seedConn.ExecContext(ctx, `insert into users (email,password_hash,created_at) values (?,?,?)`,
 		"alice@example.com", "hash", time.Now().UTC().Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	if _, err := connA.ExecContext(ctx, `insert into registries
+	if _, err := seedConn.ExecContext(ctx, `insert into registries
 		(slug,host,ens_name,owner_user_id,feed_owner_address,encrypted_feed_private_key,default_stamp_batch_id,anonymous_pull,created_at)
 		values (?,?,?,?,?,?,?,?,?)`,
 		"alice", "alice.test", "alice.eth", 1, "0xfeed", "cipher", "batch-1", 1, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed registry: %v", err)
 	}
-	connA.Close()
 
-	// (b) An orphan insert must be rejected by FK enforcement from an
-	// independently acquired connection, regardless of which physical conn the
-	// pool hands out.
-	for i := 0; i < 5; i++ {
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			t.Fatalf("acquire conn for rejection probe %d: %v", i, err)
-		}
-		_, err = conn.ExecContext(ctx, `insert into registry_memberships
+	// (b) Run an orphan-rejection probe on EVERY held (distinct) physical
+	// connection BEFORE releasing any of them. FK enforcement must be active
+	// cross-pool on each distinct conn, not merely on a single pooled conn.
+	for i := 0; i < poolSize; i++ {
+		_, err := conns[i].ExecContext(ctx, `insert into registry_memberships
 			(registry_id,user_id,role,can_pull,can_push,created_at) values (?,?,?,?,?,?)`,
 			999, 1, "member", 1, 0, time.Now().UTC().Format(time.RFC3339))
-		conn.Close()
 		if err == nil {
-			t.Fatalf("rejection probe %d: expected foreign-key violation on independently acquired connection, got nil", i)
+			t.Fatalf("held conn %d: orphan insert accepted; want foreign-key violation on distinct physical connection", i)
 		}
 	}
 
-	// A legitimate membership (real parents) must still succeed on a fresh
-	// pooled connection, proving enforcement didn't over-fire.
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		t.Fatalf("acquire conn for valid insert: %v", err)
-	}
-	if _, err := conn.ExecContext(ctx, `insert into registry_memberships
+	// (c) A legitimate membership (real parents) must still succeed on a held
+	// distinct connection OTHER than the seed conn, proving enforcement on that
+	// physical connection didn't over-fire. conns[1] is inherently a distinct
+	// physical connection (verified above), so no new acquisition/blocking.
+	validConn := conns[1]
+	if _, err := validConn.ExecContext(ctx, `insert into registry_memberships
 		(registry_id,user_id,role,can_pull,can_push,created_at) values (?,?,?,?,?,?)`,
 		1, 1, "owner", 1, 1, time.Now().UTC().Format(time.RFC3339)); err != nil {
-		t.Fatalf("valid membership on pooled connection failed: %v", err)
+		t.Fatalf("valid membership on held distinct connection failed: %v", err)
 	}
-	conn.Close()
+
+	// All held connections are closed by the registered t.Cleanup.
 }
 
 // fkRef describes one entry of PRAGMA foreign_key_list.
