@@ -912,6 +912,119 @@ func TestFeedKeyEnvelopeMigrationRejectsMalformedRows(t *testing.T) {
 	}
 }
 
+// TestFeedKeyEnvelopeMigrationRejectsMalformedLengths pins migration 3's
+// preflight against COMPLETE-but-malformed envelopes: an existing all-present
+// row whose nonce is not exactly 12 bytes or whose ciphertext is shorter than
+// the 16-byte GCM minimum fails the upgrade, rolls back completely (version
+// stays 2, no triggers installed, rows untouched), and is never silently
+// accepted as a plausible-looking key.
+func TestFeedKeyEnvelopeMigrationRejectsMalformedLengths(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Build a v2 database (feed-key columns exist, triggers do not).
+	if err := applyMigrationsThrough(ctx, db, 2); err != nil {
+		t.Fatalf("apply through v2: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"alice@example.com", "hash", now); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	seed := func(slug string, ct, nonce []byte, ver int) {
+		if _, err := db.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", 1, "0xfeed", "",
+			"batch-1", 1, now, ct, nonce, ver); err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+	}
+	// All three columns present, but the envelope is cryptographically
+	// malformed — the preflight must reject each of these.
+	seed("shortnonce", []byte("0123456789abcdef"), []byte("0123456789a"), 1)   // nonce 11 bytes
+	seed("longnonce", []byte("0123456789abcdef"), []byte("0123456789abcd"), 1) // nonce 14 bytes
+	seed("shortct", []byte("0123456789abcde"), []byte("0123456789ab"), 1)      // ciphertext 15 bytes
+
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("migration must fail on existing complete-but-malformed envelopes")
+	}
+	// Rolled back: version still 2, no triggers, malformed rows untouched, no
+	// v3 record.
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 {
+		t.Fatalf("version must stay 2 after rejected migration, got %d", version)
+	}
+	var n int
+	if err := db.QueryRow(`select count(*) from sqlite_master where type = 'trigger' and name like 'registries_feed_key_complete_%'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("no triggers may remain after rollback, found %d", n)
+	}
+	var migRows int
+	if err := db.QueryRow(`select count(*) from schema_migrations`).Scan(&migRows); err != nil {
+		t.Fatal(err)
+	}
+	if migRows != 2 {
+		t.Fatalf("expected 2 recorded migrations after rejection, got %d", migRows)
+	}
+	for _, slug := range []string{"shortnonce", "longnonce", "shortct"} {
+		var ctLen, nonceLen int
+		if err := db.QueryRow(`select length(feed_key_ciphertext), length(feed_key_nonce) from registries where slug = ?`, slug).Scan(&ctLen, &nonceLen); err != nil {
+			t.Fatal(err)
+		}
+		if ctLen != 16 && slug != "shortct" {
+			t.Fatalf("%s: row must be untouched (ctLen=%d)", slug, ctLen)
+		}
+		if slug == "shortct" && ctLen != 15 {
+			t.Fatalf("shortct: row must be untouched (ctLen=%d)", ctLen)
+		}
+		if (slug == "shortnonce" && nonceLen != 11) || (slug == "longnonce" && nonceLen != 14) || (slug == "shortct" && nonceLen != 12) {
+			t.Fatalf("%s: row must be untouched (nonceLen=%d)", slug, nonceLen)
+		}
+	}
+}
+
+// TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows pins the preflight
+// boundary: an existing all-present envelope whose ciphertext is EXACTLY 16
+// bytes (the empty-plaintext minimum) and nonce exactly 12 bytes is
+// structurally valid and must NOT block the upgrade.
+func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if err := applyMigrationsThrough(ctx, db, 2); err != nil {
+		t.Fatalf("apply through v2: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"alice@example.com", "hash", now); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+		values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"exact16", "exact16.uncloud-registry.com", "exact16.eth", 1, "0xfeed", "",
+		"batch-1", 1, now, []byte("0123456789abcdef"), []byte("0123456789ab"), 1); err != nil {
+		t.Fatalf("seed exact-16 row: %v", err)
+	}
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("migration must accept structurally valid 16-byte-ciphertext rows: %v", err)
+	}
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Fatalf("expected version 3, got %d", version)
+	}
+	assertFeedKeyEnvelopeTriggers(t, db)
+}
+
 // TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema drives migration 3
 // from each supported starting point: a fresh database (v0), a legacy
 // plaintext database upgraded through v1+v2, and an already-current v2

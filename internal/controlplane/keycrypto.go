@@ -64,9 +64,10 @@ var errFeedKeyEmptyContext = errors.New("feed key encryption context cannot be e
 var errFeedKeyInvalidRegistryID = errors.New("feed key encryption context requires a positive registry ID")
 
 // ErrFeedKeyEnvelopeMalformed is the stable sentinel for a structurally
-// invalid feed-key envelope: a nonce that is not exactly gcm.NonceSize(), a
-// ciphertext shorter than gcm.Overhead() (the empty-plaintext minimum — such
-// a value can never be authentic), or a missing/empty field. Shape checks run
+// invalid feed-key envelope: a nonce that is not exactly
+// feedKeyEnvelopeNonceSize bytes, a ciphertext shorter than
+// feedKeyEnvelopeCiphertextMin bytes (the empty-plaintext minimum — such a
+// value can never be authentic), or a missing/empty field. Shape checks run
 // BEFORE any GCM operation so a malformed stored envelope can never panic
 // gcm.Open (which panics on wrong-size nonces) and is never handed to the
 // cipher unvalidated. Store write guards reuse the same sentinel.
@@ -106,6 +107,48 @@ type EncryptedFeedKey struct {
 	Ciphertext []byte
 	Nonce      []byte
 	KeyVersion int
+}
+
+// Persisted feed-key envelope structural constants. These are the SINGLE
+// source of truth for the envelope shape that every boundary enforces — the
+// schema triggers and migration preflight (SQL literals), store scan and
+// write validation, legacy migration, and rotation. They must stay exactly in
+// sync with FeedKeyCipher's actual AES-256-GCM primitive: validateFeedKeyEnvelope
+// asserts gcm.NonceSize()/Overhead() equal these constants on every cipher
+// decode, and TestFeedKeyEnvelopeConstantsMatchAESGCM pins the standard values,
+// so a drift can never silently split the schema rules from the runtime rules.
+const (
+	// feedKeyEnvelopeNonceSize is the AES-GCM standard nonce length. A nonce
+	// of any other length would panic gcm.Open (wrong-size nonce), so every
+	// malformed envelope must be rejected before it reaches the cipher.
+	feedKeyEnvelopeNonceSize = 12
+	// feedKeyEnvelopeCiphertextMin is the minimum ciphertext byte length: the
+	// AES-GCM tag alone (empty plaintext + 16-byte tag) is a structurally
+	// valid envelope; anything shorter can never be authentic.
+	feedKeyEnvelopeCiphertextMin = 16
+)
+
+// validateFeedKeyEnvelopeShape is the structural contract shared by every
+// boundary that persists or reads an EncryptedFeedKey: a COMPLETE envelope
+// must have a nonce of exactly feedKeyEnvelopeNonceSize bytes, a ciphertext
+// of at least feedKeyEnvelopeCiphertextMin bytes (the empty-plaintext
+// minimum), and a strictly positive version. Unlike validateFeedKeyEnvelope
+// it does not need a cipher.AEAD instance and can run against raw column
+// values at the store/schema boundary; errors wrap ErrFeedKeyEnvelopeMalformed.
+// The all-NULL (unset) state is deliberately NOT passed here — callers treat
+// it as the only no-key case and reject every other column combination as
+// inconsistent before structural validation applies.
+func validateFeedKeyEnvelopeShape(value EncryptedFeedKey) error {
+	if value.KeyVersion <= 0 {
+		return fmt.Errorf("%w: version must be strictly positive, got %d", ErrFeedKeyEnvelopeMalformed, value.KeyVersion)
+	}
+	if len(value.Nonce) != feedKeyEnvelopeNonceSize {
+		return fmt.Errorf("%w: nonce must be exactly %d bytes, got %d", ErrFeedKeyEnvelopeMalformed, feedKeyEnvelopeNonceSize, len(value.Nonce))
+	}
+	if len(value.Ciphertext) < feedKeyEnvelopeCiphertextMin {
+		return fmt.Errorf("%w: ciphertext must be at least %d bytes (GCM tag), got %d", ErrFeedKeyEnvelopeMalformed, feedKeyEnvelopeCiphertextMin, len(value.Ciphertext))
+	}
+	return nil
 }
 
 // FeedKeyCipher encrypts and decrypts registry feed-owner keys with AES-256-GCM.
@@ -240,15 +283,16 @@ func (c *FeedKeyCipher) Decrypt(registryID int64, owner string, value EncryptedF
 // nonce must be exactly gcm.NonceSize() and the ciphertext at least
 // gcm.Overhead() bytes (the empty-plaintext minimum). Every malformed input
 // maps to ErrFeedKeyEnvelopeMalformed. Because gcm.Open panics on a
-// wrong-size nonce, this MUST run before every Open.
+// wrong-size nonce, this MUST run before every Open. The live cipher values
+// are asserted equal to the persisted-envelope constants
+// (feedKeyEnvelopeNonceSize / feedKeyEnvelopeCiphertextMin) so the schema
+// triggers and store/runtime rules can never silently drift apart.
 func validateFeedKeyEnvelope(value EncryptedFeedKey, gcm cipher.AEAD) error {
-	if len(value.Nonce) != gcm.NonceSize() {
-		return fmt.Errorf("%w: nonce must be exactly %d bytes, got %d", ErrFeedKeyEnvelopeMalformed, gcm.NonceSize(), len(value.Nonce))
+	if gcm.NonceSize() != feedKeyEnvelopeNonceSize || gcm.Overhead() != feedKeyEnvelopeCiphertextMin {
+		return fmt.Errorf("%w: cipher primitive drifted from envelope constants: nonce %d (want %d), overhead %d (want %d)",
+			ErrFeedKeyEnvelopeMalformed, gcm.NonceSize(), feedKeyEnvelopeNonceSize, gcm.Overhead(), feedKeyEnvelopeCiphertextMin)
 	}
-	if len(value.Ciphertext) < gcm.Overhead() {
-		return fmt.Errorf("%w: ciphertext must be at least %d bytes (GCM overhead), got %d", ErrFeedKeyEnvelopeMalformed, gcm.Overhead(), len(value.Ciphertext))
-	}
-	return nil
+	return validateFeedKeyEnvelopeShape(value)
 }
 
 // feedKeyAADPrefix is the fixed domain-separator/version prefix of every

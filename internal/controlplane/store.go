@@ -124,9 +124,12 @@ type scanRow interface {
 // scanRegistryRow scans the canonical registry column list into reg,
 // materializing the encrypted feed-key envelope. It also enforces the
 // schema-level envelope invariant on READ: the three feed-key columns must be
-// either ALL absent or ALL present with non-empty ciphertext/nonce and a
-// strictly positive version. A partial envelope (version without ciphertext,
-// ciphertext without version, zero-length blobs, non-positive version) is
+// either ALL absent or ALL present with a structurally valid envelope — nonce
+// exactly feedKeyEnvelopeNonceSize bytes, ciphertext at least
+// feedKeyEnvelopeCiphertextMin bytes, strictly positive version. A partial
+// envelope (version without ciphertext, ciphertext without version,
+// zero-length blobs, non-positive version) or a complete-but-malformed
+// envelope (wrong nonce length, ciphertext below the GCM tag minimum) is
 // rejected with ErrFeedKeyEnvelopeInconsistent — it is never silently scanned
 // as a plausible-looking value or as "no key".
 func scanRegistryRow(s scanRow, reg *Registry) error {
@@ -142,6 +145,12 @@ func scanRegistryRow(s scanRow, reg *Registry) error {
 	nonceSet := len(nonce) > 0
 	if version.Valid {
 		if !ctSet || !nonceSet || version.Int64 <= 0 {
+			return ErrFeedKeyEnvelopeInconsistent
+		}
+		// Complete but cryptographically malformed (wrong nonce/ciphertext
+		// lengths): reject like any other inconsistent row — never scanned as
+		// a plausible-looking key.
+		if err := validateFeedKeyEnvelopeShape(EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}); err != nil {
 			return ErrFeedKeyEnvelopeInconsistent
 		}
 		reg.FeedKey = EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}
@@ -200,8 +209,10 @@ func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher
 		registry.FeedKeySet = true
 	case registry.FeedKeySet:
 		// The schema-level invariant mirrored at the write boundary: a
-		// crafted envelope must be exactly all-present (non-empty ciphertext
-		// and nonce, positive version) before it can be persisted.
+		// crafted envelope must be exactly all-present with a structurally
+		// valid shape (nonce feedKeyEnvelopeNonceSize bytes, ciphertext at
+		// least feedKeyEnvelopeCiphertextMin bytes, positive version) before
+		// it can be persisted.
 		if err := validateFeedKeyEnvelopeShape(registry.FeedKey); err != nil {
 			return Registry{}, fmt.Errorf("create registry: %w", err)
 		}
@@ -219,17 +230,6 @@ func (s *Store) CreateRegistry(ctx context.Context, registry Registry, keyCipher
 	registry.ID = id
 	registry.CreatedAt = now
 	return registry, nil
-}
-
-// validateFeedKeyEnvelopeShape is the store-level (nonce-length-agnostic)
-// completeness guard used wherever an envelope is about to be persisted: all
-// three fields present and non-empty, version strictly positive. It shares
-// the ErrFeedKeyEnvelopeMalformed sentinel with the cipher-level shape check.
-func validateFeedKeyEnvelopeShape(enc EncryptedFeedKey) error {
-	if len(enc.Ciphertext) == 0 || len(enc.Nonce) == 0 || enc.KeyVersion <= 0 {
-		return fmt.Errorf("%w: envelope must be all-present with non-empty ciphertext, non-empty nonce, and a positive version", ErrFeedKeyEnvelopeMalformed)
-	}
-	return nil
 }
 
 func (s *Store) CreateMembership(ctx context.Context, membership Membership) (Membership, error) {
@@ -583,19 +583,31 @@ func (s *Store) migrateLegacyFeedKey(ctx context.Context, id int64, cipher *Feed
 		Scan(&owner, &legacy, &ciphertext, &nonce, &version); err != nil {
 		return false, fmt.Errorf("migrate legacy feed key: %w", err)
 	}
-	ctSet := len(ciphertext) > 0
-	nonceSet := len(nonce) > 0
 	switch {
-	case version.Valid && (!ctSet || !nonceSet || version.Int64 <= 0):
-		// Partial envelope: never treat as "already encrypted"; reject.
-		return false, fmt.Errorf("migrate legacy feed key for registry %d: %w", id, ErrFeedKeyEnvelopeInconsistent)
-	case !version.Valid && (ctSet || nonceSet):
+	case version.Valid:
+		// A stored envelope version: the envelope must be complete AND
+		// structurally valid BEFORE any decision about the legacy plaintext.
+		// A complete-but-malformed envelope (wrong nonce/ciphertext lengths)
+		// is rejected — never skipped as "already encrypted" even when the
+		// legacy column is empty, and never re-encrypted from the legacy
+		// value even when a version is stored. Shape is also validated here
+		// so a malformed row is caught regardless of its stored version.
+		if len(ciphertext) == 0 || len(nonce) == 0 || version.Int64 <= 0 {
+			return false, fmt.Errorf("migrate legacy feed key for registry %d: %w", id, ErrFeedKeyEnvelopeInconsistent)
+		}
+		if err := validateFeedKeyEnvelopeShape(EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}); err != nil {
+			// The row-level sentinel applies: the persisted columns are
+			// inconsistent with the envelope contract.
+			return false, fmt.Errorf("migrate legacy feed key for registry %d: %w", id, ErrFeedKeyEnvelopeInconsistent)
+		}
+	case len(ciphertext) > 0 || len(nonce) > 0:
 		// Envelope material without a version: inconsistent; reject.
 		return false, fmt.Errorf("migrate legacy feed key for registry %d: %w", id, ErrFeedKeyEnvelopeInconsistent)
-	case len(legacy) == 0:
-		// Nothing at rest to migrate (with or without an envelope):
-		// already-migrated rows (complete envelope, cleared legacy) and
-		// plaintext-free rows are both clean.
+	}
+	if len(legacy) == 0 {
+		// Nothing at rest to migrate; with a structurally valid envelope this
+		// is an already-migrated row, otherwise a plaintext-free row — both
+		// clean.
 		return false, tx.Commit()
 	}
 	defer zeroBytes(legacy)
@@ -626,9 +638,12 @@ func (s *Store) migrateLegacyFeedKey(ctx context.Context, id int64, cipher *Feed
 // (tampering or context drift aborts), the decrypted plaintext is re-sealed
 // under the explicitly requested toVersion with the same owner, and the row is
 // updated atomically. Envelope state is validated first: a PARTIAL envelope
-// rejects with ErrFeedKeyEnvelopeInconsistent; only an all-NULL row is
-// skipped (no stored key), and a row whose stored version != fromVersion is
-// skipped untouched. The temporary plaintext is zeroed after use.
+// AND a complete-but-malformed envelope (wrong nonce/ciphertext lengths)
+// reject with ErrFeedKeyEnvelopeInconsistent — before any version-based skip,
+// so a malformed row is never skipped untouched merely because its stored
+// version differs from fromVersion. Only an all-NULL row is skipped (no
+// stored key), and a structurally valid row whose stored version != fromVersion
+// is skipped untouched. The temporary plaintext is zeroed after use.
 func (s *Store) ReencryptRegistryFeedKey(ctx context.Context, registryID int64, fromVersion, toVersion int, cipher *FeedKeyCipher) (bool, error) {
 	if cipher == nil {
 		return false, errFeedKeyCipherNotConfigured
@@ -658,11 +673,20 @@ func (s *Store) ReencryptRegistryFeedKey(ctx context.Context, registryID int64, 
 		return false, fmt.Errorf("re-encrypt feed key for registry %d: %w", registryID, ErrFeedKeyEnvelopeInconsistent)
 	case !version.Valid:
 		return false, tx.Commit() // no stored key: skip
-	case int(version.Int64) != fromVersion:
+	}
+	// Complete envelope: validate structural shape BEFORE the version-based
+	// skip. A malformed envelope (nonce != feedKeyEnvelopeNonceSize bytes,
+	// ciphertext < feedKeyEnvelopeCiphertextMin bytes) is rejected even when
+	// the stored version differs from fromVersion — it is never skipped
+	// untouched just because the version gate would have excluded it.
+	enc := EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}
+	if err := validateFeedKeyEnvelopeShape(enc); err != nil {
+		return false, fmt.Errorf("re-encrypt feed key for registry %d: %w", registryID, ErrFeedKeyEnvelopeInconsistent)
+	}
+	if int(version.Int64) != fromVersion {
 		return false, tx.Commit() // not at fromVersion: skip untouched
 	}
 
-	enc := EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}
 	plaintext, err := cipher.Decrypt(registryID, ownerInDB, enc)
 	if err != nil {
 		return false, fmt.Errorf("re-encrypt feed key for registry %d: %w", registryID, err)

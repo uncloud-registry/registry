@@ -675,8 +675,10 @@ func TestWithDecryptedFeedKeyWipesAfterCallback(t *testing.T) {
 
 // TestStoreCreateRegistryRejectsIncompleteEnvelope pins the store write guard:
 // the direct-craft path (FeedKeySet) must refuse an envelope that is not
-// exactly all-present with non-empty ciphertext/nonce and a positive version —
-// the schema-level invariant mirrored at the application boundary.
+// exactly all-present with a structurally valid shape — nonce
+// feedKeyEnvelopeNonceSize bytes, ciphertext at least
+// feedKeyEnvelopeCiphertextMin bytes, positive version — the schema-level
+// invariant mirrored at the application boundary.
 func TestStoreCreateRegistryRejectsIncompleteEnvelope(t *testing.T) {
 	t.Parallel()
 	store, err := OpenSQLite("file:keycrypto_envguard?mode=memory&cache=shared")
@@ -706,6 +708,9 @@ func TestStoreCreateRegistryRejectsIncompleteEnvelope(t *testing.T) {
 		{"negative version", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: valid.Nonce, KeyVersion: -1}},
 		{"empty ciphertext", EncryptedFeedKey{Ciphertext: []byte{}, Nonce: valid.Nonce, KeyVersion: 1}},
 		{"empty nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: []byte{}, KeyVersion: 1}},
+		{"short nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: []byte("0123456789a"), KeyVersion: 1}},
+		{"long nonce", EncryptedFeedKey{Ciphertext: valid.Ciphertext, Nonce: []byte("0123456789abc"), KeyVersion: 1}},
+		{"short ciphertext", EncryptedFeedKey{Ciphertext: []byte("0123456789abcde"), Nonce: valid.Nonce, KeyVersion: 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -713,7 +718,7 @@ func TestStoreCreateRegistryRejectsIncompleteEnvelope(t *testing.T) {
 			reg.FeedKey = tc.value
 			reg.FeedKeySet = true
 			if _, err := store.CreateRegistry(ctx, reg, nil, nil); err == nil {
-				t.Fatal("incomplete envelope must be rejected by the store write guard")
+				t.Fatal("malformed envelope must be rejected by the store write guard")
 			} else if !errors.Is(err, ErrFeedKeyEnvelopeMalformed) {
 				t.Fatalf("expected ErrFeedKeyEnvelopeMalformed, got %v", err)
 			}
@@ -726,12 +731,25 @@ func TestStoreCreateRegistryRejectsIncompleteEnvelope(t *testing.T) {
 	if _, err := store.CreateRegistry(ctx, reg, nil, nil); err != nil {
 		t.Fatalf("complete envelope must be accepted: %v", err)
 	}
+	// A minimally-valid envelope (16-byte ciphertext, empty plaintext shape)
+	// is accepted STRUCTURALLY by the write guard.
+	reg2 := base
+	reg2.Slug = "min"
+	reg2.Host = "min.uncloud-registry.com"
+	reg2.FeedKey = EncryptedFeedKey{Ciphertext: []byte("0123456789abcdef"), Nonce: []byte("0123456789ab"), KeyVersion: 1}
+	reg2.FeedKeySet = true
+	if _, err := store.CreateRegistry(ctx, reg2, nil, nil); err != nil {
+		t.Fatalf("16-byte-ciphertext envelope must be accepted structurally: %v", err)
+	}
 }
 
 // TestFeedKeyEnvelopeTriggerEnforcesCompleteness drives the schema-level
 // invariant through DIRECT SQL on the migrated schema: the triggers reject
-// every partial combination of the three feed-key columns on INSERT and
-// UPDATE, and accept exactly all-NULL and all-present-nonempty-positive.
+// every partial combination of the three feed-key columns — and every
+// complete-but-malformed envelope (nonce not exactly 12 bytes, ciphertext
+// shorter than 16 bytes) — on INSERT and UPDATE, while accepting exactly
+// all-NULL and all-present with a structurally valid envelope (12-byte nonce,
+// >=16-byte ciphertext, positive version).
 func TestFeedKeyEnvelopeTriggerEnforcesCompleteness(t *testing.T) {
 	t.Parallel()
 	store, err := OpenSQLite("file:keycrypto_triggers?mode=memory&cache=shared")
@@ -758,7 +776,8 @@ func TestFeedKeyEnvelopeTriggerEnforcesCompleteness(t *testing.T) {
 	if err := insertBase("nokey", nil, nil, nil); err != nil {
 		t.Fatalf("all-NULL envelope must be accepted: %v", err)
 	}
-	// All present, non-empty, positive: accepted.
+	// All present, structurally valid (16-byte ciphertext = empty-plaintext
+	// minimum, 12-byte nonce, positive version): accepted.
 	ct := []byte("0123456789abcdef")
 	nonce := []byte("0123456789ab")
 	if err := insertBase("full", ct, nonce, 1); err != nil {
@@ -781,10 +800,13 @@ func TestFeedKeyEnvelopeTriggerEnforcesCompleteness(t *testing.T) {
 		{"negative version", ct, nonce, -1},
 		{"empty ciphertext", []byte{}, nonce, 1},
 		{"empty nonce", ct, []byte{}, 1},
+		{"short nonce", ct, []byte("0123456789a"), 1},
+		{"long nonce", ct, []byte("0123456789abc"), 1},
+		{"short ciphertext", []byte("0123456789abcde"), nonce, 1},
 	}
 	for i, tc := range partial {
 		if err := insertBase("partial"+strconv.Itoa(i), tc.ct, tc.nonce, tc.ver); err == nil {
-			t.Fatalf("%s: partial envelope INSERT must be rejected by the trigger", tc.name)
+			t.Fatalf("%s: malformed envelope INSERT must be rejected by the trigger", tc.name)
 		}
 	}
 
@@ -796,9 +818,20 @@ func TestFeedKeyEnvelopeTriggerEnforcesCompleteness(t *testing.T) {
 	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_version = null where host = ?`, "full.uncloud-registry.com"); err == nil {
 		t.Fatal("UPDATE to a partial envelope must be rejected by the trigger")
 	}
+	// A complete row cannot be mutated into a complete-but-malformed envelope.
+	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_nonce = ? where host = ?`, []byte("short"), "full.uncloud-registry.com"); err == nil {
+		t.Fatal("UPDATE to a short nonce must be rejected by the trigger")
+	}
+	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_ciphertext = ? where host = ?`, []byte("short"), "full.uncloud-registry.com"); err == nil {
+		t.Fatal("UPDATE to a short ciphertext must be rejected by the trigger")
+	}
 	// Valid UPDATEs still pass.
 	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_version = 2 where host = ?`, "full.uncloud-registry.com"); err != nil {
 		t.Fatalf("valid envelope UPDATE must be accepted: %v", err)
+	}
+	if _, err := store.DB.ExecContext(ctx, `update registries set feed_key_ciphertext = ?, feed_key_nonce = ? where host = ?`,
+		[]byte("0123456789abcdef00"), []byte("0123456789ab"), "full.uncloud-registry.com"); err != nil {
+		t.Fatalf("structurally valid envelope UPDATE must be accepted: %v", err)
 	}
 }
 
@@ -873,6 +906,71 @@ func TestScanRejectsPartialEnvelopes(t *testing.T) {
 	}
 }
 
+// TestScanRejectsMalformedCompleteEnvelopes proves every registry read path
+// validates the envelope STRUCTURALLY, not just its presence: a row whose
+// three columns are all present but carry a nonce of the wrong length or a
+// ciphertext below the 16-byte GCM minimum is rejected with
+// ErrFeedKeyEnvelopeInconsistent — it is never scanned as a plausible-looking
+// key (which would then be handed to the cipher and panic/classify oddly).
+func TestScanRejectsMalformedCompleteEnvelopes(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_scanmalformed?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	dropFeedKeyTriggers(t, store)
+
+	seed := func(slug string, ct, nonce []byte, ver int) {
+		if _, err := store.DB.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", owner.ID, "0xfeed", "",
+			"batch-1", 0, now, ct, nonce, ver); err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+	}
+	// Complete (all three present) but cryptographically malformed envelopes.
+	seed("shortnonce", []byte("0123456789abcdef"), []byte("0123456789a"), 1)   // nonce 11 bytes
+	seed("longnonce", []byte("0123456789abcdef"), []byte("0123456789abcd"), 1) // nonce 14 bytes
+	seed("shortct", []byte("0123456789abcde"), []byte("0123456789ab"), 1)      // ciphertext 15 bytes
+	for i := 1; i <= 3; i++ {
+		if _, err := store.DB.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?,?,?,?,?,?)`,
+			int64(i), owner.ID, "owner", 1, 1, now); err != nil {
+			t.Fatalf("seed membership %d: %v", i, err)
+		}
+	}
+
+	if _, err := store.ListRegistries(ctx); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("ListRegistries must reject malformed complete envelopes: %v", err)
+	}
+	if _, err := store.ListRegistriesForUser(ctx, owner.ID); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("ListRegistriesForUser must reject malformed complete envelopes: %v", err)
+	}
+	if _, err := store.FindRegistryByID(ctx, 1); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("FindRegistryByID must reject malformed complete envelopes: %v", err)
+	}
+	if _, err := store.FindRegistryByHost(ctx, "shortnonce.uncloud-registry.com"); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("FindRegistryByHost must reject malformed complete envelopes: %v", err)
+	}
+
+	// A row whose all-present envelope is structurally VALID (16-byte
+	// ciphertext minimum, 12-byte nonce, positive version) scans fine.
+	seed("good", []byte("0123456789abcdef"), []byte("0123456789ab"), 1)
+	good, err := store.FindRegistryByHost(ctx, "good.uncloud-registry.com")
+	if err != nil {
+		t.Fatalf("structurally valid envelope must scan: %v", err)
+	}
+	if !good.FeedKeySet || len(good.FeedKey.Ciphertext) != 16 || len(good.FeedKey.Nonce) != 12 {
+		t.Fatalf("valid envelope scanned incorrectly: %+v", good.FeedKey)
+	}
+}
+
 // TestMigrateLegacyFeedKeysRejectsInconsistentRows pins that the opt-in
 // legacy migration rejects (never silently skips) a row whose envelope state
 // is partial — such a row must not be left half-encrypted or treated as
@@ -906,6 +1004,75 @@ func TestMigrateLegacyFeedKeysRejectsInconsistentRows(t *testing.T) {
 	}
 	if legacy != "ciphertext" || !version.Valid {
 		t.Fatalf("inconsistent row must be left fully untouched: legacy=%q version set=%v", legacy, version.Valid)
+	}
+}
+
+// TestMigrateLegacyFeedKeysRejectsMalformedCompleteEnvelopes pins that the
+// opt-in legacy migration rejects a COMPLETE-but-malformed envelope (nonce
+// not 12 bytes / ciphertext under 16 bytes) regardless of the legacy
+// plaintext or the stored version: such a row is never classified as
+// "already encrypted" and skipped, and never re-encrypted from the legacy
+// value over a malformed stored shape.
+func TestMigrateLegacyFeedKeysRejectsMalformedCompleteEnvelopes(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedLegacyDB(t, db, now, now, true)
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	store := &Store{DB: db}
+	dropFeedKeyTriggers(t, store)
+
+	cases := []struct {
+		name       string
+		ct         []byte
+		nonce      []byte
+		ver        int
+		withLegacy bool
+	}{
+		{"short nonce, empty legacy", []byte("0123456789abcdef"), []byte("0123456789a"), 1, false},
+		{"long nonce, empty legacy", []byte("0123456789abcdef"), []byte("0123456789abc"), 1, false},
+		{"short ciphertext, legacy present", []byte("0123456789abcde"), []byte("0123456789ab"), 1, true},
+		{"malformed at stored version 2, legacy empty", []byte("0123456789abcdef"), []byte("short"), 2, false},
+	}
+	for i, tc := range cases {
+		slug := "mal" + strconv.Itoa(i)
+		legacyVal := ""
+		if tc.withLegacy {
+			legacyVal = "ciphertext"
+		}
+		if _, err := db.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", 1, "0xfeed", legacyVal,
+			"batch-1", 1, now, tc.ct, tc.nonce, tc.ver); err != nil {
+			t.Fatalf("seed %s: %v", tc.name, err)
+		}
+	}
+
+	service := newStoreService(t, db)
+	_, err := service.MigrateLegacyFeedKeys(ctx)
+	if !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("migration must reject malformed complete envelopes: %v", err)
+	}
+	// Every row must be untouched (legacy plaintext and envelope state).
+	for i, tc := range cases {
+		slug := "mal" + strconv.Itoa(i)
+		var legacy string
+		var ctLen, nonceLen int
+		var ver sql.NullInt64
+		if err := db.QueryRowContext(ctx, `select encrypted_feed_private_key, length(feed_key_ciphertext), length(feed_key_nonce), feed_key_version from registries where slug = ?`, slug).
+			Scan(&legacy, &ctLen, &nonceLen, &ver); err != nil {
+			t.Fatal(err)
+		}
+		wantLegacy := ""
+		if tc.withLegacy {
+			wantLegacy = "ciphertext"
+		}
+		if legacy != wantLegacy || ctLen != len(tc.ct) || nonceLen != len(tc.nonce) || !ver.Valid || int(ver.Int64) != tc.ver {
+			t.Fatalf("%s: row must be left fully untouched: legacy=%q ctLen=%d nonceLen=%d ver=%v", tc.name, legacy, ctLen, nonceLen, ver)
+		}
 	}
 }
 
@@ -1096,6 +1263,111 @@ func TestReencryptFeedKeysFailsOnPartialRow(t *testing.T) {
 	}
 	if _, err := service.ReencryptFeedKeys(ctx, 1, 2); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
 		t.Fatalf("rotation pass must fail on the partial row: %v", err)
+	}
+}
+
+// TestReencryptRegistryFeedKeyRejectsMalformedCompleteEnvelopes pins that
+// rotation validates the envelope STRUCTURALLY before ANY version-based
+// decision: a complete-but-malformed envelope (nonce not 12 bytes, ciphertext
+// under 16 bytes) is rejected with ErrFeedKeyEnvelopeInconsistent even when
+// its stored version differs from fromVersion — the path that previously
+// skipped it untouched.
+func TestReencryptRegistryFeedKeyRejectsMalformedCompleteEnvelopes(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_rotmalformed?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	service := newStoreService(t, store.DB)
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	dropFeedKeyTriggers(t, store)
+	seed := func(slug string, ct, nonce []byte, ver int) int64 {
+		res, err := store.DB.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+			values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+			slug, slug+".uncloud-registry.com", slug+".eth", owner.ID, "0xfeed", "",
+			"batch-1", 0, time.Now().UTC().Format(time.RFC3339), ct, nonce, ver)
+		if err != nil {
+			t.Fatalf("seed %s: %v", slug, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	// fromVersion is 1: these rows are stored at version 1 (the would-be
+	// decrypt path) and at version 2 (the would-be skip path) — both must be
+	// rejected on shape, not skipped/decrypted.
+	rows := map[string]int64{
+		"shortnonce_at1": seed("shortnonce_at1", []byte("0123456789abcdef"), []byte("0123456789a"), 1),
+		"longnonce_at1":  seed("longnonce_at1", []byte("0123456789abcdef"), []byte("0123456789abc"), 1),
+		"shortct_at1":    seed("shortct_at1", []byte("0123456789abcde"), []byte("0123456789ab"), 1),
+		"shortnonce_at2": seed("shortnonce_at2", []byte("0123456789abcdef"), []byte("0123456789a"), 2),
+		"shortct_at2":    seed("shortct_at2", []byte("0123456789abcde"), []byte("0123456789ab"), 2),
+	}
+	for name, id := range rows {
+		_, err := service.Store.ReencryptRegistryFeedKey(ctx, id, 1, 2, service.FeedKeys)
+		if !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+			t.Fatalf("%s: rotation must reject the malformed complete envelope (before any version skip): %v", name, err)
+		}
+	}
+	// The row is left untouched (rollback).
+	var version int64
+	var ctLen, nonceLen int
+	if err := store.DB.QueryRowContext(ctx, `select feed_key_version, length(feed_key_ciphertext), length(feed_key_nonce) from registries where id = ?`, rows["shortct_at2"]).
+		Scan(&version, &ctLen, &nonceLen); err != nil {
+		t.Fatal(err)
+	}
+	if version != 2 || ctLen != 15 || nonceLen != 12 {
+		t.Fatalf("malformed row must be left untouched after rejection: version=%d ctLen=%d nonceLen=%d", version, ctLen, nonceLen)
+	}
+	// A structurally VALID row at version 2 (stored != fromVersion 1) is
+	// still skipped untouched, not rejected.
+	validRes, err := store.DB.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+		values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"validat2", "validat2.uncloud-registry.com", "validat2.eth", owner.ID, "0xfeed", "",
+		"batch-1", 0, time.Now().UTC().Format(time.RFC3339), []byte("0123456789abcdef"), []byte("0123456789ab"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validID, _ := validRes.LastInsertId()
+	ok, err := service.Store.ReencryptRegistryFeedKey(ctx, validID, 1, 2, service.FeedKeys)
+	if err != nil || ok {
+		t.Fatalf("structurally valid row not at fromVersion must be skipped: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestReencryptFeedKeysFailsOnMalformedRow pins the service-level rotation
+// against a complete-but-malformed envelope whose stored version DIFFERS from
+// fromVersion: the pass must fail with the envelope sentinel instead of
+// skipping the malformed row untouched.
+func TestReencryptFeedKeysFailsOnMalformedRow(t *testing.T) {
+	t.Parallel()
+	store, err := OpenSQLite("file:keycrypto_rotfailmalformed?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	ctx := context.Background()
+	service := newStoreService(t, store.DB)
+	owner, err := store.CreateUser(ctx, "alice@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	dropFeedKeyTriggers(t, store)
+	// Stored version 2 != fromVersion 1 with a malformed (short-nonce)
+	// envelope: rotation must REJECT, not skip.
+	if _, err := store.DB.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at, feed_key_ciphertext, feed_key_nonce, feed_key_version)
+		values (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"malformedv2", "malformedv2.uncloud-registry.com", "malformedv2.eth", owner.ID, "0xfeed", "",
+		"batch-1", 0, time.Now().UTC().Format(time.RFC3339), []byte("0123456789abcdef"), []byte("short"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ReencryptFeedKeys(ctx, 1, 2); !errors.Is(err, ErrFeedKeyEnvelopeInconsistent) {
+		t.Fatalf("rotation pass must fail on the malformed row even at a different version: %v", err)
 	}
 }
 

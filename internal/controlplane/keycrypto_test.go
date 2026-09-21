@@ -263,6 +263,69 @@ func mustAESBlock(t *testing.T, c *FeedKeyCipher, version int) (block interface 
 	return aesBlock
 }
 
+// TestFeedKeyEnvelopeConstantsMatchAESGCM pins the persisted-envelope
+// structural constants to the ACTUAL AES-256-GCM primitive used by
+// FeedKeyCipher. The schema triggers and the store/runtime rules hard-code
+// the same numbers (12-byte nonce, 16-byte minimum ciphertext) in different
+// languages (SQL literals vs Go constants); if the cipher's NonceSize or
+// Overhead ever drifted, this test fails loudly instead of letting the
+// schema and runtime rules silently disagree. It also asserts the standard
+// published AES-GCM values so a cipher-swap cannot quietly change the wire
+// format.
+func TestFeedKeyEnvelopeConstantsMatchAESGCM(t *testing.T) {
+	t.Parallel()
+	block, err := aes.NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("aes new cipher: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatalf("new gcm: %v", err)
+	}
+	if gcm.NonceSize() != 12 {
+		t.Fatalf("AES-256-GCM nonce size drifted from the standard 12 bytes: got %d", gcm.NonceSize())
+	}
+	if gcm.Overhead() != 16 {
+		t.Fatalf("AES-256-GCM overhead drifted from the standard 16 bytes: got %d", gcm.Overhead())
+	}
+	if feedKeyEnvelopeNonceSize != gcm.NonceSize() {
+		t.Fatalf("feedKeyEnvelopeNonceSize (%d) drifted from the live cipher nonce size (%d)", feedKeyEnvelopeNonceSize, gcm.NonceSize())
+	}
+	if feedKeyEnvelopeCiphertextMin != gcm.Overhead() {
+		t.Fatalf("feedKeyEnvelopeCiphertextMin (%d) drifted from the live cipher overhead (%d)", feedKeyEnvelopeCiphertextMin, gcm.Overhead())
+	}
+	// The validators must behave identically whether invoked with a live GCM
+	// (validateFeedKeyEnvelope) or the shared shape validator.
+	c := newTestFeedKeyCipher(t)
+	block2, err := aes.NewCipher(c.keys[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm2, err := cipher.NewGCM(block2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := EncryptedFeedKey{Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyVersion: 1}
+	if err := validateFeedKeyEnvelope(valid, gcm2); err != nil {
+		t.Fatalf("16-byte ciphertext + 12-byte nonce must pass the live-GCM validator: %v", err)
+	}
+	if err := validateFeedKeyEnvelopeShape(valid); err != nil {
+		t.Fatalf("16-byte ciphertext + 12-byte nonce must pass the shape validator: %v", err)
+	}
+	for _, value := range []EncryptedFeedKey{
+		{Ciphertext: make([]byte, 16), Nonce: make([]byte, 11), KeyVersion: 1},  // short nonce
+		{Ciphertext: make([]byte, 16), Nonce: make([]byte, 13), KeyVersion: 1},  // long nonce
+		{Ciphertext: make([]byte, 15), Nonce: make([]byte, 12), KeyVersion: 1},  // short ciphertext
+		{Ciphertext: []byte{}, Nonce: make([]byte, 12), KeyVersion: 1},          // empty ciphertext
+		{Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyVersion: 0},  // zero version
+		{Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyVersion: -1}, // negative version
+	} {
+		if err := validateFeedKeyEnvelopeShape(value); err == nil {
+			t.Fatalf("malformed envelope %+v must be rejected by the shape validator", value)
+		}
+	}
+}
+
 func TestFeedKeyCipherRejectsWrongMasterKey(t *testing.T) {
 	t.Parallel()
 	encCipher, err := NewFeedKeyCipher(map[int][]byte{1: testMasterKeyBytes(1)}, 1)
