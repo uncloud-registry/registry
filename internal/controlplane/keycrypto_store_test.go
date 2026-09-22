@@ -25,6 +25,7 @@ func newStoreService(t *testing.T, db *sql.DB) *Service {
 		Tokens:         newTestSessionManager(t),
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}
 }
 
@@ -177,7 +178,7 @@ func TestServiceCreateRegistryFailsClosedWithoutCipher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	service := &Service{Store: store, Tokens: newTestSessionManager(t), RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: newTestSessionManager(t), RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	user, _, err := service.RegisterUser(context.Background(), "alice@example.com", "password123")
 	if err != nil {
 		t.Fatalf("register: %v", err)

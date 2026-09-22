@@ -29,7 +29,7 @@ import (
 func TestContentTypeParsedCanonicallyNotSubstring(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix3_ct?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -96,7 +96,7 @@ func TestContentTypeParsedCanonicallyNotSubstring(t *testing.T) {
 func TestMediaTypeGateAppliesAfterBodySize(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix3_sz?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -143,7 +143,7 @@ func TestCSRFMalformedFormPartialTokenRejected400(t *testing.T) {
 	// parse error rather than silently accepting the partial token.
 	store, _ := OpenSQLite("file:csec_fix3_partial?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -175,7 +175,7 @@ func TestCSRFDuplicateEqualsStillConflicts(t *testing.T) {
 	// even identical, never pass).
 	store, _ := OpenSQLite("file:csec_fix3_dup?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -204,7 +204,7 @@ func TestCSRFEmptyFormMissingToken(t *testing.T) {
 	// token -> 403, no effects.
 	store, _ := OpenSQLite("file:csec_fix3_empty?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -233,7 +233,7 @@ func TestCSRFEmptyFormMissingToken(t *testing.T) {
 func TestCSRFHandlerSeesSameFormBytes(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix3_same?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -356,7 +356,7 @@ func TestBufferRequestBodyBodyLifecycleAllPaths(t *testing.T) {
 func TestMultipartNeverParsedAsCSRF(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix3_mp?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)

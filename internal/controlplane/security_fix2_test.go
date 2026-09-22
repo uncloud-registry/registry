@@ -30,7 +30,7 @@ import (
 func TestCSRFMultipartRejected415(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_multipart?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -78,7 +78,7 @@ func TestCSRFMultipartRejected415(t *testing.T) {
 func TestMultipartRejected415AppliesBeforeRouting(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_mp_route?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -138,7 +138,7 @@ func buildTokenServer(t *testing.T, withIssuer bool, logger *slog.Logger) (*Serv
 	t.Helper()
 	store, _ := OpenSQLite("file:csec_fix2_token_" + withIssuerName(withIssuer) + "?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	if withIssuer {
 		service.RegistryTokens, _ = newTestRegistryPair(t)
 	}
@@ -289,7 +289,7 @@ func TestTokenFailureMappingUnit(t *testing.T) {
 func TestOversizedURLEncodedLoginRejected413NoSideEffects(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_urlenc?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -316,7 +316,7 @@ func TestOversizedURLEncodedLoginRejected413NoSideEffects(t *testing.T) {
 func TestOversizedMalformedFormReturns400NotMasked(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_form400?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -340,7 +340,7 @@ func TestOversizedMalformedFormReturns400NotMasked(t *testing.T) {
 func TestOversizedUnknownPOSTRejected413BeforeRouting(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_unknown?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -368,7 +368,7 @@ func TestOversizedUnknownPOSTRejected413BeforeRouting(t *testing.T) {
 func TestOversizedCookieFormPOST413NotCSRF403(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_csrfmask?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -401,7 +401,7 @@ func TestOversizedMultipartRejected413(t *testing.T) {
 	// handler or being silently treated as absent.
 	store, _ := OpenSQLite("file:csec_fix2_mp_big?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -423,7 +423,7 @@ func TestOversizedMultipartRejected413(t *testing.T) {
 func TestOversizedChunkedJSONLoginRejected413(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_chunk?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -458,7 +458,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 func TestGETTokenCustomReaderProvesZeroReads(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_token_reads?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	service.RegistryTokens, _ = newTestRegistryPair(t)
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
@@ -486,7 +486,7 @@ func TestGETTokenCustomReaderProvesZeroReads(t *testing.T) {
 func TestOversizedRegistrationAndInviteRejected413(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix2_reginv?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	service.RegistryTokens, _ = newTestRegistryPair(t)
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}

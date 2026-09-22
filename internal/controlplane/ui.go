@@ -557,7 +557,8 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
   <div class="card stack">
     <div class="kicker">What happens</div>
     <h2>Bootstrap flow</h2>
-    <p class="muted">The server generates a feed owner keypair, stores the signer privately, and publishes the initial auth and stamp policy topics.</p>
+    <p class="muted">The server generates a feed owner keypair and enqueues the initial auth and stamp policy documents for verified, asynchronous publication.</p>
+    <p class="muted">Provisioning runs in the background: the registry is created as <strong>provisioning</strong> and becomes <strong>ready</strong> only after bootstrap publication is independently verified.</p>
     <p class="muted">After creation, the detail page tells you which ENS address record to update so the registry host can resolve the correct owner.</p>
   </div>
 </div>
@@ -613,10 +614,13 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 	}
 	message := ""
 	if r.URL.Query().Get("created") == "1" {
-		message = "Registry created. Next step: update the ENS address record to the generated owner address below, then run the registry in ENS resolution mode."
+		message = "Registry created and enqueued for provisioning. Bootstrap policy is published in the background and this registry becomes ready once verified publication completes. Next step: update the ENS address record to the generated owner address below."
 	}
 	if r.URL.Query().Get("updated") == "1" {
 		message = "Registry settings updated and policy topics republished."
+	}
+	if r.URL.Query().Get("updated") == "0" {
+		message = "Provisioning is still in progress, so settings were not changed. Save them again once the registry becomes ready."
 	}
 	if r.URL.Query().Get("permissions_updated") == "1" {
 		message = "Collaborator permissions updated and policies republished."
@@ -655,11 +659,21 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
         <h2>{{.Dashboard.Registry.Host}}</h2>
       </div>
       <span class="chip">{{if .Dashboard.Registry.AnonymousPull}}Anonymous pull{{else}}Authenticated pull{{end}}</span>
+      <span class="chip">{{if eq .Dashboard.Registry.ProvisioningState "ready"}}Ready{{else if eq .Dashboard.Registry.ProvisioningState "failed"}}Failed{{else}}Provisioning…{{end}}</span>
     </div>
     <table class="table">
       <tr><th>ENS name</th><td><span class="code" title="{{.Dashboard.Registry.ENSName}}">{{.Dashboard.Registry.ENSName}}</span></td></tr>
       <tr><th>ENS address target</th><td><span class="code" title="{{.Dashboard.Registry.FeedOwnerAddress}}">{{.Dashboard.Registry.FeedOwnerAddress}}</span></td></tr>
       <tr><th>Default stamp</th><td><span class="code" title="{{.Dashboard.Registry.DefaultStampBatchID}}">{{.Dashboard.Registry.DefaultStampBatchID}}</span></td></tr>
+      <tr><th>Provisioning</th><td>
+        {{if eq .Dashboard.Registry.ProvisioningState "ready"}}
+          <span class="muted">Ready — bootstrap policy is published and verified.</span>
+        {{else if eq .Dashboard.Registry.ProvisioningState "failed"}}
+          <span class="muted">Failed — bootstrap policy could not be verified. Re-create the registry, or contact the operator for the control-plane logs.</span>
+        {{else}}
+          <span class="muted">Provisioning — bootstrap policy publication is enqueued and runs in the background. This registry becomes ready once verified.</span>
+        {{end}}
+      </td></tr>
     </table>
     <div class="link-box">
       <strong>ENS setup</strong>
@@ -674,7 +688,12 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Default stamp batch ID<input type="text" name="default_stamp_batch_id" value="{{.Dashboard.Registry.DefaultStampBatchID}}" required></label>
       <label class="checkbox-row"><input type="checkbox" name="anonymous_pull" value="true" {{if .Dashboard.Registry.AnonymousPull}}checked{{end}}> <span>Allow anonymous pull</span></label>
+      {{if eq .Dashboard.Registry.ProvisioningState "ready"}}
       <button type="submit">Save and publish policy</button>
+      {{else}}
+      <button type="submit" disabled>Save and publish policy</button>
+      <div class="muted">Registry is not ready yet. Settings (including anonymous pull) are locked until verified bootstrap publication completes.</div>
+      {{end}}
     </form>
     <div class="muted">Published policies are derived from registry settings and role-based access. Adding or accepting users does not rewrite policy topics.</div>
   </div>
@@ -806,6 +825,16 @@ func (s *HTTPServer) handleUIUpdateRegistrySettings(w http.ResponseWriter, r *ht
 		r.FormValue("default_stamp_batch_id"),
 	)
 	if err != nil {
+		if errors.Is(err, errRegistryNotReady) {
+			// Safe, user-actionable recovery path: the registry is still
+			// provisioning, so settings (e.g. anonymous pull) must not be
+			// changed yet. Redirect with a clear notice rather than surfacing
+			// raw internals, and never publish or mutate anything.
+			u := "/ui/registries/" + strconv.FormatInt(registryID, 10) + "?updated=0&notice=" +
+				url.QueryEscape("settings can be changed only after bootstrap publication completes")
+			http.Redirect(w, r, u, http.StatusSeeOther)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

@@ -172,6 +172,32 @@ var migrations = []migration{
 		Version: 6,
 		Apply:   installProvisioningOutboxSchema,
 	},
+	// Version 7 hardens the provisioning schema. It is the forward-only
+	// authority for two gaps migration 6 left open:
+	//
+	//   1. migration 6's provisioning_state guard trigger is BEFORE UPDATE only,
+	//      so direct INSERT SQL could still store a bogus vocabulary value; v7
+	//      installs a symmetric BEFORE INSERT guard so the provisioning|ready|
+	//      failed vocabulary is enforced on INSERT AND UPDATE/direct SQL;
+	//   2. the v6 registry_publication_jobs table carries only KIND/STATE CHECKs,
+	//      so direct SQL could store a malformed or incoherent job row. v7
+	//      REBUILDS the table (drop/rename-inside-the-migration-transaction, the
+	//      same atomic pattern migrations 1 and 4 use) with hardened DB
+	//      invariants: bounded, structurally valid JSON-object payload that is
+	//      kind-appropriate (auth carries $.version + $.defaultAccess, stamp
+	//      carries $.defaultPolicy.batchID), nonnegative/bounded attempts,
+	//      RFC3339 timestamps, bounded ids/token/ref/error sizes, the
+	//      registry FK + (registry_id, kind) uniqueness, and state/ownership/
+	//      lease/completion coherence (a claimed job holds a lease; every other
+	//      state clears it; a succeeded job carries verified refs and a
+	//      completion stamp). Every existing v6 row is validated by the new
+	//      CHECKs during the copy, so a malformed row rolls the whole upgrade
+	//      back (version stays 6, data untouched) while legitimate in-flight and
+	//      terminal v6 rows migrate untouched.
+	{
+		Version: 7,
+		Apply:   installProvisioningOutboxSchemaHarden,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only
@@ -1111,6 +1137,107 @@ func installProvisioningOutboxSchema(ctx context.Context, tx *sql.Tx) error {
 	)`
 	if _, err := tx.ExecContext(ctx, jobsTable); err != nil {
 		return fmt.Errorf("migration 6: create registry_publication_jobs table: %w", err)
+	}
+	return nil
+}
+
+// RFC3339 UTC timestamps are stored as text in the control plane. The
+// hardening CHECK uses a GLOB so the column is at least structurally a
+// 'YYYY-MM-DDTHH:MM:SS...' RFC3339 value (the Z suffix and optional fractional
+// seconds are allowed beyond the indicated positions). GLOB (not LIKE) is used
+// because modernc.org/sqlite's LIKE does not honour '[0-9]' character ranges.
+const rfc3339Glob = `[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*`
+
+// hardenedPublicationJobsTableSQL is the SINGLE SOURCE OF TRUTH for the
+// version-7 registry_publication_jobs schema: the v6 columns plus hardened DB
+// invariants that close the direct-SQL gap. %s is the table name (the "_new"
+// rebuild clone in the migration).
+const hardenedPublicationJobsTableSQL = `CREATE TABLE %s (
+	id integer primary key autoincrement,
+	registry_id integer not null references registries(id) on delete cascade,
+	kind text not null check (kind in ('auth','stamp')),
+	state text not null check (state in ('pending','claimed','succeeded','failed')),
+	payload_json text not null
+		check (
+			json_valid(payload_json) = 1
+			and json_type(payload_json) = 'object'
+			and length(payload_json) between 2 and 32768
+			and (
+				(kind = 'auth'
+					and json_extract(payload_json, '$.version') is not null
+					and json_extract(payload_json, '$.defaultAccess') is not null)
+				or
+				(kind = 'stamp'
+					and json_extract(payload_json, '$.version') is not null
+					and json_extract(payload_json, '$.defaultPolicy.batchID') is not null)
+			)
+		),
+	object_ref text not null default '' check (length(object_ref) <= 128),
+	feed_ref text not null default '' check (length(feed_ref) <= 128),
+	attempts integer not null default 0 check (attempts >= 0 and attempts <= 1024),
+	next_attempt_at text not null check (next_attempt_at glob '` + rfc3339Glob + `'),
+	claimed_until text check (claimed_until is null or claimed_until glob '` + rfc3339Glob + `'),
+	claimed_by text not null default '' check (length(claimed_by) <= 64),
+	last_error text not null default '' check (length(last_error) <= 512),
+	created_at text not null check (created_at glob '` + rfc3339Glob + `'),
+	completed_at text check (completed_at is null or completed_at glob '` + rfc3339Glob + `'),
+	unique (registry_id, kind),
+	-- Ownership/lease coherence: a job owns a lease (claimed_by set together
+	-- with claimed_until) IFF it is claimed; every other state has both cleared.
+	check ((state = 'claimed') = (claimed_by <> '' and claimed_until is not null)),
+	-- A succeeded job must carry its verified object_ref, feed_ref, and a
+	-- completion stamp.
+	check (state <> 'succeeded' or (object_ref <> '' and feed_ref <> '' and completed_at is not null))
+)`
+
+// provisioningStateInsertGuardTriggerSQL is the symmetric counterpart of
+// migration 6's BEFORE UPDATE guard: it enforces the provisioning_state
+// vocabulary on INSERT too, so direct SQL cannot insert a bogus value.
+const provisioningStateInsertGuardTriggerSQL = `create trigger registries_provisioning_state_guard_insert before insert on registries
+	for each row when new.provisioning_state not in ('provisioning','ready','failed')
+	begin select raise(abort, 'invalid registry provisioning_state'); end`
+
+// installProvisioningOutboxSchemaHarden is migration 7's body. It (a) installs
+// the BEFORE INSERT provisioning_state guard (migration 6 only guarded UPDATE),
+// and (b) atomically rebuilds registry_publication_jobs around the hardened
+// invariant schema. Any existing v6 row that violates a hardened invariant is
+// REJECTED by the copy's CHECKs, rolling the whole migration back (version
+// stays 6, no triggers, no data touched); every legitimate in-flight or
+// terminal v6 row migrates byte-for-byte with its ID intact.
+func installProvisioningOutboxSchemaHarden(ctx context.Context, tx *sql.Tx) error {
+	// 1. BEFORE INSERT provisioning_state guard (closes the INSERT direct-SQL
+	// gap; migration 6's UPDATE guard remains authoritative for updates).
+	if _, err := tx.ExecContext(ctx, provisioningStateInsertGuardTriggerSQL); err != nil {
+		return fmt.Errorf("migration 7: install provisioning state insert guard trigger: %w", err)
+	}
+
+	// 2. Create the hardened *_new clone.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(hardenedPublicationJobsTableSQL, "registry_publication_jobs_new")); err != nil {
+		return fmt.Errorf("migration 7: create hardened jobs clone: %w", err)
+	}
+
+	// 3. Copy every existing row by explicit column name (preserves the
+	// physical order-independence guarantee used elsewhere). If any existing
+	// row violates a hardened invariant (e.g. a malformed payload or an
+	// incoherent state/lease), the INSERT fails here and the whole migration
+	// rolls back with version 6 recorded and data untouched.
+	if _, err := tx.ExecContext(ctx, `insert into registry_publication_jobs_new
+		(id, registry_id, kind, state, payload_json, object_ref, feed_ref,
+		 attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at)
+		select id, registry_id, kind, state, payload_json, object_ref, feed_ref,
+		 attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at
+		from registry_publication_jobs`); err != nil {
+		return fmt.Errorf("migration 7: copy jobs into hardened schema: %w", err)
+	}
+
+	// 4. Drop the v6 table and rename the hardened clone into place. The
+	// registry_id FK and the (registry_id, kind) uniqueness are carried over; a
+	// concurrent foreign_key_check ensures nothing is orphaned.
+	if _, err := tx.ExecContext(ctx, `drop table registry_publication_jobs`); err != nil {
+		return fmt.Errorf("migration 7: drop v6 jobs table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `alter table registry_publication_jobs_new rename to registry_publication_jobs`); err != nil {
+		return fmt.Errorf("migration 7: rename hardened jobs table: %w", err)
 	}
 	return nil
 }

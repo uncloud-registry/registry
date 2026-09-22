@@ -29,8 +29,9 @@ func TestServiceRegisterLoginCreateRegistryAndInvite(t *testing.T) {
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
-			Documents: &memoryUploader{refs: map[string][]byte{}},
-			Feeds:     &MemoryRegistryFeedUpdater{Feeds: map[string]string{}},
+			Documents:   &memoryUploader{refs: map[string][]byte{}},
+			Feeds:       &MemoryRegistryFeedUpdater{Feeds: map[string]string{}},
+			FeedsReader: &MemoryRegistryFeedStore{Feeds: map[string]string{}},
 		},
 	}
 
@@ -94,15 +95,16 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 	}
 	manager := newTestSessionManager(t)
 	uploader := &memoryUploader{refs: map[string][]byte{}}
-	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
+	feeds := &MemoryRegistryFeedStore{Feeds: map[string]string{}}
 	service := &Service{
 		Store:          store,
 		Tokens:         manager,
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
-			Documents: uploader,
-			Feeds:     feeds,
+			Documents:   uploader,
+			Feeds:       feeds,
+			FeedsReader: feeds,
 		},
 	}
 
@@ -118,11 +120,11 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 		t.Fatalf("expected provisioning state at creation, got %q", created.State)
 	}
 
-	// Publication is transactional outlier, so nothing is published until the
+	// Publication is transactional outbox, so nothing is published until the
 	// reconciler runs. Drive RunOnce to publish both bootstrap jobs.
-	reconciler := service.NewReconciler()
-	if reconciler == nil {
-		t.Fatal("expected a reconciler from a publisher-backed service")
+	reconciler, err := service.NewReconciler()
+	if err != nil {
+		t.Fatalf("expected a reconciler from a publisher-backed service: %v", err)
 	}
 	if err := reconciler.RunOnce(context.Background()); err != nil {
 		t.Fatalf("run once: %v", err)
@@ -252,15 +254,16 @@ func TestAcceptInviteIsIdempotentForExistingMembership(t *testing.T) {
 	}
 	manager := newTestSessionManager(t)
 	uploader := &memoryUploader{refs: map[string][]byte{}}
-	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
+	feeds := &MemoryRegistryFeedStore{Feeds: map[string]string{}}
 	service := &Service{
 		Store:          store,
 		Tokens:         manager,
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
-			Documents: uploader,
-			Feeds:     feeds,
+			Documents:   uploader,
+			Feeds:       feeds,
+			FeedsReader: feeds,
 		},
 	}
 
@@ -310,7 +313,7 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 	manager := newTestSessionManager(t)
 	registryTokens, pubKeys := newTestRegistryPair(t)
 	uploader := &memoryUploader{refs: map[string][]byte{}}
-	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
+	feeds := &MemoryRegistryFeedStore{Feeds: map[string]string{}}
 	service := &Service{
 		Store:          store,
 		Tokens:         manager,
@@ -318,8 +321,9 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
 		Publisher: &Publisher{
-			Documents: uploader,
-			Feeds:     feeds,
+			Documents:   uploader,
+			Feeds:       feeds,
+			FeedsReader: feeds,
 		},
 	}
 
@@ -410,12 +414,15 @@ func TestAnonymousPullNeverBroadensMemberPush(t *testing.T) {
 	}
 	manager := newTestSessionManager(t)
 	registryTokens, pubKeys := newTestRegistryPair(t)
+	uploader := &memoryUploader{refs: map[string][]byte{}}
+	feeds := &MemoryRegistryFeedStore{Feeds: map[string]string{}}
 	service := &Service{
 		Store:          store,
 		Tokens:         manager,
 		RegistryTokens: registryTokens,
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      &Publisher{Documents: uploader, Feeds: feeds, FeedsReader: feeds},
 	}
 
 	alice, _, err := service.RegisterUser(context.Background(), "alice@example.com", "password123")
@@ -428,6 +435,21 @@ func TestAnonymousPullNeverBroadensMemberPush(t *testing.T) {
 		t.Fatalf("create registry: %v", err)
 	}
 	host := created.Registry.Host
+
+	// The provisioning gate requires settings changes to wait until bootstrap
+	// publication completes, so drive the registry to 'ready' first.
+	reconciler, err := service.NewReconciler()
+	if err != nil {
+		t.Fatalf("new reconciler: %v", err)
+	}
+	if err := reconciler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("reconcile to ready: %v", err)
+	}
+	if reg, err := store.FindRegistryByID(context.Background(), created.Registry.ID); err != nil {
+		t.Fatalf("find registry: %v", err)
+	} else if reg.ProvisioningState != ProvisioningStateReady {
+		t.Fatalf("registry must reach ready before settings change, got %q", reg.ProvisioningState)
+	}
 
 	// bob is a member with pull-only permission (CanPush=false).
 	bob, _, err := service.RegisterUser(context.Background(), "bob@example.com", "password123")
@@ -506,7 +528,7 @@ func TestPublisherBuildsBootstrapDocuments(t *testing.T) {
 	t.Parallel()
 
 	uploader := &memoryUploader{refs: map[string][]byte{}}
-	feeds := &MemoryRegistryFeedUpdater{Feeds: map[string]string{}}
+	feeds := &MemoryRegistryFeedStore{Feeds: map[string]string{}}
 	publisher := &Publisher{Documents: uploader, Feeds: feeds}
 
 	registry := Registry{

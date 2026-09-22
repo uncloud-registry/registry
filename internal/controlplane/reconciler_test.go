@@ -57,9 +57,12 @@ func (f *failObjectStore) Get(c context.Context, ref string) ([]byte, error) {
 
 func (f *failObjectStore) putCalls() int { f.mu.Lock(); defer f.mu.Unlock(); return f.putCount }
 
-// failFeedUpdater wraps a memory feed updater with per-feed failure injection.
+// failFeedUpdater wraps a memory feed store with per-feed failure injection.
+// The wrapped store is the SAME MemoryRegistryFeedStore used as the feed
+// resolver, so a successful update is independently resolvable and a failed
+// (or mis-directed) update resolves to a mismatch.
 type failFeedUpdater struct {
-	inner   *MemoryRegistryFeedUpdater
+	inner   *MemoryRegistryFeedStore
 	failFor map[string]bool
 	mu      sync.Mutex
 }
@@ -85,6 +88,7 @@ type provisioningHarness struct {
 	service    *Service
 	uploader   *failObjectStore
 	feeds      *failFeedUpdater
+	feedStore  *MemoryRegistryFeedStore
 	reconciler *Reconciler
 	ownerID    int64
 	now        time.Time
@@ -98,8 +102,9 @@ func newProvisioningHarness(t *testing.T) *provisioningHarness {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	uploader := &failObjectStore{inner: &memoryUploader{refs: map[string][]byte{}}}
+	feedStore := &MemoryRegistryFeedStore{Feeds: map[string]string{}}
 	feeds := &failFeedUpdater{
-		inner:   &MemoryRegistryFeedUpdater{Feeds: map[string]string{}},
+		inner:   feedStore,
 		failFor: map[string]bool{},
 	}
 	service := &Service{
@@ -107,20 +112,23 @@ func newProvisioningHarness(t *testing.T) *provisioningHarness {
 		Tokens:         newTestSessionManager(t),
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
-		Publisher:      &Publisher{Documents: uploader, Feeds: feeds},
+		Publisher:      &Publisher{Documents: uploader, Feeds: feeds, FeedsReader: feedStore},
 	}
 	owner, _, err := service.RegisterUser(context.Background(), "reconciler@example.com", "password123")
 	if err != nil {
 		t.Fatalf("register owner: %v", err)
 	}
-	reconciler := service.NewReconciler()
+	reconciler, err := service.NewReconciler()
+	if err != nil {
+		t.Fatalf("new reconciler: %v", err)
+	}
 	// Small, fast backoff so retry determinism does not depend on wall clock.
 	reconciler.BackoffBase = time.Nanosecond
 	reconciler.BackoffMax = time.Nanosecond
 	reconciler.Lease = 10 * time.Second
 
 	h := &provisioningHarness{
-		store: store, service: service, uploader: uploader, feeds: feeds,
+		store: store, service: service, uploader: uploader, feeds: feeds, feedStore: feedStore,
 		reconciler: reconciler, ownerID: owner.ID, now: time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC),
 	}
 	reconciler.now = func() time.Time { return h.now }

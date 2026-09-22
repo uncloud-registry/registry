@@ -60,7 +60,7 @@ func newInviteTestStore(t *testing.T, name string) *Store {
 func newInviteTestService(t *testing.T, name string) (*Store, *Service) {
 	t.Helper()
 	store := newInviteTestStore(t, name)
-	return store, &Service{Store: store, Tokens: newTestSessionManager(t), RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	return store, &Service{Store: store, Tokens: newTestSessionManager(t), RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 }
 
 // TestInviteTokenGenerationAndDigest pins the token format: exactly 24 random
@@ -536,7 +536,7 @@ func TestInviteConcurrentAcceptanceAndRevocation(t *testing.T) {
 
 	for round := 0; round < 5; round++ {
 		store := newInviteTestStore(t, fmt.Sprintf("controlplane_invite_acceptrevoke_%d", round))
-		service := &Service{Store: store, Tokens: newTestSessionManager(t), RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+		service := &Service{Store: store, Tokens: newTestSessionManager(t), RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 		ctx := context.Background()
 		alice, _, err := service.RegisterUser(ctx, "alice@example.com", "password123")
 		if err != nil {
@@ -821,8 +821,8 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
 			got, err := CurrentSchemaVersion(ctx, db)
-			if err != nil || got != 6 {
-				t.Fatalf("expected schema version 6, got %d (err %v)", got, err)
+			if err != nil || got != 7 {
+				t.Fatalf("expected schema version 7, got %d (err %v)", got, err)
 			}
 			assertInviteDigestSchema(t, db)
 
@@ -1119,8 +1119,8 @@ func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("invite recipient normalization collision must not fail the migration: %v", err)
 		}
-		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 6 {
-			t.Fatalf("expected version 6, got %d (err %v)", got, err)
+		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 7 {
+			t.Fatalf("expected version 7, got %d (err %v)", got, err)
 		}
 		var emailA, emailB string
 		if err := db.QueryRowContext(ctx, `select email from registry_invites where id = 1`).Scan(&emailA); err != nil {
@@ -1273,8 +1273,8 @@ func TestInviteDigestMigrationNormalizesLegacyEmailsEveryVersion(t *testing.T) {
 			if err := ApplyMigrations(ctx, db); err != nil {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
-			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 6 {
-				t.Fatalf("expected schema version 6, got %d (err %v)", got, err)
+			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 7 {
+				t.Fatalf("expected schema version 7, got %d (err %v)", got, err)
 			}
 
 			// Users normalized to the canonical form.
@@ -1873,15 +1873,15 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("expected schema version 6 after repair, got %d", version)
+	if version != 7 {
+		t.Fatalf("expected schema version 7 after repair, got %d", version)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 3 {
-		t.Fatalf("expected exactly 3 recorded migrations (fixture's v4 + forward 5 + forward 6), got %d", migCount)
+	if migCount != 4 {
+		t.Fatalf("expected exactly 4 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7), got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 
@@ -2001,8 +2001,8 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("re-apply migrations after repair: %v", err)
 	}
-	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 6 {
-		t.Fatalf("version must stay 5 on re-apply, got %d (err %v)", version, err)
+	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 7 {
+		t.Fatalf("version must stay 7 on re-apply, got %d (err %v)", version, err)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 }
@@ -2037,15 +2037,15 @@ func TestInviteMigrationV5FromCleanV4Schema(t *testing.T) {
 		t.Fatalf("apply migrations from clean v4: %v", err)
 	}
 	version, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || version != 6 {
-		t.Fatalf("expected schema version 6 from clean v4, got %d (err %v)", version, err)
+	if err != nil || version != 7 {
+		t.Fatalf("expected schema version 7 from clean v4, got %d (err %v)", version, err)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 6 {
-		t.Fatalf("expected 6 migration rows, got %d", migCount)
+	if migCount != 7 {
+		t.Fatalf("expected 7 migration rows, got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 	// Still protected after the reinstall, row unchanged.

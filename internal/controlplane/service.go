@@ -176,6 +176,17 @@ func (s *Service) Login(ctx context.Context, email string, password string) (Use
 }
 
 func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug string, ensName string, anonymousPull bool, defaultStampBatchID string) (CreatedRegistry, error) {
+	// Fail closed on dependencies BEFORE any key generation or DB write: a
+	// registry can only be created when the control plane can actually
+	// provision it (a Store to persist the outbox, a Publisher with a
+	// Documents object store, a Feeds updater, and feed read-back
+	// resolution). Otherwise it would silently enqueue a registry that sits
+	// provisioning forever. This runs before generatePrivateKeyBytes and
+	// before any store call, so misconfiguration causes zero DB effects.
+	if s.Store == nil || s.Publisher == nil ||
+		s.Publisher.Documents == nil || s.Publisher.Feeds == nil || s.Publisher.FeedsReader == nil {
+		return CreatedRegistry{}, errProvisioningNotConfigured
+	}
 	if s.FeedKeys == nil {
 		return CreatedRegistry{}, errFeedKeyCipherNotConfigured
 	}
@@ -252,14 +263,17 @@ func (s *Service) ListRegistries(ctx context.Context, userID int64) ([]Registry,
 }
 
 // NewReconciler builds the provisioning outbox reconciler over this service's
-// already-open store and configured publisher. It returns nil when no external
-// publication is wired (no Publisher), which the caller treats as
-// "no reconciler to run". It performs no I/O and opens no database.
-func (s *Service) NewReconciler() *Reconciler {
-	if s.Publisher == nil {
-		return nil
+// already-open store and configured publisher. It FAILS CLOSED (returns the
+// data-free errReconcilerNotConfigured) when the service cannot publish and
+// verify a job — no Store, no Publisher, or a Publisher missing its Documents,
+// Feeds, or feed read-back resolver — so a worker is never silently created
+// that could skip a stage or complete an unverified job. It performs no I/O
+// and opens no database.
+func (s *Service) NewReconciler() (*Reconciler, error) {
+	if s.Store == nil || s.Publisher == nil {
+		return nil, errReconcilerNotConfigured
 	}
-	return NewReconciler(s.Store, s.Publisher.Documents, s.Publisher.Feeds)
+	return NewReconciler(s.Store, s.Publisher.Documents, s.Publisher.Feeds, s.Publisher.FeedsReader)
 }
 
 func (s *Service) GetRegistry(ctx context.Context, userID int64, registryID int64) (Registry, error) {

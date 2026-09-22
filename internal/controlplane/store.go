@@ -541,9 +541,43 @@ func (s *Store) FindRegistryByHost(ctx context.Context, host string) (Registry, 
 	return registry, nil
 }
 
+// UpdateRegistrySettings mutates anonymous_pull / default_stamp_batch_id ONLY
+// when the registry is fully provisioned (provisioning_state == ready). The
+// guard is a conditional UPDATE inside a BEGIN IMMEDIATE write transaction, so
+// it is race-safe relative to the reconciler's final provisioning→ready
+// transition: the two coordinators serialize on the SQLite write lock, and if
+// the registry is still 'provisioning' (or the reconciler has not yet
+// committed ready) the settings row is left untouched — the whole point of
+// the gate is that a stale provisioning jobs pass must never later overwrite
+// a newer policy published from settings. On rejection nothing is mutated and
+// the typed errRegistryNotReady is returned so the caller can map it to a
+// clear, safe API/UI response (and its publisher is never invoked). A
+// nonexistent registry still returns sql.ErrNoRows exactly as before.
 func (s *Store) UpdateRegistrySettings(ctx context.Context, registryID int64, anonymousPull bool, defaultStampBatchID string) (Registry, error) {
-	_, err := s.DB.ExecContext(ctx, `update registries set anonymous_pull = ?, default_stamp_batch_id = ? where id = ?`,
-		boolToInt(anonymousPull), defaultStampBatchID, registryID)
+	err := s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		res, err := c.ExecContext(ctx, `update registries set anonymous_pull = ?, default_stamp_batch_id = ? where id = ? and provisioning_state = 'ready'`,
+			boolToInt(anonymousPull), defaultStampBatchID, registryID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 1 {
+			return nil
+		}
+		// Nothing changed: either the registry does not exist or it is not
+		// ready yet. Distinguish so the two callers get the right story.
+		var exists int
+		if err := c.QueryRowContext(ctx, `select count(*) from registries where id = ?`, registryID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return sql.ErrNoRows
+		}
+		return errRegistryNotReady
+	})
 	if err != nil {
 		return Registry{}, err
 	}

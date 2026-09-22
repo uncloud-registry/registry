@@ -212,6 +212,9 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 				BaseURL: cfg.BeeAPIURL.String(),
 				Keys:    service,
 			},
+			// Feed read-back resolution: the reconciler proves a policy feed
+			// points at the uploaded object by resolving it back to its ref.
+			FeedsReader: swarm.BeeFeedResolver{BaseURL: cfg.BeeAPIURL.String(), HTTPClient: nil},
 		}
 	}
 
@@ -219,10 +222,17 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 
 	comps := &controlPlaneComponents{handler: handler, tlsCert: tlsCert}
 	// Wire the provisioning reconciler against the validated, already-open
-	// store and the configured Bee object store / feed updater. The reconciler
-	// itself opens no database and performs no I/O at construction.
-	if service.Publisher != nil && service.Publisher.Documents != nil && service.Publisher.Feeds != nil {
-		comps.reconciler = service.NewReconciler()
+	// store and the configured Bee object store / feed updater / feed
+	// resolver. Construction fails closed: a Publisher missing read-back
+	// capability aborts startup rather than running a worker that could mark
+	// unverified jobs complete. The reconciler opens no database and performs
+	// no I/O at construction.
+	if service.Publisher != nil && service.Publisher.Documents != nil && service.Publisher.Feeds != nil && service.Publisher.FeedsReader != nil {
+		r, err := service.NewReconciler()
+		if err != nil {
+			return nil, err
+		}
+		comps.reconciler = r
 	}
 	return comps, nil
 }

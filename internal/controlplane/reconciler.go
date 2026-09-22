@@ -22,6 +22,11 @@ type Reconciler struct {
 	Store     *Store
 	Documents ObjectStore
 	Feeds     RegistryFeedUpdater
+	// ResolveFeeds is the feed resolution/read contract: it independently
+	// resolves a policy feed to the ref currently stored at it, so the
+	// reconciler proves the feed the updater claims it wrote really points at
+	// the uploaded object (a no-op/wrong/overwritten updater never completes).
+	ResolveFeeds FeedResolver
 
 	// Lease is how long one worker's claim holds a job before another worker
 	// may reclaim it (stale-claim reclamation).
@@ -52,21 +57,46 @@ const (
 	defaultLoopInterval = 2 * time.Second
 )
 
-// NewReconciler returns a Reconciler over an already-open store and a
-// writable/readable object store plus feed updater. It performs no I/O here; it
-// is safe to construct after config and key material are validated.
-func NewReconciler(store *Store, documents ObjectStore, feeds RegistryFeedUpdater) *Reconciler {
-	return &Reconciler{
-		Store:       store,
-		Documents:   documents,
-		Feeds:       feeds,
-		Lease:       defaultClaimLease,
-		BatchSize:   defaultBatchSize,
-		MaxAttempts: defaultMaxAttempts,
-		BackoffBase: defaultBackoffBase,
-		BackoffMax:  defaultBackoffMax,
-		Interval:    defaultLoopInterval,
+// NewReconciler returns a Reconciler over an already-open store, a
+// writable/readable object store, a feed updater, and a feed resolver. It
+// FAILS CLOSED on any missing dependency (store, documents, feeds updater, or
+// feed resolver) rather than constructing a reconciler that could silently
+// skip a stage or complete an unverified job. It performs no I/O here; it is
+// safe to construct after config and key material are validated.
+func NewReconciler(store *Store, documents ObjectStore, feeds RegistryFeedUpdater, resolveFeeds FeedResolver) (*Reconciler, error) {
+	if store == nil || documents == nil || feeds == nil {
+		return nil, errReconcilerNotConfigured
 	}
+	if resolveFeeds == nil {
+		// Without feed resolution/read-back the reconciler cannot prove a
+		// feed points at the uploaded object, so it must fail closed.
+		return nil, errReconcilerNotConfigured
+	}
+	return &Reconciler{
+		Store:        store,
+		Documents:    documents,
+		Feeds:        feeds,
+		ResolveFeeds: resolveFeeds,
+		Lease:        defaultClaimLease,
+		BatchSize:    defaultBatchSize,
+		MaxAttempts:  defaultMaxAttempts,
+		BackoffBase:  defaultBackoffBase,
+		BackoffMax:   defaultBackoffMax,
+		Interval:     defaultLoopInterval,
+	}, nil
+}
+
+// validate returns a data-free configuration error (never panics) when any
+// dependency the reconciler needs to publish and verify a job is missing. It
+// guards RunOnce even for an externally-constructed zero-value Reconciler.
+func (r *Reconciler) validate() error {
+	if r == nil {
+		return errReconcilerNotConfigured
+	}
+	if r.Store == nil || r.Documents == nil || r.Feeds == nil || r.ResolveFeeds == nil {
+		return errReconcilerNotConfigured
+	}
+	return nil
 }
 
 func (r *Reconciler) nowUTC() time.Time {
@@ -80,9 +110,13 @@ func (r *Reconciler) nowUTC() time.Time {
 // batch of due/stale jobs and process each through its logical stages. It
 // returns nil after a normal pass (retryable external failures are persisted
 // as backoff, not returned); it returns an error only for fatal conditions
-// (datastore or lost-claim on persist). Test-injectable via reconciler.now and
-// the store's clock where relevant.
+// (missing configuration, datastore, or lost-claim on persist). A missing
+// dependency returns the data-free errReconcilerNotConfigured, never a panic.
+// Test-injectable via reconciler.now and the store's clock where relevant.
 func (r *Reconciler) RunOnce(ctx context.Context) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
 	now := r.nowUTC()
 	jobs, worker, err := r.Store.ClaimStalePublicationJobs(ctx, now, r.Lease, r.BatchSize)
 	if err != nil {
@@ -173,9 +207,22 @@ func (r *Reconciler) reconcileJob(ctx context.Context, job PublicationJob, worke
 		job.FeedRef = feed
 	}
 
-	// Stage 3 — verified read-back: the uploaded object must return exactly
-	// the expected policy bytes. A mismatch (or read failure) is retryable,
-	// so a partially satisfying object store never falsely completes a job.
+	// Stage 3 — verified feed resolution: the feed MUST independently resolve
+	// to exactly the object ref the job uploaded. This is the explicit
+	// feed read-back that closes the no-op/wrong/overwritten-updater gap:
+	// persisting the feed_ref identifier is not proof. A feed that was never
+	// published, points at a different ref, or was overwritten is retryable
+	// (never a false completion).
+	feed := r.feedRefForJob(reg, job.Kind)
+	resolved, err := r.ResolveFeeds.ResolveFeed(ctx, feed)
+	if err != nil || resolved != job.ObjectRef {
+		return r.failRetryable(ctx, job, worker, now, "feed resolution mismatch")
+	}
+
+	// Stage 4 — verified object read-back: the uploaded object must return
+	// exactly the expected policy bytes. A mismatch (or read failure) is
+	// retryable, so a partially satisfying object store never falsely
+	// completes a job.
 	got, err := r.Documents.Get(ctx, job.ObjectRef)
 	if err != nil || !bytes.Equal(got, job.PayloadJSON) {
 		return r.failRetryable(ctx, job, worker, now, "read-back mismatch")
@@ -221,7 +268,7 @@ func (r *Reconciler) failRetryable(ctx context.Context, job PublicationJob, work
 // persist. It never propagates raw external error text.
 func sanitizeFailureClass(class string) string {
 	switch class {
-	case "upload failed", "feed update failed", "read-back mismatch":
+	case "upload failed", "feed update failed", "feed resolution mismatch", "read-back mismatch":
 		return class
 	default:
 		return fmt.Sprintf("publication failed (%s)", truncate(class, 40))

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/uncloud-registry/registry/internal/spec"
 	"github.com/uncloud-registry/registry/internal/swarm"
@@ -34,7 +35,51 @@ type Publisher struct {
 	// back so the reconciler can prove read-back. The same store must serve
 	// both, so an outbox worker that uploaded a document can later read it.
 	Documents ObjectStore
-	Feeds     RegistryFeedUpdater
+	// Feeds writes a policy feed update pointing at an uploaded document.
+	Feeds RegistryFeedUpdater
+	// FeedsReader independently resolves a policy feed to the ref currently
+	// stored at it, so the reconciler can verify the feed really points at
+	// the uploaded object before marking a job verified. Without it,
+	// CreateRegistry fails closed (a no-op/wrong/overwritten feed updater
+	// must never complete a job).
+	FeedsReader FeedResolver
+}
+
+// MemoryRegistryFeedStore is the combined in-memory feed updater + resolver
+// used by tests. Its single map holds feed->ref exactly as written, so
+// reconciliation resolves the SAME state the updater wrote. Tests may also
+// mutate Feeds directly to simulate an independent/overwritten feed mapping
+// (a mis-directed feed) and prove the reconciler refuses to complete a job
+// whose resolved ref does not equal the uploaded object ref.
+type MemoryRegistryFeedStore struct {
+	Feeds map[string]string
+	mu    sync.Mutex
+}
+
+func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string) error {
+	if m == nil {
+		return errors.New("feed store is not configured")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Feeds == nil {
+		m.Feeds = map[string]string{}
+	}
+	m.Feeds[feed] = ref
+	return nil
+}
+
+func (m *MemoryRegistryFeedStore) ResolveFeed(_ context.Context, feed string) (string, error) {
+	if m == nil {
+		return "", errors.New("feed store is not configured")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ref, ok := m.Feeds[feed]
+	if !ok {
+		return "", fmt.Errorf("feed %q not found", feed)
+	}
+	return ref, nil
 }
 
 func (p Publisher) PublishBootstrap(ctx context.Context, registry Registry, memberships []MembershipSubject) (BootstrapPublication, error) {

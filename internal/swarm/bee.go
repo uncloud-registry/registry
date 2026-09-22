@@ -47,6 +47,52 @@ type BeeSequenceFeedUpdater struct {
 	PrivateKey *ecdsa.PrivateKey
 }
 
+// BeeFeedResolver resolves a Swarm sequence feed to the object ref currently
+// stored at it. It is the read-back counterpart of BeeSequenceFeedUpdater:
+// reading the feed (GET /feeds/{owner}/{topic} via BeeDocumentStore) returns
+// the exact payload the signer wrote, which is the 8-byte little-endian
+// length-prefixed ref produced by makeChunkData. parseChunkData (the inverse
+// of makeChunkData, sharing the same constant format via this file) recovers
+// that ref, so the resolver and the signer can never drift apart on the
+// stored representation. A reconciier uses this to PROVE a policy feed points
+// at the object it uploaded before marking a bootstrap job verified: a feed
+// that was never published, points elsewhere, or was overwritten with a
+// different ref will not resolve to the expected object ref.
+type BeeFeedResolver struct {
+	BaseURL    string
+	HTTPClient *http.Client
+}
+
+func (r BeeFeedResolver) ResolveFeed(ctx context.Context, feed string) (string, error) {
+	doc := BeeDocumentStore{BaseURL: r.BaseURL, HTTPClient: r.HTTPClient}
+	data, err := doc.Read(ctx, feed)
+	if err != nil {
+		return "", err
+	}
+	payload, err := parseChunkData(data)
+	if err != nil {
+		return "", fmt.Errorf("resolve feed %q: %w", feed, err)
+	}
+	return string(payload), nil
+}
+
+// parseChunkData is the inverse of makeChunkData: it recovers the payload from
+// the 8-byte little-endian length-prefixed chunk wire format the feed signer
+// writes (and Bee's chunk store round-trips). It is the single shared decoder
+// for feed read-back so resolution of a published feed is byte-exact.
+func parseChunkData(data []byte) ([]byte, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("feed chunk payload is shorter than its 8-byte length prefix")
+	}
+	n := binary.LittleEndian.Uint64(data[:8])
+	if n != uint64(len(data)-8) {
+		return nil, fmt.Errorf("feed chunk payload length %d does not match stored prefix %d", len(data)-8, n)
+	}
+	out := make([]byte, len(data)-8)
+	copy(out, data[8:])
+	return out, nil
+}
+
 type beeReferenceResponse struct {
 	Reference string `json:"reference"`
 }

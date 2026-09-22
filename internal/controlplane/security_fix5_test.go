@@ -43,7 +43,7 @@ func unicodeWSLogout(t *testing.T, ct string) {
 	uniStoreSeq.Add(1)
 	store, _ := OpenSQLite("file:csec_fix5_uni_ws_" + strconv.FormatUint(uniStoreSeq.Load(), 10) + "?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	_, session, _ := service.RegisterUser(context.Background(), "uni@example.com", "password123")
 	csrf := sessionCSRFForTest(t, session)
@@ -117,7 +117,7 @@ func TestASCIIOWSOnlyContentTypeStillAbsent(t *testing.T) {
 	// Real path: ASCII OWS-only bodyless logout still clears the cookie (303).
 	store, _ := OpenSQLite("file:csec_fix5_ascii?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	_, session, _ := service.RegisterUser(context.Background(), "a@example.com", "password123")
 	csrf := sessionCSRFForTest(t, session)

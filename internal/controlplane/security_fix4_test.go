@@ -45,7 +45,7 @@ func TestAbsentContentTypeBodylessLogoutClearsCookie(t *testing.T) {
 	// never a blanket 415.
 	store, _ := OpenSQLite("file:csec_fix4_logout?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	_, session, _ := service.RegisterUser(context.Background(), "alice@example.com", "password123")
 	csrf := sessionCSRFForTest(t, session)
@@ -69,7 +69,7 @@ func TestBlankContentTypeTreatedAsAbsent(t *testing.T) {
 	// (unspecified), NOT malformed 415 — the bodyless logout still executes.
 	store, _ := OpenSQLite("file:csec_fix4_blank?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	_, session, _ := service.RegisterUser(context.Background(), "alice@example.com", "password123")
 	csrf := sessionCSRFForTest(t, session)
@@ -95,7 +95,7 @@ func TestUnknownUnsafeAbsentContentTypeReachesRouteNot415(t *testing.T) {
 	// route result (404), never a media-type 415.
 	store, _ := OpenSQLite("file:csec_fix4_unknown?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	for _, method := range []string{http.MethodPost, http.MethodDelete} {
@@ -114,7 +114,7 @@ func TestJSONLoginRegisterAbsentContentTypePriorBehavior(t *testing.T) {
 	// created user; login -> 200 with a session). Never a 415.
 	store, _ := OpenSQLite("file:csec_fix4_json?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	register := httptest.NewRequest(http.MethodPost, "/api/users/register", strings.NewReader(`{"email":"nova@example.com","password":"password123"}`))
@@ -139,7 +139,7 @@ func TestBlankContentTypeAbsentOnUnknownRoute(t *testing.T) {
 	// unspecified: reaches 404, not 415.
 	store, _ := OpenSQLite("file:csec_fix4_unknown_blank?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/no/such/route", nil)
@@ -154,7 +154,7 @@ func TestPresentMalformedContentType415(t *testing.T) {
 	// A PRESENT but unparseable Content-Type is still 415.
 	store, _ := OpenSQLite("file:csec_fix4_malformed?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/no/such/route", strings.NewReader("x"))
@@ -170,7 +170,7 @@ func TestDuplicateContentTypeRejected415EvenIdentical(t *testing.T) {
 	// — and rejected 415 rather than trusting Header.Get's first value.
 	store, _ := OpenSQLite("file:csec_fix4_dup?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	for _, vals := range [][]string{
@@ -194,7 +194,7 @@ func TestCommaJoinedContentTypeRejected415(t *testing.T) {
 	// per the media-type grammar -> 415.
 	store, _ := OpenSQLite("file:csec_fix4_comma?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	req := httptest.NewRequest(http.MethodPost, "/no/such/route", strings.NewReader("x"))
@@ -209,7 +209,7 @@ func TestUnderlimitMultipartContentType415(t *testing.T) {
 	// A PRESENT under-limit multipart/* is still rejected 415 on any route.
 	store, _ := OpenSQLite("file:csec_fix4_mp?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 
 	for _, ct := range []string{"multipart/form-data; boundary=x", "Multipart/Mixed; boundary=y"} {
@@ -227,7 +227,7 @@ func TestOversizedBodyDominatesAnyContentTypeState(t *testing.T) {
 	// body is 413 whether Content-Type is absent, malformed, or multipart.
 	store, _ := OpenSQLite("file:csec_fix4_oversize?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	svr := &HTTPServer{Service: service, Subjects: auth.SubjectResolver{Tokens: tokens}, security: p}
 	server := httptest.NewServer(svr)
@@ -258,7 +258,7 @@ func TestOversizedBodyDominatesAnyContentTypeState(t *testing.T) {
 func TestCanonicalUrlencodedFormStillProceeds(t *testing.T) {
 	store, _ := OpenSQLite("file:csec_fix4_form?mode=memory&cache=shared")
 	tokens := testTokens(t)
-	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t)}
+	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com", FeedKeys: newTestFeedKeyCipher(t), Publisher: newMemPublisher()}
 	p := buildPolicy(t, tokens, false, "")
 	_, session, _ := service.RegisterUser(context.Background(), "alice@example.com", "password123")
 	csrf := sessionCSRFForTest(t, session)

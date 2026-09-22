@@ -26,6 +26,7 @@ func TestUIRegistryCreationFlow(t *testing.T) {
 		Tokens:         tokens,
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
 
@@ -91,6 +92,7 @@ func TestUIInviteAcceptanceFlow(t *testing.T) {
 		Tokens:         tokens,
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
@@ -155,6 +157,7 @@ func TestUIRegistryDetailShowsAcceptedUserEmails(t *testing.T) {
 		Tokens:         tokens,
 		RegistryDomain: "uncloud-registry.com",
 		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()

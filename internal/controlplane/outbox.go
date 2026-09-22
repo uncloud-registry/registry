@@ -19,6 +19,20 @@ type ObjectStore interface {
 	Get(ctx context.Context, ref string) ([]byte, error)
 }
 
+// FeedResolver resolves a registry policy feed to the ref currently stored AT
+// it, so reconciliation can PROVE the feed really points at the object it
+// uploaded. A no-op, wrong, or overwritten feed updater — one that reports
+// success but never writes, writes to a different feed, or was later
+// clobbered — must never complete a job: the resolved ref must equal the
+// expected object ref before a job is marked verified. Persisting or trusting
+// the feed_ref identifier is NOT proof; only an independent resolution equals
+// the uploaded object ref. Production uses BeeFeedResolver (reads the feed and
+// decodes the signer's own 8-byte-length-prefixed ref); tests use a memory
+// feed store whose independent map can simulate a mis-directed feed.
+type FeedResolver interface {
+	ResolveFeed(ctx context.Context, feed string) (string, error)
+}
+
 // Provisioning state vocabulary. A registry is born 'provisioning', transitions
 // to 'ready' only after BOTH bootstrap jobs have completed verified read-back,
 // and to 'failed' only under the explicit bounded-attempts rule. Partial success
@@ -55,6 +69,26 @@ var (
 	errLostClaim        = errors.New("publication claim was lost to another worker")
 	errReadBackMismatch = errors.New("publication read-back did not match expected content")
 )
+
+// errReconcilerNotConfigured is the data-free, fail-closed error returned by
+// RunOnce (and NewReconciler) when the reconciler is missing any dependency it
+// needs to publish and verify a job (store, documents, feeds, or feed
+// resolver). It is a configuration error, never a panic.
+var errReconcilerNotConfigured = errors.New("reconciler is not fully configured: store, documents, feeds, and feed resolver are required")
+
+// errProvisioningNotConfigured is the data-free, fail-closed error returned by
+// Service.CreateRegistry when the control plane cannot actually provision a
+// registry (no Store, no Publisher, or a Publisher missing its Documents,
+// Feeds, or feed read-back resolver). Creation rejects BEFORE key generation
+// or any database write, so a misconfigured deployment never silently enqueues
+// a registry that would sit provisioning forever.
+var errProvisioningNotConfigured = errors.New("registry provisioning is not configured: a publisher with documents, feeds, and feed read-back is required")
+
+// errRegistryNotReady is the typed service error returned when a registry
+// settings update is attempted before verified bootstrap publication completes
+// (provisioning_state != ready). It is a stable sentinel so the API/UI can map
+// it to a clear, safe response without leaking internals.
+var errRegistryNotReady = errors.New("registry is still provisioning; settings can be changed only after bootstrap policy publication completes")
 
 // PublicationJob is the inbox row for one logical bootstrap publication. The
 // payload holds the DETERMINISTIC canonical policy-document JSON and contains

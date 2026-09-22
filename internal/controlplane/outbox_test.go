@@ -9,6 +9,14 @@ import (
 
 // newProvisioningStore opens a fresh in-memory store with a unique shared-cache
 // name so parallel store tests never collide.
+var (
+	// testAuthPayload / testStampPayload are structurally valid, kind-appropriate
+	// policy documents (the shape migration 7's hardened jobs CHECK requires:
+	// auth carries $.version + $.defaultAccess, stamp carries $.defaultPolicy.batchID).
+	testAuthPayload  = []byte(`{"version":1,"defaultAccess":"deny","repos":{}}`)
+	testStampPayload = []byte(`{"version":1,"defaultPolicy":{"batchID":"batch-1","allowPushFor":["role:write"]},"repos":{}}`)
+)
+
 func newProvisioningStore(t *testing.T) *Store {
 	t.Helper()
 	name := "file:provstore_" + t.Name() + "?mode=memory&cache=shared"
@@ -48,7 +56,7 @@ func TestCreateProvisionedRegistryIsAtomic(t *testing.T) {
 		Slug: "atomic", Host: "atomic.registry.test", ENSName: "atomic.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xpair1", DefaultStampBatchID: "batch-b",
 		AnonymousPull: true,
-	}, newTestFeedKeyCipherForStore(t), key, []byte(`{"kind":"auth"}`), []byte(`{"kind":"stamp"}`))
+	}, newTestFeedKeyCipherForStore(t), key, []byte(testAuthPayload), []byte(testStampPayload))
 	if err != nil {
 		t.Fatalf("create provisioned registry: %v", err)
 	}
@@ -63,7 +71,7 @@ func TestCreateProvisionedRegistryIsAtomic(t *testing.T) {
 		Slug: "atomic", Host: "atomic.registry.test", ENSName: "atomic2.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xpair2", DefaultStampBatchID: "batch-b",
 		AnonymousPull: true,
-	}, newTestFeedKeyCipherForStore(t), key, []byte(`{"kind":"auth"}`), []byte(`{"kind":"stamp"}`)); err == nil {
+	}, newTestFeedKeyCipherForStore(t), key, []byte(testAuthPayload), []byte(testStampPayload)); err == nil {
 		t.Fatal("expected duplicate-slug creation to fail")
 	}
 
@@ -131,7 +139,7 @@ func TestProvisioningStaleClaimOwnerShipAndGuards(t *testing.T) {
 		Slug: "lease", Host: "lease.registry.test", ENSName: "lease.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xlease", DefaultStampBatchID: "batch-l",
 	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
-		[]byte(`{"k":"a"}`), []byte(`{"k":"s"}`))
+		[]byte(testAuthPayload), []byte(testStampPayload))
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
@@ -171,6 +179,14 @@ func TestProvisioningStaleClaimOwnerShipAndGuards(t *testing.T) {
 
 	// The real token CAN complete it (and it then becomes ready since both jobs
 	// must complete — complete only the first; the registry stays provisioning).
+	// The completed job must satisfy the hardened succeeded coherence (verified
+	// object + feed refs and a completion stamp), so persist the refs first.
+	if err := store.SetPublicationObjectRef(ctx, job.ID, token, "0xobj"); err != nil {
+		t.Fatalf("set object ref with real token: %v", err)
+	}
+	if err := store.SetPublicationFeedRef(ctx, job.ID, token, "feed://0xowner/aa"); err != nil {
+		t.Fatalf("set feed ref with real token: %v", err)
+	}
 	if err := store.CompletePublicationJob(ctx, job.ID, token, now); err != nil {
 		t.Fatalf("complete with real token: %v", err)
 	}
@@ -209,7 +225,7 @@ func TestRegistryProvisioningStateGuard(t *testing.T) {
 		Slug: "guard", Host: "guard.registry.test", ENSName: "guard.eth",
 		OwnerUserID: owner.ID, FeedOwnerAddress: "0xguard", DefaultStampBatchID: "batch-g",
 	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
-		[]byte(`{"k":"a"}`), []byte(`{"k":"s"}`))
+		[]byte(testAuthPayload), []byte(testStampPayload))
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
