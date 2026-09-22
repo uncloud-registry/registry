@@ -212,8 +212,144 @@ bash scripts/security/check-repository-secrets.sh
   and UPDATE (JSON type/value tricks incl. missing-key NULL-3VL, storage-class
   REAL/numeric-text/NULL, calendar-invalid + non-canonical timestamps, and
   every incoherent state/ownership/completion combination); a genuine v7 DB
-  upgrades to exactly integer-millisecond instants with row meaning preserved;
+  upgrades to exactly integer-nanosecond instants with row meaning preserved;
   malformed v7 rows roll back byte-equivalently with version staying 7 and no
   clone; typed-nil panicking facades fail closed in every dependency slot with
   zero DB effects (value/non-pointer implementations are not rejected); and
   the REAL Bee object store + feed resolver drive reconciliation end-to-end.
+
+## Fix round 3 — Task 9 review remediation (evidence)
+
+Date: 2026-09-22 (UTC)
+Fix implementation commit: `08033f0` (`task9(r3): restore valid Bee chunk
+framing, harden writer I/O, exact-nanosecond migration 8, serialized sqlite
+race guard`)
+(reviewed head was `c9694d3`)
+
+This round addresses the round-2/5 open findings: (a) restore the valid
+pre-round-2 Bee chunk wire framing that round 2 regressed, (b) harden all Bee
+writer I/O, (c) make migration 8 store exact Unix nanoseconds and enforce
+`completed_at` IFF `succeeded`, and (d) make the mandatory race gate
+deterministic without disabling race detection, skipping, or reducing
+parallelism.
+
+### Binding-scope ruling (recorded, not preempted)
+
+The round-2 ruling (recorded in the task report) assigns `FeedUpdate{
+Feed,Reference,BatchID}` — the binary 32-byte feed reference payload, explicit
+postage-batch selection, and ReadFeed required headers — to **Task 11** (plan
+lines 898–954). Task 9 round 3 therefore restores the *valid pre-round-2 wire
+framing* (an 8-byte little-endian span + the ASCII reference payload) and
+preserves current interface behavior while hardening I/O. It does **not**
+implement the binary-reference/postage/header contract Task 11 owns; those
+remain the baseline defects Task 11 will replace. Cost of honoring the ruling:
+Task 9 end-to-end against a live Bee remains deferred until Task 11 lands.
+
+### 1. Bee framing restored + writer I/O hardened
+
+- **`makeChunkData` (restored):** both `/chunks` and `/soc` request bodies now
+  carry a valid 8-byte little-endian **span** (span = len(payload)) followed
+  by the current payload bytes — the exact pre-round-2 (`da00bf0`) contract
+  round 2 (`c383ac3`) broke by sending a raw ASCII ref with no span header.
+- **Resolver read path unchanged:** GET `/feeds` still parses Bee's
+  dereferenced payload body directly as the ASCII ref; it does not parse the
+  returned payload as a chunk. (Binary ref stays a Task 11 baseline defect.)
+- **Writer hardening** (`nextSequenceIndex`, `uploadChunk`, `uploadSOC`):
+  nil-safe client (returns data-free error instead of panicking on a
+  zero-value exported struct), per-request bounded deadline via request
+  context on every call, `limit+1` bounded reads and JSON decodes (rejects
+  oversized/oversized bodies outright), response body always closed, and
+  errors may carry status/coarse cause but never the raw response body.
+  Signing and owner/repository checks preserved.
+- **Tests** (`bee_test.go`): exact span + payload bytes and sequence-index
+  use asserted for both chunk and SOC writes (not just non-empty); stalled
+  reader, oversized body, error-body (non-JSON), no-leak (bounded future
+  reads), and body-closure cases added. The zero-value exported struct
+  returns an error rather than panicking (construction not claimable
+  impossible, so a direct struct zero value must fail safely).
+
+### 2. Migration 8 — exact nanoseconds + completed_at IFF succeeded
+
+- Migration 8 (still the active unreleased fix migration; m6/m7 untouched)
+  now stores exact Unix **nanoseconds** throughout schema, store, claim, and
+  backoff paths (`timeToNanos`/`nanosToTime`/`parseCanonicalUTCNanos`).
+- The v7→v8 conversion uses strict RFC3339Nano parsing that preserves every
+  representable instant **exactly** (byte-for-byte, including sub-millisecond
+  and nanosecond fractional precision) and rejects non-canonical (offset,
+  no `Z`, trailing junk, invalid calendar/clock) and out-of-range (outside the
+  int64-nanosecond span) values — an overflow guard before `UnixNano`, which
+  is undefined outside that span.
+- **New `completed_at` constraint:** `completed_at IS NOT NULL` **iff**
+  `state = 'succeeded'` (a SQLite-3VL-safe equality CHECK), explicitly
+  forbidding `completed_at` on pending, claimed, and failed — enforced on both
+  INSERT and UPDATE, on top of the retained lease/ownership/verify coherence.
+- **Tests:** sub-millisecond / nanosecond v7 preservation (distinct
+  fractions never collapse onto one counter), out-of-range + non-canonical
+  rejection, and adversarial pending/claimed/failed-with-`completed_at`
+  INSERT and UPDATE cases all added. Lease/backoff arithmetic remains
+  overflow-safe (bounded durations; backoff already hard-caps shift and max).
+- The reconciler/provisioning test harnesses previously depended on
+  millisecond truncation turning a 1ns backoff into "immediately due"; they
+  now set `BackoffBase = 0` (immediate retry under exact-ns storage), keeping
+  determinism and asserting the same behavior.
+
+### 3. Deterministic race gate (root-caused, guarded, not weakened)
+
+- **Root cause (reproduced):** the intermittent race is inside
+  `modernc.org/sqlite@v1.21.1` `lib/mutex.go` — `mutexPool.alloc()` appends to
+  the shared `m.a` slice *under the pool lock* (line 107) while
+  `mutexFromPtr()` *reads* `mutexes.a` **without the lock** (lines 88/96).
+  When enough in-memory test databases first open concurrently (parallel
+  controlplane tests), the 256-slot initial block overflows and the append
+  re-allocates the backing slice during a concurrent read. A standalone
+  reproduction (many shared-memory connects at once) reproduced the data race
+  ~100% of runs before the guard and 0/3 after.
+- **Smallest project-owned guard (adopted):** a `TestMain` in
+  `internal/controlplane` (the only package that imports the driver) opens and
+  holds 4096 in-memory connections **serially**, forcing the mutex pool to
+  grow well past its initial block before any parallel test starts. Because
+  `m.a` never shrinks (free only returns indices), the pre-grown capacity
+  persists — no test-time pool append can race a reader. The guard does NOT
+  disable the race detector, skip tests, remove meaningful parallelism, set
+  `-p=1`, or substitute a different command. Production DB startup is
+  unaffected (test-only file; real DBs use a handful of mutexes within the
+  initial pool).
+- **Rejected:** upgrading `modernc.org/sqlite` to v1.59.0 was evaluated and
+  rejected as a larger-than-needed dependency-graph rewrite; the serialized
+  pre-grow guard is the smaller, verified root fix (license unchanged).
+
+### Re-run commands
+
+```bash
+go build ./...
+bash scripts/security/check-repository-secrets.sh                # clean
+go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry  # 3/3 passes
+go test -race -count=1 ./...                                      # 3/3 passes
+go vet ./...
+go mod tidy -diff
+go mod verify
+gofmt -l internal/ cmd/             # clean (pre-existing invite_flash.go excluded, untouched)
+git diff --check
+```
+
+### Honest output (least to most)
+
+- `go build ./...`: ok. `go vet ./...`: clean. `go mod tidy -diff`: clean (no
+  go.mod/go.sum change). `go mod verify`: all modules verified. `gofmt -l
+  internal/ cmd/`: clean for every file this round touched;
+  `internal/controlplane/invite_flash.go` remains non-gofmt but is untouched
+  by this task (pre-existing). `git diff --check`: clean. Repository secret
+  scan: clean. No `controlplane.db` created or touched.
+- **Phase 1 gate — exact command, 3 consecutive runs, all green:**
+  `go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry`
+  — run 1 `ok` (controlplane 105.230s), run 2 `ok` (105.865s), run 3 `ok`
+  (104.489s). No data races, no failures in any of the three runs.
+- **Full race gate — exact command, 3 consecutive runs, all green:**
+  `go test -race -count=1 ./...` — 12 packages, every run exit 0 with no
+  `FAIL`, `DATA RACE`, or failed-test output. The formerly intermittent
+  modernc `mutexPool` race did not surface in any of the six total
+  implementation-commit runs (3 phase-1 + 3 full), confirming the guard.
+- The round-3 fix summary and prior flaky history are preserved above; the
+  deterministic gate result replaces the round-2 "not stable" caveat.
+  Implementation commit `08033f0`; this round's evidence commits include this
+  file (recorded with their SHAs at the end of the round).
