@@ -881,8 +881,10 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 
 // TestInviteDigestMigrationRejectsCorruptRows proves the migration FAILS (with
 // full rollback, version unchanged, legacy data untouched) on malformed
-// token_hash values, plaintext-as-valid rows, duplicate converted digests, and
-// accepted invites without a derivable acceptor.
+// token_hash values, plaintext-as-valid rows, and duplicate converted digests.
+// Schema-valid accepted rows are never rejected for a missing membership: the
+// historical accepter is unknowable, so they are PRESERVED (see
+// TestInviteLegacyAcceptedPreservedWithoutRecipientMembership).
 func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 	t.Parallel()
 
@@ -998,20 +1000,6 @@ func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 				(registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
 				values (1, 'bob@example.com', 'member', 1, 0, ?, 'accepted', ?, ?)`,
 				hex.EncodeToString(DigestInviteToken(tokenTextC)),
-				time.Now().UTC().Add(time.Hour).Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
-			return err
-		})
-		assertFailed(t, db)
-	})
-
-	t.Run("accepted invite without membership", func(t *testing.T) {
-		t.Parallel()
-		db := openInviteMigDB(t, "corrupt_accepted")
-		seedInvitesFixture(t, db, func(ctx context.Context, db *sql.DB) error {
-			_, err := db.ExecContext(ctx, `insert into registry_invites
-				(registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
-				values (1, 'ghost@example.com', 'member', 1, 0, ?, 'accepted', ?, ?)`,
-				hex.EncodeToString([]byte(tokenTextC)),
 				time.Now().UTC().Add(time.Hour).Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
 			return err
 		})
@@ -1365,9 +1353,14 @@ func TestInviteLegacyAcceptedUnattributedNoFalseAttributionOrRetry(t *testing.T)
 		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
 		values ('alice', 'alice.example.test', 'alice.eth', 1, '0xfeed', '', 'batch-1', 1, ?)`, now)
 	seed(`insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 1, 'owner', 1, 1, ?)`, now)
-	// dave is the intended recipient AND already a member; the historical
-	// accepter could have been anyone — attribution is impossible.
+	// Exact old-behavior fixture: dave is the intended recipient AND already
+	// a member; bob is a DIFFERENT user who historically accepted the invite
+	// and got his own membership (the pre-Task-7 acceptance path took any
+	// authenticated token holder and inserted their membership without a
+	// recipient check). Attribution is impossible, so the invite must survive
+	// unchanged as legacy_unattributed and neither user's retry can succeed.
 	seed(`insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 3, 'member', 1, 1, ?)`, now)
+	seed(`insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 2, 'member', 1, 1, ?)`, now)
 	seed(`insert into registry_invites (registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
 		values (1, 'dave@example.com', 'member', 1, 1, ?, 'accepted', ?, ?)`,
 		hex.EncodeToString([]byte(tokenTextC)), expires, now)
@@ -1409,13 +1402,252 @@ func TestInviteLegacyAcceptedUnattributedNoFalseAttributionOrRetry(t *testing.T)
 	if err != nil {
 		t.Fatalf("list memberships: %v", err)
 	}
-	if len(memberships) != 2 {
-		t.Fatalf("no membership change allowed: expected 2, got %d", len(memberships))
+	if len(memberships) != 3 {
+		t.Fatalf("no membership change allowed: expected 3, got %d", len(memberships))
 	}
 	for _, m := range memberships {
-		if m.UserID == 3 && m.Role != "member" {
-			t.Fatalf("dave's pre-existing membership must be untouched, got %+v", m)
+		if (m.UserID == 2 || m.UserID == 3) && (m.Role != "member" || !m.CanPull || !m.CanPush) {
+			t.Fatalf("user %d's pre-existing membership must be untouched, got %+v", m.UserID, m)
 		}
+	}
+}
+
+// TestInviteLegacyAcceptedPreservedWithoutRecipientMembership proves every
+// schema-valid accepted legacy invite migrates as legacy_unattributed with NO
+// membership requirement: the historical accepter is unknowable (the
+// pre-Task-7 acceptance path bound neither the recipient nor the accepter),
+// and current membership state cannot establish attribution — the recipient's
+// membership may never have existed or may have been removed later. Memberships
+// are untouched and token retries always fail generically.
+func TestInviteLegacyAcceptedPreservedWithoutRecipientMembership(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	seedBase := func(t *testing.T, db *sql.DB) (string, string) {
+		t.Helper()
+		now := time.Now().UTC().Format(time.RFC3339)
+		expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+		seed := func(q string, args ...any) {
+			t.Helper()
+			if _, err := db.ExecContext(ctx, q, args...); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+		}
+		seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "alice@example.com", "hash", now)
+		seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "bob@example.com", "hash", now)
+		seed(`insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+			values ('alice', 'alice.example.test', 'alice.eth', 1, '0xfeed', '', 'batch-1', 1, ?)`, now)
+		seed(`insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 1, 'owner', 1, 1, ?)`, now)
+		return now, expires
+	}
+
+	// assertPreserved checks the migrated row is accepted, unattributed, and
+	// legacy-flagged, that memberships are byte-count untouched, and that the
+	// token can never be replayed by anyone.
+	assertPreserved := func(t *testing.T, db *sql.DB, wantMemberships int) {
+		t.Helper()
+		var status string
+		var acceptedBy sql.NullInt64
+		var legacyFlag int
+		if err := db.QueryRowContext(ctx, `select status, accepted_by_user_id, legacy_unattributed from registry_invites where id = 1`).
+			Scan(&status, &acceptedBy, &legacyFlag); err != nil {
+			t.Fatal(err)
+		}
+		if status != "accepted" {
+			t.Fatalf("expected preserved status accepted, got %q", status)
+		}
+		if acceptedBy.Valid {
+			t.Fatalf("accepted history must never be attributed, got user %d", acceptedBy.Int64)
+		}
+		if legacyFlag != 1 {
+			t.Fatalf("expected legacy_unattributed=1, got %d", legacyFlag)
+		}
+		var count int
+		if err := db.QueryRowContext(ctx, `select count(*) from registry_memberships`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != wantMemberships {
+			t.Fatalf("memberships must be untouched, got %d want %d", count, wantMemberships)
+		}
+		store := &Store{DB: db}
+		if _, err := store.AcceptInvite(ctx, tokenTextC, User{ID: 2, Email: "bob@example.com"}); !errors.Is(err, errInviteNotFound) {
+			t.Fatalf("token retry against the preserved invite must fail generically, got %v", err)
+		}
+	}
+
+	t.Run("recipient never had a membership", func(t *testing.T) {
+		t.Parallel()
+		db := openInviteMigDB(t, "accepted_no_membership")
+		if err := applyMigrationsThrough(ctx, db, 3); err != nil {
+			t.Fatalf("apply through v3: %v", err)
+		}
+		now, expires := seedBase(t, db)
+		// ghost@example.com is the registered recipient with NO account and NO
+		// membership: a different authenticated user accepted in the legacy
+		// era. The migration must preserve the accept, not reject it.
+		if _, err := db.ExecContext(ctx, `insert into registry_invites
+			(registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
+			values (1, 'ghost@example.com', 'member', 1, 0, ?, 'accepted', ?, ?)`,
+			hex.EncodeToString([]byte(tokenTextC)), expires, now); err != nil {
+			t.Fatalf("seed accepted invite: %v", err)
+		}
+		if err := ApplyMigrations(ctx, db); err != nil {
+			t.Fatalf("accepted invite without any membership must NOT fail the migration: %v", err)
+		}
+		assertPreserved(t, db, 1)
+	})
+
+	t.Run("recipient membership removed after acceptance", func(t *testing.T) {
+		t.Parallel()
+		db := openInviteMigDB(t, "accepted_membership_removed")
+		if err := applyMigrationsThrough(ctx, db, 3); err != nil {
+			t.Fatalf("apply through v3: %v", err)
+		}
+		now, expires := seedBase(t, db)
+		if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+			"dave@example.com", "hash", now); err != nil {
+			t.Fatalf("seed dave: %v", err)
+		}
+		// dave's membership was created atomically with the historical
+		// acceptance and REMOVED later: current membership is not evidence of
+		// anything and must not be required for preservation.
+		if _, err := db.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 3, 'member', 1, 1, ?)`, now); err != nil {
+			t.Fatalf("seed dave membership: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `delete from registry_memberships where registry_id = 1 and user_id = 3`); err != nil {
+			t.Fatalf("remove dave membership: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, `insert into registry_invites
+			(registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
+			values (1, 'dave@example.com', 'member', 1, 1, ?, 'accepted', ?, ?)`,
+			hex.EncodeToString([]byte(tokenTextC)), expires, now); err != nil {
+			t.Fatalf("seed accepted invite: %v", err)
+		}
+		if err := ApplyMigrations(ctx, db); err != nil {
+			t.Fatalf("accepted invite whose membership was removed later must NOT fail the migration: %v", err)
+		}
+		assertPreserved(t, db, 1)
+	})
+}
+
+// TestInviteLegacyUnattributedRowsImmutable proves that after migration,
+// legacy_unattributed accepted invites are FULLY immutable: ordinary SQL
+// cannot clear the flag, assign an accepter, change status or timestamps, or
+// otherwise turn the row into an attributed acceptance. A BEFORE UPDATE
+// trigger rejects EVERY update to such a row, and the row is unchanged after
+// each rejected attempt. Non-legacy rows stay fully updatable, and a fresh
+// pending→accepted transition records accepted_by with legacy_unattributed=0.
+func TestInviteLegacyUnattributedRowsImmutable(t *testing.T) {
+	t.Parallel()
+
+	db := openInviteMigDB(t, "legacy_immutable")
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 3); err != nil {
+		t.Fatalf("apply through v3: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	seed := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "alice@example.com", "hash", now)
+	seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "bob@example.com", "hash", now)
+	seed(`insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+		values ('alice', 'alice.example.test', 'alice.eth', 1, '0xfeed', '', 'batch-1', 1, ?)`, now)
+	seed(`insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 1, 'owner', 1, 1, ?)`, now)
+	seed(`insert into registry_invites (registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at)
+		values (1, 'dave@example.com', 'member', 1, 1, ?, 'accepted', ?, ?)`,
+		hex.EncodeToString([]byte(tokenTextC)), expires, now)
+
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+
+	type inviteRow struct {
+		status           string
+		acceptedBy       sql.NullInt64
+		legacy           int
+		acceptedAt       sql.NullString
+		revokedAt        sql.NullString
+		expiresAt        string
+		canPull, canPush int
+	}
+	readRow := func() inviteRow {
+		t.Helper()
+		var r inviteRow
+		if err := db.QueryRowContext(ctx, `select status, accepted_by_user_id, legacy_unattributed, accepted_at, revoked_at, expires_at, can_pull, can_push from registry_invites where id = 1`).
+			Scan(&r.status, &r.acceptedBy, &r.legacy, &r.acceptedAt, &r.revokedAt, &r.expiresAt, &r.canPull, &r.canPush); err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	before := readRow()
+	if before.legacy != 1 {
+		t.Fatalf("fixture must be a legacy_unattributed row, got legacy=%d", before.legacy)
+	}
+
+	attempts := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"clear legacy flag", `update registry_invites set legacy_unattributed = 0 where id = 1`, nil},
+		{"set accepted_by", `update registry_invites set accepted_by_user_id = 2 where id = 1`, nil},
+		{"change status to revoked", `update registry_invites set status = 'revoked', revoked_at = ? where id = 1`, []any{now}},
+		{"change accepted_at", `update registry_invites set accepted_at = ? where id = 1`, []any{now}},
+		{"set revoked_at", `update registry_invites set revoked_at = ? where id = 1`, []any{now}},
+		{"combined attribution rewrite", `update registry_invites set legacy_unattributed = 0, accepted_by_user_id = 2, status = 'accepted', accepted_at = ? where id = 1`, []any{now}},
+		{"benign expires change", `update registry_invites set expires_at = ? where id = 1`, []any{now}},
+		{"benign permission change", `update registry_invites set can_pull = 0 where id = 1`, nil},
+		{"benign recipient change", `update registry_invites set email = 'x@example.com' where id = 1`, nil},
+		{"digest replace", `update registry_invites set token_digest = ? where id = 1`, []any{make([]byte, 32)}},
+	}
+	for _, a := range attempts {
+		if _, err := db.ExecContext(ctx, a.sql, a.args...); err == nil {
+			t.Fatalf("%s: expected the legacy immutability trigger to reject the update, got nil error", a.name)
+		}
+		if after := readRow(); after != before {
+			t.Fatalf("%s: row mutated despite rejection: %+v != %+v", a.name, after, before)
+		}
+	}
+
+	// A live (non-legacy) row is still fully updatable: the immutability
+	// trigger is scoped to legacy_unattributed rows only.
+	seed(`insert into registry_invites (registry_id, email, role, can_pull, can_push, token_digest, status, expires_at, created_at)
+		values (1, 'bob@example.com', 'member', 1, 1, zeroblob(32), 'pending', ?, ?)`, expires, now)
+	if _, err := db.ExecContext(ctx, `update registry_invites set can_push = 0 where id = 2`); err != nil {
+		t.Fatalf("benign update on a non-legacy row must still succeed: %v", err)
+	}
+
+	// A fresh pending→accepted transition records accepted_by and
+	// legacy_unattributed=0: the application path can never enter legacy state.
+	store := &Store{DB: db}
+	created, token, err := store.CreateInvite(ctx, Invite{
+		RegistryID: 1, Email: "bob@example.com", Role: "member",
+		CanPull: true, CanPush: true, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create invite: %v", err)
+	}
+	if _, err := store.AcceptInvite(ctx, token, User{ID: 2, Email: "bob@example.com"}); err != nil {
+		t.Fatalf("accept fresh invite: %v", err)
+	}
+	var newLegacy int
+	var newAcceptedBy sql.NullInt64
+	if err := db.QueryRowContext(ctx, `select legacy_unattributed, accepted_by_user_id from registry_invites where id = ?`, created.ID).
+		Scan(&newLegacy, &newAcceptedBy); err != nil {
+		t.Fatal(err)
+	}
+	if newLegacy != 0 {
+		t.Fatalf("new acceptance must carry legacy_unattributed=0, got %d", newLegacy)
+	}
+	if !newAcceptedBy.Valid || newAcceptedBy.Int64 != 2 {
+		t.Fatalf("new acceptance must record the attributed accepter, got %+v", newAcceptedBy)
 	}
 }
 

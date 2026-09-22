@@ -394,9 +394,11 @@ func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membersh
 		"alice@example.com", "hash", now.Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed alter-upgraded user: %v", err)
 	}
-	// bob is the invitee of the legacy ACCEPTED invite; his membership is the
-	// coherence evidence migration 4 validates BUT must never be turned into
-	// an accepted_by attribution (the historical accepter is unknowable).
+	// bob is the invitee of the legacy ACCEPTED invite; his membership is
+	// historical state that must survive untouched — migration 4 never turns
+	// it into an accepted_by attribution (the historical accepter is
+	// unknowable), and no membership is required or inferred for accepted
+	// history (it may have been removed later).
 	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
 		"bob@example.com", "hash", now.Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed alter-upgraded bob: %v", err)
@@ -413,9 +415,10 @@ func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membersh
 		1, 1, "owner", membershipCreated, 0, 1); err != nil {
 		t.Fatalf("seed alter-upgraded membership: %v", err)
 	}
-	// bob's membership (the accepted invitee): migration 4 validates it as
-	// coherence evidence but preserves the invite as legacy_unattributed —
-	// no accepted_by is inferred from this row.
+	// bob's membership (the accepted invitee): migration 4 preserves it
+	// untouched while the invite migrates as legacy_unattributed — no
+	// accepted_by is inferred from this row, and the migration does not
+	// require it to exist.
 	if _, err := db.ExecContext(ctx, `insert into registry_memberships
 		(registry_id, user_id, role, created_at, can_pull, can_push) values (?, ?, ?, ?, ?, ?)`,
 		1, 2, "member", membershipCreated, 1, 1); err != nil {

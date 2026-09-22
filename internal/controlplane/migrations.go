@@ -95,13 +95,16 @@ var migrations = []migration{
 	//     guessing, no alleged alternate digest format;
 	//   - status must be pending or accepted (revoked did not exist in
 	//     v1-v3; any other value fails);
-	//   - an accepted invite must have a membership for the registered
-	//     recipient on the same registry (the old flow created the
-	//     membership atomically with acceptance). The historical ACCEPTER is
-	//     unknowable, so accepted history is preserved as
-	//     legacy_unattributed=1 with accepted_by_user_id NULL — the
-	//     recipient membership is never turned into a false attribution and
-	//     no retry ever succeeds for such invites;
+	//   - an accepted invite is preserved VERBATIM as legacy_unattributed=1
+	//     with accepted_by_user_id NULL — no membership is required, checked,
+	//     or inferred. The pre-Task-7 acceptance path accepted any
+	//     authenticated token holder and inserted THEIR membership without a
+	//     recipient check, and the historical ACCEPTER was never recorded;
+	//     the recipient's current membership (which may never have existed or
+	//     may have been removed later) cannot establish attribution, so it is
+	//     never consulted. Every syntactically/schema-valid accepted row
+	//     survives, existing memberships are untouched, and no token retry
+	//     ever succeeds for such invites;
 	//   - expiry must parse as RFC3339 and the invite must grant pull or
 	//     push;
 	//   - converted digests must be unique (duplicate/colliding rows fail);
@@ -120,9 +123,11 @@ var migrations = []migration{
 	// migration), accepted_at/revoked_at, status/accepted_by/attribution
 	// CHECK constraints, a status index, and state-transition triggers
 	// (invites are born pending; terminal states are immutable; acceptance
-	// requires an attributed accepter; legacy_unattributed is immutable),
-	// closing the direct-SQL gap the way migration 3 did for feed keys. The
-	// rebuild itself runs inside the migration transaction, so any
+	// requires an attributed accepter; legacy_unattributed can never be set
+	// by ordinary SQL and any UPDATE touching a legacy_unattributed row is
+	// rejected outright — the row is a frozen historical record), closing the
+	// direct-SQL gap the way migration 3 did for feed keys. The rebuild itself
+	// runs inside the migration transaction, so any
 	// malformed/duplicate/corrupt row rolls the whole upgrade back with the
 	// legacy data untouched.
 	{
@@ -616,10 +621,10 @@ type legacyInviteRow struct {
 //     preserved.
 //  2. Validate EVERY existing invite row and compute its converted digest
 //     (see convertLegacyInviteHash), normalized recipient, and
-//     legacy_unattributed flag (see the migration comment for the acceptance
-//     rules). Duplicate converted digests, malformed/corrupt rows, and
-//     accepted rows without a membership for the registered recipient fail
-//     the migration with the legacy data untouched.
+//     legacy_unattributed flag (accepted rows are always preserved as
+//     legacy_unattributed — see the migration comment). Duplicate converted
+//     digests and malformed/corrupt rows fail the migration with the legacy
+//     data untouched; membership state is never consulted.
 //  3. Create the constrained clone (digest BLOB unique with a strict
 //     32-byte typeof/length CHECK, accepted_by FK, legacy_unattributed flag,
 //     status/accepted_by/attribution CHECKs).
@@ -721,25 +726,16 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 			rows.Close()
 			return fmt.Errorf("invite %d: invite grants neither pull nor push", row.id)
 		}
-		// An accepted invite must have a membership for the REGISTERED
-		// RECIPIENT (the legacy flow created it atomically with acceptance).
-		// The historical ACCEPTER is unknowable: nothing is inferred from the
-		// recipient email — the row is preserved as legacy_unattributed with
-		// accepted_by_user_id NULL, and no token retry can ever succeed for
-		// it after the upgrade.
+		// Accepted invites are preserved verbatim as legacy_unattributed=1
+		// with accepted_by_user_id NULL. The historical ACCEPTER is
+		// unknowable (the pre-Task-7 flow accepted any authenticated token
+		// holder and inserted THEIR membership without a recipient check,
+		// and never recorded who accepted), and current membership state
+		// cannot establish attribution — the recipient's membership may
+		// never have existed or may have been removed later. No membership
+		// is required or inferred, and existing memberships are untouched.
+		// New-format rows can never reach this state (born-pending trigger).
 		if status == "accepted" {
-			var n int
-			if err := tx.QueryRowContext(ctx, `select count(*) from registry_memberships m
-				join users u on u.id = m.user_id
-				where m.registry_id = ? and u.email = ?`,
-				row.registryID, NormalizeEmail(row.email)).Scan(&n); err != nil {
-				rows.Close()
-				return fmt.Errorf("invite %d: check recipient membership: %w", row.id, err)
-			}
-			if n == 0 {
-				rows.Close()
-				return fmt.Errorf("invite %d: accepted invite has no matching membership for recipient %q", row.id, NormalizeEmail(row.email))
-			}
 			row.legacyUnattributed = 1
 		}
 		row.email = NormalizeEmail(row.email)
@@ -820,6 +816,9 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 		`create trigger registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
 			for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
 			begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+		`create trigger registry_invites_legacy_attribution_immutable before update on registry_invites
+			for each row when OLD.legacy_unattributed = 1
+			begin select raise(abort, 'legacy_unattributed invites are immutable historical records'); end`,
 		`create index idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
