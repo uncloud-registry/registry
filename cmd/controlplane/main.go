@@ -11,7 +11,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/config"
@@ -33,7 +37,25 @@ func main() {
 		log.Fatal(err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Run the provisioning outbox reconciler for the process lifetime. It is
+	// joined before exit so no worker goroutine leaks and its DB transactions
+	// finish before the process dies.
+	var wg sync.WaitGroup
+	if comps.reconciler != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := comps.reconciler.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("control plane reconciler: %v", err)
+			}
+		}()
+	}
+
 	srv := &http.Server{Handler: comps.handler}
+	var listener net.Listener
 	if comps.tlsCert != nil {
 		// Direct termination: serve TLS with the already-parsed certificate,
 		// never plaintext, never a deferred file read.
@@ -45,23 +67,37 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		listener = tls.NewListener(ln, tlsConfig)
 		log.Printf("control plane serving TLS (direct) on %s", cfg.ListenAddr)
-		if err := srv.Serve(tls.NewListener(ln, tlsConfig)); err != nil {
+	} else {
+		// Trusted-proxy termination: a trusted reverse proxy terminates TLS
+		// and forwards to this internal plaintext listener.
+		ln, err := net.Listen("tcp", cfg.ListenAddr)
+		if err != nil {
 			log.Fatal(err)
 		}
-		return
+		listener = ln
+		log.Printf("control plane serving internal HTTP behind trusted proxy on %s", cfg.ListenAddr)
 	}
 
-	// Trusted-proxy termination: a trusted reverse proxy terminates TLS and
-	// forwards to this internal plaintext listener.
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		log.Fatal(err)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(listener) }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = srv.Shutdown(shutdownCtx)
+		cancel()
+		<-serveErr
 	}
-	log.Printf("control plane serving internal HTTP behind trusted proxy on %s", cfg.ListenAddr)
-	if err := srv.Serve(ln); err != nil {
-		log.Fatal(err)
-	}
+
+	// Graceful join: stop the reconciler loop and wait for it to exit.
+	stop()
+	wg.Wait()
 }
 
 // controlPlaneDeps captures every external side-effect the startup assembler
@@ -95,6 +131,10 @@ type controlPlaneComponents struct {
 	// tlsCert is non-nil exactly when termination is direct and TLS must be
 	// served with this preloaded certificate. It is parsed before the DB opens.
 	tlsCert *tls.Certificate
+	// reconciler, when non-nil, owns the provisioning outbox worker loop. It
+	// is created only when a Bee endpoint is configured (documents+feeds).
+	// Nil means no external publication is wired and no reconciler runs.
+	reconciler *controlplane.Reconciler
 }
 
 // prepareControlPlane assembles every component strictly in dependency order:
@@ -176,7 +216,15 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 	}
 
 	handler := controlplane.NewHTTPServerWithConfig(service, auth.SubjectResolver{Tokens: tokens}, cfg)
-	return &controlPlaneComponents{handler: handler, tlsCert: tlsCert}, nil
+
+	comps := &controlPlaneComponents{handler: handler, tlsCert: tlsCert}
+	// Wire the provisioning reconciler against the validated, already-open
+	// store and the configured Bee object store / feed updater. The reconciler
+	// itself opens no database and performs no I/O at construction.
+	if service.Publisher != nil && service.Publisher.Documents != nil && service.Publisher.Feeds != nil {
+		comps.reconciler = service.NewReconciler()
+	}
+	return comps, nil
 }
 
 func envOrDefault(name string, fallback string) string {

@@ -174,6 +174,7 @@ func (s *HTTPServer) handleCreateRegistry(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"registry":  NewPublicRegistry(registry.Registry),
 		"bootstrap": registry.Bootstrap,
+		"state":     registry.State,
 	})
 }
 

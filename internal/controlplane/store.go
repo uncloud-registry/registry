@@ -207,7 +207,12 @@ type Registry struct {
 	FeedKeySet          bool
 	DefaultStampBatchID string
 	AnonymousPull       bool
-	CreatedAt           time.Time
+	// ProvisioningState is the explicit transactional provisioning vocabulary
+	// (provisioning|ready|failed). Fresh registrations are born 'provisioning'
+	// and reach 'ready' only after both bootstrap jobs complete verified
+	// read-back; pre-outbox registries migrate as 'ready'.
+	ProvisioningState string
+	CreatedAt         time.Time
 }
 
 type Membership struct {
@@ -342,7 +347,7 @@ func (s *Store) findUser(ctx context.Context, query string, arg any) (User, erro
 // ONLY the encrypted feed-key columns and never the legacy plaintext column.
 const registryColumns = `id, slug, host, ens_name, owner_user_id, feed_owner_address,
 	feed_key_ciphertext, feed_key_nonce, feed_key_version,
-	default_stamp_batch_id, anonymous_pull, created_at`
+	default_stamp_batch_id, anonymous_pull, provisioning_state, created_at`
 
 // scanRow is satisfied by *sql.Row and *sql.Rows.
 type scanRow interface {
@@ -366,7 +371,7 @@ func scanRegistryRow(s scanRow, reg *Registry) error {
 	var ciphertext, nonce []byte
 	var version sql.NullInt64
 	if err := s.Scan(&reg.ID, &reg.Slug, &reg.Host, &reg.ENSName, &reg.OwnerUserID, &reg.FeedOwnerAddress,
-		&ciphertext, &nonce, &version, &reg.DefaultStampBatchID, &anonymous, &createdAt); err != nil {
+		&ciphertext, &nonce, &version, &reg.DefaultStampBatchID, &anonymous, &reg.ProvisioningState, &createdAt); err != nil {
 		return err
 	}
 	ctSet := len(ciphertext) > 0 // NULL and zero-length blobs are both "absent"
@@ -479,7 +484,7 @@ func (s *Store) ListRegistriesForUser(ctx context.Context, userID int64) ([]Regi
 	rows, err := s.DB.QueryContext(ctx, `
 		select r.id, r.slug, r.host, r.ens_name, r.owner_user_id, r.feed_owner_address,
 			r.feed_key_ciphertext, r.feed_key_nonce, r.feed_key_version,
-			r.default_stamp_batch_id, r.anonymous_pull, r.created_at
+			r.default_stamp_batch_id, r.anonymous_pull, r.provisioning_state, r.created_at
 		from registries r
 		join registry_memberships m on m.registry_id = r.id
 		where m.user_id = ?

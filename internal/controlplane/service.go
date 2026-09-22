@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -110,6 +111,11 @@ func comparePassword(storedHash string, password string) bool {
 type CreatedRegistry struct {
 	Registry  Registry             `json:"registry"`
 	Bootstrap BootstrapPublication `json:"bootstrap"`
+	// State is the registry's provisioning state at creation; it is always
+	// 'provisioning', because bootstrap is enqueued, not yet published. Public
+	// signalling of the transition to ready/failed happens through the
+	// registry's provisioningState.
+	State string `json:"state"`
 }
 
 type RegistryDashboard struct {
@@ -195,43 +201,65 @@ func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug st
 		AnonymousPull:       anonymousPull,
 	}
 
-	// The key bytes are encrypted at rest by the store, inside the insert
-	// transaction, bound with AES-GCM AAD to the row's own ID and owner. The
-	// transient plaintext lives only in this frame's priv slice (wiped on
-	// return); nothing is ever persisted or stringified in plaintext.
-	registry, err = s.Store.CreateRegistry(ctx, registry, s.FeedKeys, priv)
+	// Build the two deterministic default-deny bootstrap policy documents and
+	// canonically encode them as the durable outbox payloads. This happens
+	// BEFORE the store call so the payloads are fixed at creation time and the
+	// reconciler uploads byte-identical copies on retries. Documents never
+	// contain secret key material (owner address and role actors only).
+	authPayload, err := canonicalJSON(buildAuthPolicyDocument(registry, nil))
 	if err != nil {
 		return CreatedRegistry{}, err
 	}
-	membership, err := s.Store.CreateMembership(ctx, Membership{
-		RegistryID: registry.ID,
-		UserID:     ownerUserID,
-		Role:       "owner",
-		CanPull:    true,
-		CanPush:    true,
-	})
+	stampPayload, err := canonicalJSON(buildStampPolicyDocument(registry, nil))
 	if err != nil {
 		return CreatedRegistry{}, err
 	}
 
-	created := CreatedRegistry{Registry: registry}
-	if s.Publisher != nil {
-		bootstrap, err := s.Publisher.PublishBootstrap(ctx, registry, []MembershipSubject{{
-			UserID:  membership.UserID,
-			Role:    membership.Role,
-			CanPull: membership.CanPull,
-			CanPush: membership.CanPush,
-		}})
-		if err != nil {
-			return CreatedRegistry{}, err
-		}
-		created.Bootstrap = bootstrap
+	// One local transaction inserts the registry (provisioning), the owner
+	// membership, and both durable bootstrap jobs. The feed-owner key is
+	// encrypted inside that transaction bound to the row's ID and owner.
+	// Nothing is published externally here: creation returns 'provisioning'
+	// with the deterministic feed refs, never a claim of published bootstrap
+	// references.
+	created, err := s.Store.CreateProvisionedRegistry(ctx, registry, s.FeedKeys, priv, authPayload, stampPayload)
+	if err != nil {
+		return CreatedRegistry{}, err
 	}
-	return created, nil
+	return CreatedRegistry{
+		Registry: created,
+		State:    ProvisioningStateProvisioning,
+		Bootstrap: BootstrapPublication{
+			FeedOwnerAddress: created.FeedOwnerAddress,
+			AuthPolicyFeed:   authPolicyFeedRef(created),
+			StampPolicyFeed:  stampPolicyFeedRef(created),
+		},
+	}, nil
+}
+
+// canonicalJSON marshals a policy document to its deterministic canonical JSON.
+// For these fixed-shape documents (string-keyed maps, ordered slices) encoding/
+// json emits stable output, so a retried outbox upload is byte-identical.
+func canonicalJSON(v any) ([]byte, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("encode bootstrap policy payload: %w", err)
+	}
+	return data, nil
 }
 
 func (s *Service) ListRegistries(ctx context.Context, userID int64) ([]Registry, error) {
 	return s.Store.ListRegistriesForUser(ctx, userID)
+}
+
+// NewReconciler builds the provisioning outbox reconciler over this service's
+// already-open store and configured publisher. It returns nil when no external
+// publication is wired (no Publisher), which the caller treats as
+// "no reconciler to run". It performs no I/O and opens no database.
+func (s *Service) NewReconciler() *Reconciler {
+	if s.Publisher == nil {
+		return nil
+	}
+	return NewReconciler(s.Store, s.Publisher.Documents, s.Publisher.Feeds)
 }
 
 func (s *Service) GetRegistry(ctx context.Context, userID int64, registryID int64) (Registry, error) {

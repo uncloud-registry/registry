@@ -25,14 +25,18 @@ func NewPublicUser(user User) PublicUser {
 }
 
 type PublicRegistry struct {
-	ID                  int64     `json:"id"`
-	Slug                string    `json:"slug"`
-	Host                string    `json:"host"`
-	ENSName             string    `json:"ensName"`
-	FeedOwnerAddress    string    `json:"feedOwnerAddress"`
-	DefaultStampBatchID string    `json:"defaultStampBatchID"`
-	AnonymousPull       bool      `json:"anonymousPull"`
-	CreatedAt           time.Time `json:"createdAt"`
+	ID                  int64  `json:"id"`
+	Slug                string `json:"slug"`
+	Host                string `json:"host"`
+	ENSName             string `json:"ensName"`
+	FeedOwnerAddress    string `json:"feedOwnerAddress"`
+	DefaultStampBatchID string `json:"defaultStampBatchID"`
+	AnonymousPull       bool   `json:"anonymousPull"`
+	// ProvisioningState is the explicit provisioning vocabulary
+	// (provisioning|ready|failed). It is not secret; it signals whether
+	// verified bootstrap publication has completed.
+	ProvisioningState string    `json:"provisioningState"`
+	CreatedAt         time.Time `json:"createdAt"`
 }
 
 func NewPublicRegistry(registry Registry) PublicRegistry {
@@ -44,6 +48,7 @@ func NewPublicRegistry(registry Registry) PublicRegistry {
 		FeedOwnerAddress:    registry.FeedOwnerAddress,
 		DefaultStampBatchID: registry.DefaultStampBatchID,
 		AnonymousPull:       registry.AnonymousPull,
+		ProvisioningState:   registry.ProvisioningState,
 		CreatedAt:           registry.CreatedAt,
 	}
 }

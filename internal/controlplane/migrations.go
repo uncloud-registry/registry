@@ -157,6 +157,21 @@ var migrations = []migration{
 		Version: 5,
 		Apply:   installInviteLegacyAttributionImmutability,
 	},
+	// Version 6 adds the transactional provisioning outbox: an explicit
+	// registries.provisioning_state vocabulary (provisioning|ready|failed), a
+	// guard trigger closing the direct-SQL gap on that vocabulary, and the
+	// registry_publication_jobs table that carries exactly two deterministic
+	// bootstrap jobs (auth, stamp) per registrations, unique per (registry,
+	// kind). This is a pure forward extension: it never reads, mutates, or
+	// drops any column or row used by migrations 1-5, so already-migrated
+	// databases and fresh databases converge on the same schema. Pre-v6
+	// registries (published inline under the older control plane) default to
+	// 'ready'; fresh registrations are born 'provisioning' by the store and
+	// only transition to ready/failed through verified reconciliation.
+	{
+		Version: 6,
+		Apply:   installProvisioningOutboxSchema,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only
@@ -1050,6 +1065,52 @@ func installInviteLegacyAttributionImmutability(ctx context.Context, tx *sql.Tx)
 	}
 	if _, err := tx.ExecContext(ctx, legacyAttributionImmutableTriggerSQL); err != nil {
 		return fmt.Errorf("migration 5: install legacy immutability trigger: %w", err)
+	}
+	return nil
+}
+
+// installProvisioningOutboxSchema installs migration 6: an explicit registry
+// provisioning vocabulary plus the transactional publication outbox table.
+// It is a pure forward extension over migrations 1-5 (registries is the only
+// table touched, by ADD COLUMN with a default; nothing is read, mutated, or
+// dropped), so already-migrated and fresh databases converge identically.
+// Pre-v6 registries — which the older control plane published inline — default
+// to 'ready'; fresh registrations are born 'provisioning' and only reach
+// ready/failed via verified reconciliation. Because SQLite's ALTER TABLE ADD
+// COLUMN cannot carry a CHECK, the provisioning vocabulary is enforced by a
+// BEFORE UPDATE guard trigger (the same pattern migrations 3/4 use to close
+// the direct-SQL gap), while the new jobs table carries its KIND/STATE CHECKs
+// and (registry_id, kind) uniqueness inline in its CREATE TABLE. Both logical
+// bootstrap jobs are deterministic and unduplicable per (registry, kind).
+func installProvisioningOutboxSchema(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `alter table registries add column provisioning_state text not null default 'ready'`); err != nil {
+		return fmt.Errorf("migration 6: add provisioning_state column: %w", err)
+	}
+	const guard = `create trigger registries_provisioning_state_guard before update of provisioning_state on registries
+		for each row when new.provisioning_state not in ('provisioning','ready','failed')
+		begin select raise(abort, 'invalid registry provisioning_state'); end`
+	if _, err := tx.ExecContext(ctx, guard); err != nil {
+		return fmt.Errorf("migration 6: install provisioning state guard trigger: %w", err)
+	}
+	const jobsTable = `create table registry_publication_jobs (
+		id integer primary key autoincrement,
+		registry_id integer not null references registries(id) on delete cascade,
+		kind text not null check (kind in ('auth','stamp')),
+		state text not null check (state in ('pending','claimed','succeeded','failed')),
+		payload_json text not null,
+		object_ref text not null default '',
+		feed_ref text not null default '',
+		attempts integer not null default 0,
+		next_attempt_at text not null,
+		claimed_until text,
+		claimed_by text not null default '',
+		last_error text not null default '',
+		created_at text not null,
+		completed_at text,
+		unique (registry_id, kind)
+	)`
+	if _, err := tx.ExecContext(ctx, jobsTable); err != nil {
+		return fmt.Errorf("migration 6: create registry_publication_jobs table: %w", err)
 	}
 	return nil
 }

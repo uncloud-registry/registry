@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,12 +114,31 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
+	if created.State != ProvisioningStateProvisioning {
+		t.Fatalf("expected provisioning state at creation, got %q", created.State)
+	}
+
+	// Publication is transactional outlier, so nothing is published until the
+	// reconciler runs. Drive RunOnce to publish both bootstrap jobs.
+	reconciler := service.NewReconciler()
+	if reconciler == nil {
+		t.Fatal("expected a reconciler from a publisher-backed service")
+	}
+	if err := reconciler.RunOnce(context.Background()); err != nil {
+		t.Fatalf("run once: %v", err)
+	}
+
 	authFeed := authPolicyFeedRef(created.Registry)
 	authRef := feeds.Feeds[authFeed]
 	if authRef == "" {
-		t.Fatalf("expected auth policy feed update for %s", authFeed)
+		t.Fatalf("expected auth policy feed update for %s after reconciliation", authFeed)
 	}
-	data := uploader.refs[authRef]
+	// The feed must point at an object whose content read-back matched the
+	// published policy document (the reconciler's verified read-back proof).
+	data, err := uploader.Get(context.Background(), authRef)
+	if err != nil {
+		t.Fatalf("read back auth document: %v", err)
+	}
 	doc, err := spec.DecodeAuthPolicyDocument(data)
 	if err != nil {
 		t.Fatalf("decode auth policy: %v", err)
@@ -131,6 +151,15 @@ func TestBootstrapPublishesRoleBasedAuthPolicy(t *testing.T) {
 	}
 	if len(doc.DefaultRepo.Pull) != 3 {
 		t.Fatalf("expected anonymous + read/write pull policy, got %+v", doc.DefaultRepo.Pull)
+	}
+
+	// Both jobs complete verified read-back → the registry is 'ready'.
+	registry, err := store.FindRegistryByID(context.Background(), created.Registry.ID)
+	if err != nil {
+		t.Fatalf("find registry: %v", err)
+	}
+	if registry.ProvisioningState != ProvisioningStateReady {
+		t.Fatalf("expected registry ready after both jobs complete, got %q", registry.ProvisioningState)
 	}
 }
 
@@ -343,15 +372,33 @@ func TestUpdateCollaboratorPermissionsAffectsIssuedTokenScopes(t *testing.T) {
 type memoryUploader struct {
 	refs  map[string][]byte
 	order int
+	mu    sync.Mutex
 }
 
 func (m *memoryUploader) Put(_ context.Context, data []byte, _ string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.order++
 	ref := fmt.Sprintf("ref-%d", m.order)
 	copyData := make([]byte, len(data))
 	copy(copyData, data)
 	m.refs[ref] = copyData
 	return ref, nil
+}
+
+// Get implements ObjectStore so memoryUploader can double as the reconciler's
+// read-backed store. A missing/unknown ref is treated as an error so a stale
+// read-back is distinguishable from success.
+func (m *memoryUploader) Get(_ context.Context, ref string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.refs[ref]
+	if !ok {
+		return nil, fmt.Errorf("memory store: unknown reference %q", ref)
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out, nil
 }
 
 func TestAnonymousPullNeverBroadensMemberPush(t *testing.T) {

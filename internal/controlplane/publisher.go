@@ -11,10 +11,6 @@ import (
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
-type DocumentUploader interface {
-	Put(ctx context.Context, data []byte, batchID string) (string, error)
-}
-
 type RegistryFeedUpdater interface {
 	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string) error
 }
@@ -33,7 +29,11 @@ type BootstrapPublication struct {
 }
 
 type Publisher struct {
-	Documents DocumentUploader
+	// Documents is the writable/readable object store: Put uploads a policy
+	// document and returns its content address; Get reads a content address
+	// back so the reconciler can prove read-back. The same store must serve
+	// both, so an outbox worker that uploaded a document can later read it.
+	Documents ObjectStore
 	Feeds     RegistryFeedUpdater
 }
 
