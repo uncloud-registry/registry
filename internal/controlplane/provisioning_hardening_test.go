@@ -70,8 +70,8 @@ func newHardHarness(t *testing.T, updater RegistryFeedUpdater, feedStore *Memory
 	if err != nil {
 		t.Fatalf("new reconciler: %v", err)
 	}
-	reconciler.BackoffBase = time.Nanosecond
-	reconciler.BackoffMax = time.Nanosecond
+	reconciler.BackoffBase = 0
+	reconciler.BackoffMax = 0
 	reconciler.Lease = 10 * time.Second
 	h := &hardHarness{store: store, service: service, uploader: uploader, feedStore: feedStore,
 		reconciler: reconciler, ownerID: owner.ID, now: time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)}
@@ -288,8 +288,8 @@ func TestProvisioningTwoIndependentStoresOneFileNoDuplicatePublication(t *testin
 		if err != nil {
 			t.Fatalf("worker reconciler: %v", err)
 		}
-		rec.BackoffBase = time.Nanosecond
-		rec.BackoffMax = time.Nanosecond
+		rec.BackoffBase = 0
+		rec.BackoffMax = 0
 		return up, rec
 	}
 

@@ -219,18 +219,20 @@ var migrations = []migration{
 	//      `batchID` and an `allowPushFor` array, and `repos` object. Guards
 	//      use json_type() BEFORE value comparison, so a JSON type trick (a
 	//      string "1" or an object version) can never satisfy an integer check.
-	//   3. Timestamps move from TEXT to exact INTEGER Unix milliseconds:
+	//   3. Timestamps move from TEXT to exact INTEGER Unix NANOSECONDS:
 	//      SQLite cannot robustly validate a canonical UTC RFC3339/RFC3339Nano
 	//      TEXT (real calendar validity, canonical Z form) in a CHECK — the v7
 	//      GLOB allows calendar-invalid dates and arbitrary trailing junk. An
 	//      INTEGER collated by typeof() is a representation the DB enforces
 	//      exactly. Every existing v7 timestamp is validated in Go (canonical
-	//      UTC, real calendar/time) and converted to milliseconds, preserving
-	//      the exact instant. The store was updated to write/read integers.
+	//      UTC, real calendar/time) and converted to its exact nanosecond
+	//      instant, preserving even sub-millisecond RFC3339Nano values
+	//      byte-for-byte. The store was updated to write/read integers.
 	//   4. Full state coherence for pending/claimed/succeeded/failed, closing
 	//      every combination: a lease (claimed_by + claimed_until) exists
 	//      IFF the job is claimed and is cleared in every other state;
-	//      succeeded requires object_ref + feed_ref + a completion stamp +
+	//      completed_at is present IFF the job is succeeded (never set on
+	//      pending/claimed/failed); succeeded requires object_ref + feed_ref +
 	//      cleared ownership + an empty last_error; failed requires a safe
 	//      nonempty last_error with cleared ownership and no completion stamp;
 	//      a feed_ref may never exist without its object_ref (the feed points
@@ -1297,7 +1299,7 @@ func installProvisioningOutboxSchemaHarden(ctx context.Context, tx *sql.Tx) erro
 // exact storage-class (typeof) guards on every column, requiring the exact
 // production policy-JSON shape (json_type guards BEFORE value comparison, so a
 // type trick can never satisfy an integer/text check), moving timestamps to
-// exact INTEGER Unix milliseconds, and enforcing full state coherence. %s is
+// exact INTEGER Unix NANOSECONDS, and enforcing full state coherence. %s is
 // the table name (the "_new" rebuild clone in the migration).
 const hardenedV8PublicationJobsTableSQL = `CREATE TABLE %s (
 	id integer primary key autoincrement,
@@ -1348,16 +1350,23 @@ const hardenedV8PublicationJobsTableSQL = `CREATE TABLE %s (
 	-- NULL claimed_until never satisfies the comparison via 3VL because the
 	-- typeof guard above rejects a non-integer/NULL lease.
 	check ((state = 'claimed') = (claimed_by <> '' and claimed_until is not null)),
+	-- Completed-at coherence: completed_at is present IFF the job is succeeded
+	-- (an exact logical equivalence via 3VL-safe equals, so every non-succeeded
+	-- state — pending, claimed, failed — must have completed_at NULL on BOTH
+	-- INSERT and UPDATE, and a succeeded job MUST carry it).
+	check ((state = 'succeeded') = (completed_at is not null)),
 	-- Succeeded is terminal and verified: it MUST carry object_ref AND
-	-- feed_ref, the completion stamp, cleared ownership, and an empty
-	-- last_error (the claim cleared it and nothing set it before completion).
+	-- feed_ref, cleared ownership, and an empty last_error (the claim cleared
+	-- it and nothing set it before completion). completed_at is already forced
+	-- non-null by the IFF check above.
 	check (state <> 'succeeded'
-		or (object_ref <> '' and feed_ref <> '' and completed_at is not null
+		or (object_ref <> '' and feed_ref <> ''
 			and claimed_by = '' and claimed_until is null and last_error = '')),
 	-- Failed is terminal: a safe nonempty last_error with cleared ownership
-	-- and NO completion stamp.
+	-- and NO completion stamp (completed_at null is already required by the IFF
+	-- check, so it is not repeated here).
 	check (state <> 'failed'
-		or (last_error <> '' and claimed_by = '' and claimed_until is null and completed_at is null)),
+		or (last_error <> '' and claimed_by = '' and claimed_until is null)),
 	-- A feed_ref (published feed) may only exist when its object_ref does.
 	check (feed_ref = '' or object_ref <> '')
 )`
@@ -1366,12 +1375,12 @@ const hardenedV8PublicationJobsTableSQL = `CREATE TABLE %s (
 // atomically rebuilds registry_publication_jobs around the hardened v8 schema,
 // validating and converting every existing v7 row in Go: each RFC3339/RFC3339Nano
 // journal timestamp must be canonical UTC with real calendar validity before it
-// is converted (byte-for-byte instant-preserving) to its exact Unix millisecond
-// form, and the new table's CHECKs independently reject any storage-class,
-// JSON-shape, or coherence violation. A malformed v7 row fails the copy and
-// rolls the whole migration back (version stays 7, no schema objects, no data
-// touched); every legitimate v7/fresh row upgrades with its ID and meaning
-// preserved exactly.
+// is converted (byte-for-byte instant-preserving to the exact nanosecond) to its
+// INTEGER Unix-nanosecond form, and the new table's CHECKs independently reject
+// any storage-class, JSON-shape, or coherence violation. A malformed v7 row
+// fails the copy and rolls the whole migration back (version stays 7, no schema
+// objects, no data touched); every legitimate v7/fresh row upgrades with its ID
+// and meaning preserved exactly.
 func installProvisioningOutboxJobInvariantsV8(ctx context.Context, tx *sql.Tx) error {
 	const clone = "registry_publication_jobs_new"
 
@@ -1399,39 +1408,39 @@ func installProvisioningOutboxJobInvariantsV8(ctx context.Context, tx *sql.Tx) e
 			rows.Close()
 			return fmt.Errorf("migration 8: read v7 job %d: %w", id, err)
 		}
-		nextMillis, err := parseCanonicalUTCMillis(nextAttempt)
+		nextNanos, err := parseCanonicalUTCNanos(nextAttempt)
 		if err != nil {
 			rows.Close()
 			return fmt.Errorf("migration 8: job %d next_attempt_at: %w", id, err)
 		}
-		createdMillis, err := parseCanonicalUTCMillis(createdAt)
+		createdNanos, err := parseCanonicalUTCNanos(createdAt)
 		if err != nil {
 			rows.Close()
 			return fmt.Errorf("migration 8: job %d created_at: %w", id, err)
 		}
-		var claimedMillis, completedMillis sql.NullInt64
+		var claimedNanos, completedNanos sql.NullInt64
 		if claimedUntil.Valid {
-			ms, err := parseCanonicalUTCMillis(claimedUntil.String)
+			ns, err := parseCanonicalUTCNanos(claimedUntil.String)
 			if err != nil {
 				rows.Close()
 				return fmt.Errorf("migration 8: job %d claimed_until: %w", id, err)
 			}
-			claimedMillis = sql.NullInt64{Int64: ms, Valid: true}
+			claimedNanos = sql.NullInt64{Int64: ns, Valid: true}
 		}
 		if completedAt.Valid {
-			ms, err := parseCanonicalUTCMillis(completedAt.String)
+			ns, err := parseCanonicalUTCNanos(completedAt.String)
 			if err != nil {
 				rows.Close()
 				return fmt.Errorf("migration 8: job %d completed_at: %w", id, err)
 			}
-			completedMillis = sql.NullInt64{Int64: ms, Valid: true}
+			completedNanos = sql.NullInt64{Int64: ns, Valid: true}
 		}
 		if _, err := tx.ExecContext(ctx, `insert into registry_publication_jobs_new
 			(id, registry_id, kind, state, payload_json, object_ref, feed_ref,
 			 attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at)
 			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, registryID, kind, state, string(payload), objectRef, feedRef,
-			attempts, nextMillis, claimedMillis, claimedBy, lastError, createdMillis, completedMillis); err != nil {
+			attempts, nextNanos, claimedNanos, claimedBy, lastError, createdNanos, completedNanos); err != nil {
 			rows.Close()
 			return fmt.Errorf("migration 8: copy job %d into hardened schema: %w", id, err)
 		}

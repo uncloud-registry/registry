@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"io"
@@ -117,9 +118,20 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 	}
 	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
 
+	// The ref below is an in-memory/symbolic object ref (Task 11 owns the
+	// binary 32-byte ref contract). Its feed CHUNK body must still be valid Bee
+	// wire framing: 8-byte little-endian span (payload length) + the payload
+	// bytes. This pins the exact span-prefixed body for BOTH /chunks and /soc.
+	const ref = "repo-state-ref"
+	wantChunk := append([]byte{
+		0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // span = 14 (len(ref))
+	}, []byte(ref)...)
+
 	var gotChunkBody []byte
+	var gotSOCBody []byte
 	var gotSOCPath string
 	var gotSOCSig string
+	var gotChunkBatch, gotSOCBatch string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -128,12 +140,16 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/chunks":
 			body, _ := io.ReadAll(r.Body)
 			gotChunkBody = body
+			gotChunkBatch = r.Header.Get("Swarm-Postage-Batch-Id")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/soc/"+owner+"/"):
+			body, _ := io.ReadAll(r.Body)
+			gotSOCBody = body
 			gotSOCPath = r.URL.Path
 			gotSOCSig = r.URL.Query().Get("sig")
+			gotSOCBatch = r.Header.Get("Swarm-Postage-Batch-Id")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"reference":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`))
@@ -148,18 +164,360 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 		t.Fatalf("create updater: %v", err)
 	}
 
-	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/abcd", "repo-state-ref"); err != nil {
+	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/abcd", ref); err != nil {
 		t.Fatalf("update feed: %v", err)
 	}
 
-	if len(gotChunkBody) == 0 {
-		t.Fatal("expected chunk upload body")
+	// EVERY staging request must be a bounded, closed-body, exact-frame write.
+	// The /chunks body is the exact span-prefixed chunk for this ref...
+	if !bytes.Equal(gotChunkBody, wantChunk) {
+		t.Fatalf("chunk body must be exact span-prefixed framing:\n got %x\nwant %x", gotChunkBody, wantChunk)
+	}
+	// ...and the SOC body carries the SAME span-prefixed chunk.
+	if !bytes.Equal(gotSOCBody, wantChunk) {
+		t.Fatalf("soc body must carry the same span-prefixed chunk:\n got %x\nwant %x", gotSOCBody, wantChunk)
 	}
 	if gotSOCPath == "" {
 		t.Fatal("expected soc upload path")
 	}
+	if !strings.HasPrefix(gotSOCPath, "/soc/"+owner+"/") {
+		t.Fatalf("soc upload must target the signer-owned feed owner, path %q", gotSOCPath)
+	}
 	if gotSOCSig == "" {
 		t.Fatal("expected soc signature query")
+	}
+	// Sequence index use: the feed was not found, so the updater must use a
+	// zero (8-byte) next index and derive the SOC identifier from the topic +
+	// that zero index. The identifier is the hex of keccak(topic || zeros).
+	topicBytes, err := hex.DecodeString("abcd")
+	if err != nil {
+		t.Fatalf("decode topic: %v", err)
+	}
+	wantID := hex.EncodeToString(ethcrypto.Keccak256(append(append([]byte{}, topicBytes...), make([]byte, 8)...)))
+	// The path is /soc/<owner>/<identifier>?sig=...; assert identifier prefix.
+	pathID := strings.TrimPrefix(gotSOCPath, "/soc/"+owner+"/")
+	pathID = strings.SplitN(pathID, "?", 2)[0]
+	if pathID != wantID {
+		t.Fatalf("soc identifier must derive from topic+zero next index:\n got %s\nwant %s", pathID, wantID)
+	}
+	// The batch id is currently the ref itself (baseline defect owned by Task 11,
+	// which introduces an explicit BatchID in FeedUpdate); it must still be
+	// bounded and non-empty on both endpoints.
+	if gotChunkBatch != ref || gotSOCBatch != ref {
+		t.Fatalf("batch id must equal the ref (Task 11 owns explicit batch): chunk=%q soc=%q", gotChunkBatch, gotSOCBatch)
+	}
+}
+
+// TestBeeSequenceFeedUpdaterRespectsNextIndexHeader proves the updater reads
+// the Swarm-Feed-Index-Next header from a non-404 feed lookup and derives the
+// SOC next-index identifier from it (sequence index use), rather than always
+// assuming the zero index.
+func TestBeeSequenceFeedUpdaterRespectsNextIndexHeader(t *testing.T) {
+	t.Parallel()
+
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	const topic = "abcd"
+	const nextHex = "1122334455667788" // 8 bytes, non-zero
+
+	var gotSOCPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/feeds/"+owner+"/"+topic:
+			w.Header().Set("Swarm-Feed-Index-Next", nextHex)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/chunks":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/soc/"+owner+"/"):
+			gotSOCPath = r.URL.Path
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("create updater: %v", err)
+	}
+	const ref = "repo-state-ref" // 13 bytes; bounded symbolic ref
+	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/"+topic, ref); err != nil {
+		t.Fatalf("update feed: %v", err)
+	}
+
+	nextBytes, _ := hex.DecodeString(nextHex)
+	topicBytes, _ := hex.DecodeString(topic)
+	wantID := hex.EncodeToString(ethcrypto.Keccak256(append(append([]byte{}, topicBytes...), nextBytes...)))
+	pathID := strings.TrimPrefix(gotSOCPath, "/soc/"+owner+"/")
+	pathID = strings.SplitN(pathID, "?", 2)[0]
+	if pathID != wantID {
+		t.Fatalf("identifier must derive from topic+next-index header:\n got %s\nwant %s", pathID, wantID)
+	}
+}
+
+// TestBeeSequenceFeedUpdaterOwnerMismatchFailsBeforeNetwork proves an
+// owner/signer mismatch is rejected BEFORE any network call.
+func TestBeeSequenceFeedUpdaterOwnerMismatchFailsBeforeNetwork(t *testing.T) {
+	t.Parallel()
+
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	var touched bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		touched = true
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("create updater: %v", err)
+	}
+	const wrongOwner = "ffffffffffffffffffffffffffffffffffffffff"
+	if err := updater.UpdateFeed(context.Background(), "feed://"+wrongOwner+"/abcd", "repo-state-ref"); err == nil {
+		t.Fatal("expected an owner/signer mismatch to fail")
+	}
+	if touched {
+		t.Fatal("owner mismatch must fail before any network call")
+	}
+}
+
+// TestBeeSequenceFeedUpdaterZeroValueFailsClosed proves a direct zero-value
+// exported struct (no base URL, no signer key, nil client) returns a data-free
+// error rather than panicking.
+func TestBeeSequenceFeedUpdaterZeroValueFailsClosed(t *testing.T) {
+	t.Parallel()
+	var updater BeeSequenceFeedUpdater
+	if err := updater.UpdateFeed(context.Background(), "feed://a/b", "ref"); err == nil {
+		t.Fatal("expected a zero-value updater to fail closed")
+	}
+}
+
+// TestBeeSequenceFeedUpdaterWriterErrorIsDataFree proves a non-2xx writer
+// response returns a status-only error and NEVER leaks the raw Bee body.
+func TestBeeSequenceFeedUpdaterWriterErrorIsDataFree(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	secret := "internal-secret-" + strings.Repeat("x", 200)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/feeds/"+owner+"/abcd":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(secret))
+		case r.Method == http.MethodPost && r.URL.Path == "/chunks":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(secret))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/soc/"+owner+"/"):
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(secret))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("create updater: %v", err)
+	}
+	// feed lookup (GET) error
+	if _, err := updater.nextSequenceIndex(context.Background(), owner, "abcd"); err != nil {
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), strings.Repeat("x", 8)) {
+			t.Fatalf("feed lookup error must not leak the raw body: %v", err)
+		}
+	}
+	// chunk upload error
+	if _, err := updater.uploadChunk(context.Background(), []byte("data"), "batch"); err != nil {
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), strings.Repeat("x", 8)) {
+			t.Fatalf("chunk upload error must not leak the raw body: %v", err)
+		}
+	}
+	// soc upload error
+	if err := updater.uploadSOC(context.Background(), owner, []byte{1, 2}, []byte{3, 4}, []byte("data"), "batch"); err != nil {
+		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), strings.Repeat("x", 8)) {
+			t.Fatalf("soc upload error must not leak the raw body: %v", err)
+		}
+	}
+}
+
+// TestBeeSequenceFeedUpdaterWriterClosesBody proves the writer always closes the
+// response body on success and error paths.
+func TestBeeSequenceFeedUpdaterWriterClosesBody(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, w http.ResponseWriter, r *http.Request)
+		fn   func(t *testing.T, u *BeeSequenceFeedUpdater)
+	}{
+		{"chunk success", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
+			if _, err := u.uploadChunk(context.Background(), []byte("data"), "batch"); err != nil {
+				t.Fatalf("chunk upload: %v", err)
+			}
+		}},
+		{"chunk error", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("boom"))
+		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
+			_, _ = u.uploadChunk(context.Background(), []byte("data"), "batch")
+		}},
+		{"lookup success", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Swarm-Feed-Index-Next", "0000000000000000")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
+			if _, err := u.nextSequenceIndex(context.Background(), owner, "abcd"); err != nil {
+				t.Fatalf("feed lookup: %v", err)
+			}
+		}},
+		{"lookup error", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("boom"))
+		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
+			_, _ = u.nextSequenceIndex(context.Background(), owner, "abcd")
+		}},
+		{"soc success", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
+		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
+			if err := u.uploadSOC(context.Background(), owner, []byte{1}, []byte{2, 3, 4, 5}, []byte("data"), "batch"); err != nil {
+				t.Fatalf("soc upload: %v", err)
+			}
+		}},
+		{"soc error", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("boom"))
+		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
+			_ = u.uploadSOC(context.Background(), owner, []byte{1}, []byte{2, 3, 4, 5}, []byte("data"), "batch")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			closed := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tc.seed(t, w, r)
+			}))
+			t.Cleanup(server.Close)
+			rt := &bodyTrackingTransport{base: &http.Transport{Proxy: http.ProxyFromEnvironment}, closed: closed}
+			client := &http.Client{Transport: rt}
+			updater, err := NewBeeSequenceFeedUpdater(server.URL, client, hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+			if err != nil {
+				t.Fatalf("create updater: %v", err)
+			}
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() { defer wg.Done(); tc.fn(t, updater) }()
+			select {
+			case <-closed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("writer must close the response body")
+			}
+			wg.Wait()
+		})
+	}
+}
+
+// TestBeeSequenceFeedUpdaterWriterStalledRespectsDeadline proves a stalled Bee
+// writer request cannot block indefinitely: the per-request context deadline
+// aborts it.
+func TestBeeSequenceFeedUpdaterWriterStalledRespectsDeadline(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	release := make(chan struct{})
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+
+	updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("create updater: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := updater.nextSequenceIndex(ctx, owner, "abcd"); err == nil {
+		<-started
+		t.Fatal("expected a stalled lookup to time out")
+	}
+	<-started
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("stalled writer request must abort near the deadline, took %v", elapsed)
+	}
+}
+
+// TestBeeSequenceFeedUpdaterOversizeChunkResponseRejected proves a chunk upload
+// response beyond the body bound is rejected (not silently truncated) and the
+// write fails closed.
+func TestBeeSequenceFeedUpdaterOversizeChunkResponseRejected(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	big := `{"reference":"aaaa..."` + strings.Repeat("x", beeFeedWriteMaxBody)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(big))
+	}))
+	defer server.Close()
+	updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("create updater: %v", err)
+	}
+	if _, err := updater.uploadChunk(context.Background(), []byte("data"), "batch"); err == nil {
+		t.Fatal("expected an oversized chunk response to be rejected")
+	}
+}
+
+// TestBeeSequenceFeedUpdaterWriterRejectsOversizeRef proves an unbounded ref /
+// batch id is rejected before any network call.
+func TestBeeSequenceFeedUpdaterWriterRejectsOversizeRef(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("no request should be issued for an over-bound ref")
+	}))
+	defer server.Close()
+	updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+	if err != nil {
+		t.Fatalf("create updater: %v", err)
+	}
+	big := strings.Repeat("a", beeFeedWriteMaxRef+1)
+	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/abcd", big); err == nil {
+		t.Fatal("expected an over-bound ref to be rejected")
 	}
 }
 

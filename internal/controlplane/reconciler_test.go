@@ -123,8 +123,8 @@ func newProvisioningHarness(t *testing.T) *provisioningHarness {
 		t.Fatalf("new reconciler: %v", err)
 	}
 	// Small, fast backoff so retry determinism does not depend on wall clock.
-	reconciler.BackoffBase = time.Nanosecond
-	reconciler.BackoffMax = time.Nanosecond
+	reconciler.BackoffBase = 0
+	reconciler.BackoffMax = 0
 	reconciler.Lease = 10 * time.Second
 
 	h := &provisioningHarness{

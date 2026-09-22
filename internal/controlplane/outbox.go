@@ -143,23 +143,31 @@ const publicationJobColumns = `id, registry_id, kind, state, payload_json, objec
 	attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at`
 
 // Timestamps in registry_publication_jobs are stored as bounded INTEGER Unix
-// milliseconds (migration 8), because SQLite cannot robustly validate a
+// NANOSECONDS (migration 8), because SQLite cannot robustly validate a
 // canonical UTC RFC3339/RFC3339Nano TEXT value (calendar validity, canonical
 // form) in a CHECK; an INTEGER with a typeof guard is a representation the
-// database CAN enforce exactly. These helpers convert to/from time.Time.
-func timeToMillis(t time.Time) int64 { return t.UTC().UnixMilli() }
+// database CAN enforce exactly. Nanoseconds (not milliseconds) are used so a
+// sub-millisecond RFC3339Nano instants survives migration 8 EXACTLY — no
+// representable instant is truncated. These helpers convert to/from time.Time.
+func timeToNanos(t time.Time) int64 {
+	return t.UTC().UnixNano()
+}
 
-func millisToTime(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
+func nanosToTime(ns int64) time.Time {
+	return time.Unix(0, ns).UTC()
+}
 
-// parseCanonicalUTCMillis parses a legacy (v7) TEXT journal timestamp into its
-// epoch milliseconds. It is the store-side inverse of the migration 8
-// conversion and is used by migration 8 to validate+convert every existing row:
-// it accepts ONLY a canonical UTC RFC3339/RFC3339Nano value (real calendar/time
-// validity via time.Parse, and a trailing 'Z' so an offset form is rejected) and
-// returns its millisecond instant, so the migrated INTEGER columns and any
-// consumer agree exactly. Fresh integer columns are read directly as int64; no
-// silent fallback ever turns a malformed timestamp into a zero time.
-func parseCanonicalUTCMillis(s string) (int64, error) {
+// parseCanonicalUTCNanos parses a legacy (v7) TEXT journal timestamp into its
+// epoch nanoseconds. It is the store-side inverse of the migration 8
+// conversion and is used by migration 8 to validate+convert every existing
+// row: it accepts ONLY a canonical UTC RFC3339/RFC3339Nano value (real
+// calendar/time validity via time.Parse, and a trailing 'Z' so an offset form
+// is rejected) and returns its exact nanosecond instant, so the migrated
+// INTEGER columns and any consumer agree to the last nanosecond. Out-of-range
+// values (outside the int64-nanosecond representable span) and noncanonical
+// forms are rejected; no silent fallback ever turns a malformed timestamp into
+// a zero time.
+func parseCanonicalUTCNanos(s string) (int64, error) {
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
 		return 0, err
@@ -167,27 +175,37 @@ func parseCanonicalUTCMillis(s string) (int64, error) {
 	if t.Location() != time.UTC || len(s) == 0 || s[len(s)-1] != 'Z' {
 		return 0, fmt.Errorf("timestamp %q is not canonical UTC (must end in 'Z')", s)
 	}
-	return t.UnixMilli(), nil
+	// Guard against int64-nanosecond overflow BEFORE calling UnixNano (which is
+	// undefined outside it). Unix() seconds are safe for every 4-digit RFC3339
+	// year; check the seconds fit the nanosecond int64 span, then compose the
+	// exact nanosecond instant (whole seconds + fraction) without truncation.
+	const maxNs = int64(1<<63 - 1)
+	const maxSec = maxNs / int64(time.Second)
+	sec := t.Unix()
+	if sec > maxSec || sec < -maxSec {
+		return 0, fmt.Errorf("timestamp %q is out of the int64-nanosecond range", s)
+	}
+	return sec*int64(time.Second) + int64(t.Nanosecond()), nil
 }
 
 func scanPublicationJob(s scanRow, job *PublicationJob) error {
-	var nextAttemptMillis, createdAtMillis int64
+	var nextAttemptNanos, createdAtNanos int64
 	var claimedUntil, completedAt sql.NullInt64
 	var payload []byte
 	if err := s.Scan(&job.ID, &job.RegistryID, &job.Kind, &job.State, &payload,
-		&job.ObjectRef, &job.FeedRef, &job.Attempts, &nextAttemptMillis, &claimedUntil,
-		&job.ClaimedBy, &job.LastError, &createdAtMillis, &completedAt); err != nil {
+		&job.ObjectRef, &job.FeedRef, &job.Attempts, &nextAttemptNanos, &claimedUntil,
+		&job.ClaimedBy, &job.LastError, &createdAtNanos, &completedAt); err != nil {
 		return err
 	}
 	job.PayloadJSON = payload
-	job.NextAttempt = millisToTime(nextAttemptMillis)
-	job.CreatedAt = millisToTime(createdAtMillis)
+	job.NextAttempt = nanosToTime(nextAttemptNanos)
+	job.CreatedAt = nanosToTime(createdAtNanos)
 	if claimedUntil.Valid {
-		t := millisToTime(claimedUntil.Int64)
+		t := nanosToTime(claimedUntil.Int64)
 		job.ClaimedUntil = &t
 	}
 	if completedAt.Valid {
-		t := millisToTime(completedAt.Int64)
+		t := nanosToTime(completedAt.Int64)
 		job.CompletedAt = &t
 	}
 	return nil
@@ -230,9 +248,9 @@ func (s *Store) CreateProvisionedRegistry(ctx context.Context, registry Registry
 		now := time.Now().UTC()
 		// registries/memberships created_at stay canonical RFC3339 TEXT (read
 		// back via time.Parse); only the jobs table's journal timestamps are
-		// INTEGER Unix milliseconds (migration 8's exact, DB-enforceable form).
+		// INTEGER Unix nanoseconds (migration 8's exact, DB-enforceable form).
 		nowText := now.Format(time.RFC3339)
-		nowMillis := timeToMillis(now)
+		nowMillis := timeToNanos(now)
 		result, err := c.ExecContext(ctx, `insert into registries
 			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, provisioning_state, created_at)
 			values (?, ?, ?, ?, ?, '', ?, ?, ?, ?)`,
@@ -299,8 +317,8 @@ func (s *Store) ClaimStalePublicationJobs(ctx context.Context, now time.Time, le
 	if err != nil {
 		return nil, "", err
 	}
-	nowText := timeToMillis(now)
-	untilText := timeToMillis(now.Add(lease))
+	nowText := timeToNanos(now)
+	untilText := timeToNanos(now.Add(lease))
 
 	var claimed []PublicationJob
 	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
@@ -377,7 +395,7 @@ func (s *Store) SetPublicationFeedRef(ctx context.Context, jobID int64, worker s
 func (s *Store) CompletePublicationJob(ctx context.Context, jobID int64, worker string, now time.Time) error {
 	return s.jobGuardUpdate(ctx, jobID, worker,
 		`update registry_publication_jobs set state = 'succeeded', completed_at = ?, claimed_by = '', claimed_until = null
-		 where id = ? and state = 'claimed' and claimed_by = ?`, timeToMillis(now))
+		 where id = ? and state = 'claimed' and claimed_by = ?`, timeToNanos(now))
 }
 
 // FailPublicationJob registers a retryable failure for a claimed job: it
@@ -404,7 +422,7 @@ func (s *Store) FailPublicationJob(ctx context.Context, jobID int64, worker stri
 			state = PublicationStateFailed
 			terminal = true
 		}
-		next := timeToMillis(now.Add(attemptBackoff(newAttempts, backoffBase, backoffMax)))
+		next := timeToNanos(now.Add(attemptBackoff(newAttempts, backoffBase, backoffMax)))
 		res, err := c.ExecContext(ctx, `update registry_publication_jobs
 			set attempts = ?, state = ?, last_error = ?, next_attempt_at = ?, claimed_by = '', claimed_until = null
 			where id = ? and state = 'claimed' and claimed_by = ?`,

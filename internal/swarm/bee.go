@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -370,7 +371,35 @@ func NewBeeSequenceFeedUpdaterBytes(baseURL string, client *http.Client, private
 	}, nil
 }
 
+// beeFeedWriteTimeout is the per-request deadline applied via the request
+// context for every outbound writer request (sequence lookup, chunk upload,
+// SOC upload) even when the supplied HTTP client has no Timeout configured, so
+// a stalled or hung Bee node can never block reconciliation indefinitely.
+const beeFeedWriteTimeout = 30 * time.Second
+
+// beeFeedWriteMaxBody bounds success and error response bodies for the writer
+// endpoints. A chunk upload returns a small JSON wrapper around a 64-hex ref
+// (plus the feed index header), so the bound comfortably covers legitimate
+// output while rejecting oversized or garbage bodies with a bounded read.
+const beeFeedWriteMaxBody = 512
+
+// beeFeedWriteMaxRef bounds the object reference / batch-id / feed index values
+// accepted on the writer path. A genuine Swarm ref or batch id is exactly 64
+// hex chars; the bound rejects oversized or malformed values before any network
+// call while still allowing the bounded in-memory/symbolic test refs.
+const beeFeedWriteMaxRef = 256
+
 func (u *BeeSequenceFeedUpdater) UpdateFeed(ctx context.Context, feed string, ref string) error {
+	if u == nil || u.PrivateKey == nil {
+		return errors.New("feed updater signing key is not configured; refusing to sign feed updates")
+	}
+	if len(ref) == 0 {
+		return errors.New("feed update reference is empty")
+	}
+	if len(ref) > beeFeedWriteMaxRef {
+		return errors.New("feed update reference exceeds the bound")
+	}
+
 	ownerHex, topicHex, err := parseFeedRef(feed)
 	if err != nil {
 		return err
@@ -386,12 +415,17 @@ func (u *BeeSequenceFeedUpdater) UpdateFeed(ctx context.Context, feed string, re
 		return fmt.Errorf("decode feed topic: %w", err)
 	}
 
-	// The feed payload IS the raw object reference bytes ([]byte(ref)) — NOT
-	// an 8-byte little-endian length-prefixed chunk. GET /feeds/{owner}/{topic}
-	// returns this payload directly, so the resolver reads it as the reference
-	// itself. This is the single shared contract between the signer and the
-	// resolver: the chunk and SOC payloads both carry exactly the reference.
-	chunkData := []byte(ref)
+	// The feed update's chunk payload is the 8-byte little-endian span followed
+	// by the current payload bytes — a valid Bee chunk wire format that the
+	// /chunks and /soc endpoints both accept and that round 2 mistakenly broke
+	// by sending raw ASCII ref bytes with no span. The payload itself is the
+	// object REFERENCE inline (the same bytes GET /feeds returns), not a
+	// content-addressed chunk address; the span is purely the wire length
+	// prefix Bee requires. Changing that payload to a binary 32-byte ref and
+	// carrying an explicit postage batch id are Task 11's scope
+	// (FeedUpdate{Feed,Reference,BatchID}); this task restores only the valid
+	// span-prefixed framing and preserves current interface behavior.
+	chunkData := makeChunkData([]byte(ref))
 	chunkRef, err := u.uploadChunk(ctx, chunkData, ref)
 	if err != nil {
 		return err
@@ -439,13 +473,48 @@ func stripPort(host string) string {
 	return host
 }
 
+// writerClient returns a guaranteed non-nil *http.Client for writer requests
+// (http.DefaultClient when the updater's client is nil) so a zero-value or
+// under-configured updater never panics on a nil receiver client.
+func (u *BeeSequenceFeedUpdater) writerClient() *http.Client {
+	return defaultHTTPClient(u.HTTPClient)
+}
+
+// writerBaseURL returns the normalized base URL or a data-free configuration
+// error when the updater has none, so a direct exported-struct zero value
+// fails closed with an error instead of building an empty-URL request.
+func (u *BeeSequenceFeedUpdater) writerBaseURL() (string, error) {
+	if u == nil {
+		return "", errors.New("bee feed updater is not configured")
+	}
+	if strings.TrimSpace(u.BaseURL) == "" {
+		return "", errors.New("feed updater base URL is not configured")
+	}
+	return strings.TrimRight(u.BaseURL, "/"), nil
+}
+
 func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner string, topic string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.BaseURL+"/feeds/"+owner+"/"+topic, nil)
+	if len(owner) > beeFeedWriteMaxRef || len(topic) > beeFeedWriteMaxRef {
+		return nil, errors.New("feed owner or topic exceeds the bound")
+	}
+	baseURL, err := u.writerBaseURL()
+	if err != nil {
+		return nil, err
+	}
+	// Path-escape both parts so an unusual owner/topic can never smuggle a
+	// different path segment or query into the request.
+	path := "/feeds/" + url.PathEscape(owner) + "/" + url.PathEscape(topic)
+
+	client := u.writerClient()
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create feed lookup request: %w", err)
 	}
 
-	resp, err := u.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("feed lookup request failed: %w", err)
 	}
@@ -455,13 +524,18 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 		return make([]byte, 8), nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("feed lookup failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// Drain a bounded amount (never the whole body) so the connection can
+		// be reused, but NEVER include the raw body in the returned error.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		return nil, fmt.Errorf("feed lookup failed with status %d", resp.StatusCode)
 	}
 
 	nextHex := strings.TrimSpace(resp.Header.Get("Swarm-Feed-Index-Next"))
 	if nextHex == "" {
-		return nil, fmt.Errorf("feed lookup response missing Swarm-Feed-Index-Next header")
+		return nil, errors.New("feed lookup response missing Swarm-Feed-Index-Next header")
+	}
+	if len(nextHex) > beeFeedWriteMaxRef {
+		return nil, errors.New("feed next index header exceeds the bound")
 	}
 
 	nextBytes, err := hex.DecodeString(nextHex)
@@ -475,27 +549,42 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 }
 
 func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []byte, batchID string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.BaseURL+"/chunks", bytes.NewReader(chunkData))
+	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
+		return nil, errors.New("postage batch id is empty or exceeds the bound")
+	}
+	baseURL, err := u.writerBaseURL()
+	if err != nil {
+		return nil, err
+	}
+
+	client := u.writerClient()
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/chunks", bytes.NewReader(chunkData))
 	if err != nil {
 		return nil, fmt.Errorf("create chunk upload request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
 
-	resp, err := u.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("chunk upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("chunk upload failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		return nil, fmt.Errorf("chunk upload failed with status %d", resp.StatusCode)
 	}
 
 	var payload beeReferenceResponse
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return nil, fmt.Errorf("decode chunk upload response: %w", err)
+	if err := decodeBoundedJSON(resp.Body, &payload); err != nil {
+		return nil, err
+	}
+	if len(payload.Reference) == 0 || len(payload.Reference) > beeFeedWriteMaxRef {
+		return nil, errors.New("chunk upload response has an empty or oversized reference")
 	}
 	refBytes, err := hex.DecodeString(payload.Reference)
 	if err != nil {
@@ -505,25 +594,80 @@ func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []by
 }
 
 func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, identifier []byte, signature []byte, chunkData []byte, batchID string) error {
-	endpoint := fmt.Sprintf("%s/soc/%s/%s?sig=%s", u.BaseURL, owner, hex.EncodeToString(identifier), hex.EncodeToString(signature))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(chunkData))
+	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
+		return errors.New("postage batch id is empty or exceeds the bound")
+	}
+	if len(owner) == 0 || len(owner) > beeFeedWriteMaxRef {
+		return errors.New("feed owner is empty or exceeds the bound")
+	}
+	baseURL, err := u.writerBaseURL()
+	if err != nil {
+		return err
+	}
+
+	client := u.writerClient()
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+
+	endpoint := fmt.Sprintf("%s/soc/%s/%s?sig=%s", baseURL, url.PathEscape(owner), hex.EncodeToString(identifier), hex.EncodeToString(signature))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(chunkData))
 	if err != nil {
 		return fmt.Errorf("create soc upload request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
 
-	resp, err := u.HTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("soc upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("soc upload failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		return fmt.Errorf("soc upload failed with status %d", resp.StatusCode)
+	}
+	// Drain a bounded amount so the connection can be reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+	return nil
+}
+
+// writeRequestContext derives the per-request context for a writer call: it
+// respects the caller's own deadline when one is set, otherwise imposes the
+// bounded beeFeedWriteTimeout so a stalled Bee node can never block
+// reconciliation indefinitely.
+func writeRequestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, beeFeedWriteTimeout)
+}
+
+// decodeBoundedJSON decodes a JSON value from a bounded body read (limit+1
+// detect, so an oversized response is rejected rather than silently truncated)
+// and never buffers unbounded bytes.
+func decodeBoundedJSON(body io.Reader, dst any) error {
+	data, err := io.ReadAll(io.LimitReader(body, beeFeedWriteMaxBody+1))
+	if err != nil {
+		return fmt.Errorf("read bee response body: %w", err)
+	}
+	if len(data) > beeFeedWriteMaxBody {
+		return errors.New("bee response body exceeded the bound")
+	}
+	if err := json.Unmarshal(data, dst); err != nil {
+		return fmt.Errorf("decode bee response: %w", err)
 	}
 	return nil
+}
+
+// makeChunkData wraps the current payload bytes in Bee's chunk wire format: an
+// 8-byte little-endian span (the payload length) followed by the payload.
+// /chunks and /soc both store and accept this span-prefixed form.
+func makeChunkData(payload []byte) []byte {
+	chunk := make([]byte, 8+len(payload))
+	binary.LittleEndian.PutUint64(chunk[:8], uint64(len(payload)))
+	copy(chunk[8:], payload)
+	return chunk
 }
 
 func makeFeedIdentifier(topic []byte, index []byte) []byte {

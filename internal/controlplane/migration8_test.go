@@ -11,16 +11,19 @@ import (
 
 // Migration 8 closes the storage-class / dynamic-typing / JSON-shape / calendar
 // loopholes migration 7's CHECKs could not reach and moves journal timestamps
-// to exact INTEGER Unix milliseconds. These tests pin:
+// to exact INTEGER Unix NANOSECONDS (so sub-millisecond RFC3339Nano instants
+// survive byte-for-byte, never truncated to the millisecond). These tests pin:
 //   - a genuine v7 DB upgrades with every row's ID, content, and timestamp
-//     MEANING preserved exactly (text RFC3339 → integer ms, same instant);
+//     MEANING preserved exactly (text RFC3339 → integer ns, same instant to the
+//     last nanosecond);
 //   - a malformed v7 row (calendar-invalid or non-canonical timestamp, or a
 //     payload that only the weaker v7 JSON checks accept) ROLLS BACK
 //     byte-equivalently (version stays 7, no clone, no data touched);
 //   - every new v8 invariant is enforced against adversarial INSERTs and
 //     UPDATEs on direct SQL: JSON type/value tricks, NULL/three-valued
 //     comparisons, REAL/numeric-text attempts, invalid timestamp storage
-//     classes, and every incoherent state/ownership/completion combination.
+//     classes, and every incoherent state/ownership/completion combination,
+//     including completed_at present IFF state=succeeded.
 
 const mig8Base = "2026-09-22T12:00:00Z"
 
@@ -84,12 +87,12 @@ func seedV7ProvisionedRegistry(t *testing.T) (*sql.DB, map[string]int64) {
 	seed(2, "auth", "claimed", mig7Auth, "ref-auth-2", "", "1", base, "worker-1", lease, "", "")
 	seed(2, "stamp", "failed", mig7Stamp, "", "", "8", base, "", "", "upload failed", "")
 
-	baseMillis, _ := parseCanonicalUTCMillis(base)
-	leaseMillis, _ := parseCanonicalUTCMillis(lease)
-	doneMillis, _ := parseCanonicalUTCMillis(done)
-	retryMillis, _ := parseCanonicalUTCMillis("2026-09-22T13:00:00Z")
+	baseNanos, _ := parseCanonicalUTCNanos(base)
+	leaseNanos, _ := parseCanonicalUTCNanos(lease)
+	doneNanos, _ := parseCanonicalUTCNanos(done)
+	retryNanos, _ := parseCanonicalUTCNanos("2026-09-22T13:00:00Z")
 	return db, map[string]int64{
-		"base": baseMillis, "lease": leaseMillis, "done": doneMillis, "retry": retryMillis,
+		"base": baseNanos, "lease": leaseNanos, "done": doneNanos, "retry": retryNanos,
 	}
 }
 
@@ -310,7 +313,7 @@ func newV8JobsEnv(t *testing.T) *v8JobsEnv {
 	return &v8JobsEnv{
 		db:      db,
 		regNow:  time.Now().UTC().Format(time.RFC3339),
-		jobNow:  time.Now().UTC().UnixMilli(),
+		jobNow:  time.Now().UTC().UnixNano(),
 		payload: map[string]string{"auth": mig7Auth, "stamp": mig7Stamp},
 	}
 }
@@ -462,6 +465,12 @@ func TestMigration8JobsInvariantEnforcement(t *testing.T) {
 			[]interface{}{1, "auth", "failed", auth, base, base}},
 		{"failed with completed_at", []string{"registry_id", "kind", "state", "payload_json", "next_attempt_at", "created_at", "completed_at", "last_error"},
 			[]interface{}{1, "auth", "failed", auth, base, base, base, "boom"}},
+		{"pending with completed_at", []string{"registry_id", "kind", "state", "payload_json", "next_attempt_at", "created_at", "completed_at", "last_error"},
+			[]interface{}{1, "auth", "pending", auth, base, base, base, ""}},
+		{"claimed with completed_at", []string{"registry_id", "kind", "state", "payload_json", "next_attempt_at", "created_at", "claimed_by", "claimed_until", "completed_at"},
+			[]interface{}{1, "auth", "claimed", auth, base, base, "w", base + 30000, base}},
+		{"succeeded missing completed_at covered above — pending/claimed/failed must all forbid it", []string{"registry_id", "kind", "state", "payload_json", "next_attempt_at", "created_at"},
+			[]interface{}{1, "auth", "succeeded", auth, base, base}},
 		{"failed with lease held", []string{"registry_id", "kind", "state", "payload_json", "next_attempt_at", "created_at", "claimed_by", "claimed_until", "last_error"},
 			[]interface{}{1, "auth", "failed", auth, base, base, "w", base, "boom"}},
 		{"feed_ref without object_ref", []string{"registry_id", "kind", "state", "payload_json", "feed_ref", "next_attempt_at", "created_at"},
@@ -542,6 +551,9 @@ func TestMigration8JobsInvariantEnforcement(t *testing.T) {
 		{"succeeded job completed_at to NULL", "kind='stamp' and registry_id=" + fmt.Sprint(updReg2),
 			"state='succeeded', object_ref='r', feed_ref='f', completed_at=NULL", nil},
 		{"failed job with completed_at", "kind='stamp' and registry_id=" + fmt.Sprint(updReg2), "state='failed', last_error='boom', completed_at=" + fmt.Sprint(base), nil},
+		{"pending job with completed_at", "kind='stamp' and registry_id=" + fmt.Sprint(updReg2), "completed_at=" + fmt.Sprint(base), nil},
+		{"claimed job completed_at without lease", "kind='stamp' and registry_id=" + fmt.Sprint(updReg2), "state='claimed', claimed_by='w', completed_at=" + fmt.Sprint(base), nil},
+		{"claimed job with completed_at across transition", "kind='stamp' and registry_id=" + fmt.Sprint(updReg2), "state='claimed', claimed_by='w', claimed_until=" + fmt.Sprint(base+30000) + ", completed_at=" + fmt.Sprint(base), nil},
 	}
 	for _, u := range updates {
 		t.Run("update "+u.name, func(t *testing.T) {
@@ -561,4 +573,91 @@ func TestMigration8JobsInvariantEnforcement(t *testing.T) {
 		base+30000, updReg); err != nil {
 		t.Fatalf("valid claimed update must succeed: %v", err)
 	}
+}
+
+// subNsV7Times holds sub-millisecond and nanosecond-precision RFC3339Nano
+// instants (in genuinely DIFFERENT milliseconds) that a millisecond-truncating
+// migration would destroy by rounding them onto the same whole millisecond.
+var subNsV7Times = []string{
+	"2026-09-22T12:00:00.000000001Z",
+	"2026-09-22T12:00:00.000000123Z",
+	"2026-09-22T12:00:00.000000999Z",
+	"2026-09-22T12:00:00.001000000Z",
+	"2026-09-22T12:00:00.999999999Z",
+	"2026-09-22T12:00:01.999999999Z",
+}
+
+// TestMigration8PreservesSubNanosecondInstantsExactly proves migration 8 stores
+// each RFC3339Nano v7 timestamp as the EXACT int64 nanosecond instant — a
+// sub-millisecond / nanosecond-precision value is never truncated to the
+// millisecond. Each distinct input must round-trip to its own canonical instant,
+// and distinct sub-millisecond fractions must NOT collapse onto the same
+// nanosecond counter (a millisecond-truncating store would collapse all six).
+func TestMigration8PreservesSubNanosecondInstantsExactly(t *testing.T) {
+	seen := map[int64]string{}
+	for _, ts := range subNsV7Times {
+		want, err := parseCanonicalUTCNanos(ts)
+		if err != nil {
+			t.Fatalf("parse %q: %v", ts, err)
+		}
+		// Distinct input instants must map to distinct nanoseconds (no collapse).
+		if prev, ok := seen[want]; ok && prev != ts {
+			t.Fatalf("distinct instants %q and %q collapsed to the same nanosecond %d", prev, ts, want)
+		}
+		seen[want] = ts
+
+		// The nanosecond instant must be the EXACT input (nanosToTime recovers
+		// it; comparing canonical RFC3339Nano strings).
+		if got := nanosToTime(want).Format(time.RFC3339Nano); got != normalizedNano(ts) {
+			t.Fatalf("nanosecond conversion changed the instant: %q -> %q", ts, got)
+		}
+	}
+	if len(seen) != len(subNsV7Times) {
+		t.Fatalf("expected all %d distinct instants, got %d distinct nanosecond counters", len(subNsV7Times), len(seen))
+	}
+}
+
+// TestMigration8ParseRejectsOutOfRangeAndNoncanonicalNanos proves the strict
+// RFC3339Nano→nanosecond conversion (used by migration 8) rejects anything that
+// is not canonical UTC or whose instant exceeds the int64-nanosecond span —
+// it never clamps or truncates, so a malformed or out-of-range v7 row rolls the
+// migration back rather than silently storing a wrong instant.
+func TestMigration8ParseRejectsOutOfRangeAndNoncanonicalNanos(t *testing.T) {
+	for _, bad := range []string{
+		"2026-09-22T12:00:00",            // no 'Z'
+		"2026-09-22T12:00:00+02:00",      // non-canonical offset (not UTC)
+		"2026-13-40T25:61:61Z",           // calendar/clock invalid
+		"2026-09-22T12:00:00Zjunk",       // trailing garbage (fails time.Parse)
+		"9999-12-31T23:59:59.999999999Z", // year 9999 → int64-nanosecond overflow
+	} {
+		if _, err := parseCanonicalUTCNanos(bad); err == nil {
+			t.Fatalf("expected %q to be rejected as non-canonical or out of range", bad)
+		}
+	}
+	// A canonical UTC instant at the int64-nanosecond extremes must be accepted
+	// exactly (recovered via nanosToTime must equal the same instant).
+	for _, good := range []string{
+		"2200-01-01T00:00:00.123456789Z",
+		"1678-01-01T00:00:00Z",
+	} {
+		ns, err := parseCanonicalUTCNanos(good)
+		if err != nil {
+			t.Fatalf("expected %q to convert: %v", good, err)
+		}
+		if got := nanosToTime(ns).Format(time.RFC3339Nano); got != normalizedNano(good) {
+			t.Fatalf("round-trip changed %q -> %q", good, got)
+		}
+	}
+}
+
+// normalizedNano renders an RFC3339Nano string in canonical form for a
+// byte-stable comparison (Go may pad or abbreviate trailing zeros differently
+// from the literal input, so equality is judged on the normalized instant, not
+// the exact text).
+func normalizedNano(s string) string {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return s
+	}
+	return t.Format(time.RFC3339Nano)
 }
