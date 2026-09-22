@@ -5,9 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 type Store struct {
@@ -33,6 +34,151 @@ func (s *Store) nowUTC() time.Time {
 		return s.now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+// SQLite result codes used for busy/locked classification (SQLITE_BUSY,
+// SQLITE_LOCKED, and the shared-cache table lock variant). See
+// modernc.org/sqlite Error.Code().
+const (
+	sqliteCodeBusy           = 5   // SQLITE_BUSY: database file is locked
+	sqliteCodeLocked         = 6   // SQLITE_LOCKED: table in the database is locked
+	sqliteCodeLockedShared   = 262 // SQLITE_LOCKED | (1 << 8): shared-cache table lock
+	sqliteWriteTxMaxAttempts = 20
+)
+
+// isBusyOrLocked reports whether err is a SQLite busy/locked conflict that a
+// retried write transaction can overcome. It classifies both the typed
+// modernc.org/sqlite *Error (by result code) and wrapped/stringified driver
+// errors, so classification never depends on a single error shape.
+func isBusyOrLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *sqlite.Error
+	if errors.As(err, &se) {
+		switch se.Code() {
+		case sqliteCodeBusy, sqliteCodeLocked, sqliteCodeLockedShared:
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") ||
+		strings.Contains(msg, "sqlite_busy") ||
+		strings.Contains(msg, "sqlite_locked")
+}
+
+// withWriteTx runs fn inside a SQLite write transaction on ONE pinned
+// connection. Unlike a deferred read→write transaction (which can hit
+// snapshot and lock-upgrade conflicts under concurrent acceptance/revocation),
+// the transaction starts with BEGIN IMMEDIATE so the write lock is acquired up
+// front and every statement in fn executes on the same connection.
+//
+// Busy/locked conflicts (SQLITE_BUSY/SQLITE_LOCKED, incl. the shared-cache
+// table-lock variant) retry the COMPLETE transaction — fn is re-run from
+// scratch on a fresh connection, no partial writes survive — for a bounded
+// number of attempts with a short backoff that respects ctx cancellation.
+// Errors are classified without leaking invite state: retryable conflicts are
+// absorbed, ctx cancellation is returned as-is, retry exhaustion surfaces the
+// underlying busy error, and any other failure is returned unwrapped from fn.
+// The connection is closed after every attempt and `rollback` is best-effort
+// on failure, so no half-open transaction or borrowed connection leaks.
+func (s *Store) withWriteTx(ctx context.Context, fn func(ctx context.Context, c *sql.Conn) error) error {
+	const (
+		baseBackoff = time.Millisecond
+		maxBackoff  = 50 * time.Millisecond
+	)
+	var attempt int
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attempt++
+
+		conn, err := s.DB.Conn(ctx)
+		if err != nil {
+			return err
+		}
+
+		if _, err := conn.ExecContext(ctx, `begin immediate`); err != nil {
+			_ = conn.Close()
+			if !isBusyOrLocked(err) {
+				return err
+			}
+			if attempt >= sqliteWriteTxMaxAttempts {
+				return fmt.Errorf("write transaction: %w", err)
+			}
+			if werr := waitBackoff(ctx, attempt, baseBackoff, maxBackoff); werr != nil {
+				return werr
+			}
+			continue
+		}
+
+		fnErr := fn(ctx, conn)
+		if fnErr != nil {
+			// Best-effort rollback before the pinned connection is closed:
+			// the transaction never leaks onto the pool.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `rollback`)
+			_ = conn.Close()
+			if !isBusyOrLocked(fnErr) {
+				return fnErr
+			}
+			if attempt >= sqliteWriteTxMaxAttempts {
+				return fmt.Errorf("write transaction: %w", fnErr)
+			}
+			if werr := waitBackoff(ctx, attempt, baseBackoff, maxBackoff); werr != nil {
+				return werr
+			}
+			continue
+		}
+
+		_, commitErr := conn.ExecContext(ctx, `commit`)
+		if commitErr != nil {
+			// A failed COMMIT leaves the transaction state undefined on this
+			// connection; roll back best-effort, close, and re-run fn fully.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `rollback`)
+			_ = conn.Close()
+			if !isBusyOrLocked(commitErr) {
+				return fmt.Errorf("commit write transaction: %w", commitErr)
+			}
+			if attempt >= sqliteWriteTxMaxAttempts {
+				return fmt.Errorf("write transaction: %w", commitErr)
+			}
+			if werr := waitBackoff(ctx, attempt, baseBackoff, maxBackoff); werr != nil {
+				return werr
+			}
+			continue
+		}
+		_ = conn.Close()
+		return nil
+	}
+}
+
+// waitBackoff sleeps base<<(attempt-1) (capped at max) or returns ctx.Err()
+// when the context is cancelled first.
+func waitBackoff(ctx context.Context, attempt int, base, max time.Duration) error {
+	shift := attempt - 1
+	if shift > 16 {
+		shift = 16
+	}
+	d := base << shift
+	if d > max {
+		d = max
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// execQuerier is the subset of *sql.Tx / *sql.Conn transaction-surface used
+// by the write-transaction helpers, so the same body can run against either.
+type execQuerier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 type User struct {
@@ -81,43 +227,50 @@ type Membership struct {
 // path reconstructs the token from the digest. AcceptedByUserID / AcceptedAt /
 // RevokedAt are audit/consistency fields (nullable); status transitions are
 // additionally guarded by schema CHECK constraints and triggers (migration 4).
+// LegacyUnattributed marks accepted invites migrated from the pre-Task-7
+// schema whose historical accepter is unknowable: such rows carry
+// accepted_by_user_id NULL, can never be accepted again, and the flag is
+// migration-only state (schema triggers reject setting it on live rows).
 type Invite struct {
-	ID               int64
-	RegistryID       int64
-	Email            string
-	Role             string
-	CanPull          bool
-	CanPush          bool
-	TokenDigest      []byte
-	Status           string
-	AcceptedByUserID *int64
-	ExpiresAt        time.Time
-	AcceptedAt       *time.Time
-	RevokedAt        *time.Time
-	CreatedAt        time.Time
+	ID                 int64
+	RegistryID         int64
+	Email              string
+	Role               string
+	CanPull            bool
+	CanPush            bool
+	TokenDigest        []byte
+	Status             string
+	AcceptedByUserID   *int64
+	LegacyUnattributed bool
+	ExpiresAt          time.Time
+	AcceptedAt         *time.Time
+	RevokedAt          *time.Time
+	CreatedAt          time.Time
 }
 
 // inviteColumns is the canonical read column list for registry_invites.
 const inviteColumns = `id, registry_id, email, role, can_pull, can_push, token_digest, status,
-	accepted_by_user_id, expires_at, accepted_at, revoked_at, created_at`
+	accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at`
 
 // scanInviteRow scans the canonical invite column list into invite. The
 // digest is picked up as raw bytes (BLOB); it is never stringified.
 func scanInviteRow(s scanRow, invite *Invite) error {
 	var (
 		canPull, canPush      int
+		legacyUnattributed    int
 		createdAt, expiresAt  string
 		acceptedBy            sql.NullInt64
 		acceptedAt, revokedAt sql.NullString
 	)
 	err := s.Scan(&invite.ID, &invite.RegistryID, &invite.Email, &invite.Role,
 		&canPull, &canPush, &invite.TokenDigest, &invite.Status, &acceptedBy,
-		&expiresAt, &acceptedAt, &revokedAt, &createdAt)
+		&legacyUnattributed, &expiresAt, &acceptedAt, &revokedAt, &createdAt)
 	if err != nil {
 		return err
 	}
 	invite.CanPull = canPull == 1
 	invite.CanPush = canPush == 1
+	invite.LegacyUnattributed = legacyUnattributed == 1
 	if acceptedBy.Valid {
 		id := acceptedBy.Int64
 		invite.AcceptedByUserID = &id
@@ -491,19 +644,28 @@ func (s *Store) CreateInvite(ctx context.Context, invite Invite) (Invite, string
 	return invite, token, nil
 }
 
-// AcceptInvite binds a pending invite to the accepting user, atomically: the
-// caller-supplied User's identity (email/role) is NEVER trusted — the user
-// row is re-loaded by User.ID inside the same transaction, the invite is
-// looked up by the one-way digest of the CANONICAL raw token (malformed or
-// non-canonical tokens are rejected before any hashing or querying), and the
-// normalized stored emails must match. The state transition is a guarded
-// UPDATE (pending/unrevoked/unexpired → accepted, with accepted_by): exactly
-// one concurrent transition wins; a retry by the SAME database-loaded user
-// observes the accepted state and its atomic membership and returns the same
-// successful Invite (no duplicate membership), while any other principal or a
-// terminal state gets the generic failure. Membership is merged permission-
-// safely: an existing stronger membership is never downgraded (see
-// mergeMembershipTx).
+// AcceptInvite binds a pending invite to the accepting user, atomically, in a
+// BEGIN IMMEDIATE write transaction (see withWriteTx) so concurrent
+// acceptance/revocation races are serialized on the write lock instead of
+// hitting deferred-read upgrade conflicts. The caller-supplied User's identity
+// (email/role) is NEVER trusted — the user row is re-loaded by User.ID inside
+// the same transaction, the invite is looked up by the one-way digest of the
+// CANONICAL raw token (malformed or non-canonical tokens are rejected before
+// any hashing or querying), and the normalized stored emails must match.
+//
+// Decision order: user → invite → recipient binding → status/accepted_by →
+// expiry. The status/accepted_by decision PRECEDES the expiry gate: an invite
+// already accepted by this same database user with its atomic membership is a
+// stable idempotent success even AFTER expiry (expiry only blocks
+// pending→accepted); revoked invites and legacy_unattributed invites (whose
+// historical accepter is unknowable) never succeed for anyone. The state
+// transition is a guarded UPDATE (pending/unrevoked/unexpired → accepted, with
+// accepted_by): exactly one concurrent transition wins; a retry by the SAME
+// database-loaded user observes the accepted state and its atomic membership
+// and returns the same successful Invite (no duplicate membership), while any
+// other principal or a terminal state gets the generic failure. Membership is
+// merged permission-safely: an existing stronger membership is never
+// downgraded (see mergeMembershipTx).
 func (s *Store) AcceptInvite(ctx context.Context, rawToken string, accepting User) (Invite, error) {
 	canonical, err := ParseInviteToken(rawToken)
 	if err != nil {
@@ -512,79 +674,96 @@ func (s *Store) AcceptInvite(ctx context.Context, rawToken string, accepting Use
 	digest := DigestInviteToken(canonical)
 	now := s.nowUTC()
 
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return Invite{}, err
-	}
-	defer tx.Rollback()
-
-	// Load the accepting user fresh by ID; the caller-supplied email is not
-	// trusted for the binding comparison.
-	var user User
-	var createdAt string
-	if err := tx.QueryRowContext(ctx, `select id, email, password_hash, created_at from users where id = ?`, accepting.ID).
-		Scan(&user.ID, &user.Email, &user.PasswordHash, &createdAt); err != nil {
-		return Invite{}, errInviteNotFound
-	}
-
-	var invite Invite
-	if err := scanInviteRow(tx.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where token_digest = ?`, digest), &invite); err != nil {
-		return Invite{}, errInviteNotFound // includes unknown digest: same generic story
-	}
-	if NormalizeEmail(user.Email) != NormalizeEmail(invite.Email) {
-		return Invite{}, errInviteNotFound // wrong recipient
-	}
-	// Explicit boundary semantics: at expires_at the invite IS expired.
-	if !now.Before(invite.ExpiresAt) {
-		return Invite{}, errInviteNotFound
-	}
-
-	// Claim the transition atomically. Expiry is rechecked in SQL against the
-	// same RFC3339-UTC text (lexicographic == chronological) so a race cannot
-	// accept an invite that expired mid-flight.
-	res, err := tx.ExecContext(ctx, `update registry_invites
-		set status = 'accepted', accepted_by_user_id = ?, accepted_at = ?
-		where id = ? and status = 'pending' and revoked_at is null and expires_at > ?`,
-		accepting.ID, now.Format(time.RFC3339), invite.ID, now.Format(time.RFC3339))
-	if err != nil {
-		return Invite{}, err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return Invite{}, err
-	}
-	if affected == 1 {
-		if err := s.mergeMembershipTx(ctx, tx, invite.RegistryID, invite.Role, invite.CanPull, invite.CanPush, accepting.ID, now); err != nil {
-			return Invite{}, err
+	var result Invite
+	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		// Load the accepting user fresh by ID; the caller-supplied email is
+		// not trusted for the binding comparison.
+		var user User
+		var createdAt string
+		if err := c.QueryRowContext(ctx, `select id, email, password_hash, created_at from users where id = ?`, accepting.ID).
+			Scan(&user.ID, &user.Email, &user.PasswordHash, &createdAt); err != nil {
+			return errInviteNotFound
 		}
-		if err := tx.Commit(); err != nil {
-			return Invite{}, err
-		}
-		invite.Status = "accepted"
-		invite.AcceptedByUserID = &accepting.ID
-		return invite, nil
-	}
 
-	// The guarded update changed nothing: another transaction transitioned the
-	// invite first (or it became expired/revoked). Only an idempotent retry by
-	// the SAME user against the accepted invite with its atomic membership can
-	// succeed; everything else is the generic failure.
-	var reload Invite
-	if err := scanInviteRow(tx.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ?`, invite.ID), &reload); err != nil {
-		return Invite{}, errInviteNotFound
-	}
-	if reload.Status == "accepted" && reload.AcceptedByUserID != nil && *reload.AcceptedByUserID == accepting.ID {
-		var membershipID int64
-		err := tx.QueryRowContext(ctx, `select id from registry_memberships where registry_id = ? and user_id = ?`, reload.RegistryID, accepting.ID).Scan(&membershipID)
+		var invite Invite
+		if err := scanInviteRow(c.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where token_digest = ?`, digest), &invite); err != nil {
+			return errInviteNotFound // includes unknown digest: same generic story
+		}
+		if NormalizeEmail(user.Email) != NormalizeEmail(invite.Email) {
+			return errInviteNotFound // wrong recipient
+		}
+
+		// Idempotent retry decision BEFORE the expiry gate: an accepted
+		// invite retried by its own accepter (with the atomic membership
+		// present) is a stable success even past expires_at. Accepted-by-
+		// someone-else, legacy_unattributed (accepted_by NULL), and revoked
+		// invites NEVER succeed; expiry only blocks pending→accepted.
+		if invite.Status == "accepted" {
+			if invite.AcceptedByUserID == nil || *invite.AcceptedByUserID != accepting.ID || invite.LegacyUnattributed {
+				return errInviteNotFound
+			}
+			var membershipID int64
+			if err := c.QueryRowContext(ctx, `select id from registry_memberships where registry_id = ? and user_id = ?`, invite.RegistryID, accepting.ID).Scan(&membershipID); err != nil {
+				return errInviteNotFound // accepted without its membership: anomalous, fail generically
+			}
+			result = invite
+			return nil
+		}
+		if invite.Status != "pending" {
+			return errInviteNotFound // revoked or otherwise terminal
+		}
+		// Explicit boundary semantics: at expires_at the invite IS expired.
+		if !now.Before(invite.ExpiresAt) {
+			return errInviteNotFound
+		}
+
+		// Claim the transition atomically. Expiry is rechecked in SQL against
+		// the same RFC3339-UTC text (lexicographic == chronological) so a
+		// race cannot accept an invite that expired mid-flight — including
+		// the clock advancing within this very transaction.
+		res, err := c.ExecContext(ctx, `update registry_invites
+			set status = 'accepted', accepted_by_user_id = ?, accepted_at = ?
+			where id = ? and status = 'pending' and revoked_at is null and expires_at > ?`,
+			accepting.ID, now.Format(time.RFC3339), invite.ID, now.Format(time.RFC3339))
 		if err != nil {
-			return Invite{}, errInviteNotFound // accepted without its membership: anomalous, fail generically
+			return err
 		}
-		if err := tx.Commit(); err != nil {
-			return Invite{}, err
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
 		}
-		return reload, nil
+		if affected == 1 {
+			if err := s.mergeMembershipTx(ctx, c, invite.RegistryID, invite.Role, invite.CanPull, invite.CanPush, accepting.ID, now); err != nil {
+				return err
+			}
+			invite.Status = "accepted"
+			invite.AcceptedByUserID = &accepting.ID
+			result = invite
+			return nil
+		}
+
+		// The guarded update changed nothing: another transaction transitioned
+		// the invite first (or it became expired/revoked). Only an idempotent
+		// retry by the SAME user against the accepted invite with its atomic
+		// membership can succeed; everything else is the generic failure.
+		var reload Invite
+		if err := scanInviteRow(c.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ?`, invite.ID), &reload); err != nil {
+			return errInviteNotFound
+		}
+		if reload.Status == "accepted" && reload.AcceptedByUserID != nil && *reload.AcceptedByUserID == accepting.ID && !reload.LegacyUnattributed {
+			var membershipID int64
+			if err := c.QueryRowContext(ctx, `select id from registry_memberships where registry_id = ? and user_id = ?`, reload.RegistryID, accepting.ID).Scan(&membershipID); err != nil {
+				return errInviteNotFound // accepted without its membership: anomalous, fail generically
+			}
+			result = reload
+			return nil
+		}
+		return errInviteNotFound
+	})
+	if err != nil {
+		return Invite{}, err
 	}
-	return Invite{}, errInviteNotFound
+	return result, nil
 }
 
 // mergeMembershipTx inserts or merges the acceptance membership inside the
@@ -594,15 +773,15 @@ func (s *Store) AcceptInvite(ctx context.Context, rawToken string, accepting Use
 // of the existing row and the invite grant, and a pre-existing owner/admin
 // role is preserved (the invite role only applies when the existing role is
 // not a senior one).
-func (s *Store) mergeMembershipTx(ctx context.Context, tx *sql.Tx, registryID int64, role string, canPull, canPush bool, userID int64, now time.Time) error {
+func (s *Store) mergeMembershipTx(ctx context.Context, q execQuerier, registryID int64, role string, canPull, canPush bool, userID int64, now time.Time) error {
 	var existingID int64
 	var existingRole string
 	var existingPull, existingPush int
-	err := tx.QueryRowContext(ctx, `select id, role, can_pull, can_push from registry_memberships where registry_id = ? and user_id = ?`, registryID, userID).
+	err := q.QueryRowContext(ctx, `select id, role, can_pull, can_push from registry_memberships where registry_id = ? and user_id = ?`, registryID, userID).
 		Scan(&existingID, &existingRole, &existingPull, &existingPush)
 	switch {
 	case err == sql.ErrNoRows:
-		_, err := tx.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?, ?, ?, ?, ?, ?)`,
+		_, err := q.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?, ?, ?, ?, ?, ?)`,
 			registryID, userID, role, boolToInt(canPull), boolToInt(canPush), now.Format(time.RFC3339))
 		return err
 	case err != nil:
@@ -612,62 +791,61 @@ func (s *Store) mergeMembershipTx(ctx context.Context, tx *sql.Tx, registryID in
 		if existingRole != "owner" && existingRole != "admin" {
 			mergedRole = role
 		}
-		_, err := tx.ExecContext(ctx, `update registry_memberships set role = ?, can_pull = ?, can_push = ? where id = ?`,
+		_, err := q.ExecContext(ctx, `update registry_memberships set role = ?, can_pull = ?, can_push = ? where id = ?`,
 			mergedRole, boolToInt(existingPull == 1 || canPull), boolToInt(existingPush == 1 || canPush), existingID)
 		return err
 	}
 }
 
-// RevokeInvite transitions a PENDING invite to revoked, atomically and
-// idempotently for repeated revocations of the same invite: only pending
-// invites can be revoked; an accepted invite cannot be revoked (terminal) and
-// returns the generic failure; an already-revoked invite is reported as a
-// successful revocation (no state change, no duplicate). The raw token is
-// never consulted and the digest is never exposed.
+// RevokeInvite transitions a PENDING invite to revoked atomically (in a
+// BEGIN IMMEDIATE write transaction — see withWriteTx) and idempotently for
+// repeated revocations of the same invite: only pending invites can be
+// revoked; an accepted invite cannot be revoked (terminal) and returns the
+// generic failure; an already-revoked invite is reported as a successful
+// revocation (no state change, no duplicate). The raw token is never
+// consulted and the digest is never exposed.
 func (s *Store) RevokeInvite(ctx context.Context, registryID int64, inviteID int64) (Invite, error) {
 	now := s.nowUTC()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return Invite{}, err
-	}
-	defer tx.Rollback()
-
-	res, err := tx.ExecContext(ctx, `update registry_invites
-		set status = 'revoked', revoked_at = ?
-		where id = ? and registry_id = ? and status = 'pending'`,
-		now.Format(time.RFC3339), inviteID, registryID)
-	if err != nil {
-		return Invite{}, err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return Invite{}, err
-	}
-	if affected == 1 {
-		if err := tx.Commit(); err != nil {
-			return Invite{}, err
+	var result Invite
+	err := s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		res, err := c.ExecContext(ctx, `update registry_invites
+			set status = 'revoked', revoked_at = ?
+			where id = ? and registry_id = ? and status = 'pending'`,
+			now.Format(time.RFC3339), inviteID, registryID)
+		if err != nil {
+			return err
 		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 1 {
+			var invite Invite
+			if err := scanInviteRow(c.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ?`, inviteID), &invite); err != nil {
+				return err
+			}
+			result = invite
+			return nil
+		}
+
+		// Nothing changed: either the invite does not exist (generic
+		// not-found) or it already left pending. Already-revoked is an
+		// idempotent success; anything else (accepted) is terminal and cannot
+		// be revoked.
 		var invite Invite
-		if err := scanInviteRow(s.DB.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ?`, inviteID), &invite); err != nil {
-			return Invite{}, err
+		if err := scanInviteRow(c.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ? and registry_id = ?`, inviteID, registryID), &invite); err != nil {
+			return errInviteNotFound
 		}
-		return invite, nil
-	}
-
-	// Nothing changed: either the invite does not exist (generic not-found) or
-	// it already left pending. Already-revoked is an idempotent success;
-	// anything else (accepted) is terminal and cannot be revoked.
-	var invite Invite
-	if err := scanInviteRow(tx.QueryRowContext(ctx, `select `+inviteColumns+` from registry_invites where id = ? and registry_id = ?`, inviteID, registryID), &invite); err != nil {
-		return Invite{}, errInviteNotFound
-	}
-	if invite.Status == "revoked" {
-		if err := tx.Commit(); err != nil {
-			return Invite{}, err
+		if invite.Status == "revoked" {
+			result = invite
+			return nil
 		}
-		return invite, nil
+		return errInviteCannotRevoke
+	})
+	if err != nil {
+		return Invite{}, err
 	}
-	return Invite{}, errInviteCannotRevoke
+	return result, nil
 }
 
 // FindInviteByDigest looks up an invite by the one-way digest of a canonical

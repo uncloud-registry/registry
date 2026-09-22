@@ -51,11 +51,41 @@ var errInviteRecipientRequired = errors.New("recipient email is required")
 
 // NormalizeEmail is the single canonical email form used for identity
 // semantics across account creation, login, invite creation, and invite
-// acceptance binding: surrounding ASCII whitespace trimmed, then full
-// lowercase. Provider-specific alias rewriting is deliberately NOT performed,
+// acceptance binding: ONLY surrounding ASCII whitespace bytes (space, HT, LF,
+// VT, FF, CR) are trimmed, then the address is fully lowercased. Unicode
+// whitespace (NBSP, em-space, …) is deliberately NOT trimmed — it is part of
+// the identity, so `"dave@example.com\u00a0"` and `"dave@example.com"` are
+// distinct addresses. Provider-specific alias rewriting is never performed,
 // so identity matching is purely textual and deterministic.
 func NormalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
+	return strings.ToLower(trimASCIIWhitespace(email))
+}
+
+// trimASCIIWhitespace removes only surrounding ASCII whitespace bytes (0x20
+// space, 0x09 HT, 0x0A LF, 0x0B VT, 0x0C FF, 0x0D CR) from s. Every other
+// byte — including every Unicode whitespace code point — is preserved
+// verbatim, so it remains part of the identity.
+func trimASCIIWhitespace(s string) string {
+	start, end := 0, len(s)
+	for start < end && isASCIIWhitespaceByte(s[start]) {
+		start++
+	}
+	for end > start && isASCIIWhitespaceByte(s[end-1]) {
+		end--
+	}
+	return s[start:end]
+}
+
+// isASCIIWhitespaceByte reports whether c is one of the six ASCII whitespace
+// bytes (space, horizontal tab, line feed, vertical tab, form feed, carriage
+// return). This is deliberately narrower than unicode.IsSpace: the identity
+// semantics of NormalizeEmail depend on exactly these bytes.
+func isASCIIWhitespaceByte(c byte) bool {
+	switch c {
+	case ' ', '	', '\n', '\v', '\f', '\r':
+		return true
+	}
+	return false
 }
 
 // isCanonicalInviteTokenText reports whether text is a canonical invite token:

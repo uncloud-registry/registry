@@ -76,35 +76,53 @@ var migrations = []migration{
 		Apply:   installFeedKeyEnvelopeInvariant,
 	},
 	// Version 4 converts invite credentials to a one-way, recipient-bound,
-	// revocable lifecycle. The legacy token_hash TEXT column (which the
-	// pre-task-7 control plane populated with hex(token text) — a REVERSIBLE
-	// encoding — and which some deployments already carry as SHA-256 lowercase
-	// hex) is rebuilt as token_digest BLOB: exactly 32 bytes, unique,
-	// never reversible. The rebuild VALIDATES every existing row first:
+	// revocable lifecycle. The legacy token_hash TEXT column is rebuilt as
+	// token_digest BLOB: exactly 32 bytes (schema CHECK), unique, never
+	// reversible. The rebuild VALIDATES every existing row first:
 	//
-	//   - token_hash must be 64 lowercase-hex characters whose bytes are
-	//     either a canonical legacy token TEXT (hex of the 32-char base64url
-	//     token → converted deterministically to SHA-256 over that text) or a
-	//     SHA-256 digest (hex of exactly 32 bytes → stored verbatim). Anything
-	//     else is malformed and FAILS the migration (fully rolled back) —
-	//     plaintext-like values are never accepted as valid digests, and
-	//     pending invites are preserved ONLY when their digest is demonstrably
-	//     canonical;
-	//   - status must be pending or accepted (revoked did not exist in v1-v3;
-	//     any other value fails);
-	//   - an accepted invite must have a derivable acceptor: the
-	//     registry_memberships join on the normalized recipient email (the old
-	//     flow created the membership atomically with acceptance), otherwise
-	//     the row is corrupt and fails the migration;
-	//   - expiry must parse as RFC3339 and the invite must grant pull or push;
-	//   - converted digests must be unique (duplicate/colliding rows fail).
+	//   - token_hash records EXACTLY ONE historical representation: the
+	//     pre-Task-7 control plane stored `hex.EncodeToString([]byte(token))`
+	//     — lowercase hex of the 32-char canonical raw-token TEXT — and never
+	//     stored a SHA-256 digest. The 64 lowercase-hex value must therefore
+	//     decode to exactly 32 bytes and those bytes MUST be a canonical
+	//     Task-7 raw token (strict parse/re-encode); the digest is then
+	//     SHA-256 over that recovered token text — the same digest the
+	//     acceptance path computes, so pending invites stay acceptable after
+	//     the upgrade. Every OTHER 64-hex value — including hex of a real
+	//     SHA-256 digest (whose bytes are not a canonical token text) — is
+	//     malformed and FAILS the migration (fully rolled back). Terminal
+	//     (accepted) rows are validated exactly the same way. No content
+	//     guessing, no alleged alternate digest format;
+	//   - status must be pending or accepted (revoked did not exist in
+	//     v1-v3; any other value fails);
+	//   - an accepted invite must have a membership for the registered
+	//     recipient on the same registry (the old flow created the
+	//     membership atomically with acceptance). The historical ACCEPTER is
+	//     unknowable, so accepted history is preserved as
+	//     legacy_unattributed=1 with accepted_by_user_id NULL — the
+	//     recipient membership is never turned into a false attribution and
+	//     no retry ever succeeds for such invites;
+	//   - expiry must parse as RFC3339 and the invite must grant pull or
+	//     push;
+	//   - converted digests must be unique (duplicate/colliding rows fail);
+	//   - every existing user email AND invite recipient is normalized with
+	//     the production NormalizeEmail inside the same transaction. A
+	//     normalized USER collision (two legacy rows mapping to one
+	//     canonical address) is detected BEFORE any update and fails the
+	//     migration unchanged; invite-recipient collisions are fine (no
+	//     unique invite-email invariant). Post-upgrade logins and recipient
+	//     acceptance therefore work for whitespace/case legacy rows, with
+	//     user IDs and every FK to them preserved.
 	//
-	// The rebuilt table adds accepted_by_user_id (FK → users, backfilled from
-	// the member join for legacy accepted invites), accepted_at/revoked_at,
-	// status/accepted_by/revocation CHECK constraints, a status index, and
-	// state-transition triggers (invites are born pending; terminal states are
-	// immutable), closing the direct-SQL gap the way migration 3 did for feed
-	// keys. The rebuild itself runs inside the migration transaction, so any
+	// The rebuilt table adds accepted_by_user_id (FK → users, NULL for
+	// legacy_unattributed accepted history), legacy_unattributed (migration-
+	// only flag; new rows must be 0 and the flag can never be set after this
+	// migration), accepted_at/revoked_at, status/accepted_by/attribution
+	// CHECK constraints, a status index, and state-transition triggers
+	// (invites are born pending; terminal states are immutable; acceptance
+	// requires an attributed accepter; legacy_unattributed is immutable),
+	// closing the direct-SQL gap the way migration 3 did for feed keys. The
+	// rebuild itself runs inside the migration transaction, so any
 	// malformed/duplicate/corrupt row rolls the whole upgrade back with the
 	// legacy data untouched.
 	{
@@ -519,29 +537,29 @@ func installFeedKeyEnvelopeInvariant(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// legacyInviteHashHexLen pin the two supported legacy token_hash encodings:
-// both are exactly 64 lowercase hex characters (uint8 hex of a 32-char
-// canonical token text in the historical format, or hex of the 32-byte SHA-256
-// digest in the newer format).
+// legacyInviteHashHexLen pins the ONLY historical token_hash encoding: 64
+// lowercase hex characters — hex.EncodeToString([]byte(token)) over the
+// 32-char canonical token TEXT that the pre-Task-7 control plane stored.
+// There is no digest-hex variant.
 const legacyInviteHashHexLen = 64
 
 // convertLegacyInviteHash deterministically converts one legacy token_hash
 // TEXT value into the canonical 32-byte SHA-256 digest BLOB:
 //
-//   - If the hex-decoded bytes form a canonical invite token TEXT (32
-//     base64url chars decoding to 24 bytes), the value is the historical
-//     reversible format hex(token text): the digest is SHA-256 over that
-//     recovered token text — the same digest the acceptance path computes, so
-//     existing pending invites remain acceptable after the upgrade.
-//   - Otherwise the bytes are treated as an already-SHA-256 digest (lowercase
-//     hex) and stored verbatim.
+//   - The value must be 64 lowercase hex characters decoding to exactly 32
+//     bytes, and those bytes MUST be a canonical Task-7 raw token TEXT (32
+//     base64url chars decoding to 24 bytes with zero pad bits — strict
+//     parse/re-encode). This is the exact historical representation
+//     `hex.EncodeToString([]byte(token))`.
+//   - The digest is then SHA-256 over that recovered token text — the same
+//     digest the acceptance path computes, so pending invites remain
+//     acceptable after the upgrade.
 //
-// A real SHA-256 digest coincidentally decoding to a canonical token text is
-// cryptographically negligible (the bytes would have to land in the base64url
-// alphabet AND re-encode exactly), so the historical interpretation wins
-// deterministically. Any value that is not 64 lowercase-hex characters (or
-// does not decode to exactly 32 bytes) is malformed: the migration FAILS
-// rather than treating plaintext as a valid digest.
+// Every other value fails: wrong length, non-lowercase hex, decode failure,
+// or 32 decoded bytes that do not form a canonical token TEXT (this includes
+// hex of a real SHA-256 digest — the pre-Task-7 code never stored a digest,
+// so no 32-byte value is a legitimate "digest" representation). No content
+// guessing and no alternate format are ever accepted.
 func convertLegacyInviteHash(stored string) ([]byte, error) {
 	if len(stored) != legacyInviteHashHexLen {
 		return nil, fmt.Errorf("invite token hash is not 64 hex characters")
@@ -556,48 +574,102 @@ func convertLegacyInviteHash(stored string) ([]byte, error) {
 	if err != nil || len(raw) != 32 {
 		return nil, fmt.Errorf("invite token hash is not a 32-byte hex value")
 	}
-	// Historical reversible format: the bytes ARE the canonical token text.
-	if isCanonicalInviteTokenText(string(raw)) {
-		return DigestInviteToken(string(raw)), nil
+	// The decoded bytes ARE the historical token text; they must be a
+	// canonical raw token or the value is corrupt.
+	if !isCanonicalInviteTokenText(string(raw)) {
+		return nil, fmt.Errorf("invite token hash does not decode to a canonical invite token")
 	}
-	// Newer format: the bytes ARE the digest.
-	return raw, nil
+	return DigestInviteToken(string(raw)), nil
 }
 
 // legacyInviteRow is the fully validated, converted form of one legacy
 // registry_invites row, ready to be inserted into the rebuilt table.
 type legacyInviteRow struct {
-	id         int64
-	registryID int64
-	email      string
-	role       string
-	canPull    int
-	canPush    int
-	digest     []byte
-	status     string
-	acceptedBy sql.NullInt64
-	expiresAt  string
-	acceptedAt *string
-	revokedAt  *string
-	createdAt  string
+	id                 int64
+	registryID         int64
+	email              string
+	role               string
+	canPull            int
+	canPush            int
+	digest             []byte
+	status             string
+	acceptedBy         sql.NullInt64
+	legacyUnattributed int
+	expiresAt          string
+	acceptedAt         *string
+	revokedAt          *string
+	createdAt          string
 }
 
 // installInviteDigestSchema rebuilds registry_invites around the one-way
-// digest lifecycle and installs its constraints and triggers, all inside the
-// migration transaction (rolled back atomically on any error). Steps:
+// digest lifecycle, normalizes legacy user/invite emails, and installs the
+// constraints and triggers, all inside the migration transaction (rolled back
+// atomically on any error). Steps:
 //
-//  1. Validate EVERY existing row and compute its converted digest, accepted_by
-//     backfill, and audit timestamps (see convertLegacyInviteHash and the
-//     migration comment for the acceptance rules). Duplicate converted digests
-//     and any malformed/corrupt row fail the migration with the legacy data
-//     untouched.
-//  2. Create the constrained clone (digest BLOB unique, accepted_by FK,
-//     status/accepted_by/revocation CHECKs).
-//  3. Copy the converted rows into the clone by explicit column name (physical
-//     column order of legacy ALTER-appended schemas must not matter).
-//  4. Drop the legacy table and rename the clone into place.
-//  5. Install the state-transition triggers and the status index.
+//  1. Normalize every existing user email with the production NormalizeEmail
+//     (legacy rows were stored strings.ToLower(email) only — no trim). A
+//     normalized-user collision fails the migration BEFORE any update. The
+//     in-place updates are order-safe: with a collision-free update set, no
+//     ordering of the per-row UPDATEs can transiently violate the unique
+//     email index (any such violation implies a normalized collision, which
+//     was already rejected), and user IDs plus every FK to users are
+//     preserved.
+//  2. Validate EVERY existing invite row and compute its converted digest
+//     (see convertLegacyInviteHash), normalized recipient, and
+//     legacy_unattributed flag (see the migration comment for the acceptance
+//     rules). Duplicate converted digests, malformed/corrupt rows, and
+//     accepted rows without a membership for the registered recipient fail
+//     the migration with the legacy data untouched.
+//  3. Create the constrained clone (digest BLOB unique with a strict
+//     32-byte typeof/length CHECK, accepted_by FK, legacy_unattributed flag,
+//     status/accepted_by/attribution CHECKs).
+//  4. Copy the converted rows into the clone by explicit column name
+//     (physical column order of legacy ALTER-appended schemas must not
+//     matter).
+//  5. Drop the legacy table and rename the clone into place.
+//  6. Install the state-transition and attribution triggers and the status
+//     index.
 func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
+	// ---- 1. Normalize legacy user emails (with collision detection). ----
+	type legacyUser struct {
+		id    int64
+		email string
+	}
+	userRows, err := tx.QueryContext(ctx, `select id, email from users order by id asc`)
+	if err != nil {
+		return fmt.Errorf("enumerate legacy users: %w", err)
+	}
+	var users []legacyUser
+	seenNorm := make(map[string]int64)
+	for userRows.Next() {
+		var u legacyUser
+		if err := userRows.Scan(&u.id, &u.email); err != nil {
+			userRows.Close()
+			return fmt.Errorf("read legacy user: %w", err)
+		}
+		norm := NormalizeEmail(u.email)
+		if prev, dup := seenNorm[norm]; dup {
+			userRows.Close()
+			return fmt.Errorf("user email normalization collision: users %d and %d both normalize to %q", prev, u.id, norm)
+		}
+		seenNorm[norm] = u.id
+		users = append(users, u)
+	}
+	userRows.Close()
+	if err := userRows.Err(); err != nil {
+		return fmt.Errorf("iterate legacy users: %w", err)
+	}
+	for _, u := range users {
+		norm := NormalizeEmail(u.email)
+		if norm == u.email {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `update users set email = ? where id = ?`, norm, u.id); err != nil {
+			return fmt.Errorf("normalize user %d email: %w", u.id, err)
+		}
+	}
+
+	// ---- 2. Validate + convert every legacy invite row. ----
 	rows, err := tx.QueryContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_hash, status, expires_at, created_at from registry_invites order by id asc`)
 	if err != nil {
 		return fmt.Errorf("enumerate legacy invites: %w", err)
@@ -620,7 +692,8 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 		row.status = status
 		row.expiresAt, row.createdAt = expiresAt, createdAt
 
-		// Digest must be demonstrably canonical.
+		// Digest must be exactly the historical representation — hex of a
+		// canonical token text (see convertLegacyInviteHash).
 		digest, err := convertLegacyInviteHash(tokenHash)
 		if err != nil {
 			rows.Close()
@@ -648,21 +721,28 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 			rows.Close()
 			return fmt.Errorf("invite %d: invite grants neither pull nor push", row.id)
 		}
-		// Accepted invites must have a derivable acceptor (the legacy flow
-		// created the membership atomically with acceptance).
+		// An accepted invite must have a membership for the REGISTERED
+		// RECIPIENT (the legacy flow created it atomically with acceptance).
+		// The historical ACCEPTER is unknowable: nothing is inferred from the
+		// recipient email — the row is preserved as legacy_unattributed with
+		// accepted_by_user_id NULL, and no token retry can ever succeed for
+		// it after the upgrade.
 		if status == "accepted" {
-			var acceptorID int64
-			err := tx.QueryRowContext(ctx, `select u.id
-				from registry_memberships m
+			var n int
+			if err := tx.QueryRowContext(ctx, `select count(*) from registry_memberships m
 				join users u on u.id = m.user_id
-				where m.registry_id = ? and lower(u.email) = lower(?)`,
-				row.registryID, row.email).Scan(&acceptorID)
-			if err != nil {
+				where m.registry_id = ? and u.email = ?`,
+				row.registryID, NormalizeEmail(row.email)).Scan(&n); err != nil {
 				rows.Close()
-				return fmt.Errorf("invite %d: accepted invite has no matching membership for recipient %q", row.id, row.email)
+				return fmt.Errorf("invite %d: check recipient membership: %w", row.id, err)
 			}
-			row.acceptedBy = sql.NullInt64{Int64: acceptorID, Valid: true}
+			if n == 0 {
+				rows.Close()
+				return fmt.Errorf("invite %d: accepted invite has no matching membership for recipient %q", row.id, NormalizeEmail(row.email))
+			}
+			row.legacyUnattributed = 1
 		}
+		row.email = NormalizeEmail(row.email)
 		legacy = append(legacy, row)
 	}
 	rows.Close()
@@ -670,9 +750,10 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("iterate legacy invites: %w", err)
 	}
 
-	// 2. Create the constrained clone. The CHECK constraints encode the
+	// ---- 3. Create the constrained clone. The CHECK constraints encode the
 	// lifecycle consistency rules; the triggers (installed after the copy)
-	// enforce the state machine for every future write, including direct SQL.
+	// enforce the state machine and the attribution rules for every future
+	// write, including direct SQL. ----
 	for _, stmt := range []string{
 		`create table registry_invites_new (
 			id integer primary key autoincrement,
@@ -681,16 +762,17 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 			role text not null,
 			can_pull integer not null,
 			can_push integer not null,
-			token_digest blob not null unique,
+			token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32),
 			status text not null check (status in ('pending','accepted','revoked')),
 			accepted_by_user_id integer references users(id),
+			legacy_unattributed integer not null default 0 check (legacy_unattributed in (0,1)),
 			expires_at text not null,
 			accepted_at text,
 			revoked_at text,
 			created_at text not null,
 			check (can_pull = 1 or can_push = 1),
 			check ((status = 'revoked') = (revoked_at is not null)),
-			check (status <> 'accepted' or accepted_by_user_id is not null),
+			check (status <> 'accepted' or accepted_by_user_id is not null or legacy_unattributed = 1),
 			check (accepted_at is null or status = 'accepted')
 		)`,
 	} {
@@ -699,21 +781,22 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 
-	// 3. Copy converted rows by explicit column name (legacy ALTER-appended
-	// schema has a different PHYSICAL column order; names must match).
+	// ---- 4. Copy converted rows by explicit column name (legacy
+	// ALTER-appended schema has a different PHYSICAL column order; names must
+	// match). ----
 	for _, row := range legacy {
 		if _, err := tx.ExecContext(ctx, `insert into registry_invites_new
 			(id, registry_id, email, role, can_pull, can_push, token_digest, status,
-			 accepted_by_user_id, expires_at, accepted_at, revoked_at, created_at)
-			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.id, row.registryID, row.email, row.role, row.canPull, row.canPush,
-			row.digest, row.status, row.acceptedBy, row.expiresAt,
+			row.digest, row.status, row.acceptedBy, row.legacyUnattributed, row.expiresAt,
 			row.acceptedAt, row.revokedAt, row.createdAt); err != nil {
 			return fmt.Errorf("copy invite %d into digest schema: %w", row.id, err)
 		}
 	}
 
-	// 4. Drop the legacy table and rename the clone into place.
+	// ---- 5. Drop the legacy table and rename the clone into place. ----
 	if _, err := tx.ExecContext(ctx, `drop table registry_invites`); err != nil {
 		return fmt.Errorf("drop legacy registry_invites: %w", err)
 	}
@@ -721,15 +804,22 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("rename registry_invites_new: %w", err)
 	}
 
-	// 5. State-transition triggers + the listing index. Triggers are installed
-	// AFTER the copy so backfilled (non-pending) rows are not rejected.
+	// ---- 6. State-transition + attribution triggers and the listing index.
+	// Triggers are installed AFTER the copy so backfilled (non-pending)
+	// rows are not rejected. ----
 	for _, stmt := range []string{
 		`create trigger registry_invites_born_pending before insert on registry_invites
-			for each row when NEW.status != 'pending'
-			begin select raise(abort, 'invites must be created with pending status'); end`,
+			for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
+			begin select raise(abort, 'invites must be created pending and attributed'); end`,
 		`create trigger registry_invites_terminal_status before update of status on registry_invites
 			for each row when OLD.status != 'pending' and NEW.status != OLD.status
 			begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+		`create trigger registry_invites_no_unattributed_acceptance before update of status on registry_invites
+			for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+			begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+		`create trigger registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+			for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+			begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
 		`create index idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {

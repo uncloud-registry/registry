@@ -917,7 +917,10 @@ func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter
 }
 
 func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	// The raw query value is passed EXACTLY as received — no TrimSpace or any
+	// other mutation before the strict canonical ParseInviteToken, so
+	// whitespace-padded tokens are rejected, never silently accepted.
+	token := r.URL.Query().Get("token")
 	if token == "" {
 		http.NotFound(w, r)
 		return

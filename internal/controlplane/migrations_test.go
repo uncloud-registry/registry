@@ -268,18 +268,21 @@ func TestUpgradePreservesAlterAppendedPermissionFields(t *testing.T) {
 	// Invites: the shift is larger (token_hash, status, expires_at, created_at
 	// all move relative to the appended can_pull/can_push). Assert every field,
 	// including the migration-4 conversion: the legacy hex(token text) hash
-	// must become the one-way SHA-256 digest BLOB and the accepted-by record
-	// must be backfilled from the member join.
+	// must become the one-way SHA-256 digest BLOB, and the accepted history is
+	// preserved as legacy_unattributed — the historical accepter is
+	// UNKNOWABLE, so NO accepted_by record is ever inferred from bob's
+	// membership.
 	var (
 		iID, iReg               int64
 		iEmail, iRole           string
 		iPull, iPush            int
 		iDigest                 []byte
 		iStatus, iExp, iCreated string
-		iAcceptedBy             int64
+		iAcceptedBy             sql.NullInt64
+		iLegacy                 int
 	)
-	if err := db.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, expires_at, created_at from registry_invites where id = 1`).
-		Scan(&iID, &iReg, &iEmail, &iRole, &iPull, &iPush, &iDigest, &iStatus, &iAcceptedBy, &iExp, &iCreated); err != nil {
+	if err := db.QueryRowContext(ctx, `select id, registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, created_at from registry_invites where id = 1`).
+		Scan(&iID, &iReg, &iEmail, &iRole, &iPull, &iPush, &iDigest, &iStatus, &iAcceptedBy, &iLegacy, &iExp, &iCreated); err != nil {
 		t.Fatalf("read migrated invite: %v", err)
 	}
 	if iID != 1 || iReg != 1 {
@@ -298,8 +301,11 @@ func TestUpgradePreservesAlterAppendedPermissionFields(t *testing.T) {
 	if iStatus != "accepted" {
 		t.Fatalf("invite status corrupted: got %q", iStatus)
 	}
-	if iAcceptedBy != 2 {
-		t.Fatalf("expected accepted_by backfilled to bob (user 2), got %d", iAcceptedBy)
+	if iAcceptedBy.Valid {
+		t.Fatalf("accepted history must NOT be attributed to bob's membership, got user %d", iAcceptedBy.Int64)
+	}
+	if iLegacy != 1 {
+		t.Fatalf("expected legacy_unattributed=1 for the migrated accepted invite, got %d", iLegacy)
 	}
 	if iExp != expires {
 		t.Fatalf("invite expires_at corrupted: got %q want %q", iExp, expires)
@@ -388,8 +394,9 @@ func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membersh
 		"alice@example.com", "hash", now.Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed alter-upgraded user: %v", err)
 	}
-	// bob is the invitee of the legacy ACCEPTED invite; his membership is what
-	// migration 4 must backfill accepted_by_user_id from.
+	// bob is the invitee of the legacy ACCEPTED invite; his membership is the
+	// coherence evidence migration 4 validates BUT must never be turned into
+	// an accepted_by attribution (the historical accepter is unknowable).
 	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
 		"bob@example.com", "hash", now.Format(time.RFC3339)); err != nil {
 		t.Fatalf("seed alter-upgraded bob: %v", err)
@@ -406,8 +413,9 @@ func seedAlterUpgradedLegacyDB(t *testing.T, db *sql.DB, now time.Time, membersh
 		1, 1, "owner", membershipCreated, 0, 1); err != nil {
 		t.Fatalf("seed alter-upgraded membership: %v", err)
 	}
-	// bob's membership (the accepted invitee): migration 4 backfills the
-	// invite's accepted_by_user_id from this row.
+	// bob's membership (the accepted invitee): migration 4 validates it as
+	// coherence evidence but preserves the invite as legacy_unattributed —
+	// no accepted_by is inferred from this row.
 	if _, err := db.ExecContext(ctx, `insert into registry_memberships
 		(registry_id, user_id, role, created_at, can_pull, can_push) values (?, ?, ?, ?, ?, ?)`,
 		1, 2, "member", membershipCreated, 1, 1); err != nil {
@@ -849,9 +857,10 @@ const legacyInviteTokenTextV1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 const legacyInviteHashV1 = "4141414141414141414141414141414141414141414141414141414141414141"
 
 // assertInviteDigestSchema proves the migration-4 lifecycle schema is
-// physically installed: token_digest BLOB unique, the accepted_by FK, the
-// consistency CHECKs (via a rejected direct-SQL insert), and the two
-// state-transition triggers.
+// physically installed: token_digest BLOB unique with a strict 32-byte CHECK,
+// the accepted_by FK, the legacy_unattributed flag, the consistency CHECKs
+// (via a rejected direct-SQL insert), and the state-transition/attribution
+// triggers.
 func assertInviteDigestSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -863,6 +872,16 @@ func assertInviteDigestSchema(t *testing.T, db *sql.DB) {
 	}
 	if !strings.Contains(strings.ToUpper(digestType), "BLOB") {
 		t.Fatalf("token_digest must be a BLOB, got %q", digestType)
+	}
+	// The digest CHECK and the migration-only flag are part of the DDL.
+	var ddl string
+	if err := db.QueryRowContext(ctx, `select sql from sqlite_master where type = 'table' and name = 'registry_invites'`).Scan(&ddl); err != nil {
+		t.Fatalf("read registry_invites DDL: %v", err)
+	}
+	for _, needle := range []string{"typeof(token_digest)", "length(token_digest) = 32", "legacy_unattributed"} {
+		if !strings.Contains(ddl, needle) {
+			t.Fatalf("registry_invites DDL missing %q: %s", needle, ddl)
+		}
 	}
 
 	// Invites are born pending only: a direct insert with another status must
@@ -881,7 +900,12 @@ func assertInviteDigestSchema(t *testing.T, db *sql.DB) {
 	if fks != 2 {
 		t.Fatalf("expected 2 foreign keys on registry_invites (registry cascade + accepted_by), got %d", fks)
 	}
-	for _, name := range []string{"registry_invites_born_pending", "registry_invites_terminal_status"} {
+	for _, name := range []string{
+		"registry_invites_born_pending",
+		"registry_invites_terminal_status",
+		"registry_invites_no_unattributed_acceptance",
+		"registry_invites_legacy_flag_locked",
+	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = ?`, name).Scan(&n); err != nil {
 			t.Fatalf("count trigger %s: %v", name, err)
