@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -660,4 +661,146 @@ func normalizedNano(s string) string {
 		return s
 	}
 	return t.Format(time.RFC3339Nano)
+}
+
+// Exact int64-nanosecond extremes, rendered canonically (verified against
+// time.Unix(0, math.MinInt64/MaxInt64).UTC().Format(RFC3339Nano)).
+const (
+	exactMinNanoString = "1677-09-21T00:12:43.145224192Z" // == time.Unix(0, math.MinInt64).UTC()
+	exactMaxNanoString = "2262-04-11T23:47:16.854775807Z" // == time.Unix(0, math.MaxInt64).UTC()
+)
+
+// TestMigration8ParseAcceptsExactInt64Boundaries proves the parse→nanosecond
+// conversion accepts BOTH int64-nanosecond extremes EXACTLY — converting to
+// math.MinInt64 and math.MaxInt64 respectively — and preserves every in-range
+// instant to the last nanosecond. The historical implementation compared whole
+// seconds against a symmetric bound, so it wrongly REJECTED the exact minimum
+// (whose unix second is -9223372037 < -(MaxInt64/1e9)) and silently WRAPPED the
+// maximum's fractional overflow; both must now be exact.
+func TestMigration8ParseAcceptsExactInt64Boundaries(t *testing.T) {
+	minNanos := int64(math.MinInt64)
+	maxNanos := int64(math.MaxInt64)
+	for _, tc := range []struct {
+		s    string
+		want int64
+	}{
+		{exactMinNanoString, minNanos},
+		{exactMaxNanoString, maxNanos},
+	} {
+		ns, err := parseCanonicalUTCNanos(tc.s)
+		if err != nil {
+			t.Fatalf("parse(%q): %v", tc.s, err)
+		}
+		if ns != tc.want {
+			t.Fatalf("parse(%q) = %d, want exact %d", tc.s, ns, tc.want)
+		}
+		// Round-trip must recover the identical canonical instant (no drift).
+		if got := nanosToTime(ns).Format(time.RFC3339Nano); got != normalizedNano(tc.s) {
+			t.Fatalf("round-trip changed %q -> %q", tc.s, got)
+		}
+	}
+	// A value one nanosecond off the extremes must survive as its own instant
+	// too (the edges are exact, not clamped).
+	oneIn := []struct {
+		s    string
+		want int64
+	}{
+		{"1677-09-21T00:12:43.145224193Z", minNanos + 1},
+		{"2262-04-11T23:47:16.854775806Z", maxNanos - 1},
+	}
+	for _, tc := range oneIn {
+		ns, err := parseCanonicalUTCNanos(tc.s)
+		if err != nil {
+			t.Fatalf("parse(%q): %v", tc.s, err)
+		}
+		if ns != tc.want {
+			t.Fatalf("parse(%q) = %d, want %d", tc.s, ns, tc.want)
+		}
+	}
+}
+
+// TestMigration8ParseRejectsOutsideBoundaryNanos proves the conversion rejects
+// anything one nanosecond outside either int64 edge (plus the specific
+// fractional-overflow value the old whole-second bound silently wrapped), and
+// never clamps. It cannot round a boundary nanosecond into range.
+func TestMigration8ParseRejectsOutsideBoundaryNanos(t *testing.T) {
+	for _, bad := range []string{
+		// One nanosecond BELOW the exact minimum (underflows math.MinInt64).
+		"1677-09-21T00:12:43.145224191Z",
+		// One nanosecond ABOVE the exact maximum (overflows math.MaxInt64).
+		"2262-04-11T23:47:16.854775808Z",
+		// ~145ms past the maximum in the same second — the fractional overflow
+		// the old whole-second bound (sec == MaxInt64/1e9) accepted and wrapped.
+		"2262-04-11T23:47:16.999999999Z",
+		// Clearly beyond the span (a whole additional year).
+		"2263-04-11T23:47:16.854775807Z",
+		"1676-09-21T00:12:43.145224192Z",
+	} {
+		if ns, err := parseCanonicalUTCNanos(bad); err == nil {
+			t.Fatalf("expected %q to be rejected as out of the int64-nanosecond range, got %d", bad, ns)
+		}
+	}
+}
+
+// TestMigration8PreservesBoundaryInstantsAtBothEdges proves a genuine v7 row
+// whose journal timestamps sit at BOTH int64-nanosecond extremes upgrades to
+// v8 with those EXACT integer nanosecond values preserved (math.MinInt64 and
+// math.MaxInt64), and the resulting succeeded row still satisfies every v8
+// coherence invariant including completed_at IFF state=succeeded.
+func TestMigration8PreservesBoundaryInstantsAtBothEdges(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 7); err != nil {
+		t.Fatalf("build v7 schema: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"owner@example.com", "hash", "2026-09-22T12:00:00Z"); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key,
+		 default_stamp_batch_id, anonymous_pull, provisioning_state, created_at)
+		values ('edge', 'edge.registry.example', 'edge.eth', 1, '0xffff', '', 'batch-1', 0, 'ready', ?)`,
+		"2026-09-22T12:00:00Z"); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+	// One succeeded job: created_at/next_attempt_at at the exact minimum,
+	// completed_at at the exact maximum. Every v7 domain/invariant still holds
+	// (both are canonical RFC3339Nano UTC text passing the v7 GLOB).
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`insert into registry_publication_jobs
+		(registry_id, kind, state, payload_json, object_ref, feed_ref, attempts,
+		 next_attempt_at, claimed_by, last_error, created_at, completed_at)
+		values (1, 'auth', 'succeeded', ?, 'ref-edge', 'feed://0xffff/edge', 1,
+			'%s', '', '', '%s', '%s')`,
+		exactMinNanoString, exactMinNanoString, exactMaxNanoString),
+		mig7Auth); err != nil {
+		t.Fatalf("seed succeeded boundary job: %v", err)
+	}
+
+	if err := applyMigrationsThrough(ctx, db, 8); err != nil {
+		t.Fatalf("apply migration 8: %v", err)
+	}
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil || version != 8 {
+		t.Fatalf("expected version 8, got %d (err %v)", version, err)
+	}
+	var (
+		state, objectRef, feedRef, lastError string
+		nextAt, createdAt, completedAt       int64
+	)
+	if err := db.QueryRow(`select state, object_ref, feed_ref, last_error,
+		next_attempt_at, created_at, completed_at
+		from registry_publication_jobs where id = 1`).
+		Scan(&state, &objectRef, &feedRef, &lastError, &nextAt, &createdAt, &completedAt); err != nil {
+		t.Fatalf("read migrated boundary job: %v", err)
+	}
+	if state != "succeeded" || objectRef != "ref-edge" || feedRef != "feed://0xffff/edge" || lastError != "" {
+		t.Fatalf("succeeded coherence lost after migration: state=%q refs=%q/%q err=%q", state, objectRef, feedRef, lastError)
+	}
+	if nextAt != int64(math.MinInt64) || createdAt != int64(math.MinInt64) {
+		t.Fatalf("minimum edge not preserved exactly: next_attempt_at=%d created_at=%d want MinInt64=%d", nextAt, createdAt, int64(math.MinInt64))
+	}
+	if completedAt != int64(math.MaxInt64) {
+		t.Fatalf("maximum edge not preserved exactly: completed_at=%d want MaxInt64=%d", completedAt, int64(math.MaxInt64))
+	}
 }

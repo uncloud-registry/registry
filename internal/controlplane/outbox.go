@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"time"
 )
@@ -163,10 +164,15 @@ func nanosToTime(ns int64) time.Time {
 // row: it accepts ONLY a canonical UTC RFC3339/RFC3339Nano value (real
 // calendar/time validity via time.Parse, and a trailing 'Z' so an offset form
 // is rejected) and returns its exact nanosecond instant, so the migrated
-// INTEGER columns and any consumer agree to the last nanosecond. Out-of-range
-// values (outside the int64-nanosecond representable span) and noncanonical
-// forms are rejected; no silent fallback ever turns a malformed timestamp into
-// a zero time.
+// INTEGER columns and any consumer agree to the last nanosecond. The bounds
+// check is mathematically exact: the parsed instant is compared as a time.Time
+// against the real int64-nanosecond extremes (time.Unix(0, math.MinInt64) and
+// time.Unix(0, math.MaxInt64), UTC) BEFORE any UnixNano() call, so the exact
+// minimum 1677-09-21T00:12:43.145224192Z and maximum
+// 2262-04-11T23:47:16.854775807Z are accepted, one nanosecond outside either
+// edge is rejected, and a whole-second bound can never admit a fractional
+// overflow/underflow. Noncanonical forms are rejected; no silent fallback ever
+// turns a malformed timestamp into a zero time.
 func parseCanonicalUTCNanos(s string) (int64, error) {
 	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
@@ -175,17 +181,15 @@ func parseCanonicalUTCNanos(s string) (int64, error) {
 	if t.Location() != time.UTC || len(s) == 0 || s[len(s)-1] != 'Z' {
 		return 0, fmt.Errorf("timestamp %q is not canonical UTC (must end in 'Z')", s)
 	}
-	// Guard against int64-nanosecond overflow BEFORE calling UnixNano (which is
-	// undefined outside it). Unix() seconds are safe for every 4-digit RFC3339
-	// year; check the seconds fit the nanosecond int64 span, then compose the
-	// exact nanosecond instant (whole seconds + fraction) without truncation.
-	const maxNs = int64(1<<63 - 1)
-	const maxSec = maxNs / int64(time.Second)
-	sec := t.Unix()
-	if sec > maxSec || sec < -maxSec {
+	// Compare against the exact representable int64-nanosecond extremes as
+	// time.Time values (not after a lossy Unix()/seconds bound), so boundary
+	// nanoseconds are not silently wrapped by an overflow or underflow.
+	if t.Before(time.Unix(0, math.MinInt64).UTC()) || t.After(time.Unix(0, math.MaxInt64).UTC()) {
 		return 0, fmt.Errorf("timestamp %q is out of the int64-nanosecond range", s)
 	}
-	return sec*int64(time.Second) + int64(t.Nanosecond()), nil
+	// t is now provably within [minInt64, maxInt64] nanoseconds, so UnixNano is
+	// well-defined and cannot overflow.
+	return t.UTC().UnixNano(), nil
 }
 
 func scanPublicationJob(s scanRow, job *PublicationJob) error {
