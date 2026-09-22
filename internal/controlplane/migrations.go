@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -628,6 +629,84 @@ type legacyInviteRow struct {
 	createdAt          string
 }
 
+// errInviteDigestSchemaMalformed is the SINGLE stable, data-free sentinel for
+// migration 5's mandatory prerequisite: registry_invites is not the genuine
+// version-4 invite-digest schema (a view/virtual substitute, a hand-rolled
+// lookalike, or a schema missing/weakening any required column, constraint,
+// index, or lifecycle trigger). Every malformed-prerequisite failure collapses
+// to this one error so callers can test with errors.Is without ever receiving
+// schema SQL, trigger definitions, or data that could leak internals.
+var errInviteDigestSchemaMalformed = errors.New("controlplane: migration 5 prerequisite failed: registry_invites is not the genuine version-4 invite-digest schema")
+
+// The following DDL constants are the SINGLE SOURCE OF TRUTH for the
+// version-4 registry_invites invite-digest schema and its invariant objects.
+// Migration 4 INSTALLS from them, so the exact schema they describe is what a
+// real version-4 database carries; migration 5 validates a pre-existing
+// version-4 database against them via foldSQL (insignificant-whitespace-only
+// normalization), so a malformed or hand-rolled lookalike — one that merely
+// exposes legacy_unattributed, as the previous weak column-only prerequisite
+// accepted — is rejected before any trigger DDL runs.
+//
+// The literal text (keyword case, identifier case, constraint wording)
+// MUST match what migration 4 has always written, because that is the exact
+// normalized-whitespace fingerprint stored in sqlite_master by every genuine
+// version-4 database, pre-fix (8178a82) and corrected alike.
+
+// inviteDigestTableSQLFmt is the canonical CREATE TABLE for the invite-digest
+// schema. %s is the table name: migration 4 builds its "_new" rebuild clone,
+// migration 5 validates the final "registry_invites". SQLite writes the stored
+// form of a RENAMEd table with the name double-quoted, so the table-name token
+// is normalized away from the comparison.
+const inviteDigestTableSQLFmt = `CREATE TABLE %s (
+	id integer primary key autoincrement,
+	registry_id integer not null references registries(id) on delete cascade,
+	email text not null,
+	role text not null,
+	can_pull integer not null,
+	can_push integer not null,
+	token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32),
+	status text not null check (status in ('pending','accepted','revoked')),
+	accepted_by_user_id integer references users(id),
+	legacy_unattributed integer not null default 0 check (legacy_unattributed in (0,1)),
+	expires_at text not null,
+	accepted_at text,
+	revoked_at text,
+	created_at text not null,
+	check (can_pull = 1 or can_push = 1),
+	check ((status = 'revoked') = (revoked_at is not null)),
+	check (status <> 'accepted' or accepted_by_user_id is not null or legacy_unattributed = 1),
+	check (accepted_at is null or status = 'accepted')
+)`
+
+// inviteBornPendingTriggerSQL forces every insert to a pending, attributed
+// state: status must be 'pending' and legacy_unattributed must be 0 on insert.
+const inviteBornPendingTriggerSQL = `CREATE TRIGGER registry_invites_born_pending before insert on registry_invites
+	for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
+	begin select raise(abort, 'invites must be created pending and attributed'); end`
+
+// inviteTerminalStatusTriggerSQL makes a non-pending (accepted/revoked) status
+// immutable: once a row leaves pending, its status can never change.
+const inviteTerminalStatusTriggerSQL = `CREATE TRIGGER registry_invites_terminal_status before update of status on registry_invites
+	for each row when OLD.status != 'pending' and NEW.status != OLD.status
+	begin select raise(abort, 'invite status is terminal and cannot be changed'); end`
+
+// inviteNoUnattributedAcceptanceTriggerSQL forbids transitioning to accepted
+// without recording an accepting user (legacy_unattributed backfill is the
+// migration-only exception enforced by the CHECK, not by acceptance).
+const inviteNoUnattributedAcceptanceTriggerSQL = `CREATE TRIGGER registry_invites_no_unattributed_acceptance before update of status on registry_invites
+	for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+	begin select raise(abort, 'acceptance requires an attributed accepter'); end`
+
+// inviteLegacyFlagLockedTriggerSQL forbids ordinary SQL from SETTING the
+// legacy_unattributed flag to 1 (it is migration-only state).
+const inviteLegacyFlagLockedTriggerSQL = `CREATE TRIGGER registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+	for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+	begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`
+
+// inviteRegistryStatusIndexSQL is the supporting index for the invite listing
+// and status queries.
+const inviteRegistryStatusIndexSQL = `CREATE INDEX idx_registry_invites_registry_status on registry_invites(registry_id, status)`
+
 // legacyAttributionImmutableTriggerSQL is the SINGLE SOURCE OF TRUTH for the
 // BEFORE UPDATE trigger that makes legacy_unattributed invite rows immutable:
 // EVERY update to a row whose OLD.legacy_unattributed = 1 is aborted — clearing
@@ -641,6 +720,127 @@ const legacyAttributionImmutableTriggerSQL = `create trigger registry_invites_le
 	for each row when OLD.legacy_unattributed = 1
 	begin select raise(abort, 'legacy_unattributed invites are immutable historical records'); end`
 
+// foldSQL collapses every run of insignificant whitespace (spaces, tabs,
+// newlines) to a single space and trims the ends, leaving everything else —
+// keyword case, identifier case, punctuation, and string-literal contents —
+// untouched. It is the ONLY normalization applied when comparing stored
+// sqlite_schema SQL against the canonical DDL constants: genuine version-4
+// databases may differ from the constants in whitespace layout only (editors
+// reformat; the _new→final RENAME rewrites the name in quotes), never in
+// semantic content.
+func foldSQL(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// storedObjectSQL reads the stored sqlite_schema (sql) text for one named
+// object. It reports (false, nil) when the object does not exist and an error
+// when the read fails.
+func storedObjectSQL(ctx context.Context, tx *sql.Tx, typ, name string) (string, bool, error) {
+	var stored string
+	if err := tx.QueryRowContext(ctx, `select sql from sqlite_master where type = ? and name = ?`, typ, name).Scan(&stored); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return stored, true, nil
+}
+
+// inviteForeignKey describes one foreign-key clause of a table.
+type inviteForeignKey struct {
+	table, fromCol, toCol, onUpdate, onDelete string
+}
+
+// readInviteForeignKeys returns each foreign key of a table keyed by its local
+// "from" column.
+func readInviteForeignKeys(ctx context.Context, tx *sql.Tx, tbl string) (map[string]inviteForeignKey, error) {
+	rows, err := tx.QueryContext(ctx, `select "table", "from", "to", on_update, on_delete from pragma_foreign_key_list(?)`, tbl)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]inviteForeignKey)
+	for rows.Next() {
+		var f inviteForeignKey
+		if err := rows.Scan(&f.table, &f.fromCol, &f.toCol, &f.onUpdate, &f.onDelete); err != nil {
+			return nil, err
+		}
+		out[f.fromCol] = f
+	}
+	return out, rows.Err()
+}
+
+// readIndexColumns returns the ordered columns of a named index, or (nil, nil)
+// when the index does not exist.
+func readIndexColumns(ctx context.Context, tx *sql.Tx, tbl, indexName string) ([]string, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx, `select count(*) from pragma_index_list(?) where name = ?`, tbl, indexName).Scan(&n); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, `select "name" from pragma_index_info(?) order by seqno`, indexName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, rows.Err()
+}
+
+// readAutoUniqueIndexColumns returns, for each unique index created by a
+// UNIQUE constraint (origin 'u', e.g. token_digest blob not null unique), the
+// ordered list of its columns.
+func readAutoUniqueIndexColumns(ctx context.Context, tx *sql.Tx, tbl string) ([][]string, error) {
+	rows, err := tx.QueryContext(ctx, `select name from pragma_index_list(?) where "unique" = 1 and origin = 'u'`, tbl)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([][]string, 0, len(names))
+	for _, n := range names {
+		cols, err := readIndexColumns(ctx, tx, tbl, n)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cols)
+	}
+	return out, nil
+}
+
+// equalStringSlice reports whether two ordered string slices are equal.
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // installInviteLegacyAttributionImmutability is migration 5's body: it
 // guarantees the immutable legacy-unattributed-history trigger exists on a
 // version-4 schema — the delivery a database that applied the PRE-FIX
@@ -648,9 +848,12 @@ const legacyAttributionImmutableTriggerSQL = `create trigger registry_invites_le
 // migration) never received, because it records version 4 and skips the
 // corrected code.
 //
-//  1. Prerequisite: registry_invites must exist with the legacy_unattributed
-//     column the trigger guards. Every genuine v4 digest schema carries it; a
-//     malformed or hand-rolled "v4" fails here, BEFORE any DDL, so the
+//  1. Prerequisite: run validateInviteV4DigestSchema — registry_invites must be
+//     a genuine, COMPLETE version-4 invite-digest schema (a real table with the
+//     exact digest columns/CHECKs/uniqueness, the two exact foreign keys, the
+//     supporting index, and the four lifecycle triggers), NOT merely an object
+//     exposing legacy_unattributed. Any malformed or hand-rolled lookalike
+//     fails here with the single data-free sentinel, BEFORE any DDL, so the
 //     migration rolls back with version 4 still recorded and no data touched.
 //  2. Drop any stale same-name trigger: the corrected migration 4 already
 //     installs one, the pre-fix v4 has none — DROP IF EXISTS is a no-op or
@@ -661,12 +864,8 @@ const legacyAttributionImmutableTriggerSQL = `create trigger registry_invites_le
 // The whole body runs inside the migration transaction (applyMigration): a
 // failed create rolls back the drop and never records version 5.
 func installInviteLegacyAttributionImmutability(ctx context.Context, tx *sql.Tx) error {
-	var present int
-	if err := tx.QueryRowContext(ctx, `select count(*) from pragma_table_info('registry_invites') where name = 'legacy_unattributed'`).Scan(&present); err != nil {
-		return fmt.Errorf("migration 5 prerequisite: inspect registry_invites: %w", err)
-	}
-	if present == 0 {
-		return fmt.Errorf("migration 5 prerequisite: registry_invites is missing the legacy_unattributed column (not a version-4 digest schema); refusing to install the immutability trigger")
+	if err := validateInviteV4DigestSchema(ctx, tx); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `drop trigger if exists registry_invites_legacy_attribution_immutable`); err != nil {
 		return fmt.Errorf("migration 5: drop stale legacy immutability trigger: %w", err)
@@ -674,6 +873,141 @@ func installInviteLegacyAttributionImmutability(ctx context.Context, tx *sql.Tx)
 	if _, err := tx.ExecContext(ctx, legacyAttributionImmutableTriggerSQL); err != nil {
 		return fmt.Errorf("migration 5: install legacy immutability trigger: %w", err)
 	}
+	return nil
+}
+
+// validateInviteV4DigestSchema is the hardened migration-5 prerequisite. It
+// verifies that registry_invites is a genuine, COMPLETE version-4 invite-digest
+// schema BEFORE any trigger DDL runs, so a malformed or hand-rolled lookalike
+// that merely exposes legacy_unattributed (what the previous weak column-only
+// check accepted) is rejected. It validates:
+//
+//  1. registry_invites is a real SQLite TABLE, never a view, index, or virtual
+//     substitute — pragma_table_info silently resolves view and virtual-table
+//     columns, so the sqlite_master object type must be examined first.
+//  2. The stored CREATE TABLE is the exact migration-4 schema fingerprint: every
+//     required column (id, registry_id, email, role, can_pull, can_push,
+//     token_digest, status, expires_at, created_at, accepted_by_user_id,
+//     accepted_at, revoked_at, legacy_unattributed) with its declared type,
+//     NOT NULL / nullability, PK, default, token_digest uniqueness, and EVERY
+//     CHECK (strict 32-byte BLOB digest, status domain, permission, and
+//     accepted/revoked/legacy attribution relationships) — compared by foldSQL
+//     (insignificant-whitespace normalization only) against the single shared
+//     DDL constant, so columns/CHECKs/uniqueness cannot be dropped, weakened,
+//     or spoofed by whitespace or comment placement.
+//  3. The foreign keys are exactly registry_id→registries(id) ON DELETE CASCADE
+//     and accepted_by_user_id→users(id) (the precise migration-4 contract), so
+//     a missing or wrong FK fails.
+//  4. token_digest is backed by a REAL unique index covering exactly
+//     [token_digest], and the supporting (registry_id, status) index exists —
+//     verified both by stored-SQL fold comparison and PRAGMA columns.
+//  5. The four pre-existing lifecycle triggers (born-pending, terminal-status,
+//     no-unattributed-acceptance, legacy-flag-locked) exist with their exact
+//     guarding semantics (fold-compared against the shared constants), so a
+//     missing or weakened trigger fails here. Migration 5 MAY repair ONLY the
+//     immutable-attribution trigger it owns; it may repair none of these, so
+//     any defect in them must fail at v4.
+//
+// Every malformed case collapses to the single data-free sentinel
+// errInviteDigestSchemaMalformed — never a leaked schema/trigger/SQL detail —
+// and always BEFORE the DROP/CREATE. All queries run inside the migration
+// transaction, so a failure rolls back with version 4 still recorded and no
+// data or trigger changed.
+func validateInviteV4DigestSchema(ctx context.Context, tx *sql.Tx) error {
+	malformed := func() error { return errInviteDigestSchemaMalformed }
+
+	// 1. Must be a real TABLE, not a view or virtual substitute.
+	var objType string
+	if err := tx.QueryRowContext(ctx, `select type from sqlite_master where name = 'registry_invites'`).Scan(&objType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return malformed()
+		}
+		return fmt.Errorf("migration 5 prerequisite: read registry_invites object type: %w", err)
+	}
+	if objType != "table" {
+		return malformed()
+	}
+
+	// 2. Exact CREATE TABLE fingerprint (columns, types, nullability, PK,
+	// default, UNIQUE, all CHECKs). SQLite writes the stored form of a
+	// RENAMEd table (migration 4's _new→final rename) with the table name in
+	// double quotes; a directly-created table stores it unquoted. The quote
+	// around the table-name token (the only quoted identifier migration 4
+	// emits) is normalized away on BOTH sides before comparing, so the two
+	// genuine storage forms are byte-equivalent and a lookalike cannot sneak a
+	// difference past by quoted-vs-unquoted naming alone.
+	tblSQL, ok, err := storedObjectSQL(ctx, tx, "table", "registry_invites")
+	if err != nil {
+		return fmt.Errorf("migration 5 prerequisite: read registry_invites DDL: %w", err)
+	}
+	if !ok {
+		return malformed()
+	}
+	wantTbl := fmt.Sprintf(inviteDigestTableSQLFmt, "registry_invites")
+	tblNorm := strings.ReplaceAll(tblSQL, `"registry_invites"`, "registry_invites")
+	wantNorm := strings.ReplaceAll(wantTbl, `"registry_invites"`, "registry_invites")
+	if foldSQL(tblNorm) != foldSQL(wantNorm) {
+		return malformed()
+	}
+
+	// 3. Foreign keys must be exactly the migration-4 contract.
+	fks, err := readInviteForeignKeys(ctx, tx, "registry_invites")
+	if err != nil {
+		return fmt.Errorf("migration 5 prerequisite: read registry_invites foreign keys: %w", err)
+	}
+	if len(fks) != 2 {
+		return malformed()
+	}
+	if fks["registry_id"] != (inviteForeignKey{table: "registries", fromCol: "registry_id", toCol: "id", onUpdate: "NO ACTION", onDelete: "CASCADE"}) {
+		return malformed()
+	}
+	if fks["accepted_by_user_id"] != (inviteForeignKey{table: "users", fromCol: "accepted_by_user_id", toCol: "id", onUpdate: "NO ACTION", onDelete: "NO ACTION"}) {
+		return malformed()
+	}
+
+	// 4. token_digest must be backed by a real unique index (origin 'u')
+	// covering exactly [token_digest], and the (registry_id, status) index must
+	// exist with exactly those columns.
+	uniq, err := readAutoUniqueIndexColumns(ctx, tx, "registry_invites")
+	if err != nil {
+		return fmt.Errorf("migration 5 prerequisite: read registry_invites unique indexes: %w", err)
+	}
+	if len(uniq) != 1 || !equalStringSlice(uniq[0], []string{"token_digest"}) {
+		return malformed()
+	}
+	idxSQL, ok, err := storedObjectSQL(ctx, tx, "index", "idx_registry_invites_registry_status")
+	if err != nil {
+		return fmt.Errorf("migration 5 prerequisite: read registry_invites status index: %w", err)
+	}
+	if !ok || foldSQL(idxSQL) != foldSQL(inviteRegistryStatusIndexSQL) {
+		return malformed()
+	}
+	idxCols, err := readIndexColumns(ctx, tx, "registry_invites", "idx_registry_invites_registry_status")
+	if err != nil {
+		return fmt.Errorf("migration 5 prerequisite: read registry_invites status index columns: %w", err)
+	}
+	if !equalStringSlice(idxCols, []string{"registry_id", "status"}) {
+		return malformed()
+	}
+
+	// 5. The four pre-existing lifecycle triggers must carry the exact guarding
+	// semantics (fold-compared). A missing, renamed, or weakened trigger fails
+	// here; migration 5 repairs none of them.
+	for _, tc := range []struct{ name, wantSQL string }{
+		{"registry_invites_born_pending", inviteBornPendingTriggerSQL},
+		{"registry_invites_terminal_status", inviteTerminalStatusTriggerSQL},
+		{"registry_invites_no_unattributed_acceptance", inviteNoUnattributedAcceptanceTriggerSQL},
+		{"registry_invites_legacy_flag_locked", inviteLegacyFlagLockedTriggerSQL},
+	} {
+		trgSQL, ok, err := storedObjectSQL(ctx, tx, "trigger", tc.name)
+		if err != nil {
+			return fmt.Errorf("migration 5 prerequisite: read trigger %s: %w", tc.name, err)
+		}
+		if !ok || foldSQL(trgSQL) != foldSQL(tc.wantSQL) {
+			return malformed()
+		}
+	}
+
 	return nil
 }
 
@@ -820,32 +1154,11 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 	// ---- 3. Create the constrained clone. The CHECK constraints encode the
 	// lifecycle consistency rules; the triggers (installed after the copy)
 	// enforce the state machine and the attribution rules for every future
-	// write, including direct SQL. ----
-	for _, stmt := range []string{
-		`create table registry_invites_new (
-			id integer primary key autoincrement,
-			registry_id integer not null references registries(id) on delete cascade,
-			email text not null,
-			role text not null,
-			can_pull integer not null,
-			can_push integer not null,
-			token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32),
-			status text not null check (status in ('pending','accepted','revoked')),
-			accepted_by_user_id integer references users(id),
-			legacy_unattributed integer not null default 0 check (legacy_unattributed in (0,1)),
-			expires_at text not null,
-			accepted_at text,
-			revoked_at text,
-			created_at text not null,
-			check (can_pull = 1 or can_push = 1),
-			check ((status = 'revoked') = (revoked_at is not null)),
-			check (status <> 'accepted' or accepted_by_user_id is not null or legacy_unattributed = 1),
-			check (accepted_at is null or status = 'accepted')
-		)`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("create invite digest clone: %w", err)
-		}
+	// write, including direct SQL. The DDL is the shared constant so the exact
+	// schema a genuine version-4 database carries is the same single source of
+	// truth migration 5 validates against. ----
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(inviteDigestTableSQLFmt, "registry_invites_new")); err != nil {
+		return fmt.Errorf("create invite digest clone: %w", err)
 	}
 
 	// ---- 4. Copy converted rows by explicit column name (legacy
@@ -873,22 +1186,16 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 
 	// ---- 6. State-transition + attribution triggers and the listing index.
 	// Triggers are installed AFTER the copy so backfilled (non-pending)
-	// rows are not rejected. ----
+	// rows are not rejected. The DDL comes from the shared constants so the
+	// invariants a genuine version-4 database carries are the exact single
+	// source of truth migration 5 validates against. ----
 	for _, stmt := range []string{
-		`create trigger registry_invites_born_pending before insert on registry_invites
-			for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
-			begin select raise(abort, 'invites must be created pending and attributed'); end`,
-		`create trigger registry_invites_terminal_status before update of status on registry_invites
-			for each row when OLD.status != 'pending' and NEW.status != OLD.status
-			begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
-		`create trigger registry_invites_no_unattributed_acceptance before update of status on registry_invites
-			for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
-			begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
-		`create trigger registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
-			for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
-			begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+		inviteBornPendingTriggerSQL,
+		inviteTerminalStatusTriggerSQL,
+		inviteNoUnattributedAcceptanceTriggerSQL,
+		inviteLegacyFlagLockedTriggerSQL,
 		legacyAttributionImmutableTriggerSQL,
-		`create index idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
+		inviteRegistryStatusIndexSQL,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("create invite lifecycle trigger/index: %w", err)

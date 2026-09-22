@@ -2272,6 +2272,395 @@ func TestInviteMigrationV5RollsBackWhenTriggerInstallFails(t *testing.T) {
 	}
 }
 
+// The following test-local constants are a HAND-WRITTEN, independent copy of the
+// version-4 registry_invites digest schema and its invariant objects. They are
+// deliberately authored in the test rather than referencing the production DDL
+// constants, so a defect in a production constant cannot masquerade as a
+// "genuine" schema in these fixtures: a corrupt constant would make the
+// immutable-trigger-repair tests below diverge from the independently-authored
+// correct baseline and fail.
+
+// testV4InvitesTable is the correct version-4 invite-digest table baseline the
+// adversarial fixtures mutate (columns, types, nullability, PK, UNIQUE, and all
+// CHECKs) to build malformed lookalikes.
+const testV4InvitesTable = `CREATE TABLE registry_invites (
+	id integer primary key autoincrement,
+	registry_id integer not null references registries(id) on delete cascade,
+	email text not null,
+	role text not null,
+	can_pull integer not null,
+	can_push integer not null,
+	token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32),
+	status text not null check (status in ('pending','accepted','revoked')),
+	accepted_by_user_id integer references users(id),
+	legacy_unattributed integer not null default 0 check (legacy_unattributed in (0,1)),
+	expires_at text not null,
+	accepted_at text,
+	revoked_at text,
+	created_at text not null,
+	check (can_pull = 1 or can_push = 1),
+	check ((status = 'revoked') = (revoked_at is not null)),
+	check (status <> 'accepted' or accepted_by_user_id is not null or legacy_unattributed = 1),
+	check (accepted_at is null or status = 'accepted')
+)`
+
+// testV4InvitesLifecycle lists the correct version-4 invariant objects (four
+// lifecycle triggers + the supporting status index) as independent statements
+// an adversarial fixture appends after its (possibly defective) table.
+var testV4InvitesLifecycle = []string{
+	`CREATE TRIGGER registry_invites_born_pending before insert on registry_invites
+		for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
+		begin select raise(abort, 'invites must be created pending and attributed'); end`,
+	`CREATE TRIGGER registry_invites_terminal_status before update of status on registry_invites
+		for each row when OLD.status != 'pending' and NEW.status != OLD.status
+		begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+	`CREATE TRIGGER registry_invites_no_unattributed_acceptance before update of status on registry_invites
+		for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+		begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+	`CREATE TRIGGER registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+		for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+		begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+	`CREATE INDEX idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
+}
+
+// assertMalformedV5DigestRejected proves migration 5's hardened prerequisite
+// rejected a malformed registry_invites atomically and data-free: the single
+// errInviteDigestSchemaMalformed sentinel is returned, version stays 4, only
+// the fixture's version-4 row remains (no v5 row), no immutability trigger was
+// ever created, and the parents survive untouched.
+func assertMalformedV5DigestRejected(t *testing.T, db *sql.DB, wantRows int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("expected migration 5 to reject the malformed digest schema, got nil")
+	} else if !errors.Is(err, errInviteDigestSchemaMalformed) {
+		t.Fatalf("expected the single data-free errInviteDigestSchemaMalformed sentinel, got: %v", err)
+	}
+	if ver, err := CurrentSchemaVersion(ctx, db); err != nil || ver != 4 {
+		t.Fatalf("version must stay 4 after the rejected migration 5, got %d (err %v)", ver, err)
+	}
+	var migCount int
+	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
+		t.Fatal(err)
+	}
+	if migCount != 1 {
+		t.Fatalf("expected only the fixture's version-4 row, got %d rows", migCount)
+	}
+	var imm int
+	if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = 'registry_invites_legacy_attribution_immutable'`).Scan(&imm); err != nil {
+		t.Fatal(err)
+	}
+	if imm != 0 {
+		t.Fatalf("no immutability trigger may remain after the rejected migration, found %d", imm)
+	}
+	var users, regs int
+	if err := db.QueryRowContext(ctx, `select (select count(*) from users), (select count(*) from registries)`).Scan(&users, &regs); err != nil {
+		t.Fatal(err)
+	}
+	if users != 1 || regs != 1 {
+		t.Fatalf("parents must be untouched after the rejected migration, users=%d registries=%d", users, regs)
+	}
+	if wantRows >= 0 {
+		var rows int
+		if err := db.QueryRowContext(ctx, `select count(*) from registry_invites`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != wantRows {
+			t.Fatalf("registry_invites rows must be untouched, want %d got %d", wantRows, rows)
+		}
+	}
+}
+
+// TestInviteMigrationV5RejectsMalformedDigestSchema is the round-4 adversarial
+// regression for migration 5's hardened prerequisite. The previous weak check
+// accepted ANY registry_invites exposing the legacy_unattributed column, so a
+// malformed or hand-rolled "v4" that carried that column — but lacked the real
+// digest columns/CHECKs, exact foreign keys, the token_digest uniqueness, the
+// supporting index, or the lifecycle triggers — got stamped version 5 and
+// received the immutable trigger on top of a broken schema. This test builds
+// each such lookalike (all exposing legacy_unattributed) and proves migration 5
+// fails closed with the single data-free sentinel, leaving version 4 recorded,
+// no immutability trigger, and every row untouched. The GENUINE exact pre-fix
+// and corrected v4 schemas still migrate to v5 (covered by
+// TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5 and
+// TestInviteMigrationV5FromCleanV4Schema).
+func TestInviteMigrationV5RejectsMalformedDigestSchema(t *testing.T) {
+	t.Parallel()
+
+	type fixture struct {
+		name      string
+		tableSQL  string
+		lifecycle []string
+		// seed inserts one row valid under THIS variant's (possibly defective)
+		// schema, BEFORE the lifecycle triggers are installed (mirroring how a
+		// real version-4 legacy backfill predates them), so the test can prove
+		// the rejected migration is data-free. nil = seed nothing.
+		seed func(ctx context.Context, db *sql.DB) error
+		// wantRows is the expected registry_invites row count after rejection
+		// (-1 = skip, e.g. when registry_invites is a view).
+		wantRows int
+	}
+
+	var table = testV4InvitesTable
+	var lifecycle = testV4InvitesLifecycle
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedPending := func(ctx context.Context, db *sql.DB) error {
+		_, err := db.ExecContext(ctx, `insert into registry_invites
+			(registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+			values (1, 'carol@example.com', 'member', 1, 0, ?, 'pending', NULL, 0, ?, NULL, NULL, ?)`,
+			DigestInviteToken(tokenTextC), now, now)
+		return err
+	}
+
+	fixtures := []fixture{
+		{
+			name:      "object is a view exposing legacy_unattributed",
+			tableSQL:  "create view registry_invites as select 1 as id, zeroblob(32) as token_digest, 1 as legacy_unattributed",
+			lifecycle: []string{},
+			wantRows:  -1,
+			seed: func(ctx context.Context, db *sql.DB) error {
+				// registry_invites is a view over nothing; seed the parents only.
+				return nil
+			},
+		},
+		{
+			name: "missing token_digest (legacy token_hash instead)",
+			tableSQL: `CREATE TABLE registry_invites (
+				id integer primary key autoincrement,
+				registry_id integer not null references registries(id) on delete cascade,
+				email text not null,
+				role text not null,
+				can_pull integer not null,
+				can_push integer not null,
+				token_hash text not null unique,
+				status text not null check (status in ('pending','accepted','revoked')),
+				accepted_by_user_id integer references users(id),
+				legacy_unattributed integer not null default 0 check (legacy_unattributed in (0,1)),
+				expires_at text not null,
+				accepted_at text,
+				revoked_at text,
+				created_at text not null,
+				check (can_pull = 1 or can_push = 1),
+				check (accepted_at is null or status = 'accepted')
+			)`,
+			wantRows: 1,
+			seed: func(ctx context.Context, db *sql.DB) error {
+				_, err := db.ExecContext(ctx, `insert into registry_invites
+					(registry_id, email, role, can_pull, can_push, token_hash, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+					values (1, 'carol@example.com', 'member', 1, 0, 'deadbeef', 'pending', NULL, 0, ?, NULL, NULL, ?)`, now, now)
+				return err
+			},
+		},
+		{
+			name: "token_digest wrong type (text not blob)",
+			tableSQL: strings.Replace(table,
+				`token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32)`,
+				`token_digest text not null unique check (typeof(token_digest) = 'text' and length(token_digest) = 32)`, 1),
+			wantRows: 1,
+			seed: func(ctx context.Context, db *sql.DB) error {
+				_, err := db.ExecContext(ctx, `insert into registry_invites
+					(registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+					values (1, 'carol@example.com', 'member', 1, 0, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'pending', NULL, 0, ?, NULL, NULL, ?)`, now, now)
+				return err
+			},
+		},
+		{
+			name: "token_digest wrongly nullable",
+			tableSQL: strings.Replace(table,
+				`token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32)`,
+				`token_digest blob unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32)`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "missing strict token_digest length CHECK",
+			tableSQL: strings.Replace(table,
+				`token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32)`,
+				`token_digest blob not null unique`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "missing status-domain CHECK",
+			tableSQL: strings.Replace(table,
+				`status text not null check (status in ('pending','accepted','revoked'))`,
+				`status text not null`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "missing registry_id foreign key",
+			tableSQL: strings.Replace(table,
+				`registry_id integer not null references registries(id) on delete cascade`,
+				`registry_id integer not null`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "wrong accepted_by_user_id FK (on delete set null, not the exact v4 contract)",
+			tableSQL: strings.Replace(table,
+				`accepted_by_user_id integer references users(id)`,
+				`accepted_by_user_id integer references users(id) on delete set null`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "missing accepted_by_user_id foreign key",
+			tableSQL: strings.Replace(table,
+				`accepted_by_user_id integer references users(id),`,
+				`accepted_by_user_id integer,`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "missing token_digest uniqueness",
+			tableSQL: strings.Replace(table,
+				`token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32)`,
+				`token_digest blob not null check (typeof(token_digest) = 'blob' and length(token_digest) = 32)`, 1),
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name:     "missing (registry_id,status) supporting index",
+			tableSQL: table,
+			lifecycle: []string{
+				`CREATE TRIGGER registry_invites_born_pending before insert on registry_invites
+					for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
+					begin select raise(abort, 'invites must be created pending and attributed'); end`,
+				`CREATE TRIGGER registry_invites_terminal_status before update of status on registry_invites
+					for each row when OLD.status != 'pending' and NEW.status != OLD.status
+					begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+				`CREATE TRIGGER registry_invites_no_unattributed_acceptance before update of status on registry_invites
+					for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+					begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+				`CREATE TRIGGER registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+					for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+					begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+			},
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name:     "wrong (registry_id,status) index columns",
+			tableSQL: table,
+			lifecycle: []string{
+				`CREATE TRIGGER registry_invites_born_pending before insert on registry_invites
+					for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
+					begin select raise(abort, 'invites must be created pending and attributed'); end`,
+				`CREATE TRIGGER registry_invites_terminal_status before update of status on registry_invites
+					for each row when OLD.status != 'pending' and NEW.status != OLD.status
+					begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+				`CREATE TRIGGER registry_invites_no_unattributed_acceptance before update of status on registry_invites
+					for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+					begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+				`CREATE TRIGGER registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+					for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+					begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+				`CREATE INDEX idx_registry_invites_registry_status on registry_invites(registry_id, email)`,
+			},
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name:     "missing lifecycle trigger (born_pending absent)",
+			tableSQL: table,
+			lifecycle: []string{
+				`CREATE TRIGGER registry_invites_terminal_status before update of status on registry_invites
+					for each row when OLD.status != 'pending' and NEW.status != OLD.status
+					begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+				`CREATE TRIGGER registry_invites_no_unattributed_acceptance before update of status on registry_invites
+					for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+					begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+				`CREATE TRIGGER registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+					for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+					begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+				`CREATE INDEX idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
+			},
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name:     "weakened born_pending trigger (legacy_unattributed guard dropped)",
+			tableSQL: table,
+			lifecycle: []string{
+				`CREATE TRIGGER registry_invites_born_pending before insert on registry_invites
+					for each row when NEW.status != 'pending'
+					begin select raise(abort, 'invites must be created pending'); end`,
+				`CREATE TRIGGER registry_invites_terminal_status before update of status on registry_invites
+					for each row when OLD.status != 'pending' and NEW.status != OLD.status
+					begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+				`CREATE TRIGGER registry_invites_no_unattributed_acceptance before update of status on registry_invites
+					for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+					begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+				`CREATE TRIGGER registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+					for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+					begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+				`CREATE INDEX idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
+			},
+			seed:     seedPending,
+			wantRows: 1,
+		},
+		{
+			name: "plausible hand-rolled lookalike that passed the old weak check",
+			// A cleanly-formatted, confident-looking "v4" with every column the
+			// application reads (including legacy_unattributed and a BLOB
+			// token_digest) but NONE of the CHECK constraints, no unique index on
+			// token_digest, no accepted_by FK, no lifecycle triggers, and no
+			// supporting index. It exposed legacy_unattributed so the OLD
+			// column-only prerequisite accepted it and would have installed the
+			// immutable trigger on a broken schema.
+			tableSQL: `CREATE TABLE registry_invites (
+				id integer primary key autoincrement,
+				registry_id integer not null references registries(id) on delete cascade,
+				email text not null,
+				role text not null,
+				can_pull integer not null,
+				can_push integer not null,
+				token_digest blob not null,
+				status text not null,
+				accepted_by_user_id integer,
+				legacy_unattributed integer not null default 0,
+				expires_at text not null,
+				accepted_at text,
+				revoked_at text,
+				created_at text not null
+			)`,
+			lifecycle: nil,
+			seed:      seedPending,
+			wantRows:  1,
+		},
+	}
+
+	for _, f := range fixtures {
+		f := f
+		t.Run(f.name, func(t *testing.T) {
+			t.Parallel()
+			db := openInviteMigDB(t, "v5_digest_lookalike")
+			lc := f.lifecycle
+			if lc == nil {
+				lc = lifecycle
+			}
+			seedV4RecordedBase(t, db, func(ctx context.Context, db *sql.DB) error {
+				if _, err := db.ExecContext(ctx, f.tableSQL); err != nil {
+					return err
+				}
+				if f.seed != nil {
+					if err := f.seed(ctx, db); err != nil {
+						return err
+					}
+				}
+				for _, s := range lc {
+					if _, err := db.ExecContext(ctx, s); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			assertMalformedV5DigestRejected(t, db, f.wantRows)
+		})
+	}
+}
+
 // TestInviteIdempotentRetryAfterExpiry pins the idempotency/expiry ordering:
 // the load/status/accepted_by decision precedes the expiry gate, so an invite
 // already accepted by the same database user with its atomic membership
