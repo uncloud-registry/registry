@@ -357,7 +357,7 @@ func (s *HTTPServer) handleUIRoot(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:   "Login",
 			Heading: "Ship images through Swarm-backed registries.",
 			Lede:    "Sign in to manage registry settings, collaborators, policy publication, and Docker authentication.",
@@ -371,6 +371,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
       <p class="muted">Use your control-plane account to manage registries and invite collaborators.</p>
     </div>
     <form method="post" action="/ui/login">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Email<input type="email" name="email" required></label>
       <label>Password<input type="password" name="password" required></label>
       <button type="submit">Login</button>
@@ -392,11 +393,13 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 		}
 		_, token, err := s.Service.Login(r.Context(), r.FormValue("email"), r.FormValue("password"))
 		if err != nil {
-			renderPage(w, pageData{
+			s.renderPage(w, r, pageData{
 				Title:   "Login",
 				Heading: "Welcome back",
 				Lede:    "Sign in to continue.",
-				Message: err.Error(),
+				// Generic, identical failure message so the UI never reveals
+				// whether the email exists.
+				Message: "Invalid email or password.",
 				Body: `
 {{define "content"}}
 <a class="button secondary" href="/ui/login">Try again</a>
@@ -404,7 +407,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		setSessionCookie(w, token)
+		s.setSessionCookie(w, token)
 		http.Redirect(w, r, "/ui/registries", http.StatusSeeOther)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -415,7 +418,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:   "Register",
 			Heading: "Create your control-plane account.",
 			Lede:    "This account is used for registry administration, collaborator invites, and Docker token issuance.",
@@ -426,6 +429,7 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
     <div class="kicker">Register</div>
     <h2>Get started</h2>
     <form method="post" action="/ui/register">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Email<input type="email" name="email" required></label>
       <label>Password<input type="password" name="password" required></label>
       <button type="submit">Create account</button>
@@ -447,7 +451,7 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 		}
 		_, token, err := s.Service.RegisterUser(r.Context(), r.FormValue("email"), r.FormValue("password"))
 		if err != nil {
-			renderPage(w, pageData{
+			s.renderPage(w, r, pageData{
 				Title:   "Register",
 				Heading: "Create account",
 				Lede:    "Set up a control-plane account.",
@@ -459,7 +463,7 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		setSessionCookie(w, token)
+		s.setSessionCookie(w, token)
 		http.Redirect(w, r, "/ui/registries", http.StatusSeeOther)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -481,7 +485,7 @@ func (s *HTTPServer) handleUIRegistries(w http.ResponseWriter, r *http.Request) 
 	if r.URL.Query().Get("accepted") == "1" {
 		message = "Invite accepted. The registry should now appear in your dashboard if the membership was published successfully."
 	}
-	renderPage(w, pageData{
+	s.renderPage(w, r, pageData{
 		Title:         "Registries",
 		Heading:       "Your registry dashboard.",
 		Lede:          "Create and manage Swarm-backed registries, review access rules, publish policy updates, and invite collaborators.",
@@ -532,7 +536,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
 	}
 	switch r.Method {
 	case http.MethodGet:
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:         "Create Registry",
 			Heading:       "Create a registry.",
 			Lede:          "Choose a registry slug, connect it to an ENS name, and set the initial default stamp and access mode.",
@@ -544,6 +548,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
     <div class="kicker">Create</div>
     <h2>Registry details</h2>
     <form method="post" action="/ui/registries/new">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Registry slug<input type="text" name="slug" placeholder="alice" required></label>
       <label>ENS name<input type="text" name="ens_name" placeholder="alice.registry.eth" required></label>
       <label>Default stamp batch ID<input type="text" name="default_stamp_batch_id" placeholder="batch-id" required></label>
@@ -574,7 +579,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
 			r.FormValue("default_stamp_batch_id"),
 		)
 		if err != nil {
-			renderPage(w, pageData{
+			s.renderPage(w, r, pageData{
 				Title:         "Create Registry",
 				Heading:       "Create a registry.",
 				Lede:          "Choose registry details and publish bootstrap topics.",
@@ -637,7 +642,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 	}
 	inviteModal := inviteModalState(r)
 	dashboardDTO := NewPublicRegistryDashboard(dashboard)
-	renderPage(w, pageData{
+	s.renderPage(w, r, pageData{
 		Title:         dashboard.Registry.Slug,
 		Heading:       dashboard.Registry.Slug + " settings",
 		Lede:          "Manage registry access, default stamp policy, pending invites, and collaborator permissions from one place.",
@@ -669,6 +674,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
     <div class="kicker">Registry settings</div>
     <h2>Registry settings</h2>
     <form method="post" action="/ui/registries/{{.Dashboard.Registry.ID}}/settings">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Default stamp batch ID<input type="text" name="default_stamp_batch_id" value="{{.Dashboard.Registry.DefaultStampBatchID}}" required></label>
       <label class="checkbox-row"><input type="checkbox" name="anonymous_pull" value="true" {{if .Dashboard.Registry.AnonymousPull}}checked{{end}}> <span>Allow anonymous pull</span></label>
       <button type="submit">Save and publish policy</button>
@@ -705,6 +711,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       <td>{{.ExpiresAt}}</td>
       <td>
         <form method="post" action="/ui/registries/{{$.Dashboard.Registry.ID}}/invites/{{.ID}}/revoke" style="display:inline;">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
           <button class="secondary" type="submit">Revoke</button>
         </form>
       </td>
@@ -714,6 +721,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
   {{end}}
   <h3>Accepted users</h3>
   <form method="post" action="/ui/registries/{{.Dashboard.Registry.ID}}/permissions">
+    <input type="hidden" name="_csrf" value="{{$.CSRF}}">
     <table class="table">
       <tr>
         <th>Email</th>
@@ -759,6 +767,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       </div>
       {{if .InviteModal.Error}}<div class="error-box">{{.InviteModal.Error}}</div>{{end}}
       <form method="post" action="/ui/registries/{{.Dashboard.Registry.ID}}/invites">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}">
         <label>Email<input type="email" name="email" value="{{.InviteModal.Email}}" required></label>
         <div class="permissions">
           {{if not .Dashboard.Registry.AnonymousPull}}
@@ -953,10 +962,12 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
     <h2>{{if .SignedIn}}Confirm access{{else}}Create account and accept{{end}}</h2>
     {{if .SignedIn}}
     <form method="post" action="/ui/invites/accept?token={{.Token}}">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <button type="submit">Accept invite</button>
     </form>
     {{else}}
     <form method="post" action="/ui/invites/accept?token={{.Token}}">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Email<input type="email" name="email" value="{{.Invite.Email}}" required></label>
       <label>Password<input type="password" name="password" required></label>
       <button type="submit">Create account and accept invite</button>
@@ -965,7 +976,7 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
   </div>
 </div>
 {{end}}`
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:         "Accept Invite",
 			Heading:       "Accept collaborator invite.",
 			Lede:          "This flow creates a control-plane account if needed, then grants access to the registry.",
@@ -1005,7 +1016,7 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		setSessionCookie(w, sessionToken)
+		s.setSessionCookie(w, sessionToken)
 		http.Redirect(w, r, "/ui/registries?accepted=1", http.StatusSeeOther)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -1013,14 +1024,52 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func setSessionCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{
+func (s *HTTPServer) setSessionCookie(w http.ResponseWriter, token string) {
+	ttl := s.security.sessionTTL
+	if s.security == nil || ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	var maxAge int
+	if lim := ttl.Seconds(); lim > float64(int(^uint(0)>>1)) {
+		maxAge = int(^uint(0) >> 1)
+	} else {
+		maxAge = int(lim)
+	}
+	http.SetCookie(w, s.sessionCookie(token, maxAge))
+}
+
+// clearSessionCookie expires the session cookie with attributes identical to
+// the one that was set, so browsers remove it.
+func (s *HTTPServer) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, s.sessionCookie("", -1))
+}
+
+// sessionCookie builds the control plane's single, fixed session cookie:
+// HttpOnly, SameSite=Lax, Path=/, bounded MaxAge, Secure when the deployment
+// warrants it (validated mode plus external URL), and never a Domain attribute,
+// so the cookie can never be scoped onto a host the server does not serve.
+func (s *HTTPServer) sessionCookie(token string, maxAge int) *http.Cookie {
+	secure := false
+	if s.security != nil {
+		secure = s.security.secureCookie
+	}
+	return &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
-	})
+		MaxAge:   maxAge,
+	}
+}
+
+// handleLogout clears the session cookie and returns the user to login. It is
+// a cookie-authenticated POST, so it is protected by the session-bound CSRF
+// control like any other mutation.
+func (s *HTTPServer) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearSessionCookie(w)
+	http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
 }
 
 type pageData struct {
@@ -1029,11 +1078,15 @@ type pageData struct {
 	Lede          string
 	Message       string
 	Authenticated bool
+	CSRF          string
 	Body          string
 	Data          map[string]any
 }
 
-func renderPage(w http.ResponseWriter, page pageData) {
+func (s *HTTPServer) renderPage(w http.ResponseWriter, r *http.Request, page pageData) {
+	if s.security != nil {
+		page.CSRF = s.security.sessionCSRF(r)
+	}
 	tmpl, err := layoutTemplate.Clone()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1050,6 +1103,7 @@ func renderPage(w http.ResponseWriter, page pageData) {
 		"Lede":          page.Lede,
 		"Message":       page.Message,
 		"Authenticated": page.Authenticated,
+		"CSRF":          page.CSRF,
 	}
 	for key, value := range page.Data {
 		payload[key] = value

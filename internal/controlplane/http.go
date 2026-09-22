@@ -10,11 +10,17 @@ import (
 	"sync"
 
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/config"
 )
 
 type HTTPServer struct {
 	Service  *Service
 	Subjects auth.SubjectResolver
+
+	// security enforces the request-time controls (CSRF, rate limits, origin,
+	// client-IP resolution, headers). It is always present; development mode
+	// relaxes only the caps.
+	security *securityPolicy
 
 	// inviteFlashStore is lazily initialised on first use so a zero-value
 	// *HTTPServer is safe before any flash traffic arrives.
@@ -22,8 +28,19 @@ type HTTPServer struct {
 	flashes     *inviteFlashStore
 }
 
+// NewHTTPServer returns a handler with the default development security policy
+// (controls enforced, developer-friendly caps).
 func NewHTTPServer(service *Service, subjects auth.SubjectResolver) http.Handler {
-	return &HTTPServer{Service: service, Subjects: subjects}
+	return NewHTTPServerWithConfig(service, subjects, nil)
+}
+
+// NewHTTPServerWithConfig returns a handler whose security policy is derived
+// from an explicit ControlPlaneConfig. A nil config means development-mode
+// defaults.
+func NewHTTPServerWithConfig(service *Service, subjects auth.SubjectResolver, cfg *config.ControlPlaneConfig) http.Handler {
+	s := &HTTPServer{Service: service, Subjects: subjects}
+	s.security = newSecurityPolicy(service.Tokens, cfg)
+	return s
 }
 
 // inviteFlash returns the server's one-time invite flash store, lazily creating it
@@ -39,9 +56,20 @@ func (s *HTTPServer) inviteFlash() *inviteFlashStore {
 }
 
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.security != nil {
+		s.security.wrap(http.HandlerFunc(s.route)).ServeHTTP(w, r)
+		return
+	}
+	s.route(w, r)
+}
+
+// route dispatches to the concrete handler for a path/method pair.
+func (s *HTTPServer) route(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		s.handleUIRoot(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/ui/logout":
+		s.handleLogout(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == "/ui/login":
 		s.handleUILogin(w, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == "/ui/register":
@@ -108,9 +136,11 @@ func (s *HTTPServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	// Every authentication failure produces the same generic response so a
+	// caller can never distinguish unknown email from a wrong password.
 	user, token, err := s.Service.Login(r.Context(), req.Email, req.Password)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": errInvalidCredentials.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"user": NewPublicUser(user), "token": token})
@@ -277,10 +307,17 @@ func (s *HTTPServer) handleRegistryToken(w http.ResponseWriter, r *http.Request)
 	token, err := s.Service.IssueRegistryToken(r.Context(), service, scope, username, password)
 	if err != nil {
 		status := http.StatusUnauthorized
-		if err == sql.ErrNoRows {
+		message := err.Error()
+		if errors.Is(err, sql.ErrNoRows) {
+			// Registry for the requested host does not exist; the caller chose
+			// the host so this reveals nothing about users or credentials.
 			status = http.StatusNotFound
+			message = "registry not found"
+		} else if errors.Is(err, errInvalidCredentials) {
+			// Never distinguish unknown user from a wrong password.
+			message = errInvalidCredentials.Error()
 		}
-		writeJSON(w, status, map[string]string{"error": err.Error()})
+		writeJSON(w, status, map[string]string{"error": message})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"token": token})

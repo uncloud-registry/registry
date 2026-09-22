@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/uncloud-registry/registry/internal/auth"
 )
 
 func createTestRegistry(t *testing.T, store *Store, ownerID int64, slug, host string) Registry {
@@ -22,8 +24,32 @@ func createTestRegistry(t *testing.T, store *Store, ownerID int64, slug, host st
 	return created
 }
 
+// sessionCSRFForTest derives the session-bound CSRF value from a raw session
+// token issued by the shared test secret, so cookie-authenticated POST helpers
+// can honestly satisfy the CSRF enforcement without weakening it.
+func sessionCSRFForTest(t *testing.T, session string) string {
+	t.Helper()
+	if session == "" {
+		return ""
+	}
+	m, err := auth.NewSessionTokenManager(controlplaneTestSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	if err != nil {
+		t.Fatalf("test session manager: %v", err)
+	}
+	claims, err := m.Verify(session)
+	if err != nil {
+		t.Fatalf("derive session csrf: %v", err)
+	}
+	if claims.CSRF == "" {
+		t.Fatal("expected issued session to carry a CSRF claim")
+	}
+	return claims.CSRF
+}
+
 func postForm(t *testing.T, client *http.Client, base, path string, form url.Values, session string) (int, string, []byte) {
 	t.Helper()
+	// Cookie-authenticated UI forms must echo their session-bound CSRF token.
+	form.Set("_csrf", sessionCSRFForTest(t, session))
 	req, err := http.NewRequest(http.MethodPost, base+path, strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatalf("new post form: %v", err)

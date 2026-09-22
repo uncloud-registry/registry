@@ -29,6 +29,27 @@ type Service struct {
 	FeedKeys *FeedKeyCipher
 }
 
+// errInvalidCredentials is the single, public credential failure. It is
+// returned for unknown email, wrong password, and every other authentication
+// failure so a caller can never distinguish which part was wrong (no account
+// enumeration).
+var errInvalidCredentials = errors.New("invalid email or password")
+
+// dummyPasswordHash is a valid bcrypt hash used to keep comparison work
+// constant between a recognised and an unknown email, closing the timing
+// side-channel that would otherwise reveal whether an account exists.
+const dummyPasswordHash = "$2a$10$KtQ49oBiPrKD2p2IlHaRteBOWzn99gdPl9mzZdHGi0s3o2xh.vige"
+
+// comparePassword validates password against a stored hash, or against the
+// dummy hash when no account exists, so both paths perform a bcrypt compare.
+func comparePassword(storedHash string, password string) bool {
+	hash := storedHash
+	if storedHash == "" {
+		hash = dummyPasswordHash
+	}
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+}
+
 type CreatedRegistry struct {
 	Registry  Registry             `json:"registry"`
 	Bootstrap BootstrapPublication `json:"bootstrap"`
@@ -56,12 +77,21 @@ func (s *Service) RegisterUser(ctx context.Context, email string, password strin
 }
 
 func (s *Service) Login(ctx context.Context, email string, password string) (User, string, error) {
+	if s.Tokens == nil {
+		return User{}, "", errInvalidCredentials
+	}
 	user, err := s.Store.FindUserByEmail(ctx, email)
 	if err != nil {
-		return User{}, "", err
+		if errors.Is(err, sql.ErrNoRows) {
+			// Unknown account: still compare a bcrypt hash so an attacker
+			// cannot time the difference between a known and unknown email.
+			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
+			return User{}, "", errInvalidCredentials
+		}
+		return User{}, "", errInvalidCredentials
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return User{}, "", err
+	if !comparePassword(user.PasswordHash, password) {
+		return User{}, "", errInvalidCredentials
 	}
 	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
 	return user, token, err
@@ -436,12 +466,21 @@ func (s *Service) RegisterAndAcceptInvite(ctx context.Context, token string, ema
 }
 
 func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope string, email string, password string) (string, error) {
+	if s.RegistryTokens == nil {
+		return "", errors.New("registry token issuer is not configured")
+	}
 	user, err := s.Store.FindUserByEmail(ctx, email)
 	if err != nil {
-		return "", err
+		if errors.Is(err, sql.ErrNoRows) {
+			// Unknown account: comparable bcrypt work, generic failure (no
+			// account enumeration via the token endpoint).
+			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
+			return "", errInvalidCredentials
+		}
+		return "", errInvalidCredentials
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return "", err
+	if !comparePassword(user.PasswordHash, password) {
+		return "", errInvalidCredentials
 	}
 	registry, err := s.Store.FindRegistryByHost(ctx, host)
 	if err != nil {

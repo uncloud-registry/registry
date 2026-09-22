@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -31,6 +33,14 @@ const (
 // SessionClaims is the purpose-scoped payload of a session token.
 type SessionClaims struct {
 	TokenType string `json:"typ"`
+	// CSRF is a cryptographically random value bound to this exact session and
+	// signed with it. UI forms and cookie-authenticated API calls echo it back
+	// and the control plane compares it constant-time before any state change.
+	// It is generated fresh for every issued session and is never a bearer
+	// substitute for the token itself. Session verification (including
+	// cross-process by a registry) does not require it, so existing verifiers
+	// keep working unchanged.
+	CSRF string `json:"csrf,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -66,11 +76,18 @@ func NewSessionTokenManager(secret, issuer, audience string) (*SessionTokenManag
 }
 
 // Issue signs a session token for the given subject with a nonzero issued-at
-// and expiry.
+// and expiry. Every issued session carries a fresh cryptographically random
+// CSRF value so the CSRF defence is session-bound and opaque to any party that
+// does not hold the session token.
 func (m *SessionTokenManager) Issue(subject string, ttl time.Duration) (string, error) {
+	csrf, err := randomCSRF()
+	if err != nil {
+		return "", err
+	}
 	now := time.Now()
 	claims := SessionClaims{
 		TokenType: SessionTokenType,
+		CSRF:      csrf,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   subject,
 			Issuer:    m.issuer,
@@ -81,6 +98,18 @@ func (m *SessionTokenManager) Issue(subject string, ttl time.Duration) (string, 
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString(m.secret)
+}
+
+// randomCSRF returns 32 cryptographically random bytes hex-encoded (64
+// characters). Values are compared constant-time; revealing one never
+// compromises any other session because each issued session draws a fresh
+// value.
+func randomCSRF() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate session CSRF: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // Verify parses and fully validates a session token. It is strict: only

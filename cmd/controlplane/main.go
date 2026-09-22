@@ -12,50 +12,49 @@ import (
 	"strings"
 
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/config"
 	"github.com/uncloud-registry/registry/internal/controlplane"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
-// registrySigningKeyID is the explicit kid stamped on every registry token the
-// control plane signs. Operators distribute the matching public key under this
-// exact kid to registries (Task 5).
-const registrySigningKeyID = "cp-ed25519-1"
-
 func main() {
-	addr := envOrDefault("CONTROLPLANE_ADDR", ":8081")
-	dbPath := envOrDefault("CONTROLPLANE_DB_PATH", "file:controlplane.db?_pragma=foreign_keys(1)")
-	// No default secret: missing/weak configuration must fail startup rather
-	// than serve HMAC-signed sessions with a public key.
-	tokenSecret, err := envRequiredSecret("CONTROLPLANE_TOKEN_SECRET")
+	// The whole configuration matrix is loaded and validated ONCE, before any
+	// side effect (database, secret files, or listening). No parallel env
+	// path exists to disagree with it.
+	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
 	}
-	registryDomain := envOrDefault("CONTROLPLANE_REGISTRY_DOMAIN", "uncloud-registry.com")
-	beeAPIURL := strings.TrimSpace(os.Getenv("CONTROLPLANE_BEE_API_URL"))
+	if err := cfg.Validate(); err != nil {
+		log.Fatal(err)
+	}
 
-	// The master-key file is REQUIRED: without the current AES-256 master key
-	// no registry feed key can be stored encrypted (or decrypted for signing),
-	// so startup fails rather than running with plaintext-adjacent gaps. The
-	// path is an env value, never a command-line secret; loader errors contain
-	// no path or key material.
-	masterKeyPath, err := envRequiredSecret("CONTROLPLANE_MASTER_KEY_FILE")
-	if err != nil {
-		log.Fatal(err)
-	}
-	feedKeyCipher, err := controlplane.LoadMasterKeyFile(masterKeyPath)
+	// Final cryptographic validation still happens before any persistent side
+	// effect, using exactly the validated config values. Errors never contain
+	// secret material.
+	tokens, err := auth.NewSessionTokenManager(cfg.SessionSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	store, err := controlplane.OpenSQLite(dbPath)
+	var feedKeyCipher *controlplane.FeedKeyCipher
+	if cfg.MasterKeyFile != "" {
+		feedKeyCipher, err = controlplane.LoadMasterKeyFile(cfg.MasterKeyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	registryPriv, err := parseRegistrySeedHex(cfg.RegistryEd25519Key)
 	if err != nil {
 		log.Fatal(err)
 	}
-	tokens, err := auth.NewSessionTokenManager(tokenSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	registryTokens, err := auth.NewRegistryTokenIssuer(registryPriv, auth.RegistryIssuer, cfg.RegistryKeyID)
 	if err != nil {
 		log.Fatal(err)
 	}
-	registryTokens, err := newRegistryTokenIssuerFromEnv()
+
+	store, err := controlplane.OpenSQLite(cfg.DBPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -64,7 +63,7 @@ func main() {
 		Store:          store,
 		Tokens:         tokens,
 		RegistryTokens: registryTokens,
-		RegistryDomain: registryDomain,
+		RegistryDomain: cfg.RegistryDomain,
 		FeedKeys:       feedKeyCipher,
 	}
 
@@ -84,21 +83,21 @@ func main() {
 	}
 
 	var publisher *controlplane.Publisher
-	if beeAPIURL != "" {
+	if cfg.BeeAPIURL != nil {
 		publisher = &controlplane.Publisher{
-			Documents: swarm.NewBeeObjectStore(beeAPIURL, nil),
+			Documents: swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), nil),
 			Feeds: controlplane.BeeRegistryFeedUpdater{
-				BaseURL: beeAPIURL,
+				BaseURL: cfg.BeeAPIURL.String(),
 				Keys:    service,
 			},
 		}
 	}
 	service.Publisher = publisher
 
-	handler := controlplane.NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens})
+	handler := controlplane.NewHTTPServerWithConfig(service, auth.SubjectResolver{Tokens: tokens}, cfg)
 
-	log.Printf("control plane listening on %s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
+	log.Printf("control plane listening on %s", cfg.ListenAddr)
+	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -144,19 +143,6 @@ func legacyKeyMigrationEnabled() (bool, error) {
 	default:
 		return false, fmt.Errorf("CONTROLPLANE_MIGRATE_LEGACY_KEYS must be exactly \"true\" to enable legacy feed-key migration, or unset to skip it")
 	}
-}
-
-// newRegistryTokenIssuerFromEnv builds the Ed25519 registry token signing key
-// from a required, stable CONTROLPLANE_REGISTRY_ED25519_KEY hex seed. It never
-// generates an ephemeral key: a control plane without a stable signing seed
-// cannot start, because ephemeral tokens would not survive a restart. Errors
-// describe the failure without echoing the key material.
-func newRegistryTokenIssuerFromEnv() (*auth.RegistryTokenIssuer, error) {
-	priv, err := parseRegistrySeedHex(os.Getenv("CONTROLPLANE_REGISTRY_ED25519_KEY"))
-	if err != nil {
-		return nil, err
-	}
-	return auth.NewRegistryTokenIssuer(priv, auth.RegistryIssuer, registrySigningKeyID)
 }
 
 // parseRegistrySeedHex decodes an Ed25519 signing seed from a 64-char hex

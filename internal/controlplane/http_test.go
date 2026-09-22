@@ -56,6 +56,7 @@ func TestUIRegistryCreationFlow(t *testing.T) {
 		"ens_name":               {"alice.registry.eth"},
 		"default_stamp_batch_id": {"batch-1"},
 		"anonymous_pull":         {"true"},
+		"_csrf":                  {sessionCSRFForTest(t, cookies[0].Value)},
 	}
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/ui/registries/new", strings.NewReader(form.Encode()))
 	if err != nil {
