@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/resolve"
@@ -461,7 +462,7 @@ func TestFeedSignerUncertainResponseRecovery(t *testing.T) {
 
 	// Pre-reserve a pending operation the way a crashed first attempt left it.
 	hash := NormalizeFeedCommitHash(req)
-	if _, _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, hash); err != nil {
+	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}
 
@@ -622,5 +623,347 @@ func TestFeedSignerDifferentOperationIDsSameTarget(t *testing.T) {
 	_, err := w.signer.Commit(context.Background(), stale)
 	if !errors.Is(err, errFeedSignerGenerationConflict) {
 		t.Fatalf("expected stale-generation conflict, got %v", err)
+	}
+}
+
+// TestNormalizeFeedCommitHashCanonicalizesAndSeparates proves the request hash
+// normalizes typed fields before hashing (owner case, reference case, topic
+// case) and uses length-prefixed/domain-separated framing so no field or NUL
+// boundary can collide, and so the OperationID is bound into the hash.
+func TestNormalizeFeedCommitHashCanonicalizesAndSeparates(t *testing.T) {
+	base := publish.FeedCommitRequest{
+		OperationID:        "op-hash",
+		RegistryID:         7,
+		Owner:              "0xABCdef",
+		Topic:              "feed://0xABCdef/" + strings.Repeat("AB", 32),
+		Reference:          strings.Repeat("AB", 32),
+		BatchID:            "batch",
+		ExpectedGeneration: 3,
+	}
+	hBase := NormalizeFeedCommitHash(base)
+
+	canonical := base
+	canonical.Owner = "0xabcdef"
+	canonical.Topic = "feed://0xabcdef/" + strings.Repeat("ab", 32)
+	canonical.Reference = strings.Repeat("ab", 32)
+	if got := NormalizeFeedCommitHash(canonical); got != hBase {
+		t.Fatal("expected case-only differences to hash identically (canonicalization)")
+	}
+
+	mutations := map[string]func(*publish.FeedCommitRequest){
+		"batch":              func(r *publish.FeedCommitRequest) { r.BatchID = "batch2" },
+		"batch-with-nul":     func(r *publish.FeedCommitRequest) { r.BatchID = "batch\x00" },
+		"reference":          func(r *publish.FeedCommitRequest) { r.Reference = strings.Repeat("cd", 32) },
+		"registry":           func(r *publish.FeedCommitRequest) { r.RegistryID = 8 },
+		"generation":         func(r *publish.FeedCommitRequest) { r.ExpectedGeneration = 4 },
+		"operation-id":       func(r *publish.FeedCommitRequest) { r.OperationID = "op-hash2" },
+		"owner":              func(r *publish.FeedCommitRequest) { r.Owner = "0xfeed" },
+		"topic":              func(r *publish.FeedCommitRequest) { r.Topic = "feed://0xabcdef/" + strings.Repeat("cd", 32) },
+		"reference-nul-tail": func(r *publish.FeedCommitRequest) { r.Reference = strings.Repeat("ab", 32) + "\x00" },
+	}
+	for name, mutate := range mutations {
+		m := base
+		mutate(&m)
+		if got := NormalizeFeedCommitHash(m); got == hBase {
+			t.Fatalf("expected %q mutation to change the request hash", name)
+		}
+	}
+}
+
+// TestDecodeStoredResultStrictUnit drives the stored-result decoder directly
+// against duplicate members, unknown fields, trailing content, and
+// non-canonical field values.
+func TestDecodeStoredResultStrictUnit(t *testing.T) {
+	topic := "feed://abcdef/" + strings.Repeat("ab", 32)
+	ref := strings.Repeat("ab", 32)
+	good := `{"operationID":"op-x","feed":"` + topic + `","reference":"` + ref + `"}`
+	if _, err := decodeStoredResult([]byte(good)); err != nil {
+		t.Fatalf("well-formed stored result rejected: %v", err)
+	}
+	cases := map[string]string{
+		"duplicate-member":    `{"operationID":"op-x","feed":"` + topic + `","reference":"` + ref + `","operationID":"op-x"}`,
+		"unknown-field":       `{"operationID":"op-x","feed":"` + topic + `","reference":"` + ref + `","extra":1}`,
+		"trailing-content":    good + `{}`,
+		"blank":               ``,
+		"uppercase-reference": `{"operationID":"op-x","feed":"` + topic + `","reference":"` + strings.ToUpper(ref) + `"}`,
+		"noncanonical-feed":   `{"operationID":"op-x","feed":"` + strings.ToUpper(topic) + `","reference":"` + ref + `"}`,
+		"short-reference":     `{"operationID":"op-x","feed":"` + topic + `","reference":"abcd"}`,
+	}
+	for name, data := range cases {
+		if _, err := decodeStoredResult([]byte(data)); err == nil {
+			t.Fatalf("expected strict stored-result rejection for %s", name)
+		}
+	}
+}
+
+// TestFeedSignerStoredResultStrictDecodeFailClosed proves the signer refuses a
+// stored succeeded row whose result JSON violates the strict decoder contract,
+// failing closed with a data-free backend error rather than fabricating success.
+func TestFeedSignerStoredResultStrictDecodeFailClosed(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+	hash := NormalizeFeedCommitHash(req)
+	if _, err := w.store.ReserveFeedSignerOperation(ctx, req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+
+	cases := map[string]string{
+		"duplicate-member": `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('a') + `","operationID":"` + req.OperationID + `"}`,
+		"unknown-field":    `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('a') + `","extra":true}`,
+		"wrong-reference":  `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('d') + `"}`,
+		"wrong-feed":       `{"operationID":"` + req.OperationID + `","feed":"feed://other/` + strings.Repeat("ab", 32) + `","reference":"` + refHex('a') + `"}`,
+	}
+	for name, resultJSON := range cases {
+		if _, err := w.store.DB.ExecContext(ctx, `update feed_signer_operations
+			set state='succeeded', result_json=?, claim_token=null, lease_until=null
+			where operation_id=?`, resultJSON, req.OperationID); err != nil {
+			t.Fatalf("%s: seed succeeded row: %v", name, err)
+		}
+		_, err := w.signer.Commit(ctx, req)
+		if !errors.Is(err, errFeedSignerBackend) {
+			t.Fatalf("%s: expected fail-closed backend error, got %v", name, err)
+		}
+		// Reset to pending so the next case re-drives the same path.
+		if _, err := w.store.DB.ExecContext(ctx, `update feed_signer_operations
+			set state='pending', result_json=null where operation_id=?`, req.OperationID); err != nil {
+			t.Fatalf("%s: reset row: %v", name, err)
+		}
+	}
+}
+
+// countingFeedUpdater wraps a RegistryFeedUpdater and counts how many times the
+// network/key update path is actually exercised, across every signer/Store that
+// shares it.
+type countingFeedUpdater struct {
+	inner RegistryFeedUpdater
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingFeedUpdater) UpdateRegistryFeed(ctx context.Context, reg Registry, topic, ref string) error {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return c.inner.UpdateRegistryFeed(ctx, reg, topic, ref)
+}
+
+func (c *countingFeedUpdater) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// sharedFeedWorld opens N independent Stores over one shared on-disk database
+// and assembles N signers sharing one counting updater, one feed store, and one
+// document store, with a single ready registry.
+type sharedFeedWorld struct {
+	stores  []*Store
+	signers []*FeedSigner
+	updater *countingFeedUpdater
+	feeds   *MemoryRegistryFeedStore
+	docs    *resolve.MemoryDocumentStore
+	reg     Registry
+	topic   string
+}
+
+func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs map[string][]byte) *sharedFeedWorld {
+	t.Helper()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "shared-feed.db")
+	stores := make([]*Store, n)
+	for i := range stores {
+		s, err := OpenSQLite(dbPath)
+		if err != nil {
+			t.Fatalf("open store %d: %v", i, err)
+		}
+		// Wait out brief write locks across the independent pools instead of
+		// surfacing a spurious SQLITE_BUSY as a backend failure.
+		if _, err := s.DB.ExecContext(ctx, `pragma busy_timeout = 10000`); err != nil {
+			t.Fatalf("busy_timeout: %v", err)
+		}
+		stores[i] = s
+	}
+	owner, err := stores[0].CreateUser(ctx, "sharedfeed@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	reg, err := stores[0].CreateProvisionedRegistry(ctx, Registry{
+		Slug: "sharedfeed", Host: "sharedfeed.test", ENSName: "",
+		OwnerUserID: owner.ID, FeedOwnerAddress: "0xshared", DefaultStampBatchID: "batch-1",
+		AnonymousPull: true,
+	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
+		[]byte(testAuthPayload), []byte(testStampPayload))
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	if err := stores[0].MarkRegistryReady(ctx, reg.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	feeds := &MemoryRegistryFeedStore{Feeds: feedRefs}
+	docsStore := resolve.NewMemoryDocumentStore()
+	docsStore.Documents = docs
+	updater := &countingFeedUpdater{inner: feeds}
+	signers := make([]*FeedSigner, n)
+	for i := range signers {
+		signers[i] = &FeedSigner{Store: stores[i], Feeds: updater, ResolveFeeds: feeds, Docs: docsStore}
+	}
+	return &sharedFeedWorld{
+		stores: stores, signers: signers, updater: updater, feeds: feeds, docs: docsStore,
+		reg: reg, topic: spec.RepoStateFeedRef("0xshared", testRepo),
+	}
+}
+
+// TestFeedSignerTwoStoresIdenticalOpOneUpdate uses TWO independent Store
+// instances over one database and a counting updater to force an identical
+// concurrent interleaving: all callers succeed, but exactly ONE external update
+// happens. This is the cross-process/Store safety proof.
+func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
+	w := newSharedFeedWorld(t, 2,
+		map[string]string{spec.RepoStateFeedRef("0xshared", testRepo): refHex('b'), spec.StampPolicyFeedRef("0xshared"): refHex('c')},
+		map[string][]byte{
+			refHex('b'): mustRepoDoc(t, testRepo, 0),
+			refHex('a'): mustRepoDoc(t, testRepo, 1),
+			refHex('c'): mustStampDoc(t, "batch-1"),
+		})
+
+	req := validCommitReq(w.reg.ID, "batch-1")
+	req.Owner = "0xshared"
+	req.Topic = w.topic
+	req.ExpectedGeneration = 0
+
+	const n = 2
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		done.Add(1)
+		go func(i int) {
+			defer done.Done()
+			start.Wait()
+			_, errs[i] = w.signers[i].Commit(context.Background(), req)
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("signer %d commit: %v", i, errs[i])
+		}
+	}
+	if got := w.updater.count(); got != 1 {
+		t.Fatalf("expected exactly 1 external feed update across two Stores, got %d", got)
+	}
+	if got := w.feeds.Feeds[w.topic]; got != refHex('a') {
+		t.Fatalf("expected feed advanced once to target, got %q", got)
+	}
+	op, err := w.stores[0].GetFeedSignerOperation(context.Background(), req.OperationID)
+	if err != nil || op.State != FeedSignerOpSucceeded {
+		t.Fatalf("operation must be terminal succeeded (err=%v state=%q)", err, op.State)
+	}
+}
+
+// TestFeedSignerTwoStoresDistinctOpsOneUpdate uses TWO independent Store
+// instances and a counting updater with two DISTINCT operation IDs on the SAME
+// registry+topic: the durable (registry,topic) claim gate and the generation
+// guard together guarantee exactly ONE external update, and the loser never
+// updates the feed.
+func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
+	w := newSharedFeedWorld(t, 2,
+		map[string]string{spec.RepoStateFeedRef("0xshared", testRepo): refHex('b'), spec.StampPolicyFeedRef("0xshared"): refHex('c')},
+		map[string][]byte{
+			refHex('b'): mustRepoDoc(t, testRepo, 0),
+			refHex('a'): mustRepoDoc(t, testRepo, 1),
+			refHex('c'): mustStampDoc(t, "batch-1"),
+		})
+
+	reqA := validCommitReq(w.reg.ID, "batch-1")
+	reqA.OperationID = "shared-op-A"
+	reqA.Owner = "0xshared"
+	reqA.Topic = w.topic
+	reqA.Reference = refHex('a')
+	reqA.ExpectedGeneration = 0
+
+	reqB := reqA
+	reqB.OperationID = "shared-op-B"
+	reqB.Reference = refHex('d')
+	w.docs.Documents[refHex('d')] = mustRepoDoc(t, testRepo, 1)
+
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	done.Add(2)
+	var mu sync.Mutex
+	successes := 0
+	var firstErr error
+	run := func(signer *FeedSigner, req publish.FeedCommitRequest) {
+		defer done.Done()
+		start.Wait()
+		if _, err := signer.Commit(context.Background(), req); err == nil {
+			mu.Lock()
+			successes++
+			mu.Unlock()
+		} else if firstErr == nil {
+			mu.Lock()
+			firstErr = err
+			mu.Unlock()
+		}
+	}
+	go run(w.signers[0], reqA)
+	go run(w.signers[1], reqB)
+	start.Done()
+	done.Wait()
+
+	if got := w.updater.count(); got != 1 {
+		t.Fatalf("expected exactly 1 external feed update across two distinct ops, got %d", got)
+	}
+	if successes != 1 {
+		t.Fatalf("expected exactly one distinct-op commit to succeed, got %d (first err %v)", successes, firstErr)
+	}
+}
+
+// TestFeedSignerExpiredLeaseCrashRecovery proves crash recovery through the
+// durable claim: a processing row left by a crashed attempt (expired lease,
+// feed ALREADY advanced) is taken over by an identical request, which resolves
+// the target and completes WITHOUT a second external update.
+func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+
+	hash := NormalizeFeedCommitHash(req)
+	if _, err := w.store.ReserveFeedSignerOperation(ctx, req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	// Simulate the crashed attempt: it claimed with an already-expired lease and
+	// completed the network update (feed is at target) but never persisted.
+	if won, err := w.store.ClaimFeedSignerOperation(ctx, req.OperationID, hash, newClaimToken(), time.Now().UTC().Add(-time.Minute)); err != nil || !won {
+		t.Fatalf("seed crashed claim: won=%v err=%v", won, err)
+	}
+
+	updater := &countingFeedUpdater{inner: w.feedStore}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	result, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if result.OperationID != req.OperationID || result.Reference != req.Reference {
+		t.Fatalf("unexpected recovery result: %+v", result)
+	}
+	if got := updater.count(); got != 0 {
+		t.Fatalf("recovery must not re-run the external update, got %d", got)
+	}
+	op, _ := w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if op.State != FeedSignerOpSucceeded {
+		t.Fatalf("expected operation recovered to succeeded, got %q", op.State)
 	}
 }

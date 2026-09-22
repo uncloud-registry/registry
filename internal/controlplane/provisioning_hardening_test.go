@@ -74,7 +74,7 @@ func newHardHarness(t *testing.T, updater RegistryFeedUpdater, feedStore *Memory
 	reconciler.BackoffMax = 0
 	reconciler.Lease = 10 * time.Second
 	h := &hardHarness{store: store, service: service, uploader: uploader, feedStore: feedStore,
-		reconciler: reconciler, ownerID: owner.ID, now: time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)}
+		reconciler: reconciler, ownerID: owner.ID, now: time.Now().UTC().Add(5 * time.Second)}
 	reconciler.now = func() time.Time { return h.now }
 	return h
 }
@@ -622,6 +622,10 @@ func TestProvisioningSettingsGateStaleBootstrapCannotReenableAnonymousOrOldStamp
 	var mu sync.Mutex
 	var applied, rejected int
 	stop := make(chan struct{})
+	// rejectedSignal confirms the racer observed a rejection WHILE the registry
+	// was still provisioning, making the race outcome deterministic instead of
+	// depending on whether the goroutine scheduled before the ready transition.
+	rejectedSignal := make(chan struct{}, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -638,7 +642,14 @@ func TestProvisioningSettingsGateStaleBootstrapCannotReenableAnonymousOrOldStamp
 				}
 				mu.Lock()
 				rejected++
+				saw := rejected
 				mu.Unlock()
+				if saw > 0 {
+					select {
+					case rejectedSignal <- struct{}{}:
+					default:
+					}
+				}
 			} else {
 				mu.Lock()
 				applied++
@@ -646,6 +657,14 @@ func TestProvisioningSettingsGateStaleBootstrapCannotReenableAnonymousOrOldStamp
 			}
 		}
 	}()
+	// Wait until the racer has observed at least one rejection while the
+	// registry is still provisioning (guaranteed before readiness, once the
+	// gate is installed), THEN run the reconciler to race the ready transition.
+	select {
+	case <-rejectedSignal:
+	case <-time.After(5 * time.Second):
+		t.Fatal("racer never observed a rejection while provisioning (the registry must be provisioning until the reconciler runs)")
+	}
 	if err := h.reconciler.RunOnce(ctx); err != nil {
 		t.Fatalf("reconcile second registry: %v", err)
 	}

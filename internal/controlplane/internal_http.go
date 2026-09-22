@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 
 	"github.com/uncloud-registry/registry/internal/publish"
 )
@@ -113,12 +112,18 @@ func (s *InternalFeedServer) checkCredential(r *http.Request) bool {
 	if len(vals) != 1 {
 		return false
 	}
-	got := strings.TrimSpace(vals[0])
+	// EXACT byte comparison, never trimmed: the internal credential is the
+	// exact secret-file bytes, and a header value that differs by even one
+	// byte (including surrounding whitespace) is rejected. TrimSpace here
+	// would silently mutate the effective credential and defeat the exact
+	// comparison.
+	got := vals[0]
 	if got == "" {
 		return false
 	}
 	// Length-safe constant-time compare: unequal length returns 0 without
-	// leaking how far the prefix agreed.
+	// leaking how far the prefix agreed; duplicate-header values were already
+	// rejected above.
 	if len(got) != len(s.Secret) {
 		return false
 	}

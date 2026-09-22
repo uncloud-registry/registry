@@ -83,23 +83,49 @@ func main() {
 
 	// The internal feed-signing listener is served on its own dedicated
 	// socket, separate from the public router, so it can never inherit the
-	// public browser CSRF/session assumptions. It is stopped with the process.
+	// public browser CSRF/session assumptions. It is stopped with the process,
+	// and a Serve error here enters the main select and aborts the whole
+	// process with a nonzero exit (never log-and-continue).
 	var internalSrv *http.Server
+	var serveErr chan error
 	if comps.internalHandler != nil && comps.internalAddr != "" {
 		internalLn, err := net.Listen("tcp", comps.internalAddr)
 		if err != nil {
 			log.Fatal(err)
 		}
-		internalSrv = &http.Server{Handler: comps.internalHandler}
+		internalSrv = &http.Server{
+			Handler:           comps.internalHandler,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    64 * 1024,
+		}
+		serveErr = make(chan error, 2)
 		go func() {
-			if err := internalSrv.Serve(internalLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("control plane internal feed signer: %v", err)
+			var serr error
+			if comps.internalTLS != nil {
+				tlsConfig := &tls.Config{
+					Certificates: []tls.Certificate{*comps.internalTLS},
+					MinVersion:   tls.VersionTLS12,
+				}
+				serr = internalSrv.Serve(tls.NewListener(internalLn, tlsConfig))
+			} else {
+				serr = internalSrv.Serve(internalLn)
+			}
+			if serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+				serveErr <- serr
 			}
 		}()
-		log.Printf("control plane internal feed signer listening on %s", comps.internalAddr)
+		mode := "plaintext"
+		if comps.internalTLS != nil {
+			mode = "TLS"
+		}
+		log.Printf("control plane internal feed signer (%s) listening on %s", mode, comps.internalAddr)
 	}
-
-	serveErr := make(chan error, 1)
+	if serveErr == nil {
+		serveErr = make(chan error, 1)
+	}
 	go func() { serveErr <- srv.Serve(listener) }()
 
 	select {
@@ -126,13 +152,14 @@ func main() {
 // performs, so tests can inject spies that prove invalid values cause zero
 // file, DB, or listening side effects before startup fails.
 type controlPlaneDeps struct {
-	newSessionManager  func(secret, issuer, audience string) (*auth.SessionTokenManager, error)
-	loadMasterKey      func(path string) (*controlplane.FeedKeyCipher, error)
-	parseRegistrySeed  func(seedHex string) (ed25519.PrivateKey, error)
-	newRegistryIssuer  func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error)
-	loadTLSKeyPair     func(certFile, keyFile string) (tls.Certificate, error)
-	openStore          func(dbPath string) (*controlplane.Store, error)
-	loadInternalSecret func(path string) ([]byte, error)
+	newSessionManager      func(secret, issuer, audience string) (*auth.SessionTokenManager, error)
+	loadMasterKey          func(path string) (*controlplane.FeedKeyCipher, error)
+	parseRegistrySeed      func(seedHex string) (ed25519.PrivateKey, error)
+	newRegistryIssuer      func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error)
+	loadTLSKeyPair         func(certFile, keyFile string) (tls.Certificate, error)
+	loadInternalTLSKeyPair func(certFile, keyFile string) (tls.Certificate, error)
+	openStore              func(dbPath string) (*controlplane.Store, error)
+	loadInternalSecret     func(path string) ([]byte, error)
 }
 
 func defaultDeps() controlPlaneDeps {
@@ -143,9 +170,10 @@ func defaultDeps() controlPlaneDeps {
 		newRegistryIssuer: func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error) {
 			return auth.NewRegistryTokenIssuer(priv, issuer, keyID)
 		},
-		loadTLSKeyPair:     tls.LoadX509KeyPair,
-		openStore:          controlplane.OpenSQLite,
-		loadInternalSecret: credential.LoadSecretFile,
+		loadTLSKeyPair:         tls.LoadX509KeyPair,
+		loadInternalTLSKeyPair: tls.LoadX509KeyPair,
+		openStore:              controlplane.OpenSQLite,
+		loadInternalSecret:     credential.LoadSecretFile,
 	}
 }
 
@@ -164,6 +192,10 @@ type controlPlaneComponents struct {
 	// never inherit the public router's browser CSRF/session assumptions.
 	internalHandler http.Handler
 	internalAddr    string
+	// internalTLS, when non-nil, is the already-parsed certificate for the
+	// internal feed-signing listener (non-loopback internal binds require TLS).
+	// It is loaded and validated BEFORE the database opens.
+	internalTLS *tls.Certificate
 }
 
 // prepareControlPlane assembles every component strictly in dependency order:
@@ -174,8 +206,8 @@ type controlPlaneComponents struct {
 // listens. Errors contain no secret material and no file paths.
 func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) (*controlPlaneComponents, error) {
 	if deps.newSessionManager == nil || deps.loadMasterKey == nil || deps.parseRegistrySeed == nil ||
-		deps.newRegistryIssuer == nil || deps.loadTLSKeyPair == nil || deps.openStore == nil ||
-		deps.loadInternalSecret == nil {
+		deps.newRegistryIssuer == nil || deps.loadTLSKeyPair == nil || deps.loadInternalTLSKeyPair == nil ||
+		deps.openStore == nil || deps.loadInternalSecret == nil {
 		return nil, errors.New("startup dependencies must be fully supplied")
 	}
 
@@ -205,6 +237,19 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 		if err := credential.ValidateSecret(internalSecret); err != nil {
 			return nil, err
 		}
+	}
+
+	// A non-loopback internal feed-signing listener requires TLS (config
+	// validation enforces the prerequisite); the cert/key pair is loaded and
+	// validated BEFORE the database opens, so a malformed pair can never touch
+	// SQLite. Errors are data-free.
+	var internalTLS *tls.Certificate
+	if cfg.InternalTLSCertFile != "" {
+		cert, err := deps.loadInternalTLSKeyPair(cfg.InternalTLSCertFile, cfg.InternalTLSKeyFile)
+		if err != nil {
+			return nil, errors.New("failed to load the internal TLS certificate and private key pair")
+		}
+		internalTLS = &cert
 	}
 
 	registryPriv, err := deps.parseRegistrySeed(cfg.RegistryEd25519Key)
@@ -291,6 +336,8 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 	// internal secret. Both CONTROPLANE_INTERNAL_ADDR and the secret file must
 	// be present, or startup fails closed before any listener binds.
 	if cfg.BeeAPIURL != nil {
+		// Config validation has already required the internal addr + secret
+		// pair when Bee signing is enabled, so this is a defensive guard only.
 		if cfg.InternalAddr == "" || len(internalSecret) == 0 {
 			return nil, errors.New("control-plane Bee feed signing requires CONTROLPLANE_INTERNAL_ADDR and CONTROLPLANE_INTERNAL_SECRET_FILE")
 		}
@@ -309,8 +356,7 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 		}
 		comps.internalHandler = internal
 		comps.internalAddr = cfg.InternalAddr
-	} else if cfg.InternalAddr != "" {
-		return nil, errors.New("CONTROLPLANE_INTERNAL_ADDR requires control-plane Bee feed signing (CONTROLPLANE_BEE_API_URL)")
+		comps.internalTLS = internalTLS
 	}
 	return comps, nil
 }

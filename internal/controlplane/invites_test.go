@@ -821,7 +821,7 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
 			got, err := CurrentSchemaVersion(ctx, db)
-			if err != nil || got != 9 {
+			if err != nil || got != 10 {
 				t.Fatalf("expected schema version 9, got %d (err %v)", got, err)
 			}
 			assertInviteDigestSchema(t, db)
@@ -1119,7 +1119,7 @@ func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("invite recipient normalization collision must not fail the migration: %v", err)
 		}
-		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 9 {
+		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 10 {
 			t.Fatalf("expected version 9, got %d (err %v)", got, err)
 		}
 		var emailA, emailB string
@@ -1273,7 +1273,7 @@ func TestInviteDigestMigrationNormalizesLegacyEmailsEveryVersion(t *testing.T) {
 			if err := ApplyMigrations(ctx, db); err != nil {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
-			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 9 {
+			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 10 {
 				t.Fatalf("expected schema version 9, got %d (err %v)", got, err)
 			}
 
@@ -1873,15 +1873,15 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 9 {
+	if version != 10 {
 		t.Fatalf("expected schema version 9 after repair, got %d", version)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 6 {
-		t.Fatalf("expected exactly 6 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7 + forward 8 + forward 9), got %d", migCount)
+	if migCount != 7 {
+		t.Fatalf("expected exactly 7 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7 + forward 8 + forward 9 + forward 10), got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 
@@ -2001,7 +2001,7 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("re-apply migrations after repair: %v", err)
 	}
-	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 9 {
+	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 10 {
 		t.Fatalf("version must stay 8 on re-apply, got %d (err %v)", version, err)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
@@ -2037,14 +2037,14 @@ func TestInviteMigrationV5FromCleanV4Schema(t *testing.T) {
 		t.Fatalf("apply migrations from clean v4: %v", err)
 	}
 	version, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || version != 9 {
+	if err != nil || version != 10 {
 		t.Fatalf("expected schema version 9 from clean v4, got %d (err %v)", version, err)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 9 {
+	if migCount != 10 {
 		t.Fatalf("expected 9 migration rows, got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)

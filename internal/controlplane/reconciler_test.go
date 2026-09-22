@@ -129,7 +129,7 @@ func newProvisioningHarness(t *testing.T) *provisioningHarness {
 
 	h := &provisioningHarness{
 		store: store, service: service, uploader: uploader, feeds: feeds, feedStore: feedStore,
-		reconciler: reconciler, ownerID: owner.ID, now: time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC),
+		reconciler: reconciler, ownerID: owner.ID, now: time.Now().UTC().Add(5 * time.Second),
 	}
 	reconciler.now = func() time.Time { return h.now }
 	return h

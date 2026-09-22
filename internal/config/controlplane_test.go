@@ -30,6 +30,7 @@ func setEnv(t *testing.T, m map[string]string) {
 		envExternalURL, envRegistryDomain, envRegistryKey, envRegistryKeyID,
 		envMasterKeyFile, envBeeAPIURL, envTrustedProxies, envTLSTermination,
 		envTLSCertFile, envTLSKeyFile, envMigrateLegacy,
+		envInternalAddr, envInternalSecretFile, envInternalTLSCert, envInternalTLSKey,
 	} {
 		t.Setenv(k, "")
 	}
@@ -332,6 +333,9 @@ func TestControlPlaneConfigAggregate(t *testing.T) {
 	prod, err := loadValidated(t, prodEnv(map[string]string{
 		envSessionTTL: "1h", envBeeAPIURL: "https://bee.example.com",
 		envRegistryDomain: "Registry.Example.COM", envRegistryKeyID: "cp-ed25519-1",
+		// The internal feed signer is REQUIRED to serve Bee signing; a loopback
+		// plaintext bind (with its secret file) satisfies the pairing.
+		envInternalAddr: "127.0.0.1:8089", envInternalSecretFile: "/var/secrets/internal",
 	}))
 	if err != nil {
 		t.Fatalf("aggregate production config rejected: %v", err)

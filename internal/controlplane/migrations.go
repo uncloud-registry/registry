@@ -274,6 +274,23 @@ var migrations = []migration{
 		Version: 9,
 		Apply:   installFeedSignerOperationStore,
 	},
+	// Version 10 REBUILDS the migration-9 feed_signer_operations table with the
+	// durable-claims and concurrency invariants Task 10 requires: registry_id +
+	// canonical topic (the active repo claim) with a partial UNIQUE index over
+	// (registry_id, topic) for state='processing' so exactly one operation per
+	// repository feed can ever be advancing; a pending|processing|succeeded
+	// vocabulary with exact storage-class guards; an unpredictable claim_token
+	// and a future, bounded lease held ONLY in processing; result_json valid
+	// only on succeeded rows and only as the bounded exact-field JSON object;
+	// and attempts/timestamps. Existing migration-9 rows cannot be upgraded
+	// because registry_id and the canonical topic are not derivable from what
+	// migration 9 persisted — the migration therefore fails CLOSED whenever any
+	// row exists, and rebuilds only an empty table (the branch is unreleased, so
+	// a real database never carries migration 9).
+	{
+		Version: 10,
+		Apply:   installFeedSignerOperationStoreV10,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
-	"strconv"
+	"net/netip"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/uncloud-registry/registry/internal/spec"
 )
 
 // InternalFeedUpdatePath is the exact internal feed-update endpoint path. The
@@ -50,7 +55,9 @@ type FeedCommitResult struct {
 }
 
 // Stable sentinel errors mapping the internal service's coarse statuses. They
-// carry no internal error text, secrets, or topology.
+// carry no internal error text, secrets, or topology, and every raw transport/
+// decode/build detail is REDUCED to one of them before it can cross a caller
+// boundary.
 var (
 	// ErrCommitUnauthorized is returned when the control plane rejects the
 	// internal credential (401).
@@ -66,22 +73,19 @@ var (
 	// input, or when the repository generation advanced elsewhere (409).
 	ErrCommitConflict = errors.New("feed commit operation conflict")
 	// ErrCommitBackend is a retryable control-plane/Bee/dependency failure (503).
+	// It is also the class to which every raw network, dial, timeout, URL,
+	// TLS, decode, and validation-of-response failure collapses, so no host/
+	// port/path/topology or response body ever reaches err.Error().
 	ErrCommitBackend = errors.New("feed signing service is temporarily unavailable")
 )
 
-// CommitResponseMaxBody bounds the internal feed-commit response body. A
-// successful result is a tiny JSON object; 4 KiB is far beyond it while still
-// bounding hostile output before a single decode.
+// CommitResponseMaxBody bounds the internal feed-commit response body.
 const CommitResponseMaxBody = 4096
 
-// CommitRequestMaxBody bounds the internal feed-commit request body. The
-// request is a handful of bounded strings; 16 KiB is far beyond it.
+// CommitRequestMaxBody bounds the internal feed-commit request body.
 const CommitRequestMaxBody = 16384
 
-// Bounded string-length contract for every request field. The control plane
-// enforces the same (or stricter) bounds server-side; these are the shared
-// upper limits so the client and server can never disagree about what is
-// legitimately bounded.
+// Bounded string-length contract for every request field.
 const (
 	operationIDMaxLen = 128
 	ownerMaxLen       = 128
@@ -90,51 +94,64 @@ const (
 )
 
 // commitRequestTimeout is the per-request deadline applied via the request
-// context even when the supplied HTTP client has no Timeout configured, so a
-// stalled or hung control plane can never block a push indefinitely.
+// context even when the supplied HTTP client has no Timeout configured.
 const commitRequestTimeout = 30 * time.Second
 
 // ControlPlaneCommitter commits an immutable repository-state reference through
 // the control plane's internal feed-signing service. It carries NO key
-// material: the feed-owner signing key never leaves the control plane. The
-// internal credential (Secret) authenticates the registry data plane and is
-// mounted from a secret file; it is never a feed key.
+// material. The internal credential (Secret) authenticates the registry data
+// plane and is mounted from a secret file.
 type ControlPlaneCommitter struct {
-	// BaseURL is the control-plane internal feed-signing origin (scheme+host
-	// [+port]); the request path is always InternalFeedUpdatePath.
+	// BaseURL is the control-plane internal feed-signing origin, validated and
+	// canonicalized by Commit: absolute http(s), host required, no userinfo,
+	// path (beyond empty or "/"), query, or fragment. Plaintext http is
+	// accepted ONLY for a loopback host; any non-loopback origin must use
+	// https.
 	BaseURL string
 	// Secret is the internal service credential bytes loaded from a secret
-	// file by the caller. It must be non-empty.
+	// file. It is never echoed.
 	Secret []byte
-	// HTTPClient is the transport; a nil client uses http.DefaultClient, and
-	// every request still gets a per-request context deadline.
+	// HTTPClient is the transport; a nil client uses http.DefaultClient.
 	HTTPClient *http.Client
+	// Logger, when set, records the raw transport/diagnostic detail that is
+	// deliberately NOT propagated in returned errors (data-free to callers).
+	Logger *slog.Logger
 }
 
-// Commit sends one authenticated, bounded feed-commit request and decodes the
-// stable result. It returns one of the package sentinels mapped from the
-// control plane's coarse status code, so a caller can classify failures
-// without parsing text. There is deliberately NO retry loop here: retries that
-// could double-advance a feed are only safe under the same OperationID
-// idempotency contract, which the caller (not the transport) owns.
+func (c ControlPlaneCommitter) logf(msg string, args ...any) {
+	if c.Logger != nil {
+		c.Logger.Warn(msg, args...)
+	}
+}
+
+// Commit sends one authenticated, bounded feed-commit request, strictly decodes
+// and canonically VERIFIES the result against the request, and returns only a
+// fixed sentinel class on any failure. A successful result is never returned
+// unless its OperationID/Feed/Reference EXACTLY match the (canonicalized)
+// request; a mismatched, malformed, or duplicated response is a fail-closed
+// backend error, never an accepted success. Every raw network/URL/decode error
+// collapses to ErrCommitBackend so no URL/host/port/dial/body leaks through
+// err.Error(). There is no retry loop here: safe retries use the same
+// OperationID idempotency contract the caller owns.
 func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest) (FeedCommitResult, error) {
-	baseURL := strings.TrimRight(c.BaseURL, "/")
-	if baseURL == "" {
-		return FeedCommitResult{}, fmt.Errorf("%w: control plane URL is not configured", ErrCommitBackend)
+	baseURL, err := parseCommitBaseURL(c.BaseURL)
+	if err != nil {
+		c.logf("internal commit: invalid base URL", "err", err.Error())
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 	if len(c.Secret) == 0 {
-		return FeedCommitResult{}, fmt.Errorf("%w: internal service credential is not configured", ErrCommitBackend)
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 	if err := validateCommitRequestShape(req); err != nil {
-		return FeedCommitResult{}, fmt.Errorf("%w: %v", ErrCommitMalformed, err)
+		return FeedCommitResult{}, ErrCommitMalformed
 	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
-		return FeedCommitResult{}, fmt.Errorf("%w: encode request: %v", ErrCommitMalformed, err)
+		return FeedCommitResult{}, ErrCommitMalformed
 	}
 	if len(body) > CommitRequestMaxBody {
-		return FeedCommitResult{}, fmt.Errorf("%w: request exceeds the bound", ErrCommitMalformed)
+		return FeedCommitResult{}, ErrCommitMalformed
 	}
 
 	client := c.HTTPClient
@@ -142,9 +159,6 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 		client = http.DefaultClient
 	}
 
-	// Per-request timeout even when the supplied client has none: derive a
-	// deadline sub-context unless the caller already imposed one, and always
-	// propagate the caller's cancellation.
 	reqCtx := ctx
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -154,29 +168,30 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+InternalFeedUpdatePath, bytes.NewReader(body))
 	if err != nil {
-		return FeedCommitResult{}, fmt.Errorf("%w: create request: %v", ErrCommitMalformed, err)
+		return FeedCommitResult{}, ErrCommitMalformed
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set(InternalAuthHeader, string(c.Secret))
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return FeedCommitResult{}, fmt.Errorf("%w: %v", ErrCommitBackend, err)
+		// Raw dial/TLS/timeout detail is correlated locally, never returned.
+		c.logf("internal commit: transport failure")
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 	defer resp.Body.Close()
 
-	// Drain a bounded amount on every path so the connection can be reused.
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, CommitResponseMaxBody+1))
 	if err != nil {
-		return FeedCommitResult{}, fmt.Errorf("%w: read response: %v", ErrCommitBackend, err)
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 	if len(respBody) > CommitResponseMaxBody {
-		return FeedCommitResult{}, fmt.Errorf("%w: response exceeded the bound", ErrCommitBackend)
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		return decodeCommitResult(respBody)
+		return decodeCommitResult(respBody, req)
 	case http.StatusUnauthorized:
 		return FeedCommitResult{}, ErrCommitUnauthorized
 	case http.StatusBadRequest:
@@ -187,30 +202,101 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 		return FeedCommitResult{}, ErrCommitConflict
 	default:
 		// 503 and anything else on the backend side is retryable/dependency.
-		return FeedCommitResult{}, fmt.Errorf("%w: control plane returned status %d", ErrCommitBackend, resp.StatusCode)
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 }
 
-// decodeCommitResult strictly decodes a bounded successful response: unknown
-// top-level fields are rejected and trailing content after the single JSON
-// value is rejected.
-func decodeCommitResult(data []byte) (FeedCommitResult, error) {
+// parseCommitBaseURL validates and canonicalizes the internal feed-signing
+// origin: absolute http(s), host required, no userinfo, no path beyond empty
+// or "/", no query, no fragment. Plaintext http is allowed ONLY for a loopback
+// host (127.0.0.0/8, ::1, or localhost); any other host must use https. The
+// returned value is the canonical scheme://host[:port] origin.
+func parseCommitBaseURL(raw string) (string, error) {
+	raw = strings.TrimRight(raw, "/")
+	if raw == "" {
+		return "", errors.New("control plane URL is not configured")
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", errors.New("control plane URL is not an absolute origin")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", errors.New("control plane URL must be http or https")
+	}
+	if u.User != nil {
+		return "", errors.New("control plane URL must not contain userinfo")
+	}
+	if u.RawQuery != "" {
+		return "", errors.New("control plane URL must not contain a query")
+	}
+	if u.Fragment != "" {
+		return "", errors.New("control plane URL must not contain a fragment")
+	}
+	if p := u.EscapedPath(); p != "" && p != "/" {
+		return "", errors.New("control plane URL must be an origin with no path")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return "", errors.New("control plane URL uses plaintext http for a non-loopback host")
+	}
+	return u.Scheme + "://" + u.Host, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	// Strip IPv6 brackets before parsing.
+	h := host
+	if len(h) > 1 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	addr, err := netip.ParseAddr(h)
+	if err != nil {
+		return false // a DNS name is not provably loopback
+	}
+	return addr.IsLoopback()
+}
+
+// decodeCommitResult STRICTLY decodes a bounded successful response: duplicate
+// members anywhere, unknown top-level fields, trailing content, malformed or
+// unbounded field values, and a result that does not canonically match the
+// request are all rejected. Only a fully validated, request-equal result is
+// returned as success.
+func decodeCommitResult(data []byte, req FeedCommitRequest) (FeedCommitResult, error) {
+	if err := rejectDuplicateJSONMembers(data); err != nil {
+		return FeedCommitResult{}, ErrCommitBackend
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var result FeedCommitResult
 	if err := dec.Decode(&result); err != nil {
-		return FeedCommitResult{}, fmt.Errorf("%w: decode result: %v", ErrCommitBackend, err)
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return FeedCommitResult{}, fmt.Errorf("%w: trailing response content", ErrCommitBackend)
+		return FeedCommitResult{}, ErrCommitBackend
+	}
+	if err := ValidateCommitResult(result); err != nil {
+		return FeedCommitResult{}, ErrCommitBackend
+	}
+	// Canonical constant/normal comparison of every result field to the
+	// request before success; the publisher must never accept an unrelated
+	// result.
+	if result.OperationID != req.OperationID {
+		return FeedCommitResult{}, ErrCommitBackend
+	}
+	if result.Feed != CanonicalTopic(req.Topic) {
+		return FeedCommitResult{}, ErrCommitBackend
+	}
+	if result.Reference != CanonicalReference(req.Reference) {
+		return FeedCommitResult{}, ErrCommitBackend
 	}
 	return result, nil
 }
 
-// validateCommitRequestShape applies the client-side bounded syntax contract so
-// a malformed request is rejected before the network. The control plane applies
-// the SAME (and stronger) validation server-side; this only fails the client
-// fast.
+// validateCommitRequestShape applies the client-side bounded syntax contract.
 func validateCommitRequestShape(req FeedCommitRequest) error {
 	if req.OperationID == "" || len(req.OperationID) > operationIDMaxLen {
 		return errors.New("operationID must be non-empty and bounded")
@@ -224,7 +310,7 @@ func validateCommitRequestShape(req FeedCommitRequest) error {
 	if req.Topic == "" || len(req.Topic) > topicMaxLen {
 		return errors.New("topic must be non-empty and bounded")
 	}
-	if !isHexReference(req.Reference) {
+	if !IsHexReference(req.Reference) {
 		return errors.New("reference must be a 64-hex immutable object reference")
 	}
 	if req.BatchID == "" || len(req.BatchID) > batchIDMaxLen {
@@ -238,12 +324,14 @@ func validateCommitRequestShape(req FeedCommitRequest) error {
 
 // ValidateCommitRequest applies the bounded client-side syntax contract so the
 // control-plane feed signer and the data-plane client share exactly the same
-// acceptance rules for the fixed FeedCommitRequest shape.
+// acceptance rules.
 func ValidateCommitRequest(req FeedCommitRequest) error {
 	return validateCommitRequestShape(req)
 }
 
-func isHexReference(s string) bool {
+// IsHexReference reports whether s is a 64-character lowercase or uppercase
+// hexadecimal immutable object reference.
+func IsHexReference(s string) bool {
 	if len(s) != 64 {
 		return false
 	}
@@ -256,27 +344,133 @@ func isHexReference(s string) bool {
 	return true
 }
 
-// ComputeOperationID derives a stable, deterministic operation ID for a logical
-// repository publication from its immutable identity: registry, owner,
-// repository, tag, the manifest content digest, and the expected (current)
-// generation. Because it is a pure function of the immutable logical
-// publication, retrying the SAME publication computes the same OperationID and
-// the same FeedCommitRequest, so the control plane's durable idempotency
-// returns the stored result without advancing the feed twice. The returned
-// value is domain-separated so it cannot collide with any other ID domain.
+// CanonicalTopic returns the canonical deterministic form of a repository
+// state feed reference: feed://<normalized-owner>/<lowercase topic hex>. It is
+// the shared canonical form the client, signer, and stored result all compare
+// against, so a casing/whitespace difference can never fabricate a mismatch.
+func CanonicalTopic(topic string) string {
+	const prefix = "feed://"
+	if !strings.HasPrefix(topic, prefix) {
+		return strings.ToLower(topic)
+	}
+	rest := topic[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return prefix + spec.NormalizeOwner(rest[:i]) + "/" + strings.ToLower(rest[i+1:])
+	}
+	return prefix + spec.NormalizeOwner(rest)
+}
+
+// CanonicalReference returns the canonical lowercase form of a 64-hex object
+// reference.
+func CanonicalReference(ref string) string {
+	return strings.ToLower(ref)
+}
+
+// ValidateCommitResult enforces the bounded, canonical field contract on a
+// FeedCommitResult (used on both the wire response and the stored result).
+func ValidateCommitResult(result FeedCommitResult) error {
+	if result.OperationID == "" || len(result.OperationID) > operationIDMaxLen {
+		return errors.New("result operationID must be non-empty and bounded")
+	}
+	if result.Feed == "" || len(result.Feed) > topicMaxLen || result.Feed != CanonicalTopic(result.Feed) {
+		return errors.New("result feed must be a canonical feed reference")
+	}
+	if !IsHexReference(result.Reference) || result.Reference != CanonicalReference(result.Reference) {
+		return errors.New("result reference must be a canonical 64-hex value")
+	}
+	return nil
+}
+
+// rejectDuplicateJSONMembers rejects duplicate member names anywhere in a JSON
+// object so encoding/json's last-wins behavior cannot silently accept a
+// duplicated control-plane result field.
+func rejectDuplicateJSONMembers(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return walkJSON(dec)
+}
+
+func walkJSON(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	switch t := tok.(type) {
+	case json.Delim:
+		switch t {
+		case '{':
+			members := make(map[string]struct{})
+			for dec.More() {
+				keyTok, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyTok.(string)
+				if !ok {
+					return errors.New("invalid object key")
+				}
+				if _, dup := members[key]; dup {
+					return fmt.Errorf("duplicate object member %q", key)
+				}
+				members[key] = struct{}{}
+				if err := walkJSON(dec); err != nil {
+					return err
+				}
+			}
+			_, err := dec.Token()
+			return err
+		case '[':
+			for dec.More() {
+				if err := walkJSON(dec); err != nil {
+					return err
+				}
+			}
+			_, err := dec.Token()
+			return err
+		default:
+			return errors.New("unexpected delimiter")
+		}
+	case string, json.Number, bool, nil:
+		return nil
+	default:
+		return errors.New("unexpected token")
+	}
+}
+
+// ComputeOperationID derives a stable, deterministic, PROVISIONAL operation ID
+// for a logical repository publication from its immutable identity: registry,
+// owner, repository, tag, the manifest content digest, and the expected
+// (current) generation. It canonicalizes the owner (via NormalizeOwner) and
+// encodes every typed field with binary fixed-width (int64) or length-prefixed
+// (string) framing so no NUL/separator byte inside a value can create a field
+// boundary collision. Because it is a pure function of the immutable logical
+// publication, retrying the SAME publication computes the same OperationID.
+//
+// NOTE: Task 14 owns the FINAL stable-operation-ID and read-after-write retry
+// semantics at the manifest-PUT caller boundary. This provisional form keeps
+// the current caller wiring buildable and durable-idempotent for a supplied
+// OperationID, but does NOT itself solve Task 14's public retry contract.
 func ComputeOperationID(registryID int64, owner string, repo string, tag string, manifestDigest string, expectedGeneration int64) string {
 	h := sha256.New()
 	h.Write([]byte("uncloud-registry-feed-commit-op:v1\x00"))
-	h.Write([]byte(strconv.FormatInt(registryID, 10)))
-	h.Write([]byte{0})
-	h.Write([]byte(owner))
-	h.Write([]byte{0})
-	h.Write([]byte(repo))
-	h.Write([]byte{0})
-	h.Write([]byte(tag))
-	h.Write([]byte{0})
-	h.Write([]byte(manifestDigest))
-	h.Write([]byte{0})
-	h.Write([]byte(strconv.FormatInt(expectedGeneration, 10)))
+	writeInt64Field(h, registryID)
+	writeStringField(h, spec.NormalizeOwner(owner))
+	writeStringField(h, repo)
+	writeStringField(h, tag)
+	writeStringField(h, manifestDigest)
+	writeInt64Field(h, expectedGeneration)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeStringField(h io.Writer, s string) {
+	var lb [4]byte
+	binary.BigEndian.PutUint32(lb[:], uint32(len(s)))
+	h.Write(lb[:])
+	h.Write([]byte(s))
+}
+
+func writeInt64Field(h io.Writer, v int64) {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(v))
+	h.Write(b[:])
 }

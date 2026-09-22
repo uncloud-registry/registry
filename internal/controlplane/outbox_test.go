@@ -145,7 +145,7 @@ func TestProvisioningStaleClaimOwnerShipAndGuards(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create registry: %v", err)
 	}
-	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	lease := 10 * time.Second
 
 	jobs, token, err := store.ClaimStalePublicationJobs(ctx, now, lease, 2)

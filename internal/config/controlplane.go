@@ -84,6 +84,14 @@ type ControlPlaneConfig struct {
 	// never supplied directly in env/flags/JSON/logs, and is loaded/validated
 	// before the database opens.
 	InternalSecretFile string
+	// InternalTLSCertFile/InternalTLSKeyFile name the X.509 certificate and
+	// private key used to serve the internal feed-signing listener over TLS.
+	// They are REQUIRED together whenever the internal listener binds a
+	// NON-loopback host (plaintext bind is allowed only on loopback);
+	// loopback listeners may use TLS optionally. The keypair is loaded and
+	// validated BEFORE the database opens.
+	InternalTLSCertFile string
+	InternalTLSKeyFile  string
 }
 
 const (
@@ -116,6 +124,8 @@ const (
 	envMigrateLegacy      = "CONTROLPLANE_MIGRATE_LEGACY_KEYS"
 	envInternalAddr       = "CONTROLPLANE_INTERNAL_ADDR"
 	envInternalSecretFile = "CONTROLPLANE_INTERNAL_SECRET_FILE"
+	envInternalTLSCert    = "CONTROLPLANE_INTERNAL_TLS_CERT_FILE"
+	envInternalTLSKey     = "CONTROLPLANE_INTERNAL_TLS_KEY_FILE"
 )
 
 func rawEnv(name string) string { return os.Getenv(name) }
@@ -126,20 +136,22 @@ func trimmedEnv(name string) string { return strings.TrimSpace(os.Getenv(name)) 
 // validating it. Callers must run Validate before using the value.
 func Load() (*ControlPlaneConfig, error) {
 	cfg := &ControlPlaneConfig{
-		Mode:               Mode(trimmedEnv(envMode)),
-		ListenAddr:         envOr(envListenAddr, defaultListenAddr),
-		DBPath:             envOr(envDBPath, defaultDBPath),
-		SessionSecret:      rawEnv(envSessionSecret),
-		SessionTTL:         defaultSessionTTL,
-		RegistryDomain:     envOr(envRegistryDomain, defaultRegistryDomain),
-		RegistryEd25519Key: trimmedEnv(envRegistryKey),
-		RegistryKeyID:      envOr(envRegistryKeyID, defaultRegistryKeyID),
-		MasterKeyFile:      trimmedEnv(envMasterKeyFile),
-		InternalAddr:       trimmedEnv(envInternalAddr),
-		InternalSecretFile: trimmedEnv(envInternalSecretFile),
-		TLSTermination:     envOr(envTLSTermination, defaultTLSTermination),
-		TLSCertFile:        envOr(envTLSCertFile, ""),
-		TLSKeyFile:         envOr(envTLSKeyFile, ""),
+		Mode:                Mode(trimmedEnv(envMode)),
+		ListenAddr:          envOr(envListenAddr, defaultListenAddr),
+		DBPath:              envOr(envDBPath, defaultDBPath),
+		SessionSecret:       rawEnv(envSessionSecret),
+		SessionTTL:          defaultSessionTTL,
+		RegistryDomain:      envOr(envRegistryDomain, defaultRegistryDomain),
+		RegistryEd25519Key:  trimmedEnv(envRegistryKey),
+		RegistryKeyID:       envOr(envRegistryKeyID, defaultRegistryKeyID),
+		MasterKeyFile:       trimmedEnv(envMasterKeyFile),
+		InternalAddr:        trimmedEnv(envInternalAddr),
+		InternalSecretFile:  trimmedEnv(envInternalSecretFile),
+		InternalTLSCertFile: envOr(envInternalTLSCert, ""),
+		InternalTLSKeyFile:  envOr(envInternalTLSKey, ""),
+		TLSTermination:      envOr(envTLSTermination, defaultTLSTermination),
+		TLSCertFile:         envOr(envTLSCertFile, ""),
+		TLSKeyFile:          envOr(envTLSKeyFile, ""),
 	}
 
 	if raw := strings.TrimSpace(os.Getenv(envSessionTTL)); raw != "" {
@@ -594,21 +606,35 @@ func (c *ControlPlaneConfig) validateMasterKey() error {
 	return nil
 }
 
-// validateInternalFeed enforces the fail-closed pairing of the internal
-// feed-signing listener: the internal address and the internal secret file must
-// either both be configured or both be absent. A partial configuration fails
-// startup so the control plane never listens for feed commits without the
-// credential needed to authenticate them (or holds a secret it never serves).
+// validateInternalFeed enforces the fail-closed internal feed-signing
+// listener contract as a CONFIG-LOAD/TIME prerequisite, decided before any key
+// material is loaded or the database is opened:
+//
+//   - the internal address and internal secret file must either both be
+//     configured or both be absent (no listening without the credential);
+//   - the internal listener exists ONLY to serve control-plane Bee feed
+//     signing, so it must be configured EXACTLY when Bee is enabled — a Bee
+//     deployment without the internal pair, or an internal pair without Bee,
+//     fails startup here, never discovered after the DB opens;
+//   - a NON-loopback internal bind requires a paired internal TLS certificate/
+//     key (plaintext internal wiring is allowed only on loopback); loopback
+//     may use TLS optionally, and a partial TLS cert/key pair is rejected.
 func (c *ControlPlaneConfig) validateInternalFeed() error {
 	hasAddr := c.InternalAddr != ""
 	hasSecret := c.InternalSecretFile != ""
 	if hasAddr != hasSecret {
 		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR and CONTROLPLANE_INTERNAL_SECRET_FILE must be configured together")
 	}
+	beeEnabled := c.BeeAPIURL != nil
+	if beeEnabled != hasAddr {
+		// Bee feed signing is served ONLY through the internal signer; the
+		// internal listener serves ONLY feed signing.
+		return fmt.Errorf("CONTROLPLANE_BEE_API_URL requires CONTROLPLANE_INTERNAL_ADDR and CONTROLPLANE_INTERNAL_SECRET_FILE (control-plane Bee feed signing)")
+	}
 	if !hasAddr {
 		return nil
 	}
-	_, portStr, err := net.SplitHostPort(c.InternalAddr)
+	host, portStr, err := net.SplitHostPort(c.InternalAddr)
 	if err != nil {
 		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR must be a host:port address like %q", ":8089")
 	}
@@ -616,7 +642,35 @@ func (c *ControlPlaneConfig) validateInternalFeed() error {
 	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR must carry a numeric port in 1-65535")
 	}
+	hasTLSCert, hasTLSKey := c.InternalTLSCertFile != "", c.InternalTLSKeyFile != ""
+	if hasTLSCert != hasTLSKey {
+		return fmt.Errorf("CONTROLPLANE_INTERNAL_TLS_CERT_FILE and CONTROLPLANE_INTERNAL_TLS_KEY_FILE must be configured together")
+	}
+	if !hasTLSCert && !isLoopbackHost(host) {
+		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR must bind a loopback host for plaintext, or configure CONTROLPLANE_INTERNAL_TLS_CERT_FILE / CONTROLPLANE_INTERNAL_TLS_KEY_FILE for a non-loopback internal listener")
+	}
 	return nil
+}
+
+// isLoopbackHost reports whether an internal listener host is loopback
+// (localhost resolves to loopback; 127.0.0.0/8 and ::1 are loopback; an empty
+// host binds all interfaces and is never treated as loopback).
+func isLoopbackHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	h := host
+	if len(h) > 1 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	addr, err := netip.ParseAddr(h)
+	if err != nil {
+		return false // a DNS name is not provably loopback
+	}
+	return addr.IsLoopback()
 }
 
 func (c *ControlPlaneConfig) validateBee() error {

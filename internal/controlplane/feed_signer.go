@@ -1,14 +1,17 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
-	"strconv"
+	"time"
 
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/resolve"
@@ -44,12 +47,14 @@ var (
 // FeedKeyDecryptor solely for the immediate signing call and wipes it.
 type FeedSigner struct {
 	// Store resolves the registry by ID and persists the durable idempotency
-	// operations.
+	// operations (reserve/claim/complete).
 	Store *Store
 	// Feeds writes the repository-state feed update using the registry's
 	// feed-owner key. In Bee mode this is a BeeRegistryFeedUpdater backed by a
 	// FeedKeyDecryptor; it is invoked only after every owner/topic/generation/
-	// batch validation passes.
+	// batch validation passes AND this request won the durable (registry, topic)
+	// claim — so exactly one request per repository feed ever performs the
+	// network/key work at a time.
 	Feeds RegistryFeedUpdater
 	// ResolveFeeds independently resolves feeds (the repo-state feed and the
 	// deterministic stamp-policy feed) to their current refs. In Bee mode a
@@ -61,11 +66,15 @@ type FeedSigner struct {
 }
 
 // Commit is the constrained feed-commit boundary. It validates the bounded
-// request shape, derives a canonical request hash (never the raw JSON, so
-// field order/whitespace cannot alter identity), enforces durable per-
-// OperationID idempotency, and only then performs the registry/topic/
-// generation/batch/policy validation and the guarded feed update. All
-// validation runs BEFORE the feed-owner key is touched or any network update.
+// request shape, derives a canonical domain-separated request hash (never the
+// raw JSON), ensures a durable operation row, and then atomically CLAIMS the
+// right to perform the network/key work. Exactly one request owns the work for
+// a given operation (and for a given repository feed across DISTINCT
+// operations — via the partial unique index on processing). A concurrent
+// identical caller never performs the work: it bounds its poll for the
+// owner's stored result and returns it, or returns a retryable backend error
+// when the lease/context bound is reached. All validation runs BEFORE the
+// feed-owner key is touched or any network update.
 func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) (publish.FeedCommitResult, error) {
 	if isNilDependency(s.Store) || isNilDependency(s.Feeds) || isNilDependency(s.ResolveFeeds) || isNilDependency(s.Docs) {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: signer not fully configured", errFeedSignerBackend)
@@ -74,134 +83,187 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: %v", errFeedSignerMalformed, err)
 	}
 	reqHash := NormalizeFeedCommitHash(req)
+	canonicalTopic := publish.CanonicalTopic(req.Topic)
 
-	op, err := s.resolveOperation(ctx, req.OperationID, reqHash)
-	if err != nil {
-		// errFeedSignerConflict and all wrapped errors are already data-free
-		// and classified; return as-is.
-		return publish.FeedCommitResult{}, err
-	}
-
-	// A terminal succeeded operation with an identical request hash returns the
-	// stored result without consulting the feed or the key.
-	if op.State == FeedSignerOpSucceeded {
-		result, err := decodeStoredResult(op.ResultJSON)
-		if err != nil {
-			return publish.FeedCommitResult{}, fmt.Errorf("%w: %v", errFeedSignerBackend, err)
+	// Resolve the registry up front so an unknown registry is a deterministic,
+	// data-free "registry not found" (the durable row FK requires an existing
+	// registry, so this must precede reserving it). All remaining validation
+	// (owner, readiness, topic, generation, batch) runs later under the claim.
+	if _, err := s.Store.FindRegistryByID(ctx, req.RegistryID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return publish.FeedCommitResult{}, errFeedSignerRegistryNotFound
 		}
-		return result, nil
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
 	}
 
-	// Pending: perform the guarded signing. done=true means the feed already
-	// resolves to the target (a prior uncertain update succeeded); the result is
-	// still persisted idempotently, without a second advancement.
-	result, _, err := s.signCommit(ctx, req)
+	// Ensure a durable pending row exists for this operation. A reused
+	// OperationID with different input is a hard conflict.
+	op, err := s.Store.ReserveFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, reqHash)
 	if err != nil {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: reserve: %v", errFeedSignerBackend, err)
+	}
+	if op.RequestHash != reqHash {
+		return publish.FeedCommitResult{}, errFeedSignerConflict
+	}
+
+	// Claim the work with a bounded poll: a concurrent identical request that
+	// already owns the lease must not call the updater — we return its stored
+	// result when it succeeds, or a retryable backend error when the bound is
+	// reached.
+	for attempt := 0; ; attempt++ {
+		if attempt >= feedSignerClaimMaxAttempts {
+			return publish.FeedCommitResult{}, fmt.Errorf("%w: another request still owns this operation", errFeedSignerBackend)
+		}
+		op, err = s.Store.GetFeedSignerOperation(ctx, req.OperationID)
+		if err != nil {
+			return publish.FeedCommitResult{}, fmt.Errorf("%w: lookup: %v", errFeedSignerBackend, err)
+		}
+		switch op.State {
+		case FeedSignerOpSucceeded:
+			return s.storedResult(op, req)
+		case FeedSignerOpPending:
+			token := newClaimToken()
+			leaseUntil := time.Now().UTC().Add(feedSignerLeaseDuration)
+			won, cerr := s.Store.ClaimFeedSignerOperation(ctx, req.OperationID, reqHash, token, leaseUntil)
+			if cerr != nil {
+				// The partial-unique (registry, topic) gate refused this
+				// operation: a DISTINCT operation already owns the repository
+				// feed's processing slot (or a genuine DB failure). Either way
+				// we are the loser and must NEVER update. Retryable.
+				return publish.FeedCommitResult{}, fmt.Errorf("%w: claim: %v", errFeedSignerBackend, cerr)
+			}
+			if won {
+				return s.runSignedCommit(ctx, req, reqHash, token)
+			}
+			// An identical request won the claim; reload and poll.
+		case FeedSignerOpProcessing:
+			if op.LeaseUntil != nil && op.LeaseUntil.After(time.Now()) {
+				// A live lease is held by a concurrent owner (identical request,
+				// or a distinct operation on the same feed). Wait briefly and
+				// poll for its outcome.
+				if !waitForLease(ctx) {
+					return publish.FeedCommitResult{}, fmt.Errorf("%w: context cancelled while waiting for the operation owner", errFeedSignerBackend)
+				}
+				continue
+			}
+			// Expired lease (a crashed/uncertain prior attempt at this same
+			// operation): take it over with a fresh token and resolve.
+			token := newClaimToken()
+			leaseUntil := time.Now().UTC().Add(feedSignerLeaseDuration)
+			won, cerr := s.Store.ClaimFeedSignerOperation(ctx, req.OperationID, reqHash, token, leaseUntil)
+			if cerr != nil {
+				return publish.FeedCommitResult{}, fmt.Errorf("%w: reclaim: %v", errFeedSignerBackend, cerr)
+			}
+			if won {
+				return s.runSignedCommit(ctx, req, reqHash, token)
+			}
+			// Claim raced; reload and poll.
+		}
+	}
+}
+
+// runSignedCommit performs the guarded signing under a won claim and then
+// durably completes it (or conditionally releases on a definite pre-update
+// failure). An uncertain update failure keeps the lease until recovery.
+func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, claimToken string) (publish.FeedCommitResult, error) {
+	result, _, uncertain, err := s.signCommit(ctx, req)
+	if err != nil {
+		if !uncertain {
+			// Definite pre-update failure (malformed/not-ready/owner/topic/
+			// generation/batch): release the claim so a retry may re-claim.
+			_ = s.Store.ReleaseFeedSignerOperation(ctx, req.OperationID, claimToken)
+		}
+		// Uncertain update failure is NOT released: the lease is kept until a
+		// later identical request reclaims it (after expiry) and resolves the
+		// target without a second advancement.
 		return publish.FeedCommitResult{}, err
 	}
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: encode result: %v", errFeedSignerBackend, err)
 	}
-	if err := s.Store.CompleteFeedSignerOperation(ctx, req.OperationID, reqHash, resultJSON); err != nil {
+	if err := s.Store.CompleteFeedSignerOperation(ctx, req.OperationID, reqHash, claimToken, resultJSON); err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: persist result: %v", errFeedSignerBackend, err)
 	}
 	return result, nil
 }
 
-// resolveOperation returns the durable operation row, inserting a pending row
-// on first sight of an OperationID or reloading it when a concurrent first
-// request won the insert. It returns errFeedSignerConflict for a reused
-// OperationID whose request hash differs.
-func (s *FeedSigner) resolveOperation(ctx context.Context, operationID string, reqHash [32]byte) (FeedSignerOperation, error) {
-	existing, err := s.Store.GetFeedSignerOperation(ctx, operationID)
-	if err == nil {
-		if existing.RequestHash != reqHash {
-			return FeedSignerOperation{}, errFeedSignerConflict
-		}
-		return existing, nil
+// storedResult decodes and canonically VERIFIES a stored succeeded result
+// against the request before returning it: OperationID must equal the row and
+// the request, Feed must equal the canonical request topic, and Reference must
+// equal the canonical request reference. A corrupt or mismatched stored result
+// is a fail-closed backend error, never a fabricated success.
+func (s *FeedSigner) storedResult(op FeedSignerOperation, req publish.FeedCommitRequest) (publish.FeedCommitResult, error) {
+	result, err := decodeStoredResult(op.ResultJSON)
+	if err != nil {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: stored result: %v", errFeedSignerBackend, err)
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return FeedSignerOperation{}, fmt.Errorf("%w: lookup: %v", errFeedSignerBackend, err)
+	if result.OperationID != op.OperationID || result.OperationID != req.OperationID {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: stored result operation ID mismatch", errFeedSignerBackend)
 	}
-	op, created, rerr := s.Store.ReserveFeedSignerOperation(ctx, operationID, reqHash)
-	if rerr != nil {
-		return FeedSignerOperation{}, fmt.Errorf("%w: reserve: %v", errFeedSignerBackend, rerr)
+	if result.Feed != publish.CanonicalTopic(req.Topic) || result.Reference != publish.CanonicalReference(req.Reference) {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: stored result does not match this request", errFeedSignerBackend)
 	}
-	if created {
-		return op, nil
-	}
-	// A concurrent request inserted it between our miss and our reserve.
-	reload, rerr := s.Store.GetFeedSignerOperation(ctx, operationID)
-	if rerr != nil {
-		return FeedSignerOperation{}, fmt.Errorf("%w: reload: %v", errFeedSignerBackend, rerr)
-	}
-	if reload.RequestHash != reqHash {
-		return FeedSignerOperation{}, errFeedSignerConflict
-	}
-	return reload, nil
+	return result, nil
 }
 
 // signCommit performs the tight validation sequence and, only once every check
-// passes, the signed feed update. All validation precedes the key/network use.
-// done=true reports that the feed already resolves to the target reference
-// (uncertain-response recovery), so the caller persists the result without a
-// second advancement.
-func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitRequest) (publish.FeedCommitResult, bool, error) {
+// passes and the caller already owns the claim, the signed feed update. All
+// validation precedes the key/network use. done=true reports that the feed
+// already resolves to the target reference (uncertain-response recovery), so
+// the caller persists the result without a second advancement. uncertain=true
+// reports that the failure occurred DURING the network feed update (the update
+// may have partially/fully applied), so the caller keeps the lease.
+func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitRequest) (publish.FeedCommitResult, bool, bool, error) {
 	reg, err := s.Store.FindRegistryByID(ctx, req.RegistryID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return publish.FeedCommitResult{}, false, fmt.Errorf("%w: registry %d", errFeedSignerRegistryNotFound, req.RegistryID)
+			return publish.FeedCommitResult{}, false, false, fmt.Errorf("%w: registry %d", errFeedSignerRegistryNotFound, req.RegistryID)
 		}
-		return publish.FeedCommitResult{}, false, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
+		return publish.FeedCommitResult{}, false, false, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
 	}
 	if reg.ProvisioningState != ProvisioningStateReady {
-		return publish.FeedCommitResult{}, false, errFeedSignerNotReady
+		return publish.FeedCommitResult{}, false, false, errFeedSignerNotReady
 	}
 	// Owner check BEFORE any key access or network update: normalized
 	// constant-time comparison against the stored feed-owner address.
 	if !constantEqual(spec.NormalizeOwner(req.Owner), spec.NormalizeOwner(reg.FeedOwnerAddress)) {
-		return publish.FeedCommitResult{}, false, errFeedSignerRegistryNotFound
+		return publish.FeedCommitResult{}, false, false, errFeedSignerRegistryNotFound
 	}
 
-	// Topic proof: the immutable target reference must decode to a validated
-	// RepoStateDocument whose canonical Repo derives exactly the requested
-	// Topic (feed://<normalized owner>/<topic of "v1:repo:<repo>">), and its
-	// generation must be exactly ExpectedGeneration+1, overflow-safe.
+	// Topic proof + canonical target document + generation (definite pre-update).
 	targetRepo, err := s.verifyTopicFromReference(ctx, req, reg)
 	if err != nil {
-		return publish.FeedCommitResult{}, false, err
+		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Re-read the current repo feed and require current generation ==
-	// ExpectedGeneration and the repo identity matches. A missing feed
-	// (generation-zero bootstrap) fails closed here; Task 13 owns that path. If
-	// the current feed already resolves to the requested Reference, recovery
-	// completes idempotently (done=true) after validating the target document.
+	// Current feed + repo identity + generation (definite pre-update).
 	done, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
 	if err != nil {
-		return publish.FeedCommitResult{}, false, err
+		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Resolve the current stamp policy through the registry's deterministic
-	// stamp-policy feed and require the request batch exactly equals the
-	// selected repo override (or default) policy's batch.
+	// Stamp policy / batch proof (definite pre-update).
 	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
-		return publish.FeedCommitResult{}, false, err
+		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	result := publish.FeedCommitResult{OperationID: req.OperationID, Feed: req.Topic, Reference: req.Reference}
+	result := publish.FeedCommitResult{
+		OperationID: req.OperationID,
+		Feed:        publish.CanonicalTopic(req.Topic),
+		Reference:   publish.CanonicalReference(req.Reference),
+	}
 	if done {
-		// Already advanced to the target: no second advancement, just report.
-		return result, true, nil
+		// Already advanced to the target (recovery): no second advancement.
+		return result, true, false, nil
 	}
 
-	// All validation passed; the key is now decryptable and the feed is signed.
-	// This is the ONLY point a network update happens.
+	// All validation passed and we own the claim; the key is now decryptable
+	// and the feed is signed. THIS is the only point a network update happens.
 	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference); err != nil {
-		return publish.FeedCommitResult{}, false, fmt.Errorf("%w: feed update: %v", errFeedSignerBackend, err)
+		return result, false, true, fmt.Errorf("%w: feed update: %v", errFeedSignerBackend, err)
 	}
-	return result, false, nil
+	return result, false, false, nil
 }
 
 // verifyTopicFromReference decodes and validates the immutable target document
@@ -223,8 +285,7 @@ func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.F
 	if derived != req.Topic {
 		return "", fmt.Errorf("%w: topic is not the deterministic reference for the repository in the target document", errFeedSignerMalformed)
 	}
-	// Target generation must be exactly ExpectedGeneration+1, overflow-safe:
-	// the publication advanced exactly one generation from the caller's view.
+	// Target generation must be exactly ExpectedGeneration+1, overflow-safe.
 	if req.ExpectedGeneration == math.MaxInt64 {
 		return "", errFeedSignerGenerationConflict
 	}
@@ -245,9 +306,6 @@ func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCom
 		return false, fmt.Errorf("%w: current repo feed: %v", errFeedSignerBackend, err)
 	}
 	if swarm.CanonicalObjectRef(currentRef) == swarm.CanonicalObjectRef(req.Reference) {
-		// Already points at the target. Validate the current document identity
-		// (repo match) before reporting recovery success; target generation was
-		// already validated by verifyTopicFromReference.
 		curData, err := s.Docs.Read(ctx, currentRef)
 		if err != nil {
 			return false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
@@ -261,8 +319,6 @@ func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCom
 		}
 		return true, nil
 	}
-	// Not at the target: the feed must still be at the expected generation and
-	// the same repository, or a concurrent/other writer advanced it (conflict).
 	curData, err := s.Docs.Read(ctx, currentRef)
 	if err != nil {
 		return false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
@@ -309,34 +365,75 @@ func (s *FeedSigner) verifyBatch(ctx context.Context, req publish.FeedCommitRequ
 }
 
 // NormalizeFeedCommitHash derives the deterministic domain-separated SHA-256 of
-// the canonical typed request fields (NOT raw JSON, so field order/whitespace
-// cannot change identity, and NEVER the credential, which travels only in a
-// header). This is the fixed-size value durable-idempotency stores and compares.
+// the canonical TYPED request fields (NOT raw JSON, so field order/whitespace
+// cannot change identity, and NEVER the credential). Typed fields are
+// normalized FIRST (owner via NormalizeOwner, the 64-hex reference lowercased,
+// the topic as the canonical deterministic feed ref) and encoded with explicit
+// binary fixed-width or length-prefix framing — every string carries a 4-byte
+// big-endian length, every integer an 8-byte big-endian width — so no NUL or
+// separator byte inside a value can create field-boundary ambiguity. The
+// OperationID is deliberately included: the hash binds the request identity to
+// the durable operation row, so a reused OperationID with different input is a
+// hard conflict.
 func NormalizeFeedCommitHash(req publish.FeedCommitRequest) [32]byte {
 	h := sha256.New()
 	h.Write([]byte("uncloud-registry-feed-commit-req:v1\x00"))
-	h.Write([]byte(req.OperationID))
-	h.Write([]byte{0})
-	h.Write([]byte(strconv.FormatInt(req.RegistryID, 10)))
-	h.Write([]byte{0})
-	h.Write([]byte(req.Owner))
-	h.Write([]byte{0})
-	h.Write([]byte(req.Topic))
-	h.Write([]byte{0})
-	h.Write([]byte(req.Reference))
-	h.Write([]byte{0})
-	h.Write([]byte(req.BatchID))
-	h.Write([]byte{0})
-	h.Write([]byte(strconv.FormatInt(req.ExpectedGeneration, 10)))
+	writeHashBytes(h, publish.CanonicalTopic(req.Topic))
+	writeHashBytes(h, spec.NormalizeOwner(req.Owner))
+	writeHashBytes(h, publish.CanonicalReference(req.Reference))
+	writeHashBytes(h, req.BatchID)
+	writeHashInt(h, req.ExpectedGeneration)
+	writeHashInt(h, req.RegistryID)
+	writeHashBytes(h, req.OperationID)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
 }
 
+func writeHashBytes(h io.Writer, s string) {
+	var lb [4]byte
+	binary.BigEndian.PutUint32(lb[:], uint32(len(s)))
+	h.Write(lb[:])
+	h.Write([]byte(s))
+}
+
+func writeHashInt(h io.Writer, v int64) {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(v))
+	h.Write(b[:])
+}
+
+// decodeStoredResult STRICTLY decodes a stored succeeded result JSON: duplicate
+// members anywhere, unknown top-level fields, trailing content, and a field
+// contract violation are all rejected so a corrupt store row can never
+// fabricate a success.
 func decodeStoredResult(data []byte) (publish.FeedCommitResult, error) {
+	if len(data) == 0 {
+		return publish.FeedCommitResult{}, errors.New("blank stored result")
+	}
+	if err := rejectDuplicateJSONObjectMembers(data); err != nil {
+		return publish.FeedCommitResult{}, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	var result publish.FeedCommitResult
-	if err := json.Unmarshal(data, &result); err != nil {
+	if err := dec.Decode(&result); err != nil {
+		return publish.FeedCommitResult{}, err
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return publish.FeedCommitResult{}, errors.New("unexpected trailing content after stored result")
+	}
+	if err := publish.ValidateCommitResult(result); err != nil {
 		return publish.FeedCommitResult{}, err
 	}
 	return result, nil
+}
+
+func waitForLease(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(feedSignerClaimPollInterval):
+		return true
+	}
 }
