@@ -455,8 +455,15 @@ func (c *ControlPlaneConfig) externalURLIsOriginOnly() error {
 	if u.Fragment != "" {
 		return fmt.Errorf("CONTROLPLANE_EXTERNAL_URL must not contain a fragment")
 	}
-	if u.Hostname() == "" {
+	if h := u.Hostname(); h == "" {
 		return fmt.Errorf("CONTROLPLANE_EXTERNAL_URL must carry a host")
+	} else if strings.Contains(h, "%") {
+		// An IPv6 zone identifier is local-interface scope only (e.g.
+		// [fe80::1%eth0] after decoding %25eth0); it is not a canonical
+		// public origin and would leak a host-local scope into the browser
+		// Origin we compare against. Accept only zone-free, globally
+		// meaningful hosts.
+		return fmt.Errorf("CONTROLPLANE_EXTERNAL_URL must not contain an IPv6 zone identifier")
 	}
 	return nil
 }
@@ -650,27 +657,34 @@ func (c *ControlPlaneConfig) validateTermination() error {
 }
 
 // ExternalOrigin returns the scheme+host of the configured external URL, or "".
-// It is the only value the control plane compares browser Origins against. It
-// preserves IPv6 bracket semantics (URL.Host / net.JoinHostPort style) and
-// drops a port that equals the scheme's default (the Origin header omits it).
+// It is the only value the control plane compares browser Origins against. The
+// host/port are built with net.JoinHostPort / URL semantics so a bracketed
+// zone-free IPv6 host keeps its brackets while a scheme-default port is
+// dropped (the browser Origin header omits it); the host is never
+// hand-constructed, so an invalid host with stray colons cannot be produced.
 func (c *ControlPlaneConfig) ExternalOrigin() string {
 	if c.ExternalURL == nil {
 		return ""
 	}
 	u := c.ExternalURL
 	host := u.Hostname()
-	if strings.Contains(host, ":") {
-		// An IPv6 host must keep its brackets in a URL/Origin.
-		host = "[" + host + "]"
+	port := u.Port()
+	defaultPort := ""
+	switch u.Scheme {
+	case "http":
+		defaultPort = "80"
+	case "https":
+		defaultPort = "443"
 	}
-	if p := u.Port(); p != "" {
-		defaultPort := "80"
-		if u.Scheme == "https" {
-			defaultPort = "443"
-		}
-		if p != defaultPort {
-			host = host + ":" + p
-		}
+	if port != "" && port != defaultPort {
+		// Non-default port: JoinHostPort brackets IPv6 and leaves IPv4/DNS as-is.
+		return u.Scheme + "://" + net.JoinHostPort(host, port)
+	}
+	// No port, or the scheme-default port: emit the bare host. An IPv6 host
+	// must keep its brackets, produced by JoinHostPort (the empty port yields
+	// "[….]:", whose trailing ':' is the cleared marker, dropped here).
+	if strings.Contains(host, ":") {
+		return u.Scheme + "://" + strings.TrimSuffix(net.JoinHostPort(host, ""), ":")
 	}
 	return u.Scheme + "://" + host
 }

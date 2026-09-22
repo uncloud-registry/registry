@@ -394,9 +394,11 @@ func TestOversizedCookieFormPOST413NotCSRF403(t *testing.T) {
 	}
 }
 
-func TestOversizedMultipartRejected415(t *testing.T) {
-	// Multipart is rejected entirely (415); an oversized multipart body must
-	// not reach any handler or be silently treated as absent.
+func TestOversizedMultipartRejected413(t *testing.T) {
+	// Multipart is rejected entirely (415) when under the size bound, BUT body
+	// size is enforced FIRST for every body-capable method: an OVERSIZED
+	// multipart body is 413 (size wins over media type), never reaching any
+	// handler or being silently treated as absent.
 	store, _ := OpenSQLite("file:csec_fix2_mp_big?mode=memory&cache=shared")
 	tokens := testTokens(t)
 	service := &Service{Store: store, Tokens: tokens, RegistryDomain: "uncloud-registry.com"}
@@ -413,8 +415,8 @@ func TestOversizedMultipartRejected415(t *testing.T) {
 		t.Fatalf("oversized multipart: %v", err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusUnsupportedMediaType {
-		t.Fatalf("oversized multipart must be 415, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized multipart must be 413 (size first), got %d", resp.StatusCode)
 	}
 }
 

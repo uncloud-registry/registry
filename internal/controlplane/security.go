@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -408,7 +409,17 @@ func generousRateCaps() (RateLimitConfig, RateLimitConfig, RateLimitConfig, Rate
 // CSRF
 // ---------------------------------------------------------------------------
 
-var csrfContextKey = struct{}{}
+// securityContextKey is an unexported, typed context key so distinct security
+// context values can never collide (a bare struct{}{} key is identical for
+// every marker and would let the last write clobber the earlier ones).
+type securityContextKey string
+
+const (
+	csrfContextKey        securityContextKey = "csrf"
+	clientIPContextKey    securityContextKey = "client-ip"
+	requestIDContextKey   securityContextKey = "request-id"
+	requestBodyContextKey securityContextKey = "request-body"
+)
 
 // sessionClaimsFromCookie verifies the session cookie token, returning its
 // claims and whether it is a valid signed session.
@@ -434,9 +445,27 @@ func methodIsSafe(method string) bool {
 	}
 }
 
+// isFormContentType reports whether the request carries a canonical
+// application/x-www-form-urlencoded body — the only form type from which a
+// body CSRF candidate can be extracted. It parses the Content-Type with
+// mime.ParseMediaType (media type matching is case-insensitive/canonical and
+// ignores parameters/OWS/quoted values), NEVER substring matching, so a value
+// like "application/x-notmultipart" or a multipart string inside a quoted
+// parameter cannot false-match.
 func isFormContentType(r *http.Request) bool {
-	ct := r.Header.Get("Content-Type")
-	return strings.Contains(ct, "application/x-www-form-urlencoded") || strings.Contains(ct, "multipart/form-data")
+	mediatype, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return mediatype == "application/x-www-form-urlencoded"
+}
+
+// isMultipartMediaType reports whether a canonical media type (already parsed
+// by mime.ParseMediaType, so lowercased and parameter/quote-stripped) is
+// multipart/form-data or any multipart/* subtype. The control plane rejects all
+// multipart bodies with 415 because no handler uses them.
+func isMultipartMediaType(mediaType string) bool {
+	return mediaType == "multipart/form-data" || strings.HasPrefix(mediaType, "multipart/")
 }
 
 // checkCSRF enforces the session-bound CSRF rule for cookie-authenticated
@@ -447,9 +476,11 @@ func isFormContentType(r *http.Request) bool {
 // cookie is authoritative and CSRF is required. Requests with an invalid
 // bearer and no valid cookie fall through so the router's authorization
 // boundary 401s. Returns false after writing a 403 when the request must be
-// rejected. It never consumes a JSON body in a way that breaks the handler:
-// form bodies go through the cached ParseForm path and JSON bodies are only
-// checked via the header.
+// rejected. It never consumes or caches the request body: form `_csrf` is
+// extracted from the exact bounded bytes already captured in request context
+// (url.ParseQuery), so the handler that parses independently later sees the
+// same bytes and a malformed form is never masked. JSON bodies are checked via
+// the header only.
 func (p *securityPolicy) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
 	if methodIsSafe(r.Method) {
 		return true
@@ -479,9 +510,23 @@ func (p *securityPolicy) checkCSRF(w http.ResponseWriter, r *http.Request) bool 
 	// form-vs-header pairs, and any extra value are all rejected.
 	var candidates []string
 	if isFormContentType(r) {
-		// ParseForm caches its result, so the handler's later ParseForm reuses it.
-		_ = r.ParseForm()
-		candidates = append(candidates, r.PostForm["_csrf"]...)
+		// NEVER call ParseForm/ParseMultipartForm here: it would consume AND
+		// cache r.Body, masking a malformed body from the handler and mutating
+		// r.Form/r.PostForm. Instead parse the exact bytes already bounded and
+		// restored by the middleware (an immutable copy, so the handler that
+		// parses independently later sees the same bytes). Multipart was
+		// already rejected 415 before this point.
+		body := requestBodyFromContext(r.Context())
+		values, perr := url.ParseQuery(string(body))
+		if perr != nil {
+			// ANY url.ParseQuery error — even when it returns partial values
+			// carrying a nominally-valid `_csrf` — is a 400 before CSRF or the
+			// handler runs, with no side effects. A malformed body is never
+			// silently accepted by extracting a partial token.
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed form body"})
+			return false
+		}
+		candidates = append(candidates, values["_csrf"]...)
 	}
 	for _, hv := range r.Header.Values("X-CSRF-Token") {
 		if hv != "" {
@@ -738,30 +783,22 @@ func hashLimiterKey(k string) string {
 	return b.String()
 }
 
-// loginEmail peels the email from a login/register form or JSON body without
-// calling ParseForm, so a failed/malformed parse is never cached-and-masked for
-// the handler. It reads the buffered body and restores it (readBody), parses the
-// raw bytes directly, and leaves r.Body intact; the handler's own parse still
-// observes real parse errors.
+// loginEmail peels the email from a login/register form or JSON body for the
+// rate-limit key, WITHOUT calling ParseForm, so a failed/malformed parse is
+// never cached-and-masked for the handler. It reads the exact bounded bytes
+// from the middleware context (an immutable copy) and leaves r.Body intact, so
+// the handler's own parse still observes real parse errors.
 func loginEmail(r *http.Request) string {
+	body := requestBodyFromContext(r.Context())
+	if len(body) == 0 {
+		return ""
+	}
 	if isFormContentType(r) {
-		if isMultipartFormData(r) {
-			// Multipart is rejected earlier at the boundary; never reached.
-			return ""
-		}
-		body, err := readBody(r)
-		if err != nil {
-			return ""
-		}
 		values, perr := url.ParseQuery(string(body))
 		if perr != nil {
 			return ""
 		}
 		return values.Get("email")
-	}
-	body, err := readBody(r)
-	if err != nil {
-		return ""
 	}
 	var creds struct {
 		Email string `json:"email"`
@@ -774,16 +811,20 @@ func loginEmail(r *http.Request) string {
 // Request middleware
 // ---------------------------------------------------------------------------
 
-var clientIPContextKey = struct{}{}
-
 // ClientIPFromContext returns the resolved client address for the request.
 func ClientIPFromContext(ctx context.Context) (netip.Addr, bool) {
 	a, ok := ctx.Value(clientIPContextKey).(netip.Addr)
 	return a, ok
 }
 
-// requestIDContextKey carries the cryptographically random per-request ID.
-var requestIDContextKey = struct{}{}
+// requestBodyFromContext returns the bounded body bytes captured by the
+// security middleware for body-capable methods. It is nil when no body was
+// captured (body-free method). The returned slice is an immutable copy; never
+// mutate it.
+func requestBodyFromContext(ctx context.Context) []byte {
+	b, _ := ctx.Value(requestBodyContextKey).([]byte)
+	return b
+}
 
 // requestIDHeader names the response header echoing the correlating request ID.
 const requestIDHeader = "X-Request-Id"
@@ -843,38 +884,40 @@ func methodMayHaveBody(method string) bool {
 	}
 }
 
-// isMultipartFormData reports whether the request declares a multipart/form-data
-// body. The control plane rejects multipart entirely with 415.
-func isMultipartFormData(r *http.Request) bool {
-	return strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data")
-}
-
 // bufferRequestBody bounds and restores a request body for body-capable
 // methods. It reads at most controlPlaneBodyLimit+1 bytes: if the body is
 // larger (known via ContentLength or actual read, including chunked) it returns
-// overflow=true with no side effects; otherwise it replaces r.Body with a fresh
-// reader over the exact bounded bytes so every later ParseForm/decode reads the
-// buffer. Safe methods (GET/HEAD/OPTIONS) leave the body untouched.
-func bufferRequestBody(r *http.Request) (overflow bool, err error) {
-	if !methodMayHaveBody(r.Method) {
-		return false, nil
-	}
-	if r.Body == nil {
-		return false, nil
+// overflow=true with no side effects; otherwise it returns the exact bounded
+// bytes and replaces r.Body with a fresh reader over them so every later
+// handler parse reads the buffer. The ORIGINAL body is closed exactly once on
+// every path (success, overflow, read error, and known-ContentLength fast
+// reject); the replacement reader is installed only after a successful bounded
+// read and is never closed before the handler. Safe methods leave the body
+// untouched.
+func bufferRequestBody(r *http.Request) (data []byte, overflow bool, err error) {
+	if !methodMayHaveBody(r.Method) || r.Body == nil {
+		return nil, false, nil
 	}
 	if r.ContentLength > int64(controlPlaneBodyLimit) {
-		// Known oversized from Content-Length: reject without reading a byte.
-		return true, nil
+		// Known oversized from Content-Length: reject without reading a byte,
+		// closing the original body once.
+		r.Body.Close()
+		r.Body = http.NoBody
+		return nil, true, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, controlPlaneBodyLimit+1))
+	data, err = io.ReadAll(io.LimitReader(r.Body, controlPlaneBodyLimit+1))
+	// Close the original body exactly once regardless of the read outcome.
+	r.Body.Close()
 	if err != nil {
-		return false, err
+		r.Body = http.NoBody
+		return nil, false, err
 	}
 	if len(data) > controlPlaneBodyLimit {
-		return true, nil
+		r.Body = http.NoBody
+		return nil, true, nil
 	}
 	r.Body = io.NopCloser(bytes.NewReader(data))
-	return false, nil
+	return data, false, nil
 }
 
 const (
@@ -905,20 +948,14 @@ func (p *securityPolicy) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		securityHeaders(w.Header())
 
-		// Multipart is never used by any control-plane handler, so reject it
-		// entirely with 415 before anything parses it: a multipart `_csrf`
-		// candidate can never be silently treated as absent NOR pass CSRF.
-		if isMultipartFormData(r) {
-			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "multipart form data is not supported"})
-			return
-		}
-
-		// Bound the request body BEFORE any route classification, parse, or
-		// handler: body-capable methods are buffered up to limit+1; overflow
-		// is an immediate 413 with no side effects (even on an unknown route);
-		// within-limit bodies are restored as the exact bounded bytes for every
-		// later form/JSON/multipart parse. Safe methods never read the body.
-		overflow, err := bufferRequestBody(r)
+		// Bound and restore the request body BEFORE any route classification,
+		// content-type parse, or handler. Body-capable methods are buffered up
+		// to limit+1; overflow is an immediate 413 with no side effects — even
+		// on an unknown route AND even for multipart (size wins over media type,
+		// so an oversized multipart body is 413, not 415). Within-limit bodies
+		// are restored as the exact bounded bytes for every later parse. Safe
+		// methods never read the body.
+		data, overflow, err := bufferRequestBody(r)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not read request body"})
 			return
@@ -926,6 +963,26 @@ func (p *securityPolicy) wrap(next http.Handler) http.Handler {
 		if overflow {
 			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
 			return
+		}
+
+		// ONLY after the body is bounded, for body-capable methods, capture an
+		// immutable copy of the bounded bytes (for CSRF/email inspection, so
+		// r.Body is never consumed or cached by us) and parse the canonical
+		// Content-Type via mime.ParseMediaType — case-insensitive/canonical,
+		// parameter/quote aware, never substring matching. A malformed/absent
+		// Content-Type is rejected 415 consistently; any multipart/* body is
+		// rejected 415 because no control-plane handler uses multipart.
+		if methodMayHaveBody(r.Method) {
+			r = r.WithContext(context.WithValue(r.Context(), requestBodyContextKey, append([]byte(nil), data...)))
+			mediatype, _, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if mtErr != nil {
+				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+				return
+			}
+			if isMultipartMediaType(mediatype) {
+				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "multipart form data is not supported"})
+				return
+			}
 		}
 
 		rid := newRequestID()
@@ -968,17 +1025,4 @@ func (p *securityPolicy) sessionCSRF(r *http.Request) string {
 		return ""
 	}
 	return claims.CSRF
-}
-
-func readBody(r *http.Request) ([]byte, error) {
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		// On read error (a MaxBytesError from an oversized bounded body), do NOT
-		// replace r.Body with a fresh reader: keeping the bounded MaxBytesReader
-		// intact preserves the overflow signal so the handler's decode maps it to
-		// an explicit 413 instead of a misleading 400.
-		return nil, err
-	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
-	return raw, nil
 }
