@@ -5,10 +5,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/credential"
 	"github.com/uncloud-registry/registry/internal/policy"
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/registry"
@@ -92,15 +94,35 @@ func buildBeeHandler() (http.Handler, error) {
 		return nil, err
 	}
 
-	var feedUpdater publish.FeedUpdater = swarm.DisabledFeedUpdater{
-		Reason: "real feed updates require BEE_FEED_SIGNER_PRIVATE_KEY; use REGISTRY_BACKEND=memory for end-to-end local testing or configure a signer key for Bee mode",
+	// Bee-mode repository-state commits go exclusively through the control
+	// plane's internal feed signer. The registry process NEVER holds or accepts
+	// the feed-owner signing key: BEE_FEED_SIGNER_PRIVATE_KEY is not read in
+	// Bee mode, and there is no local signer. Fail closed if the control-plane
+	// URL or the shared internal credential is not configured, and require an
+	// unambiguous control-plane RegistryID for every resolved host.
+	cpURL := strings.TrimSpace(os.Getenv("CONTROLPLANE_URL"))
+	if cpURL == "" {
+		return nil, fmt.Errorf("CONTROLPLANE_URL is required when REGISTRY_BACKEND=bee (repository feed commits are signed by the control plane)")
 	}
-	if signerKey := strings.TrimSpace(os.Getenv("BEE_FEED_SIGNER_PRIVATE_KEY")); signerKey != "" {
-		updater, err := swarm.NewBeeSequenceFeedUpdater(beeURL, http.DefaultClient, signerKey)
-		if err != nil {
-			return nil, err
-		}
-		feedUpdater = updater
+	secretPath, err := envRequired("CONTROLPLANE_INTERNAL_SECRET_FILE")
+	if err != nil {
+		return nil, fmt.Errorf("registry-to-control-plane credential: %w", err)
+	}
+	internalSecret, err := credential.LoadSecretFile(secretPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := credential.ValidateSecret(internalSecret); err != nil {
+		return nil, err
+	}
+	if err := requireRegistryIDs(registryResolver); err != nil {
+		return nil, err
+	}
+
+	committer := &publish.ControlPlaneCommitter{
+		BaseURL:    cpURL,
+		Secret:     internalSecret,
+		HTTPClient: http.DefaultClient,
 	}
 
 	return registry.NewHandler(
@@ -121,10 +143,33 @@ func buildBeeHandler() (http.Handler, error) {
 		publish.Publisher{
 			Builder: publish.DefaultBuilder{},
 			Objects: objects,
-			Feeds:   feedUpdater,
+			Commits: committer,
 		},
 		authRealm,
 	), nil
+}
+
+// requireRegistryIDs fails closed unless every host the registry resolver can
+// serve resolves to an unambiguous positive control-plane RegistryID. Bee-mode
+// feed commits are routed by RegistryID; silently assigning or defaulting an ID
+// would route a commit to the wrong registry. Multi-host static mappings remain
+// supported (each host carries its own ID); ENS resolution (which yields only a
+// feed-owner, never a control-plane RegistryID) is therefore rejected in Bee
+// mode.
+func requireRegistryIDs(resolver resolve.RegistryIdentityResolver) error {
+	static, ok := resolver.(resolve.StaticRegistryIdentityResolver)
+	if !ok {
+		return fmt.Errorf("Bee-mode repository feed commits require an explicit host→registryID map (REGISTRY_ID_MAP); resolution mode must be static")
+	}
+	for host, identity := range static.Hosts {
+		if identity.RegistryID <= 0 {
+			return fmt.Errorf("Bee-mode repository feed commands require a positive registryID for host %q; configure REGISTRY_ID_MAP", host)
+		}
+	}
+	if len(static.Hosts) == 0 {
+		return fmt.Errorf("Bee-mode repository feed commits require at least one host mapped to a registryID (REGISTRY_ID_MAP)")
+	}
+	return nil
 }
 
 func envOrDefault(name string, fallback string) string {
@@ -247,12 +292,46 @@ func buildRegistryIdentityResolver() (resolve.RegistryIdentityResolver, error) {
 
 func staticRegistryIdentityResolverFromEnv() resolve.RegistryIdentityResolver {
 	owners := parseRegistryOwners(os.Getenv("REGISTRY_OWNER_MAP"))
+	ids := parseRegistryIDs(os.Getenv("REGISTRY_ID_MAP"))
 	hosts := make(map[string]resolve.RegistryIdentity, len(owners))
 	for host, owner := range owners {
+		regID := ids[host]
 		hosts[host] = resolve.RegistryIdentity{
-			Host:  host,
-			Owner: owner,
+			Host:       host,
+			Owner:      owner,
+			RegistryID: regID,
 		}
 	}
 	return resolve.StaticRegistryIdentityResolver{Hosts: hosts}
+}
+
+// parseRegistryIDs parses a CSV "host=id" map naming each host's unambiguous
+// control-plane RegistryID. Every value must be canonical positive decimal text
+// so a malformed or non-positive value cannot silently become a zero/assigned
+// ID; the caller (Bee mode) then fails closed unless every served host has one.
+func parseRegistryIDs(raw string) map[string]int64 {
+	ids := map[string]int64{}
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		host := strings.TrimSpace(parts[0])
+		if host == "" {
+			continue
+		}
+		idText := strings.TrimSpace(parts[1])
+		id, err := strconv.ParseInt(idText, 10, 64)
+		if err != nil || id <= 0 {
+			// A malformed or non-positive id can never be used as a registry ID;
+			// leave the host unmapped so fail-closed validation catches it.
+			continue
+		}
+		ids[host] = id
+	}
+	return ids
 }

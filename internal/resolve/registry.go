@@ -9,8 +9,17 @@ import (
 )
 
 type RegistryIdentity struct {
-	Host  string
+	Host string
+	// Owner is the registry's feed-owner address as configured on the control
+	// plane, used to derive its deterministic feeds.
 	Owner string
+	// RegistryID is the unambiguous control-plane registry identifier for the
+	// host, so the data plane can route an internal feed commit to the exact
+	// registry. It is 0 when the resolver does not carry an explicit ID — an
+	// in-memory/dev identity — in which case authenticated control-plane feed
+	// commits (which require a positive RegistryID) fail closed rather than
+	// silently assigning an ID.
+	RegistryID int64
 }
 
 type Reader interface {

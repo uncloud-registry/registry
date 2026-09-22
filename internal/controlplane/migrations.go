@@ -246,9 +246,33 @@ var migrations = []migration{
 	// storage-class or JSON-shape violation) fails the copy and rolls the whole
 	// migration back byte-equivalently (version stays 7, no schema objects, no
 	// data touched).
+	// Version 9 is the durable idempotency store for the constrained internal
+	// feed signer (Task 10): one row per stable OperationID, carrying the
+	// fixed-size (32-byte BLOB) domain-separated hash of the canonical typed
+	// request, a pending/succeeded state, and — only for succeeded rows — the
+	// bounded, canonical JSON result. The operation_id primary key and the
+	// request-hash equality check make a retried identical request return the
+	// stored result and a reused operation ID with different input a hard
+	// conflict, atomically, across process restarts. This is pure forward DDL
+	// (a new table); it never reads, mutates, or drops any migration 1-8 state,
+	// so already-migrated and fresh databases converge on the same schema.
 	{
 		Version: 8,
 		Apply:   installProvisioningOutboxJobInvariantsV8,
+	},
+	// Version 9 is the durable idempotency store for the constrained internal
+	// feed signer (Task 10): one row per stable OperationID, carrying the
+	// fixed-size (32-byte BLOB) domain-separated hash of the canonical typed
+	// request, a pending/succeeded state, and — only for succeeded rows — the
+	// bounded, canonical JSON result. The operation_id primary key and the
+	// request-hash equality check make a retried identical request return the
+	// stored result and a reused operation ID with different input a hard
+	// conflict, atomically, across process restarts. This is pure forward DDL
+	// (a new table); it never reads, mutates, or drops any migration 1-8 state,
+	// so already-migrated and fresh databases converge on the same schema.
+	{
+		Version: 9,
+		Apply:   installFeedSignerOperationStore,
 	},
 }
 

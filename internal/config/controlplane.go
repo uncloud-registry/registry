@@ -72,6 +72,18 @@ type ControlPlaneConfig struct {
 	// any other value is rejected during Load so a typo can never silently
 	// skip or run the migration.
 	LegacyKeyMigration bool
+	// InternalAddr is the separate internal listener address serving the
+	// constrained feed-signing endpoint (/internal/v1/feed-updates). It is a
+	// dedicated listener, never the public router, so the internal endpoint can
+	// never inherit public browser CSRF/session assumptions. Empty disables the
+	// internal feed server.
+	InternalAddr string
+	// InternalSecretFile names the secure file holding the high-entropy
+	// internal service credential that the registry data plane must present to
+	// call the internal feed-signing endpoint. It is mounted from a file and
+	// never supplied directly in env/flags/JSON/logs, and is loaded/validated
+	// before the database opens.
+	InternalSecretFile string
 }
 
 const (
@@ -86,22 +98,24 @@ const (
 )
 
 const (
-	envMode           = "CONTROLPLANE_MODE"
-	envListenAddr     = "CONTROLPLANE_ADDR"
-	envDBPath         = "CONTROLPLANE_DB_PATH"
-	envSessionSecret  = "CONTROLPLANE_TOKEN_SECRET"
-	envSessionTTL     = "CONTROLPLANE_SESSION_TTL"
-	envExternalURL    = "CONTROLPLANE_EXTERNAL_URL"
-	envRegistryDomain = "CONTROLPLANE_REGISTRY_DOMAIN"
-	envRegistryKey    = "CONTROLPLANE_REGISTRY_ED25519_KEY"
-	envRegistryKeyID  = "CONTROLPLANE_REGISTRY_KEY_ID"
-	envMasterKeyFile  = "CONTROLPLANE_MASTER_KEY_FILE"
-	envBeeAPIURL      = "CONTROLPLANE_BEE_API_URL"
-	envTrustedProxies = "CONTROLPLANE_TRUSTED_PROXIES"
-	envTLSTermination = "CONTROLPLANE_TLS_TERMINATION"
-	envTLSCertFile    = "CONTROLPLANE_TLS_CERT_FILE"
-	envTLSKeyFile     = "CONTROLPLANE_TLS_KEY_FILE"
-	envMigrateLegacy  = "CONTROLPLANE_MIGRATE_LEGACY_KEYS"
+	envMode               = "CONTROLPLANE_MODE"
+	envListenAddr         = "CONTROLPLANE_ADDR"
+	envDBPath             = "CONTROLPLANE_DB_PATH"
+	envSessionSecret      = "CONTROLPLANE_TOKEN_SECRET"
+	envSessionTTL         = "CONTROLPLANE_SESSION_TTL"
+	envExternalURL        = "CONTROLPLANE_EXTERNAL_URL"
+	envRegistryDomain     = "CONTROLPLANE_REGISTRY_DOMAIN"
+	envRegistryKey        = "CONTROLPLANE_REGISTRY_ED25519_KEY"
+	envRegistryKeyID      = "CONTROLPLANE_REGISTRY_KEY_ID"
+	envMasterKeyFile      = "CONTROLPLANE_MASTER_KEY_FILE"
+	envBeeAPIURL          = "CONTROLPLANE_BEE_API_URL"
+	envTrustedProxies     = "CONTROLPLANE_TRUSTED_PROXIES"
+	envTLSTermination     = "CONTROLPLANE_TLS_TERMINATION"
+	envTLSCertFile        = "CONTROLPLANE_TLS_CERT_FILE"
+	envTLSKeyFile         = "CONTROLPLANE_TLS_KEY_FILE"
+	envMigrateLegacy      = "CONTROLPLANE_MIGRATE_LEGACY_KEYS"
+	envInternalAddr       = "CONTROLPLANE_INTERNAL_ADDR"
+	envInternalSecretFile = "CONTROLPLANE_INTERNAL_SECRET_FILE"
 )
 
 func rawEnv(name string) string { return os.Getenv(name) }
@@ -121,6 +135,8 @@ func Load() (*ControlPlaneConfig, error) {
 		RegistryEd25519Key: trimmedEnv(envRegistryKey),
 		RegistryKeyID:      envOr(envRegistryKeyID, defaultRegistryKeyID),
 		MasterKeyFile:      trimmedEnv(envMasterKeyFile),
+		InternalAddr:       trimmedEnv(envInternalAddr),
+		InternalSecretFile: trimmedEnv(envInternalSecretFile),
 		TLSTermination:     envOr(envTLSTermination, defaultTLSTermination),
 		TLSCertFile:        envOr(envTLSCertFile, ""),
 		TLSKeyFile:         envOr(envTLSKeyFile, ""),
@@ -236,6 +252,9 @@ func (c *ControlPlaneConfig) Validate() error {
 		return err
 	}
 	if err := c.validateMasterKey(); err != nil {
+		return err
+	}
+	if err := c.validateInternalFeed(); err != nil {
 		return err
 	}
 	if err := c.validateBee(); err != nil {
@@ -571,6 +590,31 @@ func (c *ControlPlaneConfig) validateRegistryKeyID() error {
 func (c *ControlPlaneConfig) validateMasterKey() error {
 	if c.MasterKeyFile == "" {
 		return fmt.Errorf("CONTROLPLANE_MASTER_KEY_FILE is required; startup always loads it before the database")
+	}
+	return nil
+}
+
+// validateInternalFeed enforces the fail-closed pairing of the internal
+// feed-signing listener: the internal address and the internal secret file must
+// either both be configured or both be absent. A partial configuration fails
+// startup so the control plane never listens for feed commits without the
+// credential needed to authenticate them (or holds a secret it never serves).
+func (c *ControlPlaneConfig) validateInternalFeed() error {
+	hasAddr := c.InternalAddr != ""
+	hasSecret := c.InternalSecretFile != ""
+	if hasAddr != hasSecret {
+		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR and CONTROLPLANE_INTERNAL_SECRET_FILE must be configured together")
+	}
+	if !hasAddr {
+		return nil
+	}
+	_, portStr, err := net.SplitHostPort(c.InternalAddr)
+	if err != nil {
+		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR must be a host:port address like %q", ":8089")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("CONTROLPLANE_INTERNAL_ADDR must carry a numeric port in 1-65535")
 	}
 	return nil
 }

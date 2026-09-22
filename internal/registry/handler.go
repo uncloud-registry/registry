@@ -417,7 +417,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		}
 	}
 
-	next, err := h.Publisher.Publish(r.Context(), spec.RepoStateFeedRef(registryIdentity.Owner, repo), current, publish.BuildInput{
+	next, err := h.Publisher.PublishCommit(r.Context(), spec.RepoStateFeedRef(registryIdentity.Owner, repo), current, publish.BuildInput{
 		Repo:           repo,
 		Tag:            reference,
 		ManifestDigest: computeDigest(body),
@@ -427,7 +427,10 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			Size:      int64(len(body)),
 		},
 		StagedBlobs: blobMap,
-	}, batchID)
+	}, batchID, registryIdentity.RegistryID, registryIdentity.Owner,
+		// Stable deterministic operation ID for this logical publication, so a
+		// retry of the same publication is idempotent at the control plane.
+		publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, computeDigest(body), current.Generation))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", err.Error())
 		return

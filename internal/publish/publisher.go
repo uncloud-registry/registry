@@ -18,6 +18,16 @@ type FeedUpdater interface {
 	UpdateFeed(ctx context.Context, feed string, ref string) error
 }
 
+// RepoCommitter commits an immutable repository-state reference through the
+// control-plane internal feed signer. The control plane verifies the topic is
+// the deterministic feed for the referenced repository, the generation
+// advanced by exactly one, the batch is permitted by the current stamp policy,
+// and the operation ID is durable-idempotent. ControlPlaneCommitter satisfies
+// it; in-memory modes use Publisher.Feeds directly and leave it nil.
+type RepoCommitter interface {
+	Commit(ctx context.Context, req FeedCommitRequest) (FeedCommitResult, error)
+}
+
 type RepoStateStore interface {
 	LoadCurrent(ctx context.Context, repo string) (spec.RepoStateDocument, error)
 }
@@ -39,6 +49,12 @@ type Publisher struct {
 	Builder Builder
 	Objects ObjectUploader
 	Feeds   FeedUpdater
+	// Commits, when set, routes the repository-state feed commit through the
+	// control-plane internal feed signer instead of the local Feeds updater.
+	// Bee-mode registry processes set it; in-memory mode leaves it nil and
+	// publishes through Feeds. It is never an in-process signer — the control
+	// plane alone holds and uses the feed-owner signing key.
+	Commits RepoCommitter
 }
 
 type DefaultBuilder struct{}
@@ -54,6 +70,20 @@ type ociManifest struct {
 }
 
 func (p Publisher) Publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string) (spec.RepoStateDocument, error) {
+	return p.publish(ctx, stateFeed, current, input, batchID, false, 0, "", "")
+}
+
+// PublishCommit is the publisher path that carries the registry identity,
+// owner, expected generation, and a stable deterministic operation ID into the
+// repository feed commit. When Publisher.Commits is configured (Bee mode) the
+// immutable state reference is committed through the control-plane internal
+// feed signer with a FeedCommitRequest built from those fields; otherwise it
+// falls back to the local Feeds updater (in-memory mode).
+func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, operationID string) (spec.RepoStateDocument, error) {
+	return p.publish(ctx, stateFeed, current, input, batchID, true, registryID, owner, operationID)
+}
+
+func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, error) {
 	manifestRef, err := p.Objects.Put(ctx, input.ManifestJSON, batchID)
 	if err != nil {
 		return spec.RepoStateDocument{}, fmt.Errorf("upload manifest bytes: %w", err)
@@ -75,7 +105,22 @@ func (p Publisher) Publish(ctx context.Context, stateFeed string, current spec.R
 		return spec.RepoStateDocument{}, fmt.Errorf("upload repo state: %w", err)
 	}
 
-	if err := p.Feeds.UpdateFeed(ctx, stateFeed, stateRef); err != nil {
+	if useCommits && p.Commits != nil {
+		// Bee mode: route the immutable state reference through the control
+		// plane. The control plane alone holds and uses the feed-owner signing
+		// key; the registry process never receives it.
+		if _, err := p.Commits.Commit(ctx, FeedCommitRequest{
+			OperationID:        operationID,
+			RegistryID:         registryID,
+			Owner:              owner,
+			Topic:              stateFeed,
+			Reference:          stateRef,
+			BatchID:            batchID,
+			ExpectedGeneration: current.Generation,
+		}); err != nil {
+			return spec.RepoStateDocument{}, fmt.Errorf("commit state feed: %w", err)
+		}
+	} else if err := p.Feeds.UpdateFeed(ctx, stateFeed, stateRef); err != nil {
 		return spec.RepoStateDocument{}, fmt.Errorf("update state feed: %w", err)
 	}
 

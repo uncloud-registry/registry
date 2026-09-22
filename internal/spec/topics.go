@@ -34,6 +34,15 @@ func normalizeOwner(owner string) string {
 	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(owner)), "0x")
 }
 
+// NormalizeOwner returns the canonical lowercase, 0x-trimmed form of a feed
+// owner address. It is the exported form of normalizeOwner so identity
+// comparison (e.g. the control-plane feed signer comparing a request owner to a
+// stored feed-owner address) uses exactly the same normalization as feed
+// construction.
+func NormalizeOwner(owner string) string {
+	return normalizeOwner(owner)
+}
+
 func topicHex(logicalTopic string) string {
 	return hex.EncodeToString(ethcrypto.Keccak256([]byte(logicalTopic)))
 }
