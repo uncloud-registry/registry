@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/config"
@@ -466,6 +467,66 @@ func isFormContentType(r *http.Request) bool {
 // multipart bodies with 415 because no handler uses them.
 func isMultipartMediaType(mediaType string) bool {
 	return mediaType == "multipart/form-data" || strings.HasPrefix(mediaType, "multipart/")
+}
+
+// contentTypeState classifies the request's "Content-Type" header for routing.
+type contentTypeState int
+
+const (
+	// contentTypeUnspecified means the request carries no explicit Content-Type:
+	// either the header is absent entirely or it holds exactly one value that is
+	// blank after ASCII trimming. The body proceeds WITHOUT a Content-Type — this
+	// is a legitimate, common request (a bodyless POST, or a JSON/urlencoded body
+	// sent without a header) and must reach routing/CSRF/handler, never a 415.
+	contentTypeUnspecified contentTypeState = iota
+	// contentTypeOK carries a single present, well-formed, non-multipart media type.
+	contentTypeOK
+	// contentTypeMultipart carries a single present, well-formed multipart/* type.
+	contentTypeMultipart
+	// contentTypeMalformed carries a single present value that mime.ParseMediaType
+	// cannot parse (including a comma-joined list of media types, which the
+	// media-type grammar disallows).
+	contentTypeMalformed
+	// contentTypeAmbiguous carries multiple "Content-Type" header values (even
+	// when identical or all blank), which cannot be resolved to one media type.
+	contentTypeAmbiguous
+)
+
+// resolveContentType classifies the request's raw "Content-Type" header.
+// Header.Get is NEVER used here because a request may legitimately repeat the
+// header; Header.Get returns only the first value and would otherwise hide an
+// ambiguity. Every present value must agree to a single canonical media type:
+//
+//   - Absent, or exactly one value that is blank after ASCII trimming, is
+//     UNSPECIFIED, not malformed (the regression this round closes).
+//   - More than one value (Go keeps repeated lines as a slice) is ambiguous —
+//     even identical or all-blank values — and rejected rather than trusting
+//     one entry.
+//   - Exactly one present value is parsed canonically with mime.ParseMediaType
+//     (case-insensitive, parameter/OWS/quote aware, never substring matching);
+//     a parse error is malformed, a clean multipart/* is multipart, and
+//     anything else is OK.
+func resolveContentType(r *http.Request) contentTypeState {
+	vals := r.Header.Values("Content-Type")
+	if len(vals) == 0 {
+		return contentTypeUnspecified
+	}
+	if len(vals) > 1 {
+		return contentTypeAmbiguous
+	}
+	v := strings.TrimFunc(vals[0], unicode.IsSpace)
+	if v == "" {
+		// A single value that trims to blank counts as absent (unspecified).
+		return contentTypeUnspecified
+	}
+	mediatype, _, err := mime.ParseMediaType(v)
+	if err != nil {
+		return contentTypeMalformed
+	}
+	if isMultipartMediaType(mediatype) {
+		return contentTypeMultipart
+	}
+	return contentTypeOK
 }
 
 // checkCSRF enforces the session-bound CSRF rule for cookie-authenticated
@@ -967,20 +1028,26 @@ func (p *securityPolicy) wrap(next http.Handler) http.Handler {
 
 		// ONLY after the body is bounded, for body-capable methods, capture an
 		// immutable copy of the bounded bytes (for CSRF/email inspection, so
-		// r.Body is never consumed or cached by us) and parse the canonical
-		// Content-Type via mime.ParseMediaType — case-insensitive/canonical,
-		// parameter/quote aware, never substring matching. A malformed/absent
-		// Content-Type is rejected 415 consistently; any multipart/* body is
-		// rejected 415 because no control-plane handler uses multipart.
+		// r.Body is never consumed or cached by us) and resolve the canonical
+		// Content-Type. An ABSENT or blank Content-Type is UNSPECIFIED — a
+		// legitimate request (bodyless POST, JSON/urlencoded body without a
+		// header) proceeds to routing/CSRF/handler, never a blanket 415. A
+		// PRESENT value must parse canonically via mime.ParseMediaType
+		// (case-insensitive, parameter/quote aware, never substring matching)
+		// and must not be multipart/*; ambiguity (multiple header values even
+		// when identical, or a comma-joined value) is also 415. Body size was
+		// already enforced first, so an oversized body is 413 regardless.
 		if methodMayHaveBody(r.Method) {
 			r = r.WithContext(context.WithValue(r.Context(), requestBodyContextKey, append([]byte(nil), data...)))
-			mediatype, _, mtErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
-			if mtErr != nil {
-				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
-				return
-			}
-			if isMultipartMediaType(mediatype) {
+			switch resolveContentType(r) {
+			case contentTypeOK:
+				// A well-formed, non-multipart media type: proceed; the
+				// downstream handler/CSRF decides whether the type is usable.
+			case contentTypeMultipart:
 				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "multipart form data is not supported"})
+				return
+			case contentTypeMalformed, contentTypeAmbiguous:
+				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
 				return
 			}
 		}
