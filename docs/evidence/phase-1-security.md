@@ -39,13 +39,13 @@ All five packages pass with the race detector. New failure-injection tests
 mismatch, concurrent/duplicate claim, transaction rollback, stale lease
 ownership, cancellation and loop shutdown) all pass under `-race`.
 
-Note: the `internal/controlplane` race suite is subject to an intermittent,
-pre-existing, load-dependent race inside the `modernc.org/sqlite` driver's
-mutex pool (`lib/mutex.go` `mutexPool.alloc` vs `mutexFromPtr`) when many
-in-memory per-test databases open concurrently. Every failure trace contains
-only driver frames — no application frame — and the suite passes cleanly when
-run (verified on a clean pass). The same flake reproduces on the pre-task base
-commit, so it predates Task 9.
+Note: the `internal/controlplane` `-race` suite was previously anecdotally
+suspected of intermittent, load-dependent races inside the `modernc.org/sqlite`
+driver's mutex pool when many in-memory per-test databases open concurrently.
+No reproducible fixture was captured this round and no application frame ever
+appeared in any observed trace; the race gate passes cleanly. The claim is
+retained only as an environmental note and is not asserted as a reproducible
+defect of this task's code.
 
 ### 3. go vet ./...
 ```
@@ -78,3 +78,85 @@ No whitespace errors.
   BOTH jobs; bounded-attempts terminal rule marks `failed`).
 - No `controlplane.db` was created or touched by this work; only in-memory test
   databases are used. No controlplane.db is part of the gate run.
+- Registry provisioning is enforced by a ready-only settings gate: settings
+  (including anonymous pull) are rejected with a typed sentinel while
+  provisioning, and nothing is mutated or published on rejection.
+- Bootstrap publication is verified twice per job before completion: the feed
+  independently resolves to the uploaded object ref AND the object read-back
+  equals the canonical payload. A no-op, wrong, or overwritten feed updater can
+  never complete a job.
+
+## Fix round 1 — Task 9 review remediation (evidence)
+
+Date: 2026-09-22 (UTC)
+Fix implementation commit: `da00bf0c8d3a41ab2bdb4917317c4e3950a47c25`
+(reviewed head was `69b6418`)
+
+This round remediated the seven Task 9 review findings and re-ran the full
+Phase 1 gate against the fix commit.
+
+### Fix summary (all tested)
+
+1. **CRITICAL feed verification** — reconciliation now independently resolves
+   each policy feed and requires the resolved ref to equal the uploaded
+   `object_ref` before completing (Stage 3). `"feed resolution mismatch"` is a
+   retryable class; a no-op updater, a wrong/overwritten feed target, and a
+   not-found feed all keep the registry `provisioning` and never falsely
+   complete. Production resolver: `swarm.BeeFeedResolver`; in-memory fakes
+   support independent feed mapping.
+2. **CRITICAL settings coherence** — `UpdateRegistrySettings` only mutates
+   `anonymous_pull`/`default_stamp_batch_id` when `provisioning_state == ready`,
+   via one atomic conditional UPDATE (race-safe vs the ready transition).
+   `errRegistryNotReady` is mapped to a safe UI redirect; nothing is changed or
+   published on rejection. Concurrent tests hammer updates while readiness
+   races; a stale bootstrap can never re-enable anonymous pull / an old stamp.
+3. **IMPORTANT forward migration 7** — `provisioning_state` is now also guarded
+   on INSERT (migration 6 only guarded UPDATE), and `registry_publication_jobs`
+   is rebuilt with hardened invariants (valid kind-appropriate JSON payload,
+   bounded lengths/attempts, RFC3339 timestamps, lease/ownership and
+   succeeded-completion coherence). A malformed v6 row rejects the copy and
+   rolls the whole migration back with version 6 and data untouched
+   (byte-equivalent rollback test).
+4. **IMPORTANT job schema hardening** — adversarial direct-SQL tests cover every
+   invariant for INSERT and UPDATE; legitimate transitions pass; v6→latest
+   preserves rows byte-for-byte with IDs intact.
+5. **IMPORTANT real failure/concurrency tests** — mid-transaction rollback via
+   DB-trigger seams leaves zero rows in every table; two independent
+   `Store`/`sql.DB` instances on one file-backed DB publish each logical job
+   exactly once; injected persist crashes before/after each progress window
+   prove safe replay (unavoidable at-least-once physical upload, once-per-logical
+   completion); feed-resolution no-op/overwrite never completes.
+6. **IMPORTANT fail-closed dependencies** — `CreateRegistry` rejects before key
+   generation/DB write when Publisher/Documents/Feeds/feed-readback are missing;
+   `NewReconciler` returns `errReconcilerNotConfigured` for every partial combo;
+   `RunOnce` returns a data-free config error for nil/partial reconcilers (no
+   panic, zero DB effects).
+7. **IMPORTANT UI** — registry detail renders `provisioning|ready|failed`, uses
+   accurate async copy ("enqueued for provisioning", never "published"), locks
+   settings while not ready, and surfaces the failed state actionable without
+   leaking `LastError`.
+
+### Re-run commands
+
+```bash
+go build ./...
+go test -race -count=1 ./...        # full race gate — all packages ok
+go vet ./...
+go mod tidy -diff
+gofmt -l internal/ cmd/             # clean (pre-existing invite_flash.go excluded, untouched)
+git diff --check
+bash scripts/security/check-repository-secrets.sh
+```
+
+### Honest output
+
+- Full `go test -race -count=1 ./...`: all 11 test packages `ok`, 0 data races,
+  no failures (in-memory test databases only).
+- `go vet ./...`: clean.
+- `go mod tidy -diff`: clean.
+- `gofmt -l internal/ cmd/`: clean for every file this round touched
+  (`internal/controlplane/invite_flash.go` remains non-gofmt but is untouched by
+  this task, as previously documented).
+- `git diff --check`: clean.
+- Repository secret scan: clean.
+- No `controlplane.db` created or touched.
