@@ -791,7 +791,7 @@ func seedInvitesDigestFixture(t *testing.T, db *sql.DB, expires string) {
 }
 
 // TestInviteDigestMigrationFromEverySupportedSchema upgrades databases at every
-// supported schema version (0 legacy, 1, 2, 3) to v4 and proves: mixed legacy
+// supported schema version (0 legacy, 1, 2, 3) to v5 and proves: mixed legacy
 // hash values convert deterministically (historical hex-of-token-text only),
 // accepted history is preserved as legacy_unattributed with NO accepter
 // attribution (the historical accepter is unknowable — token retries for these
@@ -821,8 +821,8 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
 			got, err := CurrentSchemaVersion(ctx, db)
-			if err != nil || got != 4 {
-				t.Fatalf("expected schema version 4, got %d (err %v)", got, err)
+			if err != nil || got != 5 {
+				t.Fatalf("expected schema version 5, got %d (err %v)", got, err)
 			}
 			assertInviteDigestSchema(t, db)
 
@@ -867,6 +867,19 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 			}
 			if _, err := store.AcceptInvite(ctx, tokenTextC, User{ID: 2, Email: "bob@example.com"}); !errors.Is(err, errInviteNotFound) {
 				t.Fatalf("legacy accepted invite must refuse a different user, got %v", err)
+			}
+			// The v5 forward-only migration installs the immutability trigger
+			// on every upgrade path: dave's legacy_unattributed row is now a
+			// frozen record that ordinary SQL can no longer rewrite.
+			if _, err := db.ExecContext(ctx, `update registry_invites set legacy_unattributed = 0, accepted_by_user_id = 2 where id = 3`); err == nil {
+				t.Fatal("upgrade to v5 must make legacy_unattributed rows immutable")
+			}
+			var afterRewriteFlag int
+			if err := db.QueryRowContext(ctx, `select legacy_unattributed from registry_invites where id = 3`).Scan(&afterRewriteFlag); err != nil {
+				t.Fatal(err)
+			}
+			if afterRewriteFlag != 1 {
+				t.Fatalf("rejected rewrite must leave the legacy flag at 1, got %d", afterRewriteFlag)
 			}
 			memberships, err := store.ListMembershipsForRegistry(ctx, 1)
 			if err != nil {
@@ -1106,8 +1119,8 @@ func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("invite recipient normalization collision must not fail the migration: %v", err)
 		}
-		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 4 {
-			t.Fatalf("expected version 4, got %d (err %v)", got, err)
+		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 5 {
+			t.Fatalf("expected version 5, got %d (err %v)", got, err)
 		}
 		var emailA, emailB string
 		if err := db.QueryRowContext(ctx, `select email from registry_invites where id = 1`).Scan(&emailA); err != nil {
@@ -1260,8 +1273,8 @@ func TestInviteDigestMigrationNormalizesLegacyEmailsEveryVersion(t *testing.T) {
 			if err := ApplyMigrations(ctx, db); err != nil {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
-			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 4 {
-				t.Fatalf("expected schema version 4, got %d (err %v)", got, err)
+			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 5 {
+				t.Fatalf("expected schema version 5, got %d (err %v)", got, err)
 			}
 
 			// Users normalized to the canonical form.
@@ -1648,6 +1661,614 @@ func TestInviteLegacyUnattributedRowsImmutable(t *testing.T) {
 	}
 	if !newAcceptedBy.Valid || newAcceptedBy.Int64 != 2 {
 		t.Fatalf("new acceptance must record the attributed accepter, got %+v", newAcceptedBy)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 3: forward-only migration 5 — the immutable legacy-attribution
+// trigger must be delivered by a NEW migration, never by editing an applied
+// migration.
+// ---------------------------------------------------------------------------
+
+// seedPrefixV4DigestDB builds the EXACT schema state that migration 4 shipped
+// at head 8178a82 (the pre-fix migration): the digest-schema registry_invites
+// with the four state/attribution triggers (born_pending, terminal_status,
+// no_unattributed_acceptance, legacy_flag_locked) and WITHOUT
+// registry_invites_legacy_attribution_immutable. The immutability trigger was
+// added later by EDITING migration 4 (ef48240), so any database that applied
+// the pre-fix v4 records schema_migrations.version = 4 and skips the corrected
+// code forever — that is the delivery flaw this round fixes.
+//
+// The fixture is reproduced by hand and deliberately NEVER calls the current
+// migration 4: a call to the current (corrected) migration would silently
+// absorb the fix and prove nothing. Ordering mirrors the real migration —
+// tables, then the legacy backfill rows, then triggers, then the recorded
+// version — because the born-pending trigger rejects non-pending inserts and
+// must not be live during the backfill.
+func seedPrefixV4DigestDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+
+	// v1-constrained parents exactly as migrations 1-3 produced them.
+	for _, stmt := range []string{
+		`create table users (
+			id integer primary key autoincrement,
+			email text not null unique,
+			password_hash text not null,
+			created_at text not null
+		)`,
+		`create table registries (
+			id integer primary key autoincrement,
+			slug text not null unique,
+			host text not null unique,
+			ens_name text not null,
+			owner_user_id integer not null references users(id),
+			feed_owner_address text not null,
+			encrypted_feed_private_key text not null,
+			default_stamp_batch_id text not null,
+			anonymous_pull integer not null,
+			created_at text not null
+		)`,
+		`create table registry_memberships (
+			id integer primary key autoincrement,
+			registry_id integer not null references registries(id) on delete cascade,
+			user_id integer not null references users(id) on delete cascade,
+			role text not null,
+			can_pull integer not null,
+			can_push integer not null,
+			created_at text not null,
+			unique(registry_id, user_id)
+		)`,
+		// The digest-schema registry_invites exactly as the pre-fix migration
+		// 4 rebuilt it (identical at 8178a82 and ef48240).
+		`create table registry_invites (
+			id integer primary key autoincrement,
+			registry_id integer not null references registries(id) on delete cascade,
+			email text not null,
+			role text not null,
+			can_pull integer not null,
+			can_push integer not null,
+			token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32),
+			status text not null check (status in ('pending','accepted','revoked')),
+			accepted_by_user_id integer references users(id),
+			legacy_unattributed integer not null default 0 check (legacy_unattributed in (0,1)),
+			expires_at text not null,
+			accepted_at text,
+			revoked_at text,
+			created_at text not null,
+			check (can_pull = 1 or can_push = 1),
+			check ((status = 'revoked') = (revoked_at is not null)),
+			check (status <> 'accepted' or accepted_by_user_id is not null or legacy_unattributed = 1),
+			check (accepted_at is null or status = 'accepted')
+		)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("build pre-fix v4 schema: %v", err)
+		}
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	seed := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("seed pre-fix v4 row: %v", err)
+		}
+	}
+	seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "alice@example.com", "hash", now)
+	seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "bob@example.com", "hash", now)
+	seed(`insert into users (email, password_hash, created_at) values (?, ?, ?)`, "carol@example.com", "hash", now)
+	seed(`insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+		values ('alice', 'alice.example.test', 'alice.eth', 1, '0xfeed', '', 'batch-1', 1, ?)`, now)
+	seed(`insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 1, 'owner', 1, 1, ?)`, now)
+	// Two valid legacy_unattributed accepted rows (migration-4 backfill shape:
+	// status accepted, accepted_by NULL, legacy flag 1, no accepted_at). Row 1
+	// is the pre-fix vulnerability victim; row 2 stays pristine for the
+	// post-repair immutability battery.
+	seed(`insert into registry_invites
+		(registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+		values (1, 'bob@example.com', 'member', 1, 1, ?, 'accepted', NULL, 1, ?, NULL, NULL, ?)`,
+		DigestInviteToken(tokenTextA), expires, now)
+	seed(`insert into registry_invites
+		(registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+		values (1, 'carol@example.com', 'member', 1, 1, ?, 'accepted', NULL, 1, ?, NULL, NULL, ?)`,
+		DigestInviteToken(tokenTextB), expires, now)
+
+	// The pre-fix (8178a82) trigger set — NO immutability trigger. The fixture
+	// also self-verifies that the shipped state it reproduces really is the
+	// vulnerable one: if a future edit sneaks the immutability trigger in
+	// here, the regression silently stops regressing.
+	for _, stmt := range []string{
+		`create trigger registry_invites_born_pending before insert on registry_invites
+			for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0
+			begin select raise(abort, 'invites must be created pending and attributed'); end`,
+		`create trigger registry_invites_terminal_status before update of status on registry_invites
+			for each row when OLD.status != 'pending' and NEW.status != OLD.status
+			begin select raise(abort, 'invite status is terminal and cannot be changed'); end`,
+		`create trigger registry_invites_no_unattributed_acceptance before update of status on registry_invites
+			for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null
+			begin select raise(abort, 'acceptance requires an attributed accepter'); end`,
+		`create trigger registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
+			for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
+			begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
+		`create index idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("install pre-fix v4 triggers: %v", err)
+		}
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = 'registry_invites_legacy_attribution_immutable'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("fixture defect: the pre-fix v4 fixture must NOT carry the immutability trigger")
+	}
+	// Record the applied version exactly like the pre-fix migration did.
+	if _, err := db.ExecContext(ctx, `create table schema_migrations (version integer primary key, applied_at text not null)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into schema_migrations (version, applied_at) values (4, ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertLegacyAttributionImmutableTrigger proves the immutability trigger is
+// installed with the GUARDING SEMANTICS, not just its name: it must be a
+// BEFORE UPDATE trigger on registry_invites that aborts every update to a row
+// whose OLD.legacy_unattributed = 1. Reading the stored trigger SQL (rather
+// than trusting the name) pins the behavior the pre-fix v4 lacked. The
+// behavioral side is covered by the UPDATE batteries in the tests themselves.
+func assertLegacyAttributionImmutableTrigger(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var sql string
+	if err := db.QueryRow(`select sql from sqlite_master where type = 'trigger' and name = 'registry_invites_legacy_attribution_immutable'`).Scan(&sql); err != nil {
+		t.Fatalf("read immutability trigger SQL: %v", err)
+	}
+	lower := strings.ToLower(sql)
+	for _, needle := range []string{"before update on registry_invites", "old.legacy_unattributed = 1"} {
+		if !strings.Contains(lower, needle) {
+			t.Fatalf("immutability trigger SQL missing guard %q: %s", needle, sql)
+		}
+	}
+}
+
+// TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5 is the RED
+// regression for the migration-delivery flaw: a database that applied the
+// PRE-FIX migration 4 (head 8178a82) has schema_migrations.version = 4 and
+// never runs the corrected code — its legacy_unattributed rows stay writable
+// and ordinary SQL can turn frozen history into an attributed acceptance. The
+// test reproduces that exact shipped state (never calling the current
+// migration 4), proves the attribution rewrite SUCCEEDS pre-repair, applies
+// the current migration chain so forward-only migration 5 runs, and proves the
+// rewrite now FAILS with the row unchanged, application token retries are
+// generic, and the new-attributed lifecycle is not weakened.
+func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
+	t.Parallel()
+
+	db := openInviteMigDB(t, "v5_prefix_v4_repair")
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	seedPrefixV4DigestDB(t, db)
+
+	// ---- Pre-repair: the hole is real. On the shipped v4 schema, clearing
+	// the legacy flag, assigning an accepter, and stamping accepted_at all
+	// succeed — the frozen record becomes an attributed acceptance.
+	if _, err := db.ExecContext(ctx, `update registry_invites set legacy_unattributed = 0, accepted_by_user_id = 2, accepted_at = ? where id = 1`, now); err != nil {
+		t.Fatalf("pre-fix v4 must permit the attribution rewrite of a legacy_unattributed row, got: %v", err)
+	}
+	// The rewrite is one-way (the pre-fix legacy_flag_locked trigger still
+	// blocks 0->1 re-arming), so the damaged row stays attributed. Migration 5
+	// must NOT retro-detect or rewrite it: attribution legitimacy is not
+	// distinguishable once fabricated, so v5 closes FUTURE mutation only.
+	// Row 2 remains pristine for the immutability battery below.
+
+	// ---- Apply the current migration chain. Only migration 5 can run (v1-v4
+	// are already recorded) and it must install the authoritative trigger.
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations over pre-fix v4: %v", err)
+	}
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil {
+		t.Fatalf("schema version: %v", err)
+	}
+	if version != 5 {
+		t.Fatalf("expected schema version 5 after repair, got %d", version)
+	}
+	var migCount int
+	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
+		t.Fatal(err)
+	}
+	if migCount != 2 {
+		t.Fatalf("expected exactly 2 recorded migrations (fixture's 4 + forward 5), got %d", migCount)
+	}
+	assertLegacyAttributionImmutableTrigger(t, db)
+
+	// ---- The repaired trigger rejects every rewrite attempt on the pristine
+	// legacy row and leaves it byte-identical after each rejection.
+	type legacyRow struct {
+		status           string
+		acceptedBy       sql.NullInt64
+		legacy           int
+		acceptedAt       sql.NullString
+		revokedAt        sql.NullString
+		expiresAt        string
+		canPull, canPush int
+		email            string
+		digest           string
+	}
+	readRow := func(id int64) legacyRow {
+		t.Helper()
+		var r legacyRow
+		var digest []byte
+		if err := db.QueryRowContext(ctx, `select status, accepted_by_user_id, legacy_unattributed, accepted_at, revoked_at, expires_at, can_pull, can_push, email, token_digest from registry_invites where id = ?`, id).
+			Scan(&r.status, &r.acceptedBy, &r.legacy, &r.acceptedAt, &r.revokedAt, &r.expiresAt, &r.canPull, &r.canPush, &r.email, &digest); err != nil {
+			t.Fatal(err)
+		}
+		r.digest = string(digest)
+		return r
+	}
+	pristine := readRow(2)
+	if pristine.legacy != 1 {
+		t.Fatalf("fixture defect: row 2 must be legacy_unattributed, got legacy=%d", pristine.legacy)
+	}
+	attempts := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"clear legacy flag", `update registry_invites set legacy_unattributed = 0 where id = 2`, nil},
+		{"set accepted_by", `update registry_invites set accepted_by_user_id = 3 where id = 2`, nil},
+		{"change status to revoked", `update registry_invites set status = 'revoked', revoked_at = ? where id = 2`, []any{now}},
+		{"change accepted_at", `update registry_invites set accepted_at = ? where id = 2`, []any{now}},
+		{"set revoked_at", `update registry_invites set revoked_at = ? where id = 2`, []any{now}},
+		{"combined attribution rewrite", `update registry_invites set legacy_unattributed = 0, accepted_by_user_id = 3, status = 'accepted', accepted_at = ? where id = 2`, []any{now}},
+		{"benign expires change", `update registry_invites set expires_at = ? where id = 2`, []any{now}},
+		{"benign permission change", `update registry_invites set can_pull = 0 where id = 2`, nil},
+		{"benign recipient change", `update registry_invites set email = 'x@example.com' where id = 2`, nil},
+		{"digest replace", `update registry_invites set token_digest = ? where id = 2`, []any{make([]byte, 32)}},
+	}
+	for _, a := range attempts {
+		if _, err := db.ExecContext(ctx, a.sql, a.args...); err == nil {
+			t.Fatalf("%s: expected the repaired immutability trigger to reject the update, got nil error", a.name)
+		}
+		if after := readRow(2); after != pristine {
+			t.Fatalf("%s: row mutated despite rejection: %+v != %+v", a.name, after, pristine)
+		}
+	}
+
+	// ---- Migration 5 is data-free: the pre-repair-damaged row 1 stays
+	// exactly as the rewrite left it (no retrospective detection/rewrite).
+	row1 := readRow(1)
+	if row1.legacy != 0 || !row1.acceptedBy.Valid || row1.acceptedBy.Int64 != 2 || !row1.acceptedAt.Valid {
+		t.Fatalf("row 1 must remain as the pre-repair rewrite left it (v5 is data-free), got %+v", row1)
+	}
+
+	// ---- Application token retries fail generically against BOTH rows and
+	// mutate nothing.
+	store := &Store{DB: db}
+	if _, err := store.AcceptInvite(ctx, tokenTextB, User{ID: 3, Email: "carol@example.com"}); !errors.Is(err, errInviteNotFound) {
+		t.Fatalf("legacy_unattributed retry must fail generically after repair, got %v", err)
+	}
+	if _, err := store.AcceptInvite(ctx, tokenTextA, User{ID: 2, Email: "bob@example.com"}); !errors.Is(err, errInviteNotFound) {
+		t.Fatalf("attribution-rewritten row retry must fail generically, got %v", err)
+	}
+	if after := readRow(2); after != pristine {
+		t.Fatalf("row 2 mutated by a generic retry: %+v != %+v", after, pristine)
+	}
+
+	// ---- The fix does not weaken the new-attributed lifecycle: born-pending
+	// still rejects direct non-pending inserts, non-legacy rows stay
+	// updatable, and a fresh pending→accepted transition records the attributed
+	// accepter with legacy_unattributed=0.
+	if _, err := db.ExecContext(ctx, `insert into registry_invites
+		(registry_id, email, role, can_pull, can_push, token_digest, status, expires_at, created_at)
+		values (1, 'x@example.com', 'member', 1, 0, ?, 'accepted', ?, ?)`,
+		DigestInviteToken(tokenTextC), now, now); err == nil {
+		t.Fatal("expected born-pending trigger to reject a non-pending insert after repair")
+	}
+	if _, err := db.ExecContext(ctx, `insert into registry_invites
+		(registry_id, email, role, can_pull, can_push, token_digest, status, expires_at, created_at)
+		values (1, 'x@example.com', 'member', 1, 0, ?, 'pending', ?, ?)`,
+		DigestInviteToken(tokenTextC), now, now); err != nil {
+		t.Fatalf("pending insert must succeed: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `update registry_invites set can_push = 1 where id = 3`); err != nil {
+		t.Fatalf("benign update on a non-legacy row must still succeed: %v", err)
+	}
+	created, token, err := store.CreateInvite(ctx, Invite{
+		RegistryID: 1, Email: "bob@example.com", Role: "member",
+		CanPull: true, CanPush: true, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create fresh invite: %v", err)
+	}
+	if _, err := store.AcceptInvite(ctx, token, User{ID: 2, Email: "bob@example.com"}); err != nil {
+		t.Fatalf("accept fresh invite: %v", err)
+	}
+	var newLegacy int
+	var newAcceptedBy sql.NullInt64
+	if err := db.QueryRowContext(ctx, `select legacy_unattributed, accepted_by_user_id from registry_invites where id = ?`, created.ID).
+		Scan(&newLegacy, &newAcceptedBy); err != nil {
+		t.Fatal(err)
+	}
+	if newLegacy != 0 || !newAcceptedBy.Valid || newAcceptedBy.Int64 != 2 {
+		t.Fatalf("fresh acceptance must record the attributed accepter with legacy_unattributed=0, got legacy=%d accepted_by=%+v", newLegacy, newAcceptedBy)
+	}
+
+	// ---- Re-applying migrations is a no-op at v5.
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("re-apply migrations after repair: %v", err)
+	}
+	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 5 {
+		t.Fatalf("version must stay 5 on re-apply, got %d (err %v)", version, err)
+	}
+	assertLegacyAttributionImmutableTrigger(t, db)
+}
+
+// TestInviteMigrationV5FromCleanV4Schema drives the forward-only repair bridge
+// from a CLEAN current v4 schema (migration 4 already installed the immutable
+// trigger): migration 5 must drop the same-named trigger and recreate the
+// authoritative one idempotently, ending at version 5 with the same protection.
+func TestInviteMigrationV5FromCleanV4Schema(t *testing.T) {
+	t.Parallel()
+
+	db := openInviteMigDB(t, "v5_clean_v4")
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 3); err != nil {
+		t.Fatalf("apply through v3: %v", err)
+	}
+	expires := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	seedInvitesDigestFixture(t, db, expires)
+	// Current migration 4: converts the legacy rows and ALREADY installs the
+	// immutability trigger (the corrected v4).
+	if err := applyMigrationsThrough(ctx, db, 4); err != nil {
+		t.Fatalf("apply through v4: %v", err)
+	}
+	assertLegacyAttributionImmutableTrigger(t, db)
+	// dave's legacy_unattributed row is already protected at v4.
+	if _, err := db.ExecContext(ctx, `update registry_invites set accepted_by_user_id = 2 where id = 3`); err == nil {
+		t.Fatal("expected the v4-installed immutability trigger to reject the update")
+	}
+
+	// Migration 5: drop-if-exists + recreate, ending at version 5.
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations from clean v4: %v", err)
+	}
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil || version != 5 {
+		t.Fatalf("expected schema version 5 from clean v4, got %d (err %v)", version, err)
+	}
+	var migCount int
+	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
+		t.Fatal(err)
+	}
+	if migCount != 5 {
+		t.Fatalf("expected 5 migration rows, got %d", migCount)
+	}
+	assertLegacyAttributionImmutableTrigger(t, db)
+	// Still protected after the reinstall, row unchanged.
+	var legacyFlag int
+	if err := db.QueryRowContext(ctx, `select legacy_unattributed from registry_invites where id = 3`).Scan(&legacyFlag); err != nil {
+		t.Fatal(err)
+	}
+	if legacyFlag != 1 {
+		t.Fatalf("dave's row must stay legacy_unattributed, got %d", legacyFlag)
+	}
+	if _, err := db.ExecContext(ctx, `update registry_invites set legacy_unattributed = 0 where id = 3`); err == nil {
+		t.Fatal("expected the reinstalled immutability trigger to reject the update")
+	}
+
+	// Re-apply is a no-op at v5.
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("re-apply at v5: %v", err)
+	}
+}
+
+// seedV4RecordedBase builds a database that RECORDS schema version 4 but whose
+// registry_invites state is malformed (the scenarios migration 5 must fail
+// closed on rather than silently skip): version 4 recorded, constrained
+// parents, and no invites table at all (or an invites table without the
+// legacy_unattributed column — added by the caller via the addInvites hook).
+func seedV4RecordedBase(t *testing.T, db *sql.DB, addInvites func(ctx context.Context, db *sql.DB) error) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, stmt := range []string{
+		`create table schema_migrations (version integer primary key, applied_at text not null)`,
+		`create table users (
+			id integer primary key autoincrement,
+			email text not null unique,
+			password_hash text not null,
+			created_at text not null
+		)`,
+		`create table registries (
+			id integer primary key autoincrement,
+			slug text not null unique,
+			host text not null unique,
+			ens_name text not null,
+			owner_user_id integer not null references users(id),
+			feed_owner_address text not null,
+			encrypted_feed_private_key text not null,
+			default_stamp_batch_id text not null,
+			anonymous_pull integer not null,
+			created_at text not null
+		)`,
+		`create table registry_memberships (
+			id integer primary key autoincrement,
+			registry_id integer not null references registries(id) on delete cascade,
+			user_id integer not null references users(id) on delete cascade,
+			role text not null,
+			can_pull integer not null,
+			can_push integer not null,
+			created_at text not null,
+			unique(registry_id, user_id)
+		)`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("build v4-recorded base schema: %v", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`, "alice@example.com", "hash", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+		values ('alice', 'alice.example.test', 'alice.eth', 1, '0xfeed', '', 'batch-1', 1, ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (1, 1, 'owner', 1, 1, ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := addInvites(ctx, db); err != nil {
+		t.Fatalf("build malformed invites state: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into schema_migrations (version, applied_at) values (4, ?)`, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestInviteMigrationV5RejectsMalformedSchemaPrerequisite pins migration 5's
+// fail-closed prerequisite: a database that RECORDS version 4 but whose
+// registry_invites is not a digest schema with the legacy_unattributed column
+// is malformed — the migration must fail, roll back (version stays 4, no v5
+// row), and touch no data, instead of silently installing nothing.
+func TestInviteMigrationV5RejectsMalformedSchemaPrerequisite(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	assertFailed := func(t *testing.T, db *sql.DB) {
+		t.Helper()
+		if err := ApplyMigrations(ctx, db); err == nil {
+			t.Fatal("expected migration 5 to fail on the malformed prerequisite, got nil")
+		}
+		version, err := CurrentSchemaVersion(ctx, db)
+		if err != nil || version != 4 {
+			t.Fatalf("version must stay 4 after rejected migration 5, got %d (err %v)", version, err)
+		}
+		var migCount int
+		if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
+			t.Fatal(err)
+		}
+		if migCount != 1 {
+			t.Fatalf("expected only the fixture's version-4 row, got %d rows", migCount)
+		}
+		var n int
+		if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = 'registry_invites_legacy_attribution_immutable'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("no immutability trigger may remain after the rejected migration, found %d", n)
+		}
+		// Data-free: parents survive untouched.
+		var users, regs int
+		if err := db.QueryRowContext(ctx, `select (select count(*) from users), (select count(*) from registries)`).Scan(&users, &regs); err != nil {
+			t.Fatal(err)
+		}
+		if users != 1 || regs != 1 {
+			t.Fatalf("parents must be untouched after the rejected migration, users=%d registries=%d", users, regs)
+		}
+	}
+
+	t.Run("registry_invites table absent", func(t *testing.T) {
+		t.Parallel()
+		db := openInviteMigDB(t, "v5_malformed_absent")
+		seedV4RecordedBase(t, db, func(ctx context.Context, db *sql.DB) error { return nil })
+		assertFailed(t, db)
+	})
+
+	t.Run("legacy_unattributed column absent", func(t *testing.T) {
+		t.Parallel()
+		db := openInviteMigDB(t, "v5_malformed_nocol")
+		seedV4RecordedBase(t, db, func(ctx context.Context, db *sql.DB) error {
+			// A digest-ish invites table that carries NO legacy_unattributed
+			// column (a partial/broken v4 install): the triggers that
+			// reference the flag cannot exist on it either.
+			_, err := db.ExecContext(ctx, `create table registry_invites (
+				id integer primary key autoincrement,
+				registry_id integer not null references registries(id) on delete cascade,
+				email text not null,
+				role text not null,
+				can_pull integer not null,
+				can_push integer not null,
+				token_digest blob not null unique check (typeof(token_digest) = 'blob' and length(token_digest) = 32),
+				status text not null check (status in ('pending','accepted','revoked')),
+				accepted_by_user_id integer references users(id),
+				expires_at text not null,
+				accepted_at text,
+				revoked_at text,
+				created_at text not null,
+				check (can_pull = 1 or can_push = 1),
+				check ((status = 'revoked') = (revoked_at is not null)),
+				check (accepted_at is null or status = 'accepted')
+			)`)
+			return err
+		})
+		assertFailed(t, db)
+	})
+}
+
+// TestInviteMigrationV5RollsBackWhenTriggerInstallFails pins migration 5's
+// failure path when the prerequisite PASSES but the CREATE itself is forced to
+// fail: registry_invites is a VIEW carrying the legacy_unattributed column
+// (pragma_table_info resolves view columns, so the prerequisite reads it as
+// present), and SQLite rejects CREATE TRIGGER on a view. The migration must
+// roll back atomically — version stays 4, no v5 row, no trigger, view intact.
+func TestInviteMigrationV5RollsBackWhenTriggerInstallFails(t *testing.T) {
+	t.Parallel()
+
+	db := openInviteMigDB(t, "v5_install_fail")
+	ctx := context.Background()
+	seedV4RecordedBase(t, db, func(ctx context.Context, db *sql.DB) error {
+		// A base table + a view that presents itself as the invites table with
+		// the legacy_unattributed column the prerequisite checks for.
+		if _, err := db.ExecContext(ctx, `create table invites_base (id integer primary key, legacy_unattributed integer)`); err != nil {
+			return err
+		}
+		_, err := db.ExecContext(ctx, `create view registry_invites as select id, legacy_unattributed from invites_base`)
+		return err
+	})
+	// Sanity: the prerequisite condition REALLY reads the view as carrying the
+	// column — otherwise this subtest would exercise the prerequisite branch
+	// instead of the install-failure branch.
+	var present int
+	if err := db.QueryRowContext(ctx, `select count(*) from pragma_table_info('registry_invites') where name = 'legacy_unattributed'`).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present != 1 {
+		t.Fatalf("fixture defect: view must expose legacy_unattributed for the prerequisite, got %d", present)
+	}
+
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("expected migration 5 to fail when CREATE TRIGGER is rejected, got nil")
+	}
+	version, err := CurrentSchemaVersion(ctx, db)
+	if err != nil || version != 4 {
+		t.Fatalf("version must stay 4 after the failed trigger install, got %d (err %v)", version, err)
+	}
+	var migCount int
+	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
+		t.Fatal(err)
+	}
+	if migCount != 1 {
+		t.Fatalf("expected only the fixture's version-4 row, got %d rows", migCount)
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = 'registry_invites_legacy_attribution_immutable'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("no immutability trigger may survive the rolled-back install, found %d", n)
+	}
+	// The drop (no-op here) and view DDL were rolled back with the transaction:
+	// the view must still exist and hold its rows.
+	var views int
+	if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'view' and name = 'registry_invites'`).Scan(&views); err != nil {
+		t.Fatal(err)
+	}
+	if views != 1 {
+		t.Fatal("view must be untouched after the rolled-back migration")
 	}
 }
 

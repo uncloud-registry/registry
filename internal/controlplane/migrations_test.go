@@ -37,8 +37,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("expected schema version 4, got %d", version)
+	if version != 5 {
+		t.Fatalf("expected schema version 5, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -75,8 +75,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 4 {
-		t.Fatalf("expected 4 migration rows, got %d", rows)
+	if rows != 5 {
+		t.Fatalf("expected 5 migration rows, got %d", rows)
 	}
 }
 
@@ -139,8 +139,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("expected schema version 4 after upgrade, got %d", version)
+	if version != 5 {
+		t.Fatalf("expected schema version 5 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -908,6 +908,7 @@ func assertInviteDigestSchema(t *testing.T, db *sql.DB) {
 		"registry_invites_terminal_status",
 		"registry_invites_no_unattributed_acceptance",
 		"registry_invites_legacy_flag_locked",
+		"registry_invites_legacy_attribution_immutable",
 	} {
 		var n int
 		if err := db.QueryRowContext(ctx, `select count(*) from sqlite_master where type = 'trigger' and name = ?`, name).Scan(&n); err != nil {
@@ -917,6 +918,11 @@ func assertInviteDigestSchema(t *testing.T, db *sql.DB) {
 			t.Fatalf("expected trigger %s to be installed, found %d", name, n)
 		}
 	}
+	// The immutability trigger must carry the guarding semantics (a BEFORE
+	// UPDATE trigger rejecting every change to a legacy_unattributed row), not
+	// merely bear the name — the migration-5 repair is what delivers it to
+	// databases that applied the pre-fix migration 4.
+	assertLegacyAttributionImmutableTrigger(t, db)
 }
 
 // applyMigrationsThrough runs only the migrations up to and including version
@@ -1128,8 +1134,8 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
-		t.Fatalf("expected version 4, got %d", version)
+	if version != 5 {
+		t.Fatalf("expected version 5, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
 	assertInviteDigestSchema(t, db)
@@ -1147,8 +1153,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 4 {
-			t.Fatalf("expected version 4, got %d", version)
+		if version != 5 {
+			t.Fatalf("expected version 5, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		assertInviteDigestSchema(t, db)
@@ -1162,8 +1168,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 4 {
-			t.Fatalf("expected version 4, got %d", version)
+		if version != 5 {
+			t.Fatalf("expected version 5, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1205,8 +1211,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 4 {
-			t.Fatalf("expected version 4, got %d", version)
+		if version != 5 {
+			t.Fatalf("expected version 5, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})

@@ -134,6 +134,28 @@ var migrations = []migration{
 		Version: 4,
 		Apply:   installInviteDigestSchema,
 	},
+	// Version 5 is the forward-only repair bridge for the legacy-attribution
+	// immutability trigger. The trigger was originally added by EDITING
+	// migration 4 (head ef48240), so any database that applied the PRE-FIX
+	// migration 4 (head 8178a82) has schema_migrations.version = 4, skips the
+	// corrected code, and retains WRITABLE legacy_unattributed rows — ordinary
+	// SQL could clear the flag and assign accepted_by_user_id, turning a
+	// frozen historical record into an attributed acceptance. Editing an
+	// applied migration can never reach such databases; v5 exists solely to
+	// install (or reinstall) the authoritative BEFORE UPDATE trigger on every
+	// version-4 schema. It validates the digest-schema prerequisite
+	// (registry_invites must carry the legacy_unattributed column), DROPs any
+	// stale same-name trigger, and CREATEs the frozen-record trigger — all
+	// inside the migration transaction, so any failure rolls back with
+	// version 4 still recorded and no data touched. Fresh and v0→v3→v4
+	// databases reach this migration too (migration 4 already installed the
+	// same trigger via the shared constant); the drop-if-exists + create is
+	// idempotent and harmless there. v5 is the authoritative upgrade bridge:
+	// every database ends at version 5.
+	{
+		Version: 5,
+		Apply:   installInviteLegacyAttributionImmutability,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only
@@ -606,6 +628,55 @@ type legacyInviteRow struct {
 	createdAt          string
 }
 
+// legacyAttributionImmutableTriggerSQL is the SINGLE SOURCE OF TRUTH for the
+// BEFORE UPDATE trigger that makes legacy_unattributed invite rows immutable:
+// EVERY update to a row whose OLD.legacy_unattributed = 1 is aborted — clearing
+// the flag, assigning an accepter, changing status/timestamps, combined
+// rewrites, and benign edits alike — so ordinary SQL cannot turn a frozen
+// historical record into an attributed acceptance. It is installed by BOTH
+// migration 4 (corrected, for fresh/v0-v3 upgrades) and the forward-only
+// repair migration 5 (the authoritative bridge for every version-4 schema);
+// sharing the constant guarantees the two can never drift apart.
+const legacyAttributionImmutableTriggerSQL = `create trigger registry_invites_legacy_attribution_immutable before update on registry_invites
+	for each row when OLD.legacy_unattributed = 1
+	begin select raise(abort, 'legacy_unattributed invites are immutable historical records'); end`
+
+// installInviteLegacyAttributionImmutability is migration 5's body: it
+// guarantees the immutable legacy-unattributed-history trigger exists on a
+// version-4 schema — the delivery a database that applied the PRE-FIX
+// migration 4 (head 8178a82, before the trigger was added by editing that
+// migration) never received, because it records version 4 and skips the
+// corrected code.
+//
+//  1. Prerequisite: registry_invites must exist with the legacy_unattributed
+//     column the trigger guards. Every genuine v4 digest schema carries it; a
+//     malformed or hand-rolled "v4" fails here, BEFORE any DDL, so the
+//     migration rolls back with version 4 still recorded and no data touched.
+//  2. Drop any stale same-name trigger: the corrected migration 4 already
+//     installs one, the pre-fix v4 has none — DROP IF EXISTS is a no-op or
+//     removes the old one either way, which keeps the migration idempotent.
+//  3. Create the authoritative BEFORE UPDATE trigger from the shared
+//     constant, so v4 and v5 can never drift.
+//
+// The whole body runs inside the migration transaction (applyMigration): a
+// failed create rolls back the drop and never records version 5.
+func installInviteLegacyAttributionImmutability(ctx context.Context, tx *sql.Tx) error {
+	var present int
+	if err := tx.QueryRowContext(ctx, `select count(*) from pragma_table_info('registry_invites') where name = 'legacy_unattributed'`).Scan(&present); err != nil {
+		return fmt.Errorf("migration 5 prerequisite: inspect registry_invites: %w", err)
+	}
+	if present == 0 {
+		return fmt.Errorf("migration 5 prerequisite: registry_invites is missing the legacy_unattributed column (not a version-4 digest schema); refusing to install the immutability trigger")
+	}
+	if _, err := tx.ExecContext(ctx, `drop trigger if exists registry_invites_legacy_attribution_immutable`); err != nil {
+		return fmt.Errorf("migration 5: drop stale legacy immutability trigger: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, legacyAttributionImmutableTriggerSQL); err != nil {
+		return fmt.Errorf("migration 5: install legacy immutability trigger: %w", err)
+	}
+	return nil
+}
+
 // installInviteDigestSchema rebuilds registry_invites around the one-way
 // digest lifecycle, normalizes legacy user/invite emails, and installs the
 // constraints and triggers, all inside the migration transaction (rolled back
@@ -816,9 +887,7 @@ func installInviteDigestSchema(ctx context.Context, tx *sql.Tx) error {
 		`create trigger registry_invites_legacy_flag_locked before update of legacy_unattributed on registry_invites
 			for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1
 			begin select raise(abort, 'legacy_unattributed is migration-only state and cannot be set'); end`,
-		`create trigger registry_invites_legacy_attribution_immutable before update on registry_invites
-			for each row when OLD.legacy_unattributed = 1
-			begin select raise(abort, 'legacy_unattributed invites are immutable historical records'); end`,
+		legacyAttributionImmutableTriggerSQL,
 		`create index idx_registry_invites_registry_status on registry_invites(registry_id, status)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
