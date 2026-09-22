@@ -2661,6 +2661,381 @@ func TestInviteMigrationV5RejectsMalformedDigestSchema(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Fix round 5, finding A: quote-aware, fail-closed SQL fingerprinting.
+// normalizeSQL replaces the old strings.Fields-based foldSQL that collapsed
+// whitespace INSIDE quoted literals (equating 'invites must be  created' with
+// 'invites must be created'). The new scanner preserves every byte inside
+// literals and quoted identifiers, collapses only insignificant outside
+// whitespace, and rejects comments / unterminated quotes / NUL+control
+// anomalies. These tests pin that behavior directly on the normalizer.
+// ---------------------------------------------------------------------------
+
+func TestNormalizeSQL(t *testing.T) {
+	t.Parallel()
+
+	eq := func(name, a, b string) {
+		t.Helper()
+		an, err := normalizeSQL(a)
+		if err != nil {
+			t.Fatalf("%s: normalize(%q): %v", name, a, err)
+		}
+		bn, err := normalizeSQL(b)
+		if err != nil {
+			t.Fatalf("%s: normalize(%q): %v", name, b, err)
+		}
+		if an != bn {
+			t.Fatalf("%s: expected EQUAL normalized forms\n  a=%q → %q\n  b=%q → %q", name, a, an, b, bn)
+		}
+	}
+	diff := func(name, a, b string) {
+		t.Helper()
+		an, err := normalizeSQL(a)
+		if err != nil {
+			t.Fatalf("%s: normalize(%q): %v", name, a, err)
+		}
+		bn, err := normalizeSQL(b)
+		if err != nil {
+			t.Fatalf("%s: normalize(%q): %v", name, b, err)
+		}
+		if an == bn {
+			t.Fatalf("%s: expected DIFFERENT normalized forms, both=%q (a=%q b=%q)", name, an, a, b)
+		}
+	}
+	reject := func(name, s string) {
+		t.Helper()
+		if _, err := normalizeSQL(s); err == nil {
+			t.Fatalf("%s: expected normalizeSQL to reject %q, got nil", name, s)
+		} else if !errors.Is(err, errSQLFingerprintLexical) {
+			t.Fatalf("%s: expected errSQLFingerprintLexical for %q, got %v", name, s, err)
+		}
+	}
+	pin := func(name, in, want string) {
+		t.Helper()
+		got, err := normalizeSQL(in)
+		if err != nil {
+			t.Fatalf("%s: normalize(%q): %v", name, in, err)
+		}
+		if got != want {
+			t.Fatalf("%s: expected %q, got %q (in=%q)", name, want, got, in)
+		}
+	}
+
+	// --- outside-whitespace equivalence: layout-only differences are equal.
+	eq("double vs single outside space", "declare A  B", "declare A B")
+	eq("tab/newline/CR collapse", "declare	A\nB\r\nC  D", "declare A B C D")
+	eq("leading/trailing trimmed", "\n \n  declare A  \n 	", "declare A")
+	eq("collapse across keywords", "check   status   in   (x)", "check status in (x)")
+	eq("rename-quoted vs unquoted table name", `CREATE TABLE "reg" (a integer)`, "CREATE TABLE reg (a integer)")
+
+	// --- whitespace INSIDE single-quoted literals is significant.
+	diff("literal one vs two spaces", "select raise(abort, 'a b')", "select raise(abort, 'a  b')")
+	diff("trigger RAISE one vs two spaces", "select raise(abort, 'invites must be created pending and attributed')", "select raise(abort, 'invites must be  created pending and attributed')")
+	eq("literal identical content, identical punctuation, differing outer runs", "select x = 'it''s fine' and  y = 'ok'", "select x = 'it''s fine' and y = 'ok'")
+
+	// --- whitespace INSIDE quoted identifiers is significant.
+	diff("dquote inner whitespace", `"foo bar"`, `"foobar"`)
+	diff("backtick inner whitespace", "`foo bar`", "`foobar`")
+	diff("bracket inner whitespace", "[foo bar]", "[foobar]")
+	eq("dquote inner whitespace preserved identically", `"foo bar"`, `"foo bar"`)
+
+	// --- quoted identifier delimiters are insignificant; interior preserved.
+	eq("dquote vs bare identifier", `SELECT "status" FROM t`, "SELECT status FROM t")
+	pin("dquote identifier strips delimiters", `"registry_invites"`, "registry_invites")
+	pin("backtick identifier strips delimiters", "`registry_invites`", "registry_invites")
+	pin("bracket identifier strips delimiters", "[registry_invites]", "registry_invites")
+	// Escaped-quote forms are deterministic.
+	pin("literal doubled-quote escape preserved", "select 'it''s fine'", "select 'it''s fine'")
+	eq("literal doubled-quote escape matches itself", "select x = 'it''s fine'", "select   x   =   'it''s fine'")
+	diff("literal doubled-quote escape spacing differs", "select x = 'it''s fine'", "select x = 'it''s  fine'")
+	pin("dquote identifier doubled-quote escape", `"a""b"`, `a"b`)
+	pin("backtick identifier doubled-backtick escape", "`a``b`", "a`b")
+
+	// --- comments are rejected (project DDL carries none; a commented/spoofed
+	// lookalike must never normalize equal to it).
+	reject("line comment", "select 1 -- note")
+	reject("block comment", "select 1 /* note */")
+	reject("line comment inside clause", "check (a = 1) -- spoof")
+	reject("block comment between keywords", "select /* spoof */ 1")
+	reject("unterminated block comment", "select 1 /* unfinished")
+
+	// --- unterminated quotes are rejected.
+	reject("unterminated single", "select 'abc")
+	reject("unterminated dquote", `select "abc`)
+	reject("unterminated backtick", "select `abc")
+	reject("unterminated bracket", "select [abc")
+	reject("bare single quote", "select '")
+
+	// --- NUL / non-whitespace control anomalies are rejected.
+	reject("NUL byte", "select 1\x00")
+	reject("BEL byte", "select 1\x07")
+	reject("NUL inside literal", "select 'a\x00b'")
+	reject("NUL inside dquote", "select \"a\x00b\"")
+
+	// --- keyword / identifier case remains strict (no lowercasing).
+	diff("keyword case differs", "select 1", "SELECT 1")
+	diff("CREATE TABLE keyword case differs", "create table t (a integer)", "CREATE TABLE t (a integer)")
+	diff("identifier case differs", "select can_pull from t", "select Can_Pull from t")
+
+	// --- punctuation behavior pinned.
+	pin("collapsed run, structural spacing kept", "select   a, b  from t where ( x = 1 ) and y <> 2",
+		"select a, b from t where ( x = 1 ) and y <> 2")
+	pin("operators remain glued", "check(a=1 or b=2)", "check(a=1 or b=2)")
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 5, finding A: migration-level spoof fixtures. Each is the GENUINE
+// v4 schema perturbed by exactly one lexical/semantic-indifference change that
+// the OLD strings.Fields foldSQL would have folded away (doubled-space literal),
+// or that the normalizer deliberately refuses (comment / identifier-case
+// change). Each must FAIL migration 5 with the single data-free sentinel,
+// version 4 stays recorded, no immutability trigger, data untouched.
+// ---------------------------------------------------------------------------
+
+func TestInviteMigrationV5RejectsSpoofedFingerprints(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	litDoubled := strings.Replace(testV4InvitesLifecycle[0],
+		"'invites must be created pending and attributed'",
+		"'invites must be  created pending and attributed'", 1)
+	commented := strings.Replace(testV4InvitesLifecycle[0],
+		"for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0",
+		"for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0 -- spoof",
+		1)
+	caseChanged := strings.Replace(testV4InvitesTable, "can_pull integer not null,", "Can_Pull integer not null,", 1)
+
+	type fixture struct {
+		name      string
+		tableSQL  string
+		lifecycle []string
+	}
+	fixtures := []fixture{
+		{
+			name:      "doubled-space literal inside born_pending RAISE",
+			tableSQL:  testV4InvitesTable,
+			lifecycle: []string{litDoubled, testV4InvitesLifecycle[1], testV4InvitesLifecycle[2], testV4InvitesLifecycle[3], testV4InvitesLifecycle[4]},
+		},
+		{
+			name:      "comment injected into born_pending trigger",
+			tableSQL:  testV4InvitesTable,
+			lifecycle: []string{commented, testV4InvitesLifecycle[1], testV4InvitesLifecycle[2], testV4InvitesLifecycle[3], testV4InvitesLifecycle[4]},
+		},
+		{
+			name:      "identifier case change in can_pull column",
+			tableSQL:  caseChanged,
+			lifecycle: testV4InvitesLifecycle,
+		},
+	}
+
+	for _, f := range fixtures {
+		f := f
+		t.Run(f.name, func(t *testing.T) {
+			t.Parallel()
+			db := openInviteMigDB(t, "v5_spoof_fingerprint")
+			seedV4RecordedBase(t, db, func(ctx context.Context, db *sql.DB) error {
+				if _, err := db.ExecContext(ctx, f.tableSQL); err != nil {
+					return err
+				}
+				// Seed one pending row before the lifecycle triggers exist so the
+				// insert succeeds and the rejected migration can prove data-free.
+				if _, err := db.ExecContext(ctx, `insert into registry_invites
+					(registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+					values (1, 'carol@example.com', 'member', 1, 0, zeroblob(32), 'pending', NULL, 0, ?, NULL, NULL, ?)`, now, now); err != nil {
+					return err
+				}
+				for _, s := range f.lifecycle {
+					if _, err := db.ExecContext(ctx, s); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			assertMalformedV5DigestRejected(t, db, 1)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 5, finding B: independent, hand-written adversarial coverage of
+// EVERY migration-4 table CHECK clause and, separately, of EVERY lifecycle
+// trigger. Each case is the otherwise-genuine version-4 schema (the 14-column
+// digest table with all seven CHECKs, both exact FKs, the unique token_digest
+// index, the (registry_id,status) index, and the four lifecycle triggers)
+// perturbed by EXACTLY ONE weakened/removed invariant. All hand-composed from
+// the test-local testV4InvitesTable / testV4InvitesLifecycle baseline — never
+// from the production constants — so a defect in a production constant cannot
+// masquerade as a genuine schema. Every case must fail migration 5 closed.
+//
+// The schema fingerprints prior rounds validated were approximate (counted as
+// 13 columns); the genuine digest table has FOURTEEN declared columns: id,
+// registry_id, email, role, can_pull, can_push, token_digest, status,
+// accepted_by_user_id, legacy_unattributed, expires_at, accepted_at,
+// revoked_at, created_at — see testV4InvitesTable.
+// ---------------------------------------------------------------------------
+
+func TestInviteMigrationV5RejectsEachCheckAndTriggerMutation(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// Drop helper: returns the correct lifecycle minus element idx.
+	drop := func(idx int) []string {
+		out := make([]string, 0, len(testV4InvitesLifecycle)-1)
+		for i, s := range testV4InvitesLifecycle {
+			if i != idx {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	// Weaken helper: returns the correct lifecycle with trigger idx's WHEN
+	// clause replaced by the weakened form.
+	weaken := func(idx int) []string {
+		out := make([]string, len(testV4InvitesLifecycle))
+		copy(out, testV4InvitesLifecycle)
+		var oldWHEN, newWHEN string
+		switch idx {
+		case 0: // born_pending
+			oldWHEN = "for each row when NEW.status != 'pending' or NEW.legacy_unattributed != 0"
+			newWHEN = "for each row when NEW.status != 'pending'"
+		case 1: // terminal_status
+			oldWHEN = "for each row when OLD.status != 'pending' and NEW.status != OLD.status"
+			newWHEN = "for each row when OLD.status != 'pending'"
+		case 2: // no_unattributed_acceptance
+			oldWHEN = "for each row when NEW.status = 'accepted' and NEW.accepted_by_user_id is null"
+			newWHEN = "for each row when NEW.status = 'accepted'"
+		case 3: // legacy_flag_locked
+			oldWHEN = "for each row when NEW.legacy_unattributed != OLD.legacy_unattributed and NEW.legacy_unattributed = 1"
+			newWHEN = "for each row when NEW.legacy_unattributed != OLD.legacy_unattributed"
+		}
+		out[idx] = strings.Replace(out[idx], oldWHEN, newWHEN, 1)
+		return out
+	}
+
+	// The seven distinct migration-4 CHECK clauses, each weakened in isolation
+	// (the can_pull / can_push domains are exercised by mutating their column
+	// declarations, since the DDL combines them into one table-level CHECK that
+	// does double duty for both permissions).
+	type checkCase struct {
+		name       string
+		tableSQL   string
+		seedDigest string // SQL expression used for token_digest so the seed
+		// satisfies the WEAKENED schema (zeroblob(32) except where the length
+		// CHECK itself is weakened to 31).
+		seedRevokedAt string // SQL expression for revoked_at so the seed
+		// satisfies a WEAKENED revoked_at/status CHECK ("" = leave NULL).
+	}
+	checkCases := []checkCase{
+		{
+			name:       "token_digest length CHECK weakened (32 -> 31)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "and length(token_digest) = 32", "and length(token_digest) = 31", 1),
+			seedDigest: "zeroblob(31)",
+		},
+		{
+			name:       "status domain CHECK weakened (revoked dropped from domain)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "status in ('pending','accepted','revoked')", "status in ('pending','accepted')", 1),
+			seedDigest: "zeroblob(32)",
+		},
+		{
+			name:       "can_pull domain weakened (integer -> text column)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "can_pull integer not null,", "can_pull text not null,", 1),
+			seedDigest: "zeroblob(32)",
+		},
+		{
+			name:       "can_push domain weakened (integer -> text column)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "can_push integer not null,", "can_push text not null,", 1),
+			seedDigest: "zeroblob(32)",
+		},
+		{
+			name:       "accepted_by/status CHECK weakened (legacy_unattributed escape removed)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "check (status <> 'accepted' or accepted_by_user_id is not null or legacy_unattributed = 1)", "check (status <> 'accepted' or accepted_by_user_id is not null)", 1),
+			seedDigest: "zeroblob(32)",
+		},
+		{
+			name:       "accepted_at/status CHECK weakened (acceptance no longer requires status)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "check (accepted_at is null or status = 'accepted')", "check (accepted_at is null or status = 'pending')", 1),
+			seedDigest: "zeroblob(32)",
+		},
+		{
+			name:       "revoked_at/status CHECK weakened (revoked no longer requires revoked_at)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "check ((status = 'revoked') = (revoked_at is not null))", "check ((status = 'revoked') = (revoked_at is null))", 1),
+			seedDigest: "zeroblob(32)",
+			// The weakened CHECK demands revoked_at be non-null whenever status
+			// is not 'revoked' — seed a pending row WITH a revoked_at so the
+			// weakened constraint is satisfied and only the fingerprint differs.
+			seedRevokedAt: "'" + now + "'",
+		},
+		{
+			name:       "legacy_unattributed domain CHECK weakened (bogus value 2 admitted)",
+			tableSQL:   strings.Replace(testV4InvitesTable, "check (legacy_unattributed in (0,1))", "check (legacy_unattributed in (0,1,2))", 1),
+			seedDigest: "zeroblob(32)",
+		},
+	}
+
+	runV4Lookalike := func(t *testing.T, name, tableSQL string, seedDigest string, lifecycle []string, seedRevokedAt ...string) {
+		t.Helper()
+		revoked := "NULL"
+		if len(seedRevokedAt) > 0 && seedRevokedAt[0] != "" {
+			revoked = seedRevokedAt[0]
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			db := openInviteMigDB(t, "v5_check_trigger_mutation")
+			seedV4RecordedBase(t, db, func(ctx context.Context, db *sql.DB) error {
+				if _, err := db.ExecContext(ctx, tableSQL); err != nil {
+					return err
+				}
+				if _, err := db.ExecContext(ctx, `insert into registry_invites
+					(registry_id, email, role, can_pull, can_push, token_digest, status, accepted_by_user_id, legacy_unattributed, expires_at, accepted_at, revoked_at, created_at)
+					values (1, 'carol@example.com', 'member', 1, 0, `+seedDigest+`, 'pending', NULL, 0, ?, NULL, `+revoked+`, ?)`, now, now); err != nil {
+					return err
+				}
+				for _, s := range lifecycle {
+					if _, err := db.ExecContext(ctx, s); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			assertMalformedV5DigestRejected(t, db, 1)
+		})
+	}
+
+	for _, c := range checkCases {
+		runV4Lookalike(t, c.name, c.tableSQL, c.seedDigest, testV4InvitesLifecycle, c.seedRevokedAt)
+	}
+
+	// Each lifecycle trigger: independently removed AND independently weakened,
+	// in every case on an otherwise fully genuine v4 schema.
+	type triggerSet struct {
+		name string
+		lc   []string
+	}
+	var triggerCases []triggerSet
+	for i := 0; i < 4; i++ {
+		triggerCases = append(triggerCases, triggerSet{name: "lifecycle trigger dropped idx " + triggerName(i), lc: drop(i)})
+		triggerCases = append(triggerCases, triggerSet{name: "lifecycle trigger weakened idx " + triggerName(i), lc: weaken(i)})
+	}
+	for _, tcase := range triggerCases {
+		runV4Lookalike(t, tcase.name, testV4InvitesTable, "zeroblob(32)", tcase.lc)
+	}
+}
+
+func triggerName(i int) string {
+	switch i {
+	case 0:
+		return "born_pending"
+	case 1:
+		return "terminal_status"
+	case 2:
+		return "no_unattributed_acceptance"
+	case 3:
+		return "legacy_flag_locked"
+	}
+	return "?"
+}
+
 // TestInviteIdempotentRetryAfterExpiry pins the idempotency/expiry ordering:
 // the load/status/accepted_by decision precedes the expiry gate, so an invite
 // already accepted by the same database user with its atomic membership

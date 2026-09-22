@@ -642,7 +642,7 @@ var errInviteDigestSchemaMalformed = errors.New("controlplane: migration 5 prere
 // version-4 registry_invites invite-digest schema and its invariant objects.
 // Migration 4 INSTALLS from them, so the exact schema they describe is what a
 // real version-4 database carries; migration 5 validates a pre-existing
-// version-4 database against them via foldSQL (insignificant-whitespace-only
+// version-4 database against them via normalizeSQL (quote-aware
 // normalization), so a malformed or hand-rolled lookalike — one that merely
 // exposes legacy_unattributed, as the previous weak column-only prerequisite
 // accepted — is rejected before any trigger DDL runs.
@@ -720,16 +720,194 @@ const legacyAttributionImmutableTriggerSQL = `create trigger registry_invites_le
 	for each row when OLD.legacy_unattributed = 1
 	begin select raise(abort, 'legacy_unattributed invites are immutable historical records'); end`
 
-// foldSQL collapses every run of insignificant whitespace (spaces, tabs,
-// newlines) to a single space and trims the ends, leaving everything else —
-// keyword case, identifier case, punctuation, and string-literal contents —
-// untouched. It is the ONLY normalization applied when comparing stored
-// sqlite_schema SQL against the canonical DDL constants: genuine version-4
-// databases may differ from the constants in whitespace layout only (editors
-// reformat; the _new→final RENAME rewrites the name in quotes), never in
-// semantic content.
-func foldSQL(s string) string {
-	return strings.Join(strings.Fields(s), " ")
+// errSQLFingerprintLexical is the internal sentinel for a SQL fingerprint that
+// normalizeSQL refuses to normalize: a -- or /* */ comment, an unterminated
+// quoted literal/identifier/comment, or a NUL / non-whitespace control anomaly.
+// Every fingerprint call site translates it into the single data-free
+// errInviteDigestSchemaMalformed sentinel, so a lexical reject (like any other
+// mismatch) never echoes schema SQL, trigger definitions, or data.
+var errSQLFingerprintLexical = errors.New("controlplane: SQL fingerprint contains a comment, unterminated quote, or control anomaly")
+
+// isFingerprintWhitespace reports whether b is an insignificant-whitespace byte
+// that normalizeSQL collapses in structural (outside-literal) position.
+func isFingerprintWhitespace(b byte) bool {
+	return b == ' ' || b == '	' || b == '\n' || b == '\r' || b == '\f' || b == '\v'
+}
+
+// isFingerprintControlAnomaly reports whether b is a NUL byte or a
+// non-whitespace control character — a lexical anomaly normalizeSQL rejects.
+// Actual whitespace control bytes (tab/newline/CR etc.) are NOT anomalies and
+// are preserved inside quoted literals/identifiers.
+func isFingerprintControlAnomaly(b byte) bool {
+	return b == 0 || (b < 0x20 && !isFingerprintWhitespace(b)) || b == 0x7f
+}
+
+// writeFingerprintSpace flushes a single collapsed space when pending.
+func writeFingerprintSpace(b *strings.Builder, pending *bool) {
+	if *pending {
+		b.WriteByte(' ')
+		*pending = false
+	}
+}
+
+// normalizeSQL is the quote-aware, fail-closed canonical form used for every
+// stored-schema fingerprint comparison (the CREATE TABLE, the supporting index,
+// and each lifecycle trigger). Unlike blindly collapsing all whitespace, it is
+// a small deterministic lexical scanner that:
+//
+//   - collapses every run of insignificant whitespace OUTSIDE any quote to a
+//     single space (tabs/newlines/CR folded exactly like spaces) and trims the
+//     ends — the ONLY layout genuine storage forms may differ in;
+//   - preserves EVERY byte inside a single-quoted string literal, verbatim
+//     including its delimiters and its doubled ” escapes, so the literal
+//     contents are semantically significant ('a  b' never equals 'a b');
+//   - preserves every interior byte of a quoted IDENTIFIER — double-quoted
+//     (with doubled "" escapes), backtick (with doubled “ escapes, matching
+//     SQLite's acceptance), and bracket [ ... ] (closed by the first `]`) —
+//     while dropping ONLY the insignificant quote delimiters. This is the
+//     explicit structural handling for the known SQLite RENAME-writing of the
+//     table name double-quoted: a renamed table stores `CREATE TABLE
+//     "registry_invites"`, a directly-created one stores `CREATE TABLE
+//     registry_invites`, and both normalize to the same identifier token —
+//     WITHOUT any global text replacement that could alter a literal;
+//   - REJECTS (returns an error) -- and /* */ comments anywhere outside a
+//     literal, so project DDL — which carries none (SQLite strips them from
+//     table storage, and triggers never use them) — can never compare equal to
+//     a commented or spoofed lookalike; and
+//   - REJECTS (returns an error) unterminated quotes/comments and NUL or
+//     non-whitespace control anomalies.
+//
+// It does NOT lowercase keywords, identifiers, or literals — keyword/identifier
+// case remains strict — and it does not alter the bytes of any string literal.
+func normalizeSQL(s string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(s))
+	pending := false
+	appendOuter := func(c byte) {
+		writeFingerprintSpace(&b, &pending)
+		b.WriteByte(c)
+	}
+	i, n := 0, len(s)
+	for i < n {
+		c := s[i]
+		switch {
+		case isFingerprintWhitespace(c):
+			pending = true
+			i++
+		case isFingerprintControlAnomaly(c):
+			return "", errSQLFingerprintLexical
+		case c == '\'':
+			writeFingerprintSpace(&b, &pending)
+			start := i
+			i++
+			closed := false
+			for i < n {
+				if isFingerprintControlAnomaly(s[i]) {
+					return "", errSQLFingerprintLexical
+				}
+				if s[i] == '\'' {
+					if i+1 < n && s[i+1] == '\'' {
+						i += 2 // doubled '' escape stays inside the literal
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return "", errSQLFingerprintLexical // unterminated string literal
+			}
+			b.WriteString(s[start:i]) // verbatim, delimiters and all
+		case c == '"':
+			// SQLite writes a RENAMEd table's name double-quoted; quoting an
+			// identifier is insignificant, so drop the delimiters but preserve
+			// every interior byte (including "" escapes and inner whitespace).
+			writeFingerprintSpace(&b, &pending)
+			i++
+			closed := false
+			for i < n {
+				if isFingerprintControlAnomaly(s[i]) {
+					return "", errSQLFingerprintLexical
+				}
+				if s[i] == '"' {
+					if i+1 < n && s[i+1] == '"' {
+						b.WriteByte('"')
+						i += 2
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				b.WriteByte(s[i])
+				i++
+			}
+			if !closed {
+				return "", errSQLFingerprintLexical // unterminated quoted identifier
+			}
+		case c == '`':
+			writeFingerprintSpace(&b, &pending)
+			i++
+			closed := false
+			for i < n {
+				if isFingerprintControlAnomaly(s[i]) {
+					return "", errSQLFingerprintLexical
+				}
+				if s[i] == '`' {
+					if i+1 < n && s[i+1] == '`' {
+						b.WriteByte('`')
+						i += 2
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				b.WriteByte(s[i])
+				i++
+			}
+			if !closed {
+				return "", errSQLFingerprintLexical // unterminated backtick identifier
+			}
+		case c == '[':
+			writeFingerprintSpace(&b, &pending)
+			i++
+			closed := false
+			for i < n {
+				if isFingerprintControlAnomaly(s[i]) {
+					return "", errSQLFingerprintLexical
+				}
+				if s[i] == ']' {
+					i++
+					closed = true
+					break
+				}
+				b.WriteByte(s[i])
+				i++
+			}
+			if !closed {
+				return "", errSQLFingerprintLexical // unterminated bracket identifier
+			}
+		case c == '-':
+			if i+1 < n && s[i+1] == '-' {
+				return "", errSQLFingerprintLexical // -- comment rejected
+			}
+			appendOuter('-')
+			i++
+		case c == '/':
+			if i+1 < n && s[i+1] == '*' {
+				return "", errSQLFingerprintLexical // /* comment rejected
+			}
+			appendOuter('/')
+			i++
+		default:
+			appendOuter(c)
+			i++
+		}
+	}
+	return strings.TrimSpace(b.String()), nil
 }
 
 // storedObjectSQL reads the stored sqlite_schema (sql) text for one named
@@ -891,7 +1069,7 @@ func installInviteLegacyAttributionImmutability(ctx context.Context, tx *sql.Tx)
 //     accepted_at, revoked_at, legacy_unattributed) with its declared type,
 //     NOT NULL / nullability, PK, default, token_digest uniqueness, and EVERY
 //     CHECK (strict 32-byte BLOB digest, status domain, permission, and
-//     accepted/revoked/legacy attribution relationships) — compared by foldSQL
+//     accepted/revoked/legacy attribution relationships) — compared by normalizeSQL
 //     (insignificant-whitespace normalization only) against the single shared
 //     DDL constant, so columns/CHECKs/uniqueness cannot be dropped, weakened,
 //     or spoofed by whitespace or comment placement.
@@ -944,9 +1122,15 @@ func validateInviteV4DigestSchema(ctx context.Context, tx *sql.Tx) error {
 		return malformed()
 	}
 	wantTbl := fmt.Sprintf(inviteDigestTableSQLFmt, "registry_invites")
-	tblNorm := strings.ReplaceAll(tblSQL, `"registry_invites"`, "registry_invites")
-	wantNorm := strings.ReplaceAll(wantTbl, `"registry_invites"`, "registry_invites")
-	if foldSQL(tblNorm) != foldSQL(wantNorm) {
+	tblNorm, err := normalizeSQL(tblSQL)
+	if err != nil {
+		return malformed()
+	}
+	wantNorm, err := normalizeSQL(wantTbl)
+	if err != nil {
+		return malformed()
+	}
+	if tblNorm != wantNorm {
 		return malformed()
 	}
 
@@ -979,7 +1163,18 @@ func validateInviteV4DigestSchema(ctx context.Context, tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("migration 5 prerequisite: read registry_invites status index: %w", err)
 	}
-	if !ok || foldSQL(idxSQL) != foldSQL(inviteRegistryStatusIndexSQL) {
+	if !ok {
+		return malformed()
+	}
+	idxNorm, err := normalizeSQL(idxSQL)
+	if err != nil {
+		return malformed()
+	}
+	wantIdxNorm, err := normalizeSQL(inviteRegistryStatusIndexSQL)
+	if err != nil {
+		return malformed()
+	}
+	if idxNorm != wantIdxNorm {
 		return malformed()
 	}
 	idxCols, err := readIndexColumns(ctx, tx, "registry_invites", "idx_registry_invites_registry_status")
@@ -1003,7 +1198,18 @@ func validateInviteV4DigestSchema(ctx context.Context, tx *sql.Tx) error {
 		if err != nil {
 			return fmt.Errorf("migration 5 prerequisite: read trigger %s: %w", tc.name, err)
 		}
-		if !ok || foldSQL(trgSQL) != foldSQL(tc.wantSQL) {
+		if !ok {
+			return malformed()
+		}
+		trgNorm, err := normalizeSQL(trgSQL)
+		if err != nil {
+			return malformed()
+		}
+		wantTrgNorm, err := normalizeSQL(tc.wantSQL)
+		if err != nil {
+			return malformed()
+		}
+		if trgNorm != wantTrgNorm {
 			return malformed()
 		}
 	}
