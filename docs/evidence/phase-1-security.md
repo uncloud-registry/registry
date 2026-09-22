@@ -353,3 +353,123 @@ git diff --check
   deterministic gate result replaces the round-2 "not stable" caveat.
   Implementation commit `08033f0`; this round's evidence commits include this
   file (recorded with their SHAs at the end of the round).
+
+## Fix round 4 — Task 9 review remediation (evidence)
+
+Date: 2026-09-22 (UTC)
+Reviewed head: `008d872` (round-3 evidence commit).
+Fix implementation commit: `73fbaaeb43cca8a2823285904394a16a83496c9a` (`task9(r4): exact int64-nano
+bounds; replace sqlite race mask with verified minimal modernc dependency fix`)
+
+Round 4 addresses the two remaining BLOCKERs RED-first. The round-3 note that
+"upgrading modernc.org/sqlite to v1.59.0 was rejected as a larger-than-needed
+rewrite" was correct on magnitude but did NOT settle whether a *minimal*
+upgrade exists; this round found and adopted one. The round-3 serialized
+pre-grow `TestMain` guard is therefore superseded by a root-cause dependency
+fix, per review.
+
+### Blocker 1 — exact int64-nanosecond bounds in `parseCanonicalUTCNanos` (RED → GREEN)
+
+The round-3 implementation bounded only the whole-second (`Unix()`) span,
+then composed `sec*1e9 + nanos`. That silently **wrapped** the maximum's
+fractional overflow and **rejected** the minimum. Reproduced verbatim against
+the old body (RED):
+
+| input (RFC3339Nano) | old result | verdict |
+|---|---|---|
+| `2262-04-11T23:47:16.854775807Z` (exact max) | `9223372036854775807` | correct |
+| `2262-04-11T23:47:16.854775808Z` (max+1ns) | `-9223372036854775808` (wrapped) | WRONG |
+| `2262-04-11T23:47:16.999999999Z` | `-9223372036709551617` (wrapped) | WRONG |
+| `1677-09-21T00:12:43.145224192Z` (exact min) | `out of range` (rejected) | WRONG |
+
+**GREEN** (`internal/controlplane/outbox.go`): parse + canonical-UTC check, then
+compare the parsed `time.Time` as a value against
+`time.Unix(0, math.MinInt64).UTC()` / `time.Unix(0, math.MaxInt64).UTC()`
+**before** any `UnixNano()`. The exact minimum and maximum are accepted and
+round-trip exactly; ±1ns outside either edge, `2262-04-11T23:47:16.999999999Z`,
+and a whole extra year are rejected; every in-range instant is preserved to the
+last nanosecond. New tests: `TestMigration8ParseAcceptsExactInt64Boundaries`,
+`TestMigration8ParseRejectsOutsideBoundaryNanos`, and
+`TestMigration8PreservesBoundaryInstantsAtBothEdges` (v7→v8 migration preserves
+`math.MinInt64` and `math.MaxInt64` instants exactly on a `succeeded` row while
+keeping `completed_at` IFF `succeeded` and all coherence invariants green). All
+`TestMigration8*` suites pass under `-race`.
+
+### Blocker 2 — replace the SQLite race MASK with a verified minimal dependency fix (RED → GREEN)
+
+**The mask (removed).** `internal/controlplane/sqlite_race_guard_test.go` (the
+4096-connection serialized warm-up `TestMain`) is **deleted** entirely. It
+probabilistically preallocated the driver's mutex-pool capacity by *ignoring*
+`Open`/`Ping` errors and opening 4096 shared-memory DBs; that is masking, not
+fixing, the underlying synchronization bug — so `-race` could no longer
+reprove it and the suite's safety depended on a magic hold-count.
+
+**RED artifact (captured).** A standalone module reproducer holding ~200
+shared-memory in-memory connections at once, run with `-race` against
+`modernc.org/sqlite v1.21.1`, reproduces the data race **43 times / exit 66**, all
+inside the driver:
+`mutexPool.alloc()` at `lib/mutex.go:107` (`m.a = append(m.a, &[256]mutex{})` —
+slice-header write, under the pool lock) racing `mutexFromPtr()` at
+`lib/mutex.go:96` (`return &mutexes.a[ix>>8][ix&255]` — reads `m.a` **without**
+the pool lock). The full trace is preserved in scratch
+(`~/.hermes/cache/scratch/raceprobe/race.log`) and its leading frames are cited
+above; no application frame of this task appears in it.
+
+**Root-cause fix (smallest verified).** `modernc.org/sqlite` **v1.21.1 → v1.23.0**.
+I inspected the downloaded `lib/mutex.go` (not assumed latest): v1.22.x has no
+fix, **v1.23.0** is the smallest maintained release whose actual implementation
+makes `mutexFromPtr` take the pool lock before reading the shared slice —
+`mutexes.Lock(); defer mutexes.Unlock(); return &mutexes.a[ix>>8][ix&255]` — so
+the read and `alloc()`'s append are serialized under the same mutex. Project
+constraints met: `go 1.18` ≤ project `go 1.25.0`, `darwin/arm64` builds. Minimal
+transitive churn (this is why v1.34.5/v1.59.0 were rejected): only
+`modernc.org/libc v1.22.3 → v1.22.5` (same minor) and
+`github.com/dustin/go-humanize v1.0.0 → v1.0.1`; build-only hashes
+(tcl`1.15.1→1.15.2`, z`1.7.0→1.7.3`) refresh. No `replace`, no vendored fork.
+
+**Behavior/engine unchanged.** Both v1.21.1 and v1.23.0 bundle the identical
+SQLite amalgamation **3.41.2** (checked `lib/sqlite_darwin_arm64.go:2731`), so
+pragma/transaction/migration semantics are unchanged; the migration and
+concurrency suites still pass under `-race`, and `?pragma` DSN handling is
+exercised by the real schema/migration tests.
+
+**GREEN (same reproducer, no guard):** on `v1.23.0`, the identical reproducer
+opens 8000 DBs and reports **0 data races, exit 0**.
+
+### Re-run commands (all against the round-4 implementation commit; every exit code checked directly)
+
+```bash
+go build ./...
+bash scripts/security/check-repository-secrets.sh                # clean
+go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry   # 3 consecutive runs
+go test -race -count=1 ./...                                      # 3 consecutive runs
+go test -race -count=1 ./internal/controlplane -run 'TestMigration|TestApplyMigrations|TestOutbox|TestReconciler|TestClaim|TestComplete|TestFailPublication'   # focused migration/concurrency
+go vet ./...
+go mod tidy -diff
+go mod verify
+gofmt -l internal/ cmd/             # clean on touched files (outbox.go, migration8_test.go)
+git diff --check
+```
+
+### Honest output (least to most)
+
+- `go build ./...`: ok. `go vet ./...`: clean. `go mod tidy -diff`: clean (no
+  diff — committed mod state is the tidied state). `go mod verify`: all modules
+  verified. `gofmt -l` on the touched files: clean. `git diff --check`: clean.
+  Repository secret scan: clean. No `controlplane.db` created or touched; only
+  in-memory test databases.
+- **Focused SQLite migration/concurrency suite** under `-race`: `ok`
+  (controlplane, 5.0s).
+- **Phase 1 gate — exact command, 3 consecutive runs, exit codes checked
+  directly:** run 1 exit 0, run 2 exit 0, run 3 exit 0; every package `ok`
+  (auth, config, controlplane ~95–105s, policy, registry), no `FAIL`/`DATA RACE`
+  output in any run.
+- **Full race gate — `go test -race -count=1 ./...`, 3 consecutive runs, exit
+  codes checked directly:** runs 1/2/3 all exit 0; 11 test packages `ok` per run
+  (12 packages total incl. `internal/publish` [no test files]); **0** `DATA RACE`
+  occurrences in all three runs combined; the formerly intermittent modernc
+  `mutexPool` race does not surface with the guard removed — because the
+  dependency now serializes the pool read and write.
+- **RED→GREEN proof is un-guarded:** the same standalone reproduction that
+  fired 43 races on v1.21.1 fires ZERO on v1.23.0, with the suite additionally
+  passing 3× with no `TestMain` warm-up present.
