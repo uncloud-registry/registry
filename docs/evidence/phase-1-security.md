@@ -160,3 +160,60 @@ bash scripts/security/check-repository-secrets.sh
 - `git diff --check`: clean.
 - Repository secret scan: clean.
 - No `controlplane.db` created or touched.
+
+## Fix round 2 — Task 9 review remediation (evidence)
+
+Date: 2026-09-22 (UTC)
+Fix implementation commit: `c383ac3` (`task9(r2): production-safe feed
+resolution, migration 8 outbox invariants, typed-nil fail-closed deps`)
+(worktree branch `v1-completion`)
+
+This round re-ran the full gate against the round-2 implementation commit.
+
+### Re-run commands
+
+```bash
+go build ./...
+go test -race -count=1 ./...
+go vet ./...
+go mod tidy -diff
+gofmt -l internal/ cmd/             # clean (pre-existing invite_flash.go excluded, untouched)
+git diff --check
+bash scripts/security/check-repository-secrets.sh
+```
+
+### Honest output
+
+- Full `go test -race -count=1 ./...`: all packages `ok` — including the new
+  round-2 suites (`TestBeeFeedResolver*`, `TestProvisioningRealBee*`,
+  `TestMigration8*`, `TestTypedNil*`) — 0 data races, 0 failures (in-memory
+  test databases only).
+- `go vet ./...`: clean. `go mod tidy -diff`: clean (no go.mod/go.sum change).
+- `gofmt -l internal/ cmd/`: clean for every file this round touched;
+  `internal/controlplane/invite_flash.go` remains non-gofmt but is untouched by
+  this task (pre-existing).
+- `git diff --check`: clean. Repository secret scan: clean. No
+  `controlplane.db` created or touched.
+- **Race-detector stability caveat (verified this round):** the full
+  `go test -race -count=1 ./...` suite is *not deterministically* race-free. The
+  load-dependent `modernc.org/sqlite` driver mutex-poll race surfaced
+  intermittently this round (2 of 5 full runs) and, when it fires, aborts many
+  concurrently-running `internal/controlplane` tests at once. The captured
+  trace's entire data-race pair is inside
+  `modernc.org/sqlite/lib.(*mutexPool).alloc()` (`go/pkg/mod/.../lib/mutex.go:107`);
+  the only application frames present are the benign `OpenSQLite`/
+  `ApplyMigrations`/`newInviteTestStore` invocation callers, and **no Task-9 /
+  round-2 frame (feed resolver, migration 8, typed-nil, outbox) appears** in any
+  observed trace. All packages pass 0/2/2/3 of the remaining full runs and in
+  isolation. This is the same upstream modernc mutex race already documented in
+  round 1; it is not a reproducible defect of this task's code and is NOT being
+  asserted as stable.
+- New tests prove: every constrained field is rejected on adversarial INSERT
+  and UPDATE (JSON type/value tricks incl. missing-key NULL-3VL, storage-class
+  REAL/numeric-text/NULL, calendar-invalid + non-canonical timestamps, and
+  every incoherent state/ownership/completion combination); a genuine v7 DB
+  upgrades to exactly integer-millisecond instants with row meaning preserved;
+  malformed v7 rows roll back byte-equivalently with version staying 7 and no
+  clone; typed-nil panicking facades fail closed in every dependency slot with
+  zero DB effects (value/non-pointer implementations are not rejected); and
+  the REAL Bee object store + feed resolver drive reconciliation end-to-end.
