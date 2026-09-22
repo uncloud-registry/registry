@@ -387,8 +387,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 {{end}}`,
 		})
 	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		_, token, err := s.Service.Login(r.Context(), r.FormValue("email"), r.FormValue("password"))
@@ -445,8 +444,7 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 {{end}}`,
 		})
 	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		_, token, err := s.Service.RegisterUser(r.Context(), r.FormValue("email"), r.FormValue("password"))
@@ -566,8 +564,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
 {{end}}`,
 		})
 	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		created, err := s.Service.CreateRegistry(
@@ -637,7 +634,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 		// redirect URL, a cookie, a log, or an error.
 		if token, ok := s.inviteFlash().consume(flashID, userID, registryID); ok {
 			link := "/ui/invites/accept?token=" + url.QueryEscape(token)
-			message = "Invite created. Share this link with the collaborator: " + absoluteURL(r, link)
+			message = "Invite created. Share this link with the collaborator: " + s.absoluteURL(link)
 		}
 	}
 	inviteModal := inviteModalState(r)
@@ -798,8 +795,7 @@ func (s *HTTPServer) handleUIUpdateRegistrySettings(w http.ResponseWriter, r *ht
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !s.parseFormBounded(w, r) {
 		return
 	}
 	_, err := s.Service.UpdateRegistrySettings(
@@ -826,8 +822,7 @@ func (s *HTTPServer) handleUICreateInvite(w http.ResponseWriter, r *http.Request
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !s.parseFormBounded(w, r) {
 		return
 	}
 	canPull := r.FormValue("can_pull") == "true"
@@ -895,8 +890,7 @@ func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !s.parseFormBounded(w, r) {
 		return
 	}
 	userIDs := r.Form["user_id"]
@@ -1003,8 +997,7 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 			http.Redirect(w, r, "/ui/registries?accepted=1", http.StatusSeeOther)
 			return
 		}
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		_, _, sessionToken, err := s.Service.RegisterAndAcceptInvite(r.Context(), token, r.FormValue("email"), r.FormValue("password"))
@@ -1025,8 +1018,8 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 }
 
 func (s *HTTPServer) setSessionCookie(w http.ResponseWriter, token string) {
-	ttl := s.security.sessionTTL
-	if s.security == nil || ttl <= 0 {
+	ttl := s.sessionTTL()
+	if ttl <= 0 {
 		ttl = 24 * time.Hour
 	}
 	var maxAge int
@@ -1038,6 +1031,15 @@ func (s *HTTPServer) setSessionCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, s.sessionCookie(token, maxAge))
 }
 
+// sessionTTL returns the configured session lifetime, defaulting to 24h when
+// unset (back-compat).
+func (s *HTTPServer) sessionTTL() time.Duration {
+	if s.security != nil && s.security.sessionTTL > 0 {
+		return s.security.sessionTTL
+	}
+	return 24 * time.Hour
+}
+
 // clearSessionCookie expires the session cookie with attributes identical to
 // the one that was set, so browsers remove it.
 func (s *HTTPServer) clearSessionCookie(w http.ResponseWriter) {
@@ -1045,13 +1047,22 @@ func (s *HTTPServer) clearSessionCookie(w http.ResponseWriter) {
 }
 
 // sessionCookie builds the control plane's single, fixed session cookie:
-// HttpOnly, SameSite=Lax, Path=/, bounded MaxAge, Secure when the deployment
-// warrants it (validated mode plus external URL), and never a Domain attribute,
-// so the cookie can never be scoped onto a host the server does not serve.
+// HttpOnly, SameSite=Lax, Path=/, a bounded MaxAge with a matching Expires
+// (and a past Expires for the deletion cookie), Secure when the deployment
+// warrants it (validated mode plus external URL), and never a Domain
+// attribute, so the cookie can never be scoped onto a host the server does not
+// serve.
 func (s *HTTPServer) sessionCookie(token string, maxAge int) *http.Cookie {
 	secure := false
 	if s.security != nil {
 		secure = s.security.secureCookie
+	}
+	// Expires matches MaxAge for the set-cookie (now+maxAge) and is a past
+	// timestamp for the deletion cookie (maxAge<0) so browsers honour expiry
+	// even when they ignore MaxAge.
+	expires := time.Unix(1, 0)
+	if maxAge > 0 {
+		expires = time.Now().Add(time.Duration(maxAge) * time.Second)
 	}
 	return &http.Cookie{
 		Name:     sessionCookieName,
@@ -1061,6 +1072,7 @@ func (s *HTTPServer) sessionCookie(token string, maxAge int) *http.Cookie {
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAge,
+		Expires:  expires,
 	}
 }
 
@@ -1173,12 +1185,16 @@ func inviteModalState(r *http.Request) inviteModalView {
 	}
 }
 
-func absoluteURL(r *http.Request, path string) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
+// absoluteURL renders a public absolute URL from the configured external
+// origin, never from r.Host or r.TLS (both attacker-influenced and unreliable
+// behind a trusted proxy). With no external URL configured (development) it
+// returns the relative path so no attacker-controlled host ever leaks into a
+// public invite link.
+func (s *HTTPServer) absoluteURL(path string) string {
+	if s.security != nil && s.security.externalBase != "" {
+		return s.security.externalBase + path
 	}
-	return scheme + "://" + r.Host + path
+	return path
 }
 
 func parseUIRegistryID(path string) (int64, bool) {

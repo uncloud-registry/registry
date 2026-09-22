@@ -29,6 +29,7 @@ func setEnv(t *testing.T, m map[string]string) {
 		envMode, envListenAddr, envDBPath, envSessionSecret, envSessionTTL,
 		envExternalURL, envRegistryDomain, envRegistryKey, envRegistryKeyID,
 		envMasterKeyFile, envBeeAPIURL, envTrustedProxies, envTLSTermination,
+		envTLSCertFile, envTLSKeyFile, envMigrateLegacy,
 	} {
 		t.Setenv(k, "")
 	}
@@ -39,12 +40,31 @@ func setEnv(t *testing.T, m map[string]string) {
 
 func prodEnv(overrides map[string]string) map[string]string {
 	m := map[string]string{
-		envMode:           "production",
-		envSessionSecret:  strongSecret(),
-		envExternalURL:    "https://cp.example.com",
-		envRegistryKey:    validProductionSeed,
-		envMasterKeyFile:  "/run/secrets/master.key",
-		envTrustedProxies: "10.0.0.0/8",
+		envMode:          "production",
+		envSessionSecret: strongSecret(),
+		envExternalURL:   "https://cp.example.com",
+		envRegistryKey:   validProductionSeed,
+		envMasterKeyFile: "/run/secrets/master.key",
+		envTLSCertFile:   "/run/secrets/tls.crt",
+		envTLSKeyFile:    "/run/secrets/tls.key",
+	}
+	for k, v := range overrides {
+		m[k] = v
+	}
+	return m
+}
+
+// devBase is a validating development fixture: development must still name the
+// registry signing seed, the master-key file, and (for the default direct TLS
+// termination) the certificate/key paths.
+func devBase(overrides map[string]string) map[string]string {
+	m := map[string]string{
+		envMode:          "development",
+		envSessionSecret: strongSecret(),
+		envRegistryKey:   validProductionSeed,
+		envMasterKeyFile: "/run/secrets/master.key",
+		envTLSCertFile:   "/run/secrets/tls.crt",
+		envTLSKeyFile:    "/run/secrets/tls.key",
 	}
 	for k, v := range overrides {
 		m[k] = v
@@ -87,9 +107,9 @@ func TestProductionRejectsUnknownMode(t *testing.T) {
 }
 
 func TestProductionRejectsInsecurePlaceholderSecret(t *testing.T) {
-	long := strings.Repeat("x", 40)
-	cfg := prodEnv(map[string]string{envSessionSecret: long})
-	if _, err := loadValidated(t, cfg); err != nil {
+	// A genuinely strong secret with plenty of entropy is accepted.
+	long := strongSecret() + "xyz012"
+	if _, err := loadValidated(t, prodEnv(map[string]string{envSessionSecret: long})); err != nil {
 		t.Fatalf("strong secret rejected: %v", err)
 	}
 	// The literal placeholder, even padded past the length minimum, is rejected
@@ -221,18 +241,20 @@ func TestTLSTerminationValidation(t *testing.T) {
 }
 
 func TestDevelopmentExplicitAndLenient(t *testing.T) {
-	// Development must be explicit: it never results from a missing/unknown mode,
-	// and it permits absent external URL / registry key / master key.
-	dev := map[string]string{
-		envMode:          "development",
-		envSessionSecret: strongSecret(),
-	}
+	// Development must be explicit: it never results from a missing/unknown
+	// mode. It permits an absent external URL but still requires the crypto
+	// primitives the running server needs (registry seed, master key) and the
+	// TLS key/cert paths for its default direct termination.
+	dev := devBase(nil)
 	cfg, err := loadValidated(t, dev)
 	if err != nil {
 		t.Fatalf("valid development config rejected: %v", err)
 	}
 	if cfg.SecureCookie {
 		t.Fatal("development with no external URL must not force Secure cookies")
+	}
+	if cfg.MasterKeyFile == "" {
+		t.Fatal("development must still name a master-key file")
 	}
 	// Missing mode is NOT an implicit development fallback.
 	missing := map[string]string{envSessionSecret: strongSecret()}
@@ -241,12 +263,26 @@ func TestDevelopmentExplicitAndLenient(t *testing.T) {
 	}
 }
 
-func TestDevelopmentSecureCookieFromHttpsURL(t *testing.T) {
-	dev := map[string]string{
-		envMode:          "development",
-		envSessionSecret: strongSecret(),
-		envExternalURL:   "https://localhost:8443",
+func TestDevelopmentRequiresCryptoPrimitivesInAllModes(t *testing.T) {
+	// Registry seed and master-key file are required in development too (no
+	// optional mismatch with startup, which always needs both).
+	noSeed := devBase(map[string]string{envRegistryKey: ""})
+	if _, err := loadValidated(t, noSeed); err == nil {
+		t.Fatal("development must require the registry signing seed")
 	}
+	noMaster := devBase(map[string]string{envMasterKeyFile: ""})
+	if _, err := loadValidated(t, noMaster); err == nil {
+		t.Fatal("development must require the master-key file")
+	}
+	// Direct termination always needs the TLS key/cert paths.
+	noCert := devBase(map[string]string{envTLSCertFile: ""})
+	if _, err := loadValidated(t, noCert); err == nil {
+		t.Fatal("direct termination must require the TLS certificate path even in development")
+	}
+}
+
+func TestDevelopmentSecureCookieFromHttpsURL(t *testing.T) {
+	dev := devBase(map[string]string{envExternalURL: "https://localhost:8443"})
 	cfg, err := loadValidated(t, dev)
 	if err != nil {
 		t.Fatalf("dev https url rejected: %v", err)
@@ -285,5 +321,163 @@ func TestSessionTTLValidation(t *testing.T) {
 	}
 	if cfg.SessionTTL != 2*time.Hour {
 		t.Fatalf("unexpected TTL %v", cfg.SessionTTL)
+	}
+}
+
+// TestControlPlaneConfigAggregate is the aggregate end-to-end config test the
+// prescribed focused regex ("TestControlPlaneConfig") selects: it loads and
+// validates a full production matrix and a full development matrix, confirming
+// every knob composes into a usable config with the derived values populated.
+func TestControlPlaneConfigAggregate(t *testing.T) {
+	prod, err := loadValidated(t, prodEnv(map[string]string{
+		envSessionTTL: "1h", envBeeAPIURL: "https://bee.example.com",
+		envRegistryDomain: "Registry.Example.COM", envRegistryKeyID: "cp-ed25519-1",
+	}))
+	if err != nil {
+		t.Fatalf("aggregate production config rejected: %v", err)
+	}
+	if !prod.IsProduction() || !prod.SecureCookie {
+		t.Fatal("production aggregate must be secure")
+	}
+	if prod.SessionTTL != time.Hour {
+		t.Fatalf("aggregate TTL not wired: %v", prod.SessionTTL)
+	}
+	if prod.RegistryDomain != "registry.example.com" {
+		t.Fatalf("registry domain must be canonical lowercased, got %q", prod.RegistryDomain)
+	}
+	if prod.BeeAPIURL == nil || prod.BeeAPIURL.String() != "https://bee.example.com" {
+		t.Fatalf("bee url not parsed: %v", prod.BeeAPIURL)
+	}
+	if prod.ExternalOrigin() != "https://cp.example.com" {
+		t.Fatalf("unexpected origin %q", prod.ExternalOrigin())
+	}
+
+	dev, err := loadValidated(t, devBase(nil))
+	if err != nil {
+		t.Fatalf("aggregate development config rejected: %v", err)
+	}
+	if dev.IsProduction() || dev.SecureCookie {
+		t.Fatal("development aggregate must not be secure-cookie without https")
+	}
+}
+
+func TestListenAddrValidation(t *testing.T) {
+	for _, addr := range []string{":8081", "127.0.0.1:8081", "[::1]:8081"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envListenAddr: addr})); err != nil {
+			t.Errorf("valid listen addr %q rejected: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{":0", ":99999", "8081", "host", ":abc"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envListenAddr: addr})); err == nil {
+			t.Errorf("invalid listen addr %q must be rejected", addr)
+		}
+	}
+}
+
+func TestExternalURLOriginOnlyValidation(t *testing.T) {
+	for _, u := range []string{
+		"https://cp.example.com/path", "https://cp.example.com?x=1",
+		"https://cp.example.com#frag", "https://user:pass@cp.example.com",
+		"https://cp.example.com/api",
+	} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envExternalURL: u})); err == nil {
+			t.Errorf("non-origin external URL %q must be rejected", u)
+		}
+	}
+}
+
+func TestRegistryDomainValidation(t *testing.T) {
+	for _, d := range []string{"Uncloud-Registry.com", "registry.example.com"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envRegistryDomain: d})); err != nil {
+			t.Errorf("valid registry domain %q rejected: %v", d, err)
+		}
+	}
+	for _, d := range []string{
+		"http://reg.example.com", "reg.example.com:8080", "*.example.com",
+		"reg.example.com.", "192.168.1.1", "reg example", "reg_example.com",
+		"reg.example.com/path", "reg..com", "reg.",
+	} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envRegistryDomain: d})); err == nil {
+			t.Errorf("invalid registry domain %q must be rejected", d)
+		}
+		// Also the SQLite file-vs-host marker: a bare hyphen-only label is fine,
+		// but a host-form must not slip through as an IP.
+	}
+}
+
+func TestDBPathValidation(t *testing.T) {
+	for _, p := range []string{"file:controlplane.db?_pragma=foreign_keys(1)", "file:db?mode=memory&cache=shared"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envDBPath: p})); err != nil {
+			t.Errorf("valid db path %q rejected: %v", p, err)
+		}
+	}
+	for _, p := range []string{"file:", "file:db?bad=%zz"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envDBPath: p})); err == nil {
+			t.Errorf("invalid db path %q must be rejected", p)
+		}
+	}
+	// Control characters/NUL are rejected by validateDBPath itself (they cannot
+	// be injected through an env var, so test the method directly).
+	if err := (&ControlPlaneConfig{DBPath: "db\x00"}).validateDBPath(); err == nil {
+		t.Fatal("NUL in DB path must be rejected")
+	}
+	if err := (&ControlPlaneConfig{DBPath: "db\x01file"}).validateDBPath(); err == nil {
+		t.Fatal("control character in DB path must be rejected")
+	}
+}
+
+func TestRegistryKeyIDValidation(t *testing.T) {
+	for _, id := range []string{"cp-ed25519-1", "abc123"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envRegistryKeyID: id})); err != nil {
+			t.Errorf("valid registry key id %q rejected: %v", id, err)
+		}
+	}
+	for _, id := range []string{"-lead", "UPPER", "has space", "bad/id", "x?"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envRegistryKeyID: id})); err == nil {
+			t.Errorf("invalid registry key id %q must be rejected", id)
+		}
+	}
+}
+
+func TestProductionRejectsWeakSessionSecret(t *testing.T) {
+	weak := []string{
+		strings.Repeat("a", 32),         // one repeated byte
+		strings.Repeat("ab", 16),        // repeated 2-byte period
+		strings.Repeat("abab", 8),       // repeated 4-byte period
+		strings.Repeat("0123456789", 4), // 10 distinct < 16
+		strings.Repeat("01234567", 4),   // 8 distinct < 16
+	}
+	for _, s := range weak {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envSessionSecret: s})); err == nil {
+			t.Errorf("predictable production secret must be rejected (len %d)", len(s))
+		}
+	}
+	if _, err := loadValidated(t, prodEnv(nil)); err != nil {
+		t.Fatalf("strong random-ish secret must be accepted: %v", err)
+	}
+}
+
+func TestLegacyMigrationValueParsed(t *testing.T) {
+	// Unset means disabled.
+	if _, err := loadValidated(t, prodEnv(nil)); err != nil {
+		t.Fatalf("unset migration loaded: %v", err)
+	}
+	// Literal "true" enables it.
+	on, err := loadValidated(t, prodEnv(map[string]string{envMigrateLegacy: "true"}))
+	if err != nil {
+		t.Fatalf("migration true rejected: %v", err)
+	}
+	if !on.LegacyKeyMigration {
+		t.Fatal("CONTROLPLANE_MIGRATE_LEGACY_KEYS=true must set LegacyKeyMigration")
+	}
+	// Any other value is rejected at Load (before side effects).
+	for _, v := range []string{"false", "TRUE", "1", "yes", "ture"} {
+		if _, err := loadValidated(t, prodEnv(map[string]string{envMigrateLegacy: v})); err == nil {
+			t.Errorf("migration value %q must be rejected", v)
+		}
+	}
+	// Development with migration off still fine.
+	if _, err := loadValidated(t, devBase(map[string]string{envMigrateLegacy: "true"})); err != nil {
+		t.Errorf("development migration true rejected: %v", err)
 	}
 }

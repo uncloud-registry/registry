@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -18,9 +20,6 @@ import (
 )
 
 func main() {
-	// The whole configuration matrix is loaded and validated ONCE, before any
-	// side effect (database, secret files, or listening). No parallel env
-	// path exists to disagree with it.
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -29,34 +28,123 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Final cryptographic validation still happens before any persistent side
-	// effect, using exactly the validated config values. Errors never contain
-	// secret material.
-	tokens, err := auth.NewSessionTokenManager(cfg.SessionSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	comps, err := prepareControlPlane(cfg, defaultDeps())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var feedKeyCipher *controlplane.FeedKeyCipher
-	if cfg.MasterKeyFile != "" {
-		feedKeyCipher, err = controlplane.LoadMasterKeyFile(cfg.MasterKeyFile)
+	srv := &http.Server{Handler: comps.handler}
+	if comps.tlsCert != nil {
+		// Direct termination: serve TLS with the already-parsed certificate,
+		// never plaintext, never a deferred file read.
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{*comps.tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		ln, err := net.Listen("tcp", cfg.ListenAddr)
 		if err != nil {
 			log.Fatal(err)
 		}
+		log.Printf("control plane serving TLS (direct) on %s", cfg.ListenAddr)
+		if err := srv.Serve(tls.NewListener(ln, tlsConfig)); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
-	registryPriv, err := parseRegistrySeedHex(cfg.RegistryEd25519Key)
+	// Trusted-proxy termination: a trusted reverse proxy terminates TLS and
+	// forwards to this internal plaintext listener.
+	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	registryTokens, err := auth.NewRegistryTokenIssuer(registryPriv, auth.RegistryIssuer, cfg.RegistryKeyID)
-	if err != nil {
+	log.Printf("control plane serving internal HTTP behind trusted proxy on %s", cfg.ListenAddr)
+	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// controlPlaneDeps captures every external side-effect the startup assembler
+// performs, so tests can inject spies that prove invalid values cause zero
+// file, DB, or listening side effects before startup fails.
+type controlPlaneDeps struct {
+	newSessionManager func(secret, issuer, audience string) (*auth.SessionTokenManager, error)
+	loadMasterKey     func(path string) (*controlplane.FeedKeyCipher, error)
+	parseRegistrySeed func(seedHex string) (ed25519.PrivateKey, error)
+	newRegistryIssuer func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error)
+	loadTLSKeyPair    func(certFile, keyFile string) (tls.Certificate, error)
+	openStore         func(dbPath string) (*controlplane.Store, error)
+}
+
+func defaultDeps() controlPlaneDeps {
+	return controlPlaneDeps{
+		newSessionManager: auth.NewSessionTokenManager,
+		loadMasterKey:     controlplane.LoadMasterKeyFile,
+		parseRegistrySeed: parseRegistrySeedHex,
+		newRegistryIssuer: func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error) {
+			return auth.NewRegistryTokenIssuer(priv, issuer, keyID)
+		},
+		loadTLSKeyPair: tls.LoadX509KeyPair,
+		openStore:      controlplane.OpenSQLite,
+	}
+}
+
+// controlPlaneComponents is the fully assembled, validated control plane.
+type controlPlaneComponents struct {
+	handler http.Handler
+	// tlsCert is non-nil exactly when termination is direct and TLS must be
+	// served with this preloaded certificate. It is parsed before the DB opens.
+	tlsCert *tls.Certificate
+}
+
+// prepareControlPlane assembles every component strictly in dependency order:
+// session manager → master-key file → registry seed → TLS keypair (direct) →
+// database → service → optional legacy migration → publisher → HTTP handler.
+// Every invalid value returns an error BEFORE the database is opened (the only
+// persistent side effect), so a misconfiguration never touches storage or
+// listens. Errors contain no secret material and no file paths.
+func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) (*controlPlaneComponents, error) {
+	if deps.newSessionManager == nil || deps.loadMasterKey == nil || deps.parseRegistrySeed == nil ||
+		deps.newRegistryIssuer == nil || deps.loadTLSKeyPair == nil || deps.openStore == nil {
+		return nil, errors.New("startup dependencies must be fully supplied")
 	}
 
-	store, err := controlplane.OpenSQLite(cfg.DBPath)
+	tokens, err := deps.newSessionManager(cfg.SessionSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+
+	// The master-key file is required in every mode and always loaded before
+	// the database — there is no development-only plaintext feed-key path.
+	feedKeyCipher, err := deps.loadMasterKey(cfg.MasterKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	registryPriv, err := deps.parseRegistrySeed(cfg.RegistryEd25519Key)
+	if err != nil {
+		return nil, err
+	}
+	registryTokens, err := deps.newRegistryIssuer(registryPriv, auth.RegistryIssuer, cfg.RegistryKeyID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Direct termination: parse the TLS keypair now, before any DB side
+	// effect. trusted-proxy termination does not need a local certificate.
+	var tlsCert *tls.Certificate
+	if cfg.TLSTermination == config.TLSTermDirect {
+		cert, err := deps.loadTLSKeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			// Data-free: never leak the certificate/key file paths.
+			return nil, errors.New("failed to load the TLS certificate and private key pair")
+		}
+		tlsCert = &cert
+	}
+
+	store, err := deps.openStore(cfg.DBPath)
+	if err != nil {
+		return nil, err
 	}
 
 	service := &controlplane.Service{
@@ -65,26 +153,20 @@ func main() {
 		RegistryTokens: registryTokens,
 		RegistryDomain: cfg.RegistryDomain,
 		FeedKeys:       feedKeyCipher,
+		SessionTTL:     cfg.SessionTTL,
 	}
 
-	// Legacy plaintext feed keys are read and encrypted ONLY under an explicit
-	// opt-in; the schema migration itself never touches them. Because the
-	// migrated ciphertext and the cleared legacy column are written in the
-	// same per-row transaction, an interrupted or failed migration never leaves
-	// a partially migrated row.
-	legacyMigration, err := legacyKeyMigrationEnabled()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if legacyMigration {
+	// Legacy plaintext feed keys are read and encrypted ONLY under the
+	// validated explicit opt-in (CONTROLPLANE_MIGRATE_LEGACY_KEYS=true, already
+	// parsed into the config before any file or DB work).
+	if cfg.LegacyKeyMigration {
 		if _, err := service.MigrateLegacyFeedKeys(context.Background()); err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 	}
 
-	var publisher *controlplane.Publisher
 	if cfg.BeeAPIURL != nil {
-		publisher = &controlplane.Publisher{
+		service.Publisher = &controlplane.Publisher{
 			Documents: swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), nil),
 			Feeds: controlplane.BeeRegistryFeedUpdater{
 				BaseURL: cfg.BeeAPIURL.String(),
@@ -92,14 +174,9 @@ func main() {
 			},
 		}
 	}
-	service.Publisher = publisher
 
 	handler := controlplane.NewHTTPServerWithConfig(service, auth.SubjectResolver{Tokens: tokens}, cfg)
-
-	log.Printf("control plane listening on %s", cfg.ListenAddr)
-	if err := http.ListenAndServe(cfg.ListenAddr, handler); err != nil {
-		log.Fatal(err)
-	}
+	return &controlPlaneComponents{handler: handler, tlsCert: tlsCert}, nil
 }
 
 func envOrDefault(name string, fallback string) string {
@@ -126,23 +203,6 @@ func envRequiredSecret(name string) (string, error) {
 // never its value, so no path material reaches logs.
 func masterKeyFileFromEnv() (string, error) {
 	return envRequiredSecret("CONTROLPLANE_MASTER_KEY_FILE")
-}
-
-// legacyKeyMigrationEnabled implements the explicit opt-in gate for reading
-// legacy plaintext feed keys: only the literal value "true" (after trimming)
-// enables migration before serving. Any other non-blank value fails startup —
-// a typo must neither silently skip the migration (leaving plaintext at rest)
-// nor silently run it. Unset means no migration.
-func legacyKeyMigrationEnabled() (bool, error) {
-	value := strings.TrimSpace(os.Getenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS"))
-	switch value {
-	case "":
-		return false, nil
-	case "true":
-		return true, nil
-	default:
-		return false, fmt.Errorf("CONTROLPLANE_MIGRATE_LEGACY_KEYS must be exactly \"true\" to enable legacy feed-key migration, or unset to skip it")
-	}
 }
 
 // parseRegistrySeedHex decodes an Ed25519 signing seed from a 64-char hex

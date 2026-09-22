@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/config"
+	"github.com/uncloud-registry/registry/internal/controlplane"
 )
 
 func TestParseRegistrySeedHexDeterministic(t *testing.T) {
@@ -98,31 +102,6 @@ func TestMasterKeyFilePathRequired(t *testing.T) {
 	}
 }
 
-// TestLegacyKeyMigrationEnabled pins the explicit opt-in contract: only the
-// literal value "true" enables legacy feed-key migration; every other
-// non-blank value fails startup so a typo can neither silently skip the
-// migration (leaving plaintext at rest) nor silently run it.
-func TestLegacyKeyMigrationEnabled(t *testing.T) {
-	t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", "")
-	if enabled, err := legacyKeyMigrationEnabled(); err != nil || enabled {
-		t.Fatalf("unset must mean no migration, got enabled=%v err=%v", enabled, err)
-	}
-	t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", "true")
-	if enabled, err := legacyKeyMigrationEnabled(); err != nil || !enabled {
-		t.Fatalf("literal true must enable migration, got enabled=%v err=%v", enabled, err)
-	}
-	t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", "  true  ")
-	if enabled, err := legacyKeyMigrationEnabled(); err != nil || !enabled {
-		t.Fatalf("whitespace-padded true must enable migration, got enabled=%v err=%v", enabled, err)
-	}
-	for _, v := range []string{"false", "TRUE", "True", "1", "yes", "ture", "on"} {
-		t.Setenv("CONTROLPLANE_MIGRATE_LEGACY_KEYS", v)
-		if _, err := legacyKeyMigrationEnabled(); err == nil {
-			t.Errorf("value %q must be rejected, not silently accepted", v)
-		}
-	}
-}
-
 // INVARIANT (shared with cmd/registry's tokenManagerFromEnv): whitespace is
 // used only to detect a missing/all-whitespace value; any nonblank configured
 // secret is preserved byte-for-byte as the HMAC key. Whitespace is a
@@ -130,7 +109,7 @@ func TestLegacyKeyMigrationEnabled(t *testing.T) {
 func TestEnvRequiredSecretPreservesBytesByteForByte(t *testing.T) {
 	cases := []string{
 		" " + strings.Repeat("a", 32) + " ",  // padded both sides
-		"	" + strings.Repeat("b", 32),        // leading tab
+		"\t" + strings.Repeat("b", 32),       // leading tab
 		strings.Repeat("c", 32) + "\n\r",     // trailing newline + CR
 		"  " + strings.Repeat("d", 30) + " ", // 30-byte core padded to 34 raw
 	}
@@ -151,7 +130,7 @@ func TestControlplaneSecretRoundTripsAcrossRegistryManager(t *testing.T) {
 	// A token issued by the control plane on its exact-registered secret must
 	// verify on a registry-side manager built from the SAME raw env value, and
 	// must NOT verify on a manager built from a trimmed (mutated) value.
-	raw := " 	" + strings.Repeat("e", 32) + "\n"
+	raw := " \t" + strings.Repeat("e", 32) + "\n"
 	issuer, err := auth.NewSessionTokenManager(raw, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
 	if err != nil {
 		t.Fatalf("control-plane issuer on raw secret: %v", err)
@@ -178,3 +157,178 @@ func TestControlplaneSecretRoundTripsAcrossRegistryManager(t *testing.T) {
 		t.Fatal("a trimmed-secret manager must NOT verify a token signed with the padded secret")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Startup assembly tests
+// ---------------------------------------------------------------------------
+
+const startSeed = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+
+func testCfg(mode config.Mode, termination string) *config.ControlPlaneConfig {
+	return &config.ControlPlaneConfig{
+		Mode:               mode,
+		ListenAddr:         ":8443",
+		DBPath:             "file:mem?mode=memory&cache=shared",
+		SessionSecret:      "controlplane-test-session-secret-0123456789abcdef",
+		SessionTTL:         time.Hour,
+		RegistryDomain:     "registry.example.com",
+		RegistryEd25519Key: startSeed,
+		RegistryKeyID:      "cp-ed25519-1",
+		MasterKeyFile:      "/run/secrets/master.key",
+		TLSCertFile:        "/run/secrets/tls.crt",
+		TLSKeyFile:         "/run/secrets/tls.key",
+		TLSTermination:     termination,
+	}
+}
+
+func fakeMasterKey(t *testing.T) func(string) (*controlplane.FeedKeyCipher, error) {
+	t.Helper()
+	return func(_ string) (*controlplane.FeedKeyCipher, error) {
+		return controlplane.NewFeedKeyCipher(map[int][]byte{1: bytes.Repeat([]byte{0x42}, 32)}, 1)
+	}
+}
+
+func TestPrepareDirectChoosesTLSAndOpensDBLast(t *testing.T) {
+	cfg := testCfg(config.ModeProduction, config.TLSTermDirect)
+	var tlsLoaded, storeOpened int
+	deps := defaultDeps()
+	deps.loadMasterKey = fakeMasterKey(t)
+	deps.loadTLSKeyPair = func(_, _ string) (tls.Certificate, error) {
+		tlsLoaded++
+		return tls.Certificate{}, nil
+	}
+	deps.openStore = func(_ string) (*controlplane.Store, error) {
+		storeOpened++
+		return &controlplane.Store{}, nil
+	}
+
+	comps, err := prepareControlPlane(cfg, deps)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if comps.tlsCert == nil {
+		t.Fatal("direct termination must select a TLS certificate")
+	}
+	if tlsLoaded != 1 || storeOpened != 1 {
+		t.Fatalf("expected TLS then store exactly once, got tls=%d store=%d", tlsLoaded, storeOpened)
+	}
+}
+
+func TestPrepareTrustedProxyServesInternalHTTP(t *testing.T) {
+	cfg := testCfg(config.ModeProduction, config.TLSTermTrustedProxy)
+	cfg.TrustedProxyCIDRs = nil
+	var tlsLoaded, storeOpened int
+	deps := defaultDeps()
+	deps.loadMasterKey = fakeMasterKey(t)
+	deps.loadTLSKeyPair = func(_, _ string) (tls.Certificate, error) {
+		tlsLoaded++
+		return tls.Certificate{}, nil
+	}
+	deps.openStore = func(_ string) (*controlplane.Store, error) {
+		storeOpened++
+		return &controlplane.Store{}, nil
+	}
+
+	comps, err := prepareControlPlane(cfg, deps)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if comps.tlsCert != nil {
+		t.Fatal("trusted-proxy termination must not require or use a TLS certificate")
+	}
+	if tlsLoaded != 0 || storeOpened != 1 {
+		t.Fatalf("expected no TLS load and one store open, got tls=%d store=%d", tlsLoaded, storeOpened)
+	}
+}
+
+// TestPrepareInvalidMasterKeyZeroSideEffects proves that when the master-key
+// file is invalid, NO TLS parse, DB open, or store work happens — only the
+// master-key loader ran (a file read that legitimately precedes those steps).
+func TestPrepareInvalidMasterKeyZeroSideEffects(t *testing.T) {
+	cfg := testCfg(config.ModeProduction, config.TLSTermDirect)
+	var tlsLoaded, storeOpened int
+	deps := defaultDeps()
+	deps.loadMasterKey = func(_ string) (*controlplane.FeedKeyCipher, error) {
+		return nil, errInjected
+	}
+	deps.loadTLSKeyPair = func(_, _ string) (tls.Certificate, error) {
+		tlsLoaded++
+		return tls.Certificate{}, nil
+	}
+	deps.openStore = func(_ string) (*controlplane.Store, error) {
+		storeOpened++
+		return &controlplane.Store{}, nil
+	}
+	if _, err := prepareControlPlane(cfg, deps); err == nil {
+		t.Fatal("expected master-key failure to abort startup")
+	}
+	if tlsLoaded != 0 || storeOpened != 0 {
+		t.Fatalf("invalid master key must cause zero TLS/DB side effects, got tls=%d store=%d", tlsLoaded, storeOpened)
+	}
+}
+
+// TestPrepareMalformedTLSFilesFailBeforeDB proves that malformed or missing
+// TLS files fail before any database side effect (finding 4).
+func TestPrepareMalformedTLSFilesFailBeforeDB(t *testing.T) {
+	for _, tc := range []string{"missing", "malformed"} {
+		t.Run(tc, func(t *testing.T) {
+			cfg := testCfg(config.ModeProduction, config.TLSTermDirect)
+			var storeOpened int
+			deps := defaultDeps()
+			deps.loadMasterKey = fakeMasterKey(t)
+			deps.loadTLSKeyPair = func(_, _ string) (tls.Certificate, error) {
+				return tls.Certificate{}, errInjected
+			}
+			deps.openStore = func(_ string) (*controlplane.Store, error) {
+				storeOpened++
+				return &controlplane.Store{}, nil
+			}
+			if _, err := prepareControlPlane(cfg, deps); err == nil {
+				t.Fatal("malformed/missing TLS files must abort startup")
+			}
+			if storeOpened != 0 {
+				t.Fatalf("TLS failure must precede DB open, got store=%d", storeOpened)
+			}
+		})
+	}
+}
+
+func TestPrepareInvalidValuesCauseZeroFileDBListenActions(t *testing.T) {
+	// A chain of injectable funcs records every file/DB reach call. An invalid
+	// value at each stage must prevent every later side effect.
+	t.Run("weak session secret", func(t *testing.T) {
+		cfg := testCfg(config.ModeProduction, config.TLSTermDirect)
+		cfg.SessionSecret = "short"
+		masterRun, storeRun := 0, 0
+		deps := defaultDeps()
+		deps.loadMasterKey = func(_ string) (*controlplane.FeedKeyCipher, error) { masterRun++; return nil, errInjected }
+		deps.openStore = func(_ string) (*controlplane.Store, error) { storeRun++; return &controlplane.Store{}, nil }
+		if _, err := prepareControlPlane(cfg, deps); err == nil {
+			t.Fatal("weak session secret must abort startup")
+		}
+		if masterRun != 0 || storeRun != 0 {
+			t.Fatalf("weak secret caused side effects: master=%d store=%d", masterRun, storeRun)
+		}
+	})
+	t.Run("invalid registry seed", func(t *testing.T) {
+		cfg := testCfg(config.ModeProduction, config.TLSTermDirect)
+		cfg.RegistryEd25519Key = "zz-not-hex"
+		var storeRun int
+		deps := defaultDeps()
+		deps.loadMasterKey = fakeMasterKey(t)
+		deps.openStore = func(_ string) (*controlplane.Store, error) { storeRun++; return &controlplane.Store{}, nil }
+		if _, err := prepareControlPlane(cfg, deps); err == nil {
+			t.Fatal("invalid registry seed must abort startup")
+		}
+		if storeRun != 0 {
+			t.Fatalf("invalid registry seed caused a DB open: store=%d", storeRun)
+		}
+	})
+}
+
+// errInjected is a sentinel for spy-injected failures.
+var errInjected = &injectedError{}
+
+type injectedError struct{}
+
+func (*injectedError) Error() string { return "injected startup failure" }

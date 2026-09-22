@@ -22,10 +22,15 @@ type Service struct {
 	RegistryTokens *auth.RegistryTokenIssuer
 	RegistryDomain string
 	Publisher      *Publisher
+	// SessionTTL is the lifetime of issued session tokens. Zero means the
+	// default 24h (test/back-compat). RegisterUser and Login use it, and the
+	// session cookie's MaxAge/Expires align to the same value.
+	SessionTTL time.Duration
 	// FeedKeys is the AES-GCM cipher wrapping registry feed-owner signing keys
-	// at rest. Production startup requires it (cmd/controlplane loads the
-	// master-key file and fails closed when it is missing); operations that
-	// would otherwise store or expose plaintext fail closed when it is nil.
+	// at rest. Startup always loads it (cmd/controlplane requires the
+	// master-key file in every mode and loads it before the database);
+	// operations that would otherwise store or expose plaintext fail closed
+	// when it is nil.
 	FeedKeys *FeedKeyCipher
 }
 
@@ -34,6 +39,37 @@ type Service struct {
 // failure so a caller can never distinguish which part was wrong (no account
 // enumeration).
 var errInvalidCredentials = errors.New("invalid email or password")
+
+// Safe internal cause classifications for correlated logging. These are
+// deliberately coarse and never carry credentials, tokens, or PII, so they
+// can be logged verbatim.
+const (
+	causeUnknownAccount  = "unknown_account"
+	causeInvalidPassword = "invalid_password"
+)
+
+// credentialFailure is an internal, success-wrapped variant of
+// errInvalidCredentials that additionally carries a safe cause classification
+// for correlated logging. It still satisfies errors.Is(errInvalidCredentials)
+// and produces the identical public message, so public status/body are
+// unchanged while the operator sees a safe internal cause.
+type credentialFailure struct {
+	cause string
+}
+
+func (e *credentialFailure) Error() string { return errInvalidCredentials.Error() }
+
+func (e *credentialFailure) Unwrap() error { return errInvalidCredentials }
+
+// credentialCause extracts the safe classification, or "" for a non-wrapped
+// failure (the caller then logs a generic cause).
+func credentialCause(err error) string {
+	var cf *credentialFailure
+	if errors.As(err, &cf) {
+		return cf.cause
+	}
+	return ""
+}
 
 // dummyPasswordHash is a valid bcrypt hash used to keep comparison work
 // constant between a recognised and an unknown email, closing the timing
@@ -63,6 +99,19 @@ type RegistryDashboard struct {
 	StampPolicy spec.StampPolicyDocument `json:"stampPolicy"`
 }
 
+// defaultSessionTokenTTL is the lifetime used when Service.SessionTTL is zero
+// (test/back-compat) — identical to the config default.
+const defaultSessionTokenTTL = 24 * time.Hour
+
+// sessionTTL returns the configured session lifetime, defaulting to 24h when
+// unset so existing tests and zero-value services keep working.
+func (s *Service) sessionTTL() time.Duration {
+	if s.SessionTTL > 0 {
+		return s.SessionTTL
+	}
+	return defaultSessionTokenTTL
+}
+
 func (s *Service) RegisterUser(ctx context.Context, email string, password string) (User, string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -72,7 +121,7 @@ func (s *Service) RegisterUser(ctx context.Context, email string, password strin
 	if err != nil {
 		return User{}, "", err
 	}
-	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
+	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), s.sessionTTL())
 	return user, token, err
 }
 
@@ -86,14 +135,14 @@ func (s *Service) Login(ctx context.Context, email string, password string) (Use
 			// Unknown account: still compare a bcrypt hash so an attacker
 			// cannot time the difference between a known and unknown email.
 			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
-			return User{}, "", errInvalidCredentials
+			return User{}, "", &credentialFailure{cause: causeUnknownAccount}
 		}
-		return User{}, "", errInvalidCredentials
+		return User{}, "", &credentialFailure{cause: causeUnknownAccount}
 	}
 	if !comparePassword(user.PasswordHash, password) {
-		return User{}, "", errInvalidCredentials
+		return User{}, "", &credentialFailure{cause: causeInvalidPassword}
 	}
-	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), 24*time.Hour)
+	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), s.sessionTTL())
 	return user, token, err
 }
 
@@ -475,12 +524,12 @@ func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope str
 			// Unknown account: comparable bcrypt work, generic failure (no
 			// account enumeration via the token endpoint).
 			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
-			return "", errInvalidCredentials
+			return "", &credentialFailure{cause: causeUnknownAccount}
 		}
-		return "", errInvalidCredentials
+		return "", &credentialFailure{cause: causeUnknownAccount}
 	}
 	if !comparePassword(user.PasswordHash, password) {
-		return "", errInvalidCredentials
+		return "", &credentialFailure{cause: causeInvalidPassword}
 	}
 	registry, err := s.Store.FindRegistryByHost(ctx, host)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,10 @@ import (
 type HTTPServer struct {
 	Service  *Service
 	Subjects auth.SubjectResolver
+
+	// Logger receives component-tagged, safe internal log lines (request ID +
+	// cause classification on auth failures). Nil uses slog.Default().
+	Logger *slog.Logger
 
 	// security enforces the request-time controls (CSRF, rate limits, origin,
 	// client-IP resolution, headers). It is always present; development mode
@@ -118,8 +123,7 @@ type credentialsRequest struct {
 
 func (s *HTTPServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req credentialsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	user, token, err := s.Service.RegisterUser(r.Context(), req.Email, req.Password)
@@ -132,14 +136,15 @@ func (s *HTTPServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req credentialsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	// Every authentication failure produces the same generic response so a
-	// caller can never distinguish unknown email from a wrong password.
+	// caller can never distinguish unknown email from a wrong password, while
+	// a safe internal cause (request-correlated, no credentials) is logged.
 	user, token, err := s.Service.Login(r.Context(), req.Email, req.Password)
 	if err != nil {
+		s.logAuthFailure(r, credentialCause(err))
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": errInvalidCredentials.Error()})
 		return
 	}
@@ -159,8 +164,7 @@ func (s *HTTPServer) handleCreateRegistry(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req createRegistryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	registry, err := s.Service.CreateRegistry(r.Context(), userID, req.Slug, req.ENSName, req.AnonymousPull, req.DefaultStampBatchID)
@@ -206,8 +210,7 @@ func (s *HTTPServer) handleCreateInvite(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req createInviteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	invite, token, err := s.Service.CreateInvite(r.Context(), registryID, userID, req.Email, req.CanPull, req.CanPush)
@@ -226,8 +229,7 @@ func (s *HTTPServer) handleAcceptInvite(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	invite, err := s.Service.AcceptInvite(r.Context(), req.Token, userID)
@@ -298,6 +300,7 @@ func (s *HTTPServer) handleRevokeInvite(w http.ResponseWriter, r *http.Request) 
 func (s *HTTPServer) handleRegistryToken(w http.ResponseWriter, r *http.Request) {
 	username, password, ok := r.BasicAuth()
 	if !ok {
+		s.logAuthFailure(r, "missing_basic_auth")
 		w.Header().Set("WWW-Authenticate", `Basic realm="uncloud-registry"`)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "basic auth required"})
 		return
@@ -308,14 +311,21 @@ func (s *HTTPServer) handleRegistryToken(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		status := http.StatusUnauthorized
 		message := err.Error()
-		if errors.Is(err, sql.ErrNoRows) {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
 			// Registry for the requested host does not exist; the caller chose
 			// the host so this reveals nothing about users or credentials.
 			status = http.StatusNotFound
 			message = "registry not found"
-		} else if errors.Is(err, errInvalidCredentials) {
+			s.logAuthFailure(r, "registry_not_found")
+		case errors.Is(err, errInvalidCredentials):
 			// Never distinguish unknown user from a wrong password.
 			message = errInvalidCredentials.Error()
+			s.logAuthFailure(r, credentialCause(err))
+		default:
+			// Other failures (malformed scope, denied permission) are safe and
+			// generic; log a coarse cause without the error text.
+			s.logAuthFailure(r, "token_refused")
 		}
 		writeJSON(w, status, map[string]string{"error": message})
 		return
@@ -360,6 +370,64 @@ func (s *HTTPServer) requireSessionSubject(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return subject, true
+}
+
+// logger returns the configured Logger, defaulting to slog.Default().
+func (s *HTTPServer) logger() *slog.Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return slog.Default()
+}
+
+// logAuthFailure logs a safe, internal authentication-failure line: only the
+// cryptographically random request ID (for correlation) and a coarse cause
+// classification. It NEVER includes the email, password, token, or any error
+// string. Public status/body are unaffected.
+func (s *HTTPServer) logAuthFailure(r *http.Request, cause string) {
+	if cause == "" {
+		cause = "authentication_failed"
+	}
+	s.logger().Warn("authentication failed",
+		"component", "controlplane",
+		"request_id", RequestIDFromContext(r.Context()),
+		"route", r.Method+" "+r.URL.Path,
+		"cause", cause,
+	)
+}
+
+// decodeJSON decodes a request JSON body through the bounded body already set
+// up by the security middleware, mapping body overflow to an explicit 413.
+// Non-size decode errors return the same 400 explain-the-error body as before,
+// and never echo secrets (the caller is responsible for safe error text).
+func (s *HTTPServer) decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	err := json.NewDecoder(r.Body).Decode(dst)
+	if err == nil {
+		return true
+	}
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+		return false
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	return false
+}
+
+// parseFormBounded parses a form body through the bounded request body,
+// mapping overflow to an explicit 413 and other errors to the same 400 the
+// handlers already produce.
+func (s *HTTPServer) parseFormBounded(w http.ResponseWriter, r *http.Request) bool {
+	if err := r.ParseForm(); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

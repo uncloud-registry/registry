@@ -3,9 +3,12 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net"
@@ -264,18 +267,23 @@ func (r *ipResolver) ClientIP(remoteAddr string, xffHeaders []string) (netip.Add
 	// Walk right-to-left across the header, the appended order being the order
 	// the proxies saw the request. The first hop from the right that is not a
 	// trusted proxy is the original client; every hop in between must parse and
-	// be trusted.
+	// be trusted. Every parsed address is unmapped to canonical IPv4 first.
 	for i := len(entries) - 1; i >= 0; i-- {
 		addr, perr := netip.ParseAddr(strings.TrimSpace(entries[i]))
 		if perr != nil {
 			return netip.Addr{}, errMalformedForwardChain
 		}
+		addr = addr.Unmap()
 		if !r.isTrusted(addr) {
 			return addr, nil
 		}
 	}
 	// Every hop is trusted; the leftmost entry is the client boundary.
-	return netip.ParseAddr(strings.TrimSpace(entries[0]))
+	left, perr := netip.ParseAddr(strings.TrimSpace(entries[0]))
+	if perr != nil {
+		return netip.Addr{}, errMalformedForwardChain
+	}
+	return left.Unmap(), nil
 }
 
 var errMalformedForwardChain = &forwardChainError{}
@@ -285,7 +293,8 @@ type forwardChainError struct{}
 func (*forwardChainError) Error() string { return "malformed or spoofed forwarded IP chain" }
 
 // parseRemoteAddr extracts the IP from a TCP peer address string, tolerating
-// IPv4, IPv6-with-brackets-and-port, and zone-qualified forms.
+// IPv4, IPv6-with-brackets-and-port, and zone-qualified forms. IPv4-mapped
+// IPv6 addresses are unmapped to their canonical IPv4 form at every boundary.
 func parseRemoteAddr(remoteAddr string) (netip.Addr, error) {
 	remoteAddr = strings.TrimSpace(remoteAddr)
 	if remoteAddr == "" {
@@ -293,11 +302,11 @@ func parseRemoteAddr(remoteAddr string) (netip.Addr, error) {
 	}
 	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
 		if a, aerr := netip.ParseAddr(host); aerr == nil {
-			return a, nil
+			return a.Unmap(), nil
 		}
 	}
 	if a, err := netip.ParseAddr(remoteAddr); err == nil {
-		return a, nil
+		return a.Unmap(), nil
 	}
 	return netip.Addr{}, &forwardChainError{}
 }
@@ -326,8 +335,12 @@ type securityPolicy struct {
 	production     bool
 	secureCookie   bool
 	externalOrigin string
-	sessionTTL     time.Duration
-	resolver       *ipResolver
+	// externalBase is the validated external origin (scheme://host), used to
+	// render public absolute URLs for invite links. Empty when no external URL
+	// is configured (development), in which case relative paths are used.
+	externalBase string
+	sessionTTL   time.Duration
+	resolver     *ipResolver
 
 	loginLimiter        *Limiter
 	registrationLimiter *Limiter
@@ -353,6 +366,9 @@ func newSecurityPolicy(tokens *auth.SessionTokenManager, cfg *config.ControlPlan
 		p.production = cfg.IsProduction()
 		p.secureCookie = cfg.SecureCookie
 		p.externalOrigin = cfg.ExternalOrigin()
+		if cfg.ExternalURL != nil {
+			p.externalBase = cfg.ExternalOrigin()
+		}
 		p.sessionTTL = cfg.SessionTTL
 		trusted = cfg.TrustedProxyCIDRs
 	}
@@ -423,16 +439,22 @@ func isFormContentType(r *http.Request) bool {
 }
 
 // checkCSRF enforces the session-bound CSRF rule for cookie-authenticated
-// unsafe methods. Explicit bearer Authorization requests are exempt (ruling 1).
-// Returns false after writing a 403 when the request must be rejected. It never
-// consumes a JSON body in a way that breaks the handler: form bodies go through
-// the cached ParseForm path and JSON bodies are only checked via the header.
+// unsafe methods. An explicit Authorization header exempts ONLY when it is a
+// syntactically canonical Bearer whose session token the configured
+// verifier successfully validates. Any invalid or non-Bearer Authorization
+// does NOT exempt the request — if a valid session cookie is present the
+// cookie is authoritative and CSRF is required. Requests with an invalid
+// bearer and no valid cookie fall through so the router's authorization
+// boundary 401s. Returns false after writing a 403 when the request must be
+// rejected. It never consumes a JSON body in a way that breaks the handler:
+// form bodies go through the cached ParseForm path and JSON bodies are only
+// checked via the header.
 func (p *securityPolicy) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
 	if methodIsSafe(r.Method) {
 		return true
 	}
-	if r.Header.Get("Authorization") != "" {
-		// Explicit bearer authentication is CSRF-exempt.
+	if p.verifiedBearer(r) {
+		// Only a verified, canonical bearer is CSRF-exempt.
 		return true
 	}
 	claims, ok := p.sessionClaimsFromCookie(r)
@@ -441,37 +463,47 @@ func (p *securityPolicy) checkCSRF(w http.ResponseWriter, r *http.Request) bool 
 		// boundary; there is no authenticated session to protect.
 		return true
 	}
-	if claims.CSRF == "" {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "missing session CSRF"})
+
+	// The stored session claim must itself be canonical lowercase 64-hex
+	// decoding to exactly 32 bytes before comparison; a legacy or malformed
+	// claim is rejected outright (403), so it can never be compared or pass.
+	expected, err := decodeCSRFCandidate(claims.CSRF)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid session CSRF"})
 		return false
 	}
 
+	// Collect EVERY candidate from all form fields and all headers. Exactly
+	// one candidate total is required: duplicates (even identical), conflicting
+	// form-vs-header pairs, and any extra value are all rejected.
 	var candidates []string
 	if isFormContentType(r) {
 		// ParseForm caches its result, so the handler's later ParseForm reuses it.
 		_ = r.ParseForm()
-		if fv := r.PostFormValue("_csrf"); fv != "" {
-			candidates = append(candidates, fv)
-		}
+		candidates = append(candidates, r.PostForm["_csrf"]...)
 	}
-	if hv := r.Header.Get("X-CSRF-Token"); hv != "" {
-		candidates = append(candidates, hv)
+	for _, hv := range r.Header.Values("X-CSRF-Token") {
+		if hv != "" {
+			candidates = append(candidates, hv)
+		}
 	}
 
 	if len(candidates) == 0 {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "missing CSRF token"})
 		return false
 	}
-	if distinctCSRFValues(candidates) != 1 {
+	if len(candidates) != 1 {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "conflicting CSRF tokens"})
 		return false
 	}
-	candidate := candidates[0]
-	if len(candidate) != len(claims.CSRF) {
+	// Strict shape/decode of the single candidate before any comparison.
+	got, err := decodeCSRFCandidate(candidates[0])
+	if err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
 		return false
 	}
-	if subtle.ConstantTimeCompare([]byte(candidate), []byte(claims.CSRF)) != 1 {
+	// Constant-time compare of the decoded 32-byte values. No side effects.
+	if subtle.ConstantTimeCompare(got, expected) != 1 {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
 		return false
 	}
@@ -479,12 +511,28 @@ func (p *securityPolicy) checkCSRF(w http.ResponseWriter, r *http.Request) bool 
 	return true
 }
 
-func distinctCSRFValues(vals []string) int {
-	set := make(map[string]struct{}, len(vals))
-	for _, v := range vals {
-		set[v] = struct{}{}
+var errMalformedCSRF = errors.New("malformed CSRF value")
+
+// decodeCSRFCandidate strictly validates a session CSRF value: it must be
+// canonical lowercase hex, exactly 64 characters, decoding to exactly 32
+// bytes. Uppercase, short, long, non-hex, whitespace-padded, and otherwise
+// malformed values are rejected so no ambiguous or legacy claim can be
+// compared. Returns the raw 32 byte key material for constant-time compare.
+func decodeCSRFCandidate(s string) ([]byte, error) {
+	if len(s) != 64 {
+		return nil, errMalformedCSRF
 	}
-	return len(set)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return nil, errMalformedCSRF
+		}
+	}
+	out, err := hex.DecodeString(s)
+	if err != nil || len(out) != 32 {
+		return nil, errMalformedCSRF
+	}
+	return out, nil
 }
 
 // CSRFFromContext returns the verified CSRF value surfaced to request context
@@ -563,7 +611,12 @@ func classifyRoute(method string, path string) routeClass {
 		if method == http.MethodPost {
 			return routeLogin
 		}
-	case "/api/users/register", "/ui/register":
+	case "/api/users/register", "/ui/register", "/ui/invites/accept":
+		// /ui/invites/accept can create an account (RegisterAndAcceptInvite),
+		// so it always draws from the same per-IP registration bucket as
+		// /ui/register and cannot bypass it by alternating routes. Even when a
+		// signed-in user just accepts an invite, the registration cap still
+		// applies to this account-creation-capable route.
 		if method == http.MethodPost {
 			return routeReg
 		}
@@ -602,16 +655,40 @@ func (p *securityPolicy) verifySubject(authz string) string {
 	return claims.Subject
 }
 
+// verifiedBearer reports whether the request's Authorization header is a
+// syntactically canonical Bearer whose session token the configured verifier
+// successfully validates. It is the ONLY condition under which a bearer
+// request is CSRF-exempt. A non-Bearer scheme, a malformed header, an
+// unverifiable/forged/expired token, or an empty token all return false.
+func (p *securityPolicy) verifiedBearer(r *http.Request) bool {
+	authz := r.Header.Get("Authorization")
+	if authz == "" {
+		return false
+	}
+	bearer := strings.TrimPrefix(authz, "Bearer ")
+	if bearer == authz {
+		// Not the canonical "Bearer " scheme.
+		return false
+	}
+	if strings.TrimSpace(bearer) == "" {
+		return false
+	}
+	if _, err := p.verifySession(bearer); err != nil {
+		return false
+	}
+	return true
+}
+
 func (p *securityPolicy) writeRateLimited(w http.ResponseWriter, wait time.Duration) {
 	w.Header().Set("Retry-After", strconv.FormatInt(int64(math.Ceil(wait.Seconds())), 10))
 	writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests, please try again later"})
 }
 
 // checkRateLimit enforces the per-route bucket before any expensive credential
-// work. email (for login) must be normalized consistently; keys are hashed in
+// work. The route class is supplied by the caller (classified BEFORE any body
+// is read) so email extraction only happens on login routes. Keys are hashed in
 // memory and never stored raw.
-func (p *securityPolicy) checkRateLimit(w http.ResponseWriter, r *http.Request, clientIP netip.Addr, email string) bool {
-	class := classifyRoute(r.Method, r.URL.Path)
+func (p *securityPolicy) checkRateLimit(w http.ResponseWriter, r *http.Request, class routeClass, clientIP netip.Addr, email string) bool {
 	if class == routeNone {
 		return true
 	}
@@ -691,6 +768,34 @@ func ClientIPFromContext(ctx context.Context) (netip.Addr, bool) {
 	return a, ok
 }
 
+// requestIDContextKey carries the cryptographically random per-request ID.
+var requestIDContextKey = struct{}{}
+
+// requestIDHeader names the response header echoing the correlating request ID.
+const requestIDHeader = "X-Request-Id"
+
+// RequestIDFromContext returns the request ID generated by the security
+// middleware (never trusted from an incoming header).
+func RequestIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(requestIDContextKey).(string)
+	return v
+}
+
+// newRequestID returns a fresh cryptographically random request ID (16 bytes,
+// hex-encoded). Failures to draw randomness propagate as an absent ID.
+func newRequestID() string {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(buf)
+}
+
+// maxBodyBytes is the control-plane request-body cap (1 MiB). Any request
+// body larger than this is rejected with a 413 before it can be buffered into
+// memory at scale.
+const maxBodyBytes = 1 << 20
+
 const (
 	headerCSP      = "Content-Security-Policy"
 	headerNoSniff  = "X-Content-Type-Options"
@@ -709,12 +814,23 @@ func securityHeaders(h http.Header) {
 }
 
 // wrap returns the security-enforcing handler around the router. Order is
-// deliberate: headers are set, client IP is resolved once, login/register
-// origin and rate limits are enforced before any credential work, and CSRF is
-// enforced before any state-changing cookie-authenticated handler runs.
+// deliberate: security headers are set, the request body is bounded, a
+// cryptographically random request ID is minted (never trusted inbound) and
+// echoed, client IP is resolved once, the route is classified, login/register
+// origin and rate limits are enforced before any credential work (only login
+// routes read the body for the email key), and CSRF is enforced before any
+// state-changing cookie-authenticated handler runs.
 func (p *securityPolicy) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		securityHeaders(w.Header())
+
+		// Bound the request body before anything parses it. Overflow surfaces
+		// as a *http.MaxBytesError that bounded decode/parse helpers map to 413.
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+
+		rid := newRequestID()
+		w.Header().Set(requestIDHeader, rid)
+		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey, rid))
 
 		clientIP, err := p.resolver.ClientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"))
 		if err != nil {
@@ -727,7 +843,13 @@ func (p *securityPolicy) wrap(next http.Handler) http.Handler {
 			return
 		}
 
-		if !p.checkRateLimit(w, r, clientIP, loginEmail(r)) {
+		// Classify BEFORE reading any body; only login routes extract email.
+		class := classifyRoute(r.Method, r.URL.Path)
+		email := ""
+		if class == routeLogin {
+			email = loginEmail(r)
+		}
+		if !p.checkRateLimit(w, r, class, clientIP, email) {
 			return
 		}
 		if !p.checkCSRF(w, r) {
@@ -751,6 +873,10 @@ func (p *securityPolicy) sessionCSRF(r *http.Request) string {
 func readBody(r *http.Request) ([]byte, error) {
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
+		// On read error (a MaxBytesError from an oversized bounded body), do NOT
+		// replace r.Body with a fresh reader: keeping the bounded MaxBytesReader
+		// intact preserves the overflow signal so the handler's decode maps it to
+		// an explicit 413 instead of a misleading 400.
 		return nil, err
 	}
 	r.Body = io.NopCloser(bytes.NewReader(raw))
