@@ -21,7 +21,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/config"
@@ -514,9 +513,13 @@ func resolveContentType(r *http.Request) contentTypeState {
 	if len(vals) > 1 {
 		return contentTypeAmbiguous
 	}
-	v := strings.TrimFunc(vals[0], unicode.IsSpace)
+	v := strings.Trim(vals[0], " \t")
 	if v == "" {
-		// A single value that trims to blank counts as absent (unspecified).
+		// A single value that trims to blank (ASCII SP/HTAB OWS only) counts as
+		// absent (unspecified). HTTP field OWS is exactly SP (0x20) and HTAB
+		// (0x09); other bytes — including Unicode whitespace like NBSP/U+00A0
+		// or U+2003 — stay present and go on to mime.ParseMediaType, where a
+		// non-media-type value is malformed (415), never "blank".
 		return contentTypeUnspecified
 	}
 	mediatype, _, err := mime.ParseMediaType(v)
