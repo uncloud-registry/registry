@@ -198,6 +198,56 @@ var migrations = []migration{
 		Version: 7,
 		Apply:   installProvisioningOutboxSchemaHarden,
 	},
+	// Version 8 closes the remaining SQLite storage-class / dynamic-typing /
+	// three-valued-logic loopholes migration 7's CHECKs could not reach, and
+	// is the authoritative hardening of the provisioning outbox:
+	//
+	//   1. Storage-class enforcement: SQLite's INTEGER/TEXT columns are
+	//      dynamically typed, so `attempts integer not null` and the bounded
+	//      text columns could still hold a REAL (e.g. 5.0), a numeric TEXT, or
+	//      a NULL via direct SQL, and a 3VL comparison (`x = 1`) returns NULL
+	//      (not FALSE) for a NULL x, FAILING a CHECK's intent. v8 adds explicit
+	//      typeof() guards to every column so INTEGER columns are proven
+	//      integer, TEXT columns proven text, and every bounded string's length
+	//      and domain are exact.
+	//   2. Exact policy-JSON shape: migration 7 accepted `$.defaultAccess` /
+	//      `$.batchID` merely being present; v8 requires the production document
+	//      shape exactly — auth carries `version` integer == 1,
+	//      `defaultAccess` text == 'deny', `defaultRepo` object with
+	//      `pull`/`push` arrays, and `repos` object; stamp carries `version`
+	//      integer == 1, `defaultPolicy` object with a nonempty bounded text
+	//      `batchID` and an `allowPushFor` array, and `repos` object. Guards
+	//      use json_type() BEFORE value comparison, so a JSON type trick (a
+	//      string "1" or an object version) can never satisfy an integer check.
+	//   3. Timestamps move from TEXT to exact INTEGER Unix milliseconds:
+	//      SQLite cannot robustly validate a canonical UTC RFC3339/RFC3339Nano
+	//      TEXT (real calendar validity, canonical Z form) in a CHECK — the v7
+	//      GLOB allows calendar-invalid dates and arbitrary trailing junk. An
+	//      INTEGER collated by typeof() is a representation the DB enforces
+	//      exactly. Every existing v7 timestamp is validated in Go (canonical
+	//      UTC, real calendar/time) and converted to milliseconds, preserving
+	//      the exact instant. The store was updated to write/read integers.
+	//   4. Full state coherence for pending/claimed/succeeded/failed, closing
+	//      every combination: a lease (claimed_by + claimed_until) exists
+	//      IFF the job is claimed and is cleared in every other state;
+	//      succeeded requires object_ref + feed_ref + a completion stamp +
+	//      cleared ownership + an empty last_error; failed requires a safe
+	//      nonempty last_error with cleared ownership and no completion stamp;
+	//      a feed_ref may never exist without its object_ref (the feed points
+	//      at an uploaded object). Pending may legitimately retain a safe
+	//      last_error and stage refs after a retry, so it is unconstrained.
+	//
+	// The rebuild is atomic (create clone → validate+convert every v7 row in
+	// Go → drop → rename inside the migration transaction): a legitimate v7/fresh
+	// row upgrades with its ID and meaning preserved exactly, while any
+	// malformed v7 row (bad calendar timestamp, non-canonical timestamp,
+	// storage-class or JSON-shape violation) fails the copy and rolls the whole
+	// migration back byte-equivalently (version stays 7, no schema objects, no
+	// data touched).
+	{
+		Version: 8,
+		Apply:   installProvisioningOutboxJobInvariantsV8,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only
@@ -1238,6 +1288,164 @@ func installProvisioningOutboxSchemaHarden(ctx context.Context, tx *sql.Tx) erro
 	}
 	if _, err := tx.ExecContext(ctx, `alter table registry_publication_jobs_new rename to registry_publication_jobs`); err != nil {
 		return fmt.Errorf("migration 7: rename hardened jobs table: %w", err)
+	}
+	return nil
+}
+
+// hardenedV8PublicationJobsTableSQL is the SINGLE SOURCE OF TRUTH for the
+// version-8 registry_publication_jobs schema. It hardens migration 7 by adding
+// exact storage-class (typeof) guards on every column, requiring the exact
+// production policy-JSON shape (json_type guards BEFORE value comparison, so a
+// type trick can never satisfy an integer/text check), moving timestamps to
+// exact INTEGER Unix milliseconds, and enforcing full state coherence. %s is
+// the table name (the "_new" rebuild clone in the migration).
+const hardenedV8PublicationJobsTableSQL = `CREATE TABLE %s (
+	id integer primary key autoincrement,
+	registry_id integer not null
+		check (typeof(registry_id) = 'integer' and registry_id > 0)
+		references registries(id) on delete cascade,
+	kind text not null check (typeof(kind) = 'text' and kind in ('auth','stamp')),
+	state text not null check (typeof(state) = 'text' and state in ('pending','claimed','succeeded','failed')),
+	payload_json text not null
+		check (
+			typeof(payload_json) = 'text'
+			and length(payload_json) between 2 and 32768
+			and json_valid(payload_json) = 1
+			and json_type(payload_json) = 'object'
+			and (
+				(kind = 'auth'
+					and json_type(payload_json, '$.version') IS 'integer'
+					and json_extract(payload_json, '$.version') = 1
+					and json_type(payload_json, '$.defaultAccess') IS 'text'
+					and json_extract(payload_json, '$.defaultAccess') = 'deny'
+					and json_type(payload_json, '$.defaultRepo') IS 'object'
+					and json_type(payload_json, '$.defaultRepo.pull') IS 'array'
+					and json_type(payload_json, '$.defaultRepo.push') IS 'array'
+					and json_type(payload_json, '$.repos') IS 'object')
+				or
+				(kind = 'stamp'
+					and json_type(payload_json, '$.version') IS 'integer'
+					and json_extract(payload_json, '$.version') = 1
+					and json_type(payload_json, '$.defaultPolicy') IS 'object'
+					and json_type(payload_json, '$.defaultPolicy.batchID') IS 'text'
+					and length(json_extract(payload_json, '$.defaultPolicy.batchID')) between 1 and 128
+					and json_type(payload_json, '$.defaultPolicy.allowPushFor') IS 'array'
+					and json_type(payload_json, '$.repos') IS 'object')
+			)
+		),
+	object_ref text not null default '' check (typeof(object_ref) = 'text' and length(object_ref) <= 128),
+	feed_ref text not null default '' check (typeof(feed_ref) = 'text' and length(feed_ref) <= 128),
+	attempts integer not null default 0 check (typeof(attempts) = 'integer' and attempts >= 0 and attempts <= 1024),
+	next_attempt_at integer not null check (typeof(next_attempt_at) = 'integer'),
+	claimed_until integer check (claimed_until is null or typeof(claimed_until) = 'integer'),
+	claimed_by text not null default '' check (typeof(claimed_by) = 'text' and length(claimed_by) <= 64),
+	last_error text not null default '' check (typeof(last_error) = 'text' and length(last_error) <= 512),
+	created_at integer not null check (typeof(created_at) = 'integer'),
+	completed_at integer check (completed_at is null or typeof(completed_at) = 'integer'),
+	unique (registry_id, kind),
+	-- Ownership/lease coherence: only a CLAIMED job holds a lease (claimed_by
+	-- together with claimed_until); every other state has both cleared. A
+	-- NULL claimed_until never satisfies the comparison via 3VL because the
+	-- typeof guard above rejects a non-integer/NULL lease.
+	check ((state = 'claimed') = (claimed_by <> '' and claimed_until is not null)),
+	-- Succeeded is terminal and verified: it MUST carry object_ref AND
+	-- feed_ref, the completion stamp, cleared ownership, and an empty
+	-- last_error (the claim cleared it and nothing set it before completion).
+	check (state <> 'succeeded'
+		or (object_ref <> '' and feed_ref <> '' and completed_at is not null
+			and claimed_by = '' and claimed_until is null and last_error = '')),
+	-- Failed is terminal: a safe nonempty last_error with cleared ownership
+	-- and NO completion stamp.
+	check (state <> 'failed'
+		or (last_error <> '' and claimed_by = '' and claimed_until is null and completed_at is null)),
+	-- A feed_ref (published feed) may only exist when its object_ref does.
+	check (feed_ref = '' or object_ref <> '')
+)`
+
+// installProvisioningOutboxJobInvariantsV8 is migration 8's body. It
+// atomically rebuilds registry_publication_jobs around the hardened v8 schema,
+// validating and converting every existing v7 row in Go: each RFC3339/RFC3339Nano
+// journal timestamp must be canonical UTC with real calendar validity before it
+// is converted (byte-for-byte instant-preserving) to its exact Unix millisecond
+// form, and the new table's CHECKs independently reject any storage-class,
+// JSON-shape, or coherence violation. A malformed v7 row fails the copy and
+// rolls the whole migration back (version stays 7, no schema objects, no data
+// touched); every legitimate v7/fresh row upgrades with its ID and meaning
+// preserved exactly.
+func installProvisioningOutboxJobInvariantsV8(ctx context.Context, tx *sql.Tx) error {
+	const clone = "registry_publication_jobs_new"
+
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(hardenedV8PublicationJobsTableSQL, clone)); err != nil {
+		return fmt.Errorf("migration 8: create hardened jobs clone: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `select id, registry_id, kind, state, payload_json, object_ref, feed_ref,
+		attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at
+		from registry_publication_jobs order by id asc`)
+	if err != nil {
+		return fmt.Errorf("migration 8: enumerate v7 jobs: %w", err)
+	}
+	for rows.Next() {
+		var (
+			id, registryID, attempts        int64
+			kind, state, objectRef, feedRef string
+			claimedBy, lastError            string
+			payload                         []byte
+			nextAttempt, createdAt          string
+			claimedUntil, completedAt       sql.NullString
+		)
+		if err := rows.Scan(&id, &registryID, &kind, &state, &payload, &objectRef, &feedRef,
+			&attempts, &nextAttempt, &claimedUntil, &claimedBy, &lastError, &createdAt, &completedAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 8: read v7 job %d: %w", id, err)
+		}
+		nextMillis, err := parseCanonicalUTCMillis(nextAttempt)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 8: job %d next_attempt_at: %w", id, err)
+		}
+		createdMillis, err := parseCanonicalUTCMillis(createdAt)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 8: job %d created_at: %w", id, err)
+		}
+		var claimedMillis, completedMillis sql.NullInt64
+		if claimedUntil.Valid {
+			ms, err := parseCanonicalUTCMillis(claimedUntil.String)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 8: job %d claimed_until: %w", id, err)
+			}
+			claimedMillis = sql.NullInt64{Int64: ms, Valid: true}
+		}
+		if completedAt.Valid {
+			ms, err := parseCanonicalUTCMillis(completedAt.String)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("migration 8: job %d completed_at: %w", id, err)
+			}
+			completedMillis = sql.NullInt64{Int64: ms, Valid: true}
+		}
+		if _, err := tx.ExecContext(ctx, `insert into registry_publication_jobs_new
+			(id, registry_id, kind, state, payload_json, object_ref, feed_ref,
+			 attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at)
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, registryID, kind, state, string(payload), objectRef, feedRef,
+			attempts, nextMillis, claimedMillis, claimedBy, lastError, createdMillis, completedMillis); err != nil {
+			rows.Close()
+			return fmt.Errorf("migration 8: copy job %d into hardened schema: %w", id, err)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("migration 8: iterate v7 jobs: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `drop table registry_publication_jobs`); err != nil {
+		return fmt.Errorf("migration 8: drop v7 jobs table: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `alter table registry_publication_jobs_new rename to registry_publication_jobs`); err != nil {
+		return fmt.Errorf("migration 8: rename hardened jobs table: %w", err)
 	}
 	return nil
 }

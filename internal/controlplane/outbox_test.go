@@ -11,9 +11,11 @@ import (
 // name so parallel store tests never collide.
 var (
 	// testAuthPayload / testStampPayload are structurally valid, kind-appropriate
-	// policy documents (the shape migration 7's hardened jobs CHECK requires:
-	// auth carries $.version + $.defaultAccess, stamp carries $.defaultPolicy.batchID).
-	testAuthPayload  = []byte(`{"version":1,"defaultAccess":"deny","repos":{}}`)
+	// policy documents in the exact production shape migration 8's hardened jobs
+	// CHECK requires (auth: $.version==1, $.defaultAccess=='deny', $.defaultRepo
+	// object with pull/push arrays, $.repos object; stamp: $.version==1,
+	// $.defaultPolicy.batchID text, allowPushFor array, $.repos object).
+	testAuthPayload  = []byte(`{"version":1,"defaultAccess":"deny","defaultRepo":{"pull":["anonymous","role:read","role:write"],"push":["role:write"]},"repos":{}}`)
 	testStampPayload = []byte(`{"version":1,"defaultPolicy":{"batchID":"batch-1","allowPushFor":["role:write"]},"repos":{}}`)
 )
 

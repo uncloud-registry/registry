@@ -214,7 +214,10 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 			},
 			// Feed read-back resolution: the reconciler proves a policy feed
 			// points at the uploaded object by resolving it back to its ref.
-			FeedsReader: swarm.BeeFeedResolver{BaseURL: cfg.BeeAPIURL.String(), HTTPClient: nil},
+			// The constructor normalizes the base URL and guarantees a non-nil
+			// HTTP client plus the per-request context timeout, so a direct
+			// zero-value struct (with no base URL) is never used in production.
+			FeedsReader: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), nil),
 		}
 	}
 

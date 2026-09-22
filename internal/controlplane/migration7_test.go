@@ -18,15 +18,25 @@ import (
 //   - that every legitimate v6 row upgrades byte-for-byte with ID intact.
 
 const (
-	mig7Auth  = `{"version":1,"defaultAccess":"deny","repos":{}}`
+	// mig7Auth/mig7Stamp are structurally valid, KIND-APPROPRIATE policy
+	// documents in the exact production shape migration 8's hardened CHECK
+	// requires (auth carries $.version==1, $.defaultAccess=='deny',
+	// $.defaultRepo object with pull/push arrays, and $.repos object; stamp
+	// carries $.version==1, $.defaultPolicy.batchID text, allowPushFor array,
+	// $.repos object). They model genuine v6/v7 store rows so the v6→v7→v8
+	// upgrade preserves them.
+	mig7Auth  = `{"version":1,"defaultAccess":"deny","defaultRepo":{"pull":["anonymous","role:read","role:write"],"push":["role:write"]},"repos":{}}`
 	mig7Stamp = `{"version":1,"defaultPolicy":{"batchID":"batch-1","allowPushFor":["role:write"]},"repos":{}}`
 )
 
 func mig7Now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // seedV6ProvisionedRegistry builds a genuine v6 database (migrations 1-6) with
-// one registry and its two bootstrap jobs created through the production store
-// writer, returning the raw DB and the store (for direct-SQL assertions).
+// one registry and its two bootstrap jobs, using DIRECT SQL with the v6 row
+// representation (RFC3339 TEXT journal timestamps). It deliberately does NOT go
+// through the current store writer, whose job timestamps are now INTEGER
+// millis (migration 8's representation) and so would not be a genuine v6/v7
+// row. Returns the raw DB and a Store wrapper for direct-SQL assertions.
 func seedV6ProvisionedRegistry(t *testing.T) (*sql.DB, *Store) {
 	t.Helper()
 	db := openRawTestDB(t)
@@ -39,15 +49,25 @@ func seedV6ProvisionedRegistry(t *testing.T) (*sql.DB, *Store) {
 		"owner@example.com", "hash", mig7Now()); err != nil {
 		t.Fatalf("seed owner user: %v", err)
 	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key,
+		 default_stamp_batch_id, anonymous_pull, provisioning_state, created_at)
+		values ('alice', 'alice.registry.example', 'alice.eth', 1, '0xaaaa', '',
+		 'batch-1', 1, 'ready', ?)`, mig7Now()); err != nil {
+		t.Fatalf("seed registry at v6: %v", err)
+	}
+	for _, kind := range []string{PublicationKindAuth, PublicationKindStamp} {
+		payload := mig7Auth
+		if kind == PublicationKindStamp {
+			payload = mig7Stamp
+		}
+		if _, err := db.ExecContext(ctx, `insert into registry_publication_jobs
+			(registry_id, kind, state, payload_json, attempts, next_attempt_at, created_at)
+			values (1, ?, 'pending', ?, 0, ?, ?)`, kind, payload, mig7Now(), mig7Now()); err != nil {
+			t.Fatalf("seed %s job at v6: %v", kind, err)
+		}
+	}
 	store := &Store{DB: db}
-	reg := Registry{
-		Slug: "alice", Host: "alice.registry.example", ENSName: "alice.eth",
-		OwnerUserID: 1, FeedOwnerAddress: "0xaaaa", DefaultStampBatchID: "batch-1",
-		AnonymousPull: true,
-	}
-	if _, err := store.CreateProvisionedRegistry(ctx, reg, newTestFeedKeyCipher(t), []byte("feed-key-material"), []byte(mig7Auth), []byte(mig7Stamp)); err != nil {
-		t.Fatalf("seed provisioned registry at v6: %v", err)
-	}
 	return db, store
 }
 
@@ -89,11 +109,24 @@ func TestMigration7UpgradePreservesLegitRowsByteEquivalent(t *testing.T) {
 		"owner@example.com", "hash", mig7Now()); err != nil {
 		t.Fatalf("seed owner user: %v", err)
 	}
-	store := &Store{DB: db}
-	reg := Registry{Slug: "x", Host: "x.registry.example", ENSName: "x.eth", OwnerUserID: 1,
-		FeedOwnerAddress: "0xbbbb", DefaultStampBatchID: "b", AnonymousPull: false}
-	if _, err := store.CreateProvisionedRegistry(ctx, reg, newTestFeedKeyCipher(t), []byte("k"), []byte(mig7Auth), []byte(mig7Stamp)); err != nil {
-		t.Fatalf("seed v6 registry: %v", err)
+	// Direct-SQL v6 seeding (RFC3339 TEXT journal timestamps — the genuine v6
+	// store representation, NOT the current integer-millis store form).
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key,
+		 default_stamp_batch_id, anonymous_pull, provisioning_state, created_at)
+		values ('x', 'x.registry.example', 'x.eth', 1, '0xbbbb', '', 'b', 0, 'ready', ?)`, mig7Now()); err != nil {
+		t.Fatalf("seed registry at v6: %v", err)
+	}
+	for _, kind := range []string{PublicationKindAuth, PublicationKindStamp} {
+		payload := mig7Auth
+		if kind == PublicationKindStamp {
+			payload = mig7Stamp
+		}
+		if _, err := db.ExecContext(ctx, `insert into registry_publication_jobs
+			(registry_id, kind, state, payload_json, attempts, next_attempt_at, created_at)
+			values (1, ?, 'pending', ?, 0, ?, ?)`, kind, payload, mig7Now(), mig7Now()); err != nil {
+			t.Fatalf("seed %s job at v6: %v", kind, err)
+		}
 	}
 	// Drive one job to 'claimed' and the other to 'succeeded' with full refs so
 	// the upgrade exercises every column's hardened CHECKs.
@@ -106,7 +139,7 @@ func TestMigration7UpgradePreservesLegitRowsByteEquivalent(t *testing.T) {
 	}
 	before := jobsRowsFingerprint(t, db)
 
-	if err := ApplyMigrations(ctx, db); err != nil {
+	if err := applyMigrationsThrough(ctx, db, 7); err != nil {
 		t.Fatalf("apply migration 7: %v", err)
 	}
 	version, err := CurrentSchemaVersion(ctx, db)
@@ -134,7 +167,7 @@ func TestMigration7RejectsMalformedJobsOnUpgradeRollsBackByteEquivalent(t *testi
 		t.Fatal("expected the corrupted row to differ from the baseline")
 	}
 
-	if err := ApplyMigrations(ctx, db); err == nil {
+	if err := applyMigrationsThrough(ctx, db, 7); err == nil {
 		t.Fatal("expected migration 7 to reject a malformed v6 job, got nil")
 	}
 
@@ -169,7 +202,7 @@ func TestMigration7RejectsMalformedJobsOnUpgradeRollsBackByteEquivalent(t *testi
 func TestMigration7InstallsInsertGuardTrigger(t *testing.T) {
 	db, _ := seedV6ProvisionedRegistry(t)
 	ctx := context.Background()
-	if err := ApplyMigrations(ctx, db); err != nil {
+	if err := applyMigrationsThrough(ctx, db, 7); err != nil {
 		t.Fatalf("apply migration 7: %v", err)
 	}
 
@@ -197,7 +230,7 @@ func TestMigration7InstallsInsertGuardTrigger(t *testing.T) {
 func TestMigration7JobsInvariantEnforcement(t *testing.T) {
 	db, _ := seedV6ProvisionedRegistry(t)
 	ctx := context.Background()
-	if err := ApplyMigrations(ctx, db); err != nil {
+	if err := applyMigrationsThrough(ctx, db, 7); err != nil {
 		t.Fatalf("apply migration 7: %v", err)
 	}
 	now := mig7Now()

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -26,9 +27,11 @@ type ObjectStore interface {
 // clobbered — must never complete a job: the resolved ref must equal the
 // expected object ref before a job is marked verified. Persisting or trusting
 // the feed_ref identifier is NOT proof; only an independent resolution equals
-// the uploaded object ref. Production uses BeeFeedResolver (reads the feed and
-// decodes the signer's own 8-byte-length-prefixed ref); tests use a memory
-// feed store whose independent map can simulate a mis-directed feed.
+// the uploaded object ref. Per the Bee feed contract the feed endpoint returns
+// the feed payload bytes directly (the raw object reference — no 8-byte length
+// prefix), so the production BeeFeedResolver reads and canonically normalizes
+// that bounded body; tests use a memory feed store whose independent map can
+// simulate a mis-directed feed.
 type FeedResolver interface {
 	ResolveFeed(ctx context.Context, feed string) (string, error)
 }
@@ -76,6 +79,26 @@ var (
 // resolver). It is a configuration error, never a panic.
 var errReconcilerNotConfigured = errors.New("reconciler is not fully configured: store, documents, feeds, and feed resolver are required")
 
+// isNilDependency reports whether v is nil OR a nil-capable TYPED nil: an
+// interface (or pointer) whose dynamic value is a nil pointer/map/slice/func/
+// chan. A plain `v == nil` test misses the typed-nil case — e.g. a
+// (*t) (nil) stored in an interface slot never equals nil — so a facade check
+// would pass and the first method invocation would panic. Reflection closes
+// that gap so every dependency is validated fail-closed (no panic, a data-free
+// configuration error) BEFORE any key generation, DB write, or method call.
+func isNilDependency(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
 // errProvisioningNotConfigured is the data-free, fail-closed error returned by
 // Service.CreateRegistry when the control plane cannot actually provision a
 // registry (no Store, no Publisher, or a Publisher missing its Documents,
@@ -119,27 +142,53 @@ type PublicationJob struct {
 const publicationJobColumns = `id, registry_id, kind, state, payload_json, object_ref, feed_ref,
 	attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at`
 
+// Timestamps in registry_publication_jobs are stored as bounded INTEGER Unix
+// milliseconds (migration 8), because SQLite cannot robustly validate a
+// canonical UTC RFC3339/RFC3339Nano TEXT value (calendar validity, canonical
+// form) in a CHECK; an INTEGER with a typeof guard is a representation the
+// database CAN enforce exactly. These helpers convert to/from time.Time.
+func timeToMillis(t time.Time) int64 { return t.UTC().UnixMilli() }
+
+func millisToTime(ms int64) time.Time { return time.UnixMilli(ms).UTC() }
+
+// parseCanonicalUTCMillis parses a legacy (v7) TEXT journal timestamp into its
+// epoch milliseconds. It is the store-side inverse of the migration 8
+// conversion and is used by migration 8 to validate+convert every existing row:
+// it accepts ONLY a canonical UTC RFC3339/RFC3339Nano value (real calendar/time
+// validity via time.Parse, and a trailing 'Z' so an offset form is rejected) and
+// returns its millisecond instant, so the migrated INTEGER columns and any
+// consumer agree exactly. Fresh integer columns are read directly as int64; no
+// silent fallback ever turns a malformed timestamp into a zero time.
+func parseCanonicalUTCMillis(s string) (int64, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return 0, err
+	}
+	if t.Location() != time.UTC || len(s) == 0 || s[len(s)-1] != 'Z' {
+		return 0, fmt.Errorf("timestamp %q is not canonical UTC (must end in 'Z')", s)
+	}
+	return t.UnixMilli(), nil
+}
+
 func scanPublicationJob(s scanRow, job *PublicationJob) error {
-	var nextAttempt, createdAt string
-	var claimedUntil, completedAt sql.NullString
+	var nextAttemptMillis, createdAtMillis int64
+	var claimedUntil, completedAt sql.NullInt64
 	var payload []byte
 	if err := s.Scan(&job.ID, &job.RegistryID, &job.Kind, &job.State, &payload,
-		&job.ObjectRef, &job.FeedRef, &job.Attempts, &nextAttempt, &claimedUntil,
-		&job.ClaimedBy, &job.LastError, &createdAt, &completedAt); err != nil {
+		&job.ObjectRef, &job.FeedRef, &job.Attempts, &nextAttemptMillis, &claimedUntil,
+		&job.ClaimedBy, &job.LastError, &createdAtMillis, &completedAt); err != nil {
 		return err
 	}
 	job.PayloadJSON = payload
-	job.NextAttempt, _ = time.Parse(time.RFC3339, nextAttempt)
-	job.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	job.NextAttempt = millisToTime(nextAttemptMillis)
+	job.CreatedAt = millisToTime(createdAtMillis)
 	if claimedUntil.Valid {
-		if t, err := time.Parse(time.RFC3339, claimedUntil.String); err == nil {
-			job.ClaimedUntil = &t
-		}
+		t := millisToTime(claimedUntil.Int64)
+		job.ClaimedUntil = &t
 	}
 	if completedAt.Valid {
-		if t, err := time.Parse(time.RFC3339, completedAt.String); err == nil {
-			job.CompletedAt = &t
-		}
+		t := millisToTime(completedAt.Int64)
+		job.CompletedAt = &t
 	}
 	return nil
 }
@@ -178,12 +227,17 @@ func (s *Store) CreateProvisionedRegistry(ctx context.Context, registry Registry
 
 	var created Registry
 	err := s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
-		now := time.Now().UTC().Format(time.RFC3339)
+		now := time.Now().UTC()
+		// registries/memberships created_at stay canonical RFC3339 TEXT (read
+		// back via time.Parse); only the jobs table's journal timestamps are
+		// INTEGER Unix milliseconds (migration 8's exact, DB-enforceable form).
+		nowText := now.Format(time.RFC3339)
+		nowMillis := timeToMillis(now)
 		result, err := c.ExecContext(ctx, `insert into registries
 			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, provisioning_state, created_at)
 			values (?, ?, ?, ?, ?, '', ?, ?, ?, ?)`,
 			registry.Slug, registry.Host, registry.ENSName, registry.OwnerUserID, registry.FeedOwnerAddress,
-			registry.DefaultStampBatchID, boolToInt(registry.AnonymousPull), registry.ProvisioningState, now)
+			registry.DefaultStampBatchID, boolToInt(registry.AnonymousPull), registry.ProvisioningState, nowText)
 		if err != nil {
 			return fmt.Errorf("create registry: %w", err)
 		}
@@ -199,7 +253,7 @@ func (s *Store) CreateProvisionedRegistry(ctx context.Context, registry Registry
 		}
 
 		if _, err := c.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?, ?, ?, ?, ?, ?)`,
-			id, registry.OwnerUserID, "owner", 1, 1, now); err != nil {
+			id, registry.OwnerUserID, "owner", 1, 1, nowText); err != nil {
 			return err
 		}
 
@@ -213,7 +267,7 @@ func (s *Store) CreateProvisionedRegistry(ctx context.Context, registry Registry
 			if _, err := c.ExecContext(ctx, `insert into registry_publication_jobs
 				(registry_id, kind, state, payload_json, attempts, next_attempt_at, created_at)
 				values (?, ?, ?, ?, 0, ?, ?)`,
-				id, j.kind, PublicationStatePending, j.payload, now, now); err != nil {
+				id, j.kind, PublicationStatePending, string(j.payload), nowMillis, nowMillis); err != nil {
 				return err
 			}
 		}
@@ -245,8 +299,8 @@ func (s *Store) ClaimStalePublicationJobs(ctx context.Context, now time.Time, le
 	if err != nil {
 		return nil, "", err
 	}
-	nowText := now.UTC().Format(time.RFC3339)
-	untilText := now.UTC().Add(lease).Format(time.RFC3339)
+	nowText := timeToMillis(now)
+	untilText := timeToMillis(now.Add(lease))
 
 	var claimed []PublicationJob
 	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
@@ -323,7 +377,7 @@ func (s *Store) SetPublicationFeedRef(ctx context.Context, jobID int64, worker s
 func (s *Store) CompletePublicationJob(ctx context.Context, jobID int64, worker string, now time.Time) error {
 	return s.jobGuardUpdate(ctx, jobID, worker,
 		`update registry_publication_jobs set state = 'succeeded', completed_at = ?, claimed_by = '', claimed_until = null
-		 where id = ? and state = 'claimed' and claimed_by = ?`, now.UTC().Format(time.RFC3339))
+		 where id = ? and state = 'claimed' and claimed_by = ?`, timeToMillis(now))
 }
 
 // FailPublicationJob registers a retryable failure for a claimed job: it
@@ -350,7 +404,7 @@ func (s *Store) FailPublicationJob(ctx context.Context, jobID int64, worker stri
 			state = PublicationStateFailed
 			terminal = true
 		}
-		next := now.UTC().Add(attemptBackoff(newAttempts, backoffBase, backoffMax)).Format(time.RFC3339)
+		next := timeToMillis(now.Add(attemptBackoff(newAttempts, backoffBase, backoffMax)))
 		res, err := c.ExecContext(ctx, `update registry_publication_jobs
 			set attempts = ?, state = ?, last_error = ?, next_attempt_at = ?, claimed_by = '', claimed_until = null
 			where id = ? and state = 'claimed' and claimed_by = ?`,

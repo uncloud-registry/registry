@@ -181,10 +181,15 @@ func (s *Service) CreateRegistry(ctx context.Context, ownerUserID int64, slug st
 	// provision it (a Store to persist the outbox, a Publisher with a
 	// Documents object store, a Feeds updater, and feed read-back
 	// resolution). Otherwise it would silently enqueue a registry that sits
-	// provisioning forever. This runs before generatePrivateKeyBytes and
-	// before any store call, so misconfiguration causes zero DB effects.
-	if s.Store == nil || s.Publisher == nil ||
-		s.Publisher.Documents == nil || s.Publisher.Feeds == nil || s.Publisher.FeedsReader == nil {
+	// provisioning forever. EVERY slot is validated with isNilDependency so a
+	// nil-capable typed nil (e.g. a (*t)(nil) in an interface slot, which
+	// `== nil` misses and which would panic on first use) is rejected too.
+	// This runs before generatePrivateKeyBytes and before any store call, so
+	// misconfiguration causes zero DB effects.
+	if isNilDependency(s.Store) || isNilDependency(s.Publisher) {
+		return CreatedRegistry{}, errProvisioningNotConfigured
+	}
+	if isNilDependency(s.Publisher.Documents) || isNilDependency(s.Publisher.Feeds) || isNilDependency(s.Publisher.FeedsReader) {
 		return CreatedRegistry{}, errProvisioningNotConfigured
 	}
 	if s.FeedKeys == nil {
@@ -270,7 +275,9 @@ func (s *Service) ListRegistries(ctx context.Context, userID int64) ([]Registry,
 // that could skip a stage or complete an unverified job. It performs no I/O
 // and opens no database.
 func (s *Service) NewReconciler() (*Reconciler, error) {
-	if s.Store == nil || s.Publisher == nil {
+	// isNilDependency rejects a nil-capable typed nil in the Store or
+	// Publisher slots too, so a facade that would panic on use fails closed.
+	if isNilDependency(s.Store) || isNilDependency(s.Publisher) {
 		return nil, errReconcilerNotConfigured
 	}
 	return NewReconciler(s.Store, s.Publisher.Documents, s.Publisher.Feeds, s.Publisher.FeedsReader)

@@ -37,7 +37,7 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 7 {
+	if version != 8 {
 		t.Fatalf("expected schema version 7, got %d", version)
 	}
 
@@ -75,8 +75,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 7 {
-		t.Fatalf("expected 7 migration rows, got %d", rows)
+	if rows != 8 {
+		t.Fatalf("expected 8 migration rows, got %d", rows)
 	}
 }
 
@@ -139,7 +139,7 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 7 {
+	if version != 8 {
 		t.Fatalf("expected schema version 7 after upgrade, got %d", version)
 	}
 
@@ -1134,7 +1134,7 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 7 {
+	if version != 8 {
 		t.Fatalf("expected version 7, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
@@ -1153,7 +1153,7 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 7 {
+		if version != 8 {
 			t.Fatalf("expected version 7, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
@@ -1168,7 +1168,7 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 7 {
+		if version != 8 {
 			t.Fatalf("expected version 7, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
@@ -1211,7 +1211,7 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 7 {
+		if version != 8 {
 			t.Fatalf("expected version 7, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)

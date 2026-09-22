@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
 // Reconciler drives the transactional provisioning outbox: it claims durable
@@ -64,10 +66,13 @@ const (
 // skip a stage or complete an unverified job. It performs no I/O here; it is
 // safe to construct after config and key material are validated.
 func NewReconciler(store *Store, documents ObjectStore, feeds RegistryFeedUpdater, resolveFeeds FeedResolver) (*Reconciler, error) {
-	if store == nil || documents == nil || feeds == nil {
+	// Every dependency is validated with isNilDependency, which also rejects a
+	// nil-capable TYPED nil (e.g. a (*t)(nil) in an interface slot) that a
+	// plain == nil test would miss and that would panic on first use.
+	if isNilDependency(store) || isNilDependency(documents) || isNilDependency(feeds) {
 		return nil, errReconcilerNotConfigured
 	}
-	if resolveFeeds == nil {
+	if isNilDependency(resolveFeeds) {
 		// Without feed resolution/read-back the reconciler cannot prove a
 		// feed points at the uploaded object, so it must fail closed.
 		return nil, errReconcilerNotConfigured
@@ -93,7 +98,10 @@ func (r *Reconciler) validate() error {
 	if r == nil {
 		return errReconcilerNotConfigured
 	}
-	if r.Store == nil || r.Documents == nil || r.Feeds == nil || r.ResolveFeeds == nil {
+	// isNilDependency also rejects a nil-capable typed nil in any dependency
+	// slot, so a RunOnce on a facade that would panic on first use returns the
+	// data-free configuration error instead.
+	if isNilDependency(r.Store) || isNilDependency(r.Documents) || isNilDependency(r.Feeds) || isNilDependency(r.ResolveFeeds) {
 		return errReconcilerNotConfigured
 	}
 	return nil
@@ -212,10 +220,13 @@ func (r *Reconciler) reconcileJob(ctx context.Context, job PublicationJob, worke
 	// feed read-back that closes the no-op/wrong/overwritten-updater gap:
 	// persisting the feed_ref identifier is not proof. A feed that was never
 	// published, points at a different ref, or was overwritten is retryable
-	// (never a false completion).
+	// (never a false completion). Both sides are canonicalized with the same
+	// normalization the production resolver uses, so case differences on
+	// genuine 64-hex refs are not a false mismatch while symbolic test refs
+	// still compare exactly.
 	feed := r.feedRefForJob(reg, job.Kind)
 	resolved, err := r.ResolveFeeds.ResolveFeed(ctx, feed)
-	if err != nil || resolved != job.ObjectRef {
+	if err != nil || swarm.CanonicalObjectRef(resolved) != swarm.CanonicalObjectRef(job.ObjectRef) {
 		return r.failRetryable(ctx, job, worker, now, "feed resolution mismatch")
 	}
 
