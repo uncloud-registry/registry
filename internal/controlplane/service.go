@@ -40,33 +40,54 @@ type Service struct {
 // enumeration).
 var errInvalidCredentials = errors.New("invalid email or password")
 
-// Safe internal cause classifications for correlated logging. These are
-// deliberately coarse and never carry credentials, tokens, or PII, so they
-// can be logged verbatim.
+// authCause is a safe, coarse internal cause classification for correlated
+// logging. Values never carry credentials, tokens, scope, or PII, so they can
+// be logged verbatim.
+type authCause string
+
 const (
-	causeUnknownAccount  = "unknown_account"
-	causeInvalidPassword = "invalid_password"
+	causeUnknownAccount   authCause = "unknown_account"
+	causeInvalidPassword  authCause = "invalid_password"
+	causeDatastore        authCause = "datastore"
+	causeInvalidScope     authCause = "invalid_scope"
+	causeForbidden        authCause = "forbidden"
+	causeSigning          authCause = "signing"
+	causeRegistryNotFound authCause = "registry_not_found"
 )
 
-// credentialFailure is an internal, success-wrapped variant of
-// errInvalidCredentials that additionally carries a safe cause classification
-// for correlated logging. It still satisfies errors.Is(errInvalidCredentials)
-// and produces the identical public message, so public status/body are
-// unchanged while the operator sees a safe internal cause.
-type credentialFailure struct {
-	cause string
+// tokenFailureClass is an internal, coarse class the registry-token endpoint
+// uses to select a fixed generic public status+body. No class carries an
+// internal error string; the response text for every class is a constant.
+type tokenFailureClass int
+
+const (
+	tokenClassCredential tokenFailureClass = iota // generic 401
+	tokenClassMalformed                           // generic 400 (malformed request/scope)
+	tokenClassForbidden                           // generic 403
+	tokenClassNotFound                            // 404 (caller-chosen registry missing)
+	tokenClassBackend                             // generic 503 (backend/datastore)
+	tokenClassSigning                             // generic 500 (signing/issuer)
+)
+
+// classifiedFailure is an internal failure carrying a safe cause and a coarse
+// public class. It still satisfies errors.Is(errInvalidCredentials) and its
+// public text is always the generic credential message, so nothing internal
+// leaks through the error value itself.
+type classifiedFailure struct {
+	cause authCause
+	class tokenFailureClass
 }
 
-func (e *credentialFailure) Error() string { return errInvalidCredentials.Error() }
+func (e *classifiedFailure) Error() string { return errInvalidCredentials.Error() }
 
-func (e *credentialFailure) Unwrap() error { return errInvalidCredentials }
+func (e *classifiedFailure) Unwrap() error { return errInvalidCredentials }
 
-// credentialCause extracts the safe classification, or "" for a non-wrapped
+// credentialCause extracts the safe classification, or "" for a non-classified
 // failure (the caller then logs a generic cause).
 func credentialCause(err error) string {
-	var cf *credentialFailure
+	var cf *classifiedFailure
 	if errors.As(err, &cf) {
-		return cf.cause
+		return string(cf.cause)
 	}
 	return ""
 }
@@ -127,7 +148,7 @@ func (s *Service) RegisterUser(ctx context.Context, email string, password strin
 
 func (s *Service) Login(ctx context.Context, email string, password string) (User, string, error) {
 	if s.Tokens == nil {
-		return User{}, "", errInvalidCredentials
+		return User{}, "", &classifiedFailure{cause: causeSigning, class: tokenClassCredential}
 	}
 	user, err := s.Store.FindUserByEmail(ctx, email)
 	if err != nil {
@@ -135,12 +156,14 @@ func (s *Service) Login(ctx context.Context, email string, password string) (Use
 			// Unknown account: still compare a bcrypt hash so an attacker
 			// cannot time the difference between a known and unknown email.
 			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
-			return User{}, "", &credentialFailure{cause: causeUnknownAccount}
+			return User{}, "", &classifiedFailure{cause: causeUnknownAccount, class: tokenClassCredential}
 		}
-		return User{}, "", &credentialFailure{cause: causeUnknownAccount}
+		// A backend/datastore failure is logged as such; the public response
+		// stays the identical generic 401 so no backend detail leaks.
+		return User{}, "", &classifiedFailure{cause: causeDatastore, class: tokenClassBackend}
 	}
 	if !comparePassword(user.PasswordHash, password) {
-		return User{}, "", &credentialFailure{cause: causeInvalidPassword}
+		return User{}, "", &classifiedFailure{cause: causeInvalidPassword, class: tokenClassCredential}
 	}
 	token, err := s.Tokens.Issue(fmt.Sprintf("user:%d", user.ID), s.sessionTTL())
 	return user, token, err
@@ -516,7 +539,7 @@ func (s *Service) RegisterAndAcceptInvite(ctx context.Context, token string, ema
 
 func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope string, email string, password string) (string, error) {
 	if s.RegistryTokens == nil {
-		return "", errors.New("registry token issuer is not configured")
+		return "", &classifiedFailure{cause: causeSigning, class: tokenClassSigning}
 	}
 	user, err := s.Store.FindUserByEmail(ctx, email)
 	if err != nil {
@@ -524,52 +547,56 @@ func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope str
 			// Unknown account: comparable bcrypt work, generic failure (no
 			// account enumeration via the token endpoint).
 			_ = bcrypt.CompareHashAndPassword([]byte(dummyPasswordHash), []byte(password))
-			return "", &credentialFailure{cause: causeUnknownAccount}
+			return "", &classifiedFailure{cause: causeUnknownAccount, class: tokenClassCredential}
 		}
-		return "", &credentialFailure{cause: causeUnknownAccount}
+		// A backend/datastore failure: classify it (never "unknown_account")
+		// so operators can diagnose while the public response stays generic.
+		return "", &classifiedFailure{cause: causeDatastore, class: tokenClassBackend}
 	}
 	if !comparePassword(user.PasswordHash, password) {
-		return "", &credentialFailure{cause: causeInvalidPassword}
+		return "", &classifiedFailure{cause: causeInvalidPassword, class: tokenClassCredential}
 	}
 	registry, err := s.Store.FindRegistryByHost(ctx, host)
 	if err != nil {
-		return "", err
+		if errors.Is(err, sql.ErrNoRows) {
+			// The caller chose the host, so a missing registry reveals nothing
+			// about users or credentials.
+			return "", &classifiedFailure{cause: causeRegistryNotFound, class: tokenClassNotFound}
+		}
+		return "", &classifiedFailure{cause: causeDatastore, class: tokenClassBackend}
 	}
 
 	repository, actions, err := auth.ParseDockerScope(scope)
 	if err != nil {
-		return "", err
+		return "", &classifiedFailure{cause: causeInvalidScope, class: tokenClassMalformed}
 	}
 
 	membership, err := s.Store.FindMembership(ctx, registry.ID, user.ID)
 	if err != nil {
-		if err != sql.ErrNoRows {
-			return "", err
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", &classifiedFailure{cause: causeDatastore, class: tokenClassBackend}
 		}
 		// No membership: only anonymous pull is possible.
 		for _, a := range actions {
 			if a == auth.ActionPush {
-				return "", fmt.Errorf("user is not allowed to push to this registry")
+				return "", &classifiedFailure{cause: causeForbidden, class: tokenClassForbidden}
 			}
 			if a == auth.ActionPull && !registry.AnonymousPull {
-				return "", fmt.Errorf("user is not allowed to pull from this registry")
+				return "", &classifiedFailure{cause: causeForbidden, class: tokenClassForbidden}
 			}
 		}
-		return s.issueRegistryToken(host, "anonymous", repository, actions)
+		return s.classifiedIssue(host, "anonymous", repository, actions)
 	}
 
 	for _, a := range actions {
 		switch a {
 		case auth.ActionPush:
-			// Anonymous pull authorizes pull only: a member (or any actor)
-			// without push permission must be denied push even when the
-			// registry allows anonymous pulls.
 			if !membership.CanPush {
-				return "", fmt.Errorf("user is not allowed to push to this registry")
+				return "", &classifiedFailure{cause: causeForbidden, class: tokenClassForbidden}
 			}
 		case auth.ActionPull:
 			if !membership.CanPull && !registry.AnonymousPull {
-				return "", fmt.Errorf("user is not allowed to pull from this registry")
+				return "", &classifiedFailure{cause: causeForbidden, class: tokenClassForbidden}
 			}
 		}
 	}
@@ -578,20 +605,26 @@ func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope str
 	if membership.CanPush {
 		subject = "role:write"
 	}
-	return s.issueRegistryToken(host, subject, repository, actions)
+	return s.classifiedIssue(host, subject, repository, actions)
 }
 
-func (s *Service) issueRegistryToken(service, subject, repository string, actions []auth.Action) (string, error) {
+// classifiedIssue signs a registry token, classifying any failure as signing
+// (never exposing the internal issuer error text).
+func (s *Service) classifiedIssue(service, subject, repository string, actions []auth.Action) (string, error) {
 	if s.RegistryTokens == nil {
-		return "", fmt.Errorf("registry token issuer is not configured")
+		return "", &classifiedFailure{cause: causeSigning, class: tokenClassSigning}
 	}
-	return s.RegistryTokens.Issue(context.Background(), auth.RegistryTokenRequest{
+	tok, err := s.RegistryTokens.Issue(context.Background(), auth.RegistryTokenRequest{
 		Subject:    subject,
 		Service:    service,
 		Repository: repository,
 		Actions:    actions,
 		TTL:        time.Hour,
 	})
+	if err != nil {
+		return "", &classifiedFailure{cause: causeSigning, class: tokenClassSigning}
+	}
+	return tok, nil
 }
 
 func UserIDFromSubject(subject string) (int64, error) {

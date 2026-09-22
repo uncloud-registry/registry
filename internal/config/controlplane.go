@@ -320,27 +320,34 @@ func (c *ControlPlaneConfig) validateSessionSecret() error {
 }
 
 // weakSessionSecret reports whether a production session secret is
-// predictable: fewer than 16 distinct byte values, or a short repeated period
-// covering the whole value. Raw-byte compatibility is preserved in both
-// modes — the value is never trimmed or otherwise mutated — but production
-// rejects values that are structurally guessable.
+// predictable: fewer than 16 distinct byte values, an exact repeated block of
+// any period up to len/2 (including `0123456789abcdef` repeated twice), a
+// monotonic/sequential byte sequence, or a known common literal. Raw-byte
+// compatibility is preserved in both modes — the value is never trimmed or
+// otherwise mutated — but production rejects values that are structurally
+// guessable. Ordinary high-entropy random bytes are accepted.
 func weakSessionSecret(s string) bool {
-	distinct := make(map[byte]struct{})
-	for i := 0; i < len(s); i++ {
+	n := len(s)
+	if n < minSessionSecretBytes {
+		return false // length is guarded separately; a short secret is weak by length
+	}
+	distinct := make(map[byte]struct{}, n)
+	for i := 0; i < n; i++ {
 		distinct[s[i]] = struct{}{}
 	}
 	if len(distinct) < 16 {
 		return true
 	}
-	// A short period (<=8 bytes) repeating across the whole value, e.g. a
-	// single repeated byte or an ababab… pattern, is predictable.
-	for p := 1; p <= 8; p++ {
-		if len(s)%p != 0 {
+	// An exact repeated block of ANY period p in 1..len/2 covering the whole
+	// value is predictable (e.g. a single repeated byte, an abab pattern, or
+	// the 16-byte hex-alphabet block `0123456789abcdef` repeated twice).
+	for p := 1; p <= n/2; p++ {
+		if n%p != 0 {
 			continue
 		}
 		block := s[:p]
 		whole := true
-		for i := p; i < len(s); i += p {
+		for i := p; i < n; i += p {
 			if s[i:i+p] != block {
 				whole = false
 				break
@@ -350,7 +357,63 @@ func weakSessionSecret(s string) bool {
 			return true
 		}
 	}
+	// Monotonic/sequential byte sequences and known common literals are also
+	// predictable (real random bytes are effectively never fully sorted).
+	if predictableSequence(s) {
+		return true
+	}
+	for _, known := range knownWeakSecrets {
+		if s == known {
+			return true
+		}
+	}
 	return false
+}
+
+// predictableSequence reports whether s is a monotonic/sequential byte run:
+// either a constant-delta arithmetic progression or a strictly increasing or
+// strictly decreasing sequence. Such values are trivially guessable.
+func predictableSequence(s string) bool {
+	n := len(s)
+	if n < 3 {
+		return false
+	}
+	d := int(s[1]) - int(s[0])
+	if d != 0 {
+		all := true
+		for i := 2; i < n; i++ {
+			if int(s[i])-int(s[i-1]) != d {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	inc, dec := true, true
+	for i := 1; i < n; i++ {
+		if s[i] <= s[i-1] {
+			inc = false
+		}
+		if s[i] >= s[i-1] {
+			dec = false
+		}
+	}
+	return inc || dec
+}
+
+// knownWeakSecrets is a small table of common predictable 32+ byte literals
+// that pass the structural guards above but are still recognizable defaults.
+var knownWeakSecrets = []string{
+	"0123456789abcdef0123456789abcdef",
+	"1234567890abcdef1234567890abcdef",
+	"0123456789abcdefghijklmnopqrstuv",
+	"abcdefghijklmnopqrstuvwxyz0123456789",
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+	"abcabcabcabcabcabcabcabcabcabcab",
+	"deadbeefdeadbeefdeadbeefdeadbeef",
+	"passwordpasswordpasswordpassword",
 }
 
 // validateExternalURL enforces the origin-only secure-origin contract:
@@ -399,35 +462,59 @@ func (c *ControlPlaneConfig) externalURLIsOriginOnly() error {
 }
 
 // validateRegistryDomain enforces the canonical lowercase DNS hostname
-// contract: a valid hostname (letters, digits, hyphens, dots) with no scheme,
-// path, port, wildcard, trailing dot, or IP literal. It is stored lowercased
-// so host construction is canonical.
+// contract: each label 1..63 chars of ASCII letters/digits/hyphens, starting
+// and ending with a letter or digit (internal hyphens only), a total length of
+// at most 253, no scheme/path/port/wildcard/IP literal/trailing dot, and
+// canonical lowercase. Raw bytes are preserved and the lowercased canonical
+// value is stored so host construction is unambiguous.
 func (c *ControlPlaneConfig) validateRegistryDomain() error {
-	c.RegistryDomain = strings.ToLower(strings.TrimSpace(c.RegistryDomain))
-	if c.RegistryDomain == "" {
+	raw := strings.TrimSpace(c.RegistryDomain)
+	if raw == "" {
 		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must not be empty")
 	}
-	if net.ParseIP(c.RegistryDomain) != nil {
+	if net.ParseIP(raw) != nil {
 		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must be a DNS hostname, not an IP address")
 	}
-	if strings.HasSuffix(c.RegistryDomain, ".") {
+	if strings.HasSuffix(raw, ".") {
 		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must not end with a trailing dot")
 	}
-	if strings.HasPrefix(c.RegistryDomain, ".") {
-		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must not contain a leading dot")
+	if strings.HasPrefix(raw, ".") || strings.Contains(raw, "..") {
+		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must be a bare hostname with non-empty dot-separated labels")
 	}
-	if strings.Contains(c.RegistryDomain, "..") {
-		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must not contain consecutive dots")
-	}
-	if strings.ContainsAny(c.RegistryDomain, ":/\\@%?#*_= ") {
+	if strings.ContainsAny(raw, ":/\\@%?#*_= ") {
 		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must be a bare DNS hostname with no scheme, port, or wildcard")
 	}
-	for _, ch := range c.RegistryDomain {
-		if !(ch == '-' || ch == '.' || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) {
-			return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must contain only letters, digits, hyphens, and dots")
+	domain := strings.ToLower(raw)
+	if len(domain) > 253 {
+		return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must be at most 253 characters")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) > 63 {
+			return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN labels must each be at most 63 characters")
+		}
+		if !isDNSAlphaNum(label[0]) || !isDNSAlphaNum(label[len(label)-1]) {
+			return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN labels must start and end with a letter or digit")
+		}
+		for i := 0; i < len(label); i++ {
+			ch := label[i]
+			if ch == '-' {
+				if i == 0 || i == len(label)-1 {
+					return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN labels must not begin or end with a hyphen")
+				}
+				continue
+			}
+			if !isDNSAlphaNum(ch) {
+				return fmt.Errorf("CONTROLPLANE_REGISTRY_DOMAIN must contain only letters, digits, hyphens, and dots")
+			}
 		}
 	}
+	c.RegistryDomain = domain
 	return nil
+}
+
+// isDNSAlphaNum reports whether b is an ASCII letter or digit.
+func isDNSAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 // validateRegistryKey requires the Ed25519 signing seed in EVERY mode — the
@@ -563,24 +650,29 @@ func (c *ControlPlaneConfig) validateTermination() error {
 }
 
 // ExternalOrigin returns the scheme+host of the configured external URL, or "".
-// It is the only value the control plane compares browser Origins against.
+// It is the only value the control plane compares browser Origins against. It
+// preserves IPv6 bracket semantics (URL.Host / net.JoinHostPort style) and
+// drops a port that equals the scheme's default (the Origin header omits it).
 func (c *ControlPlaneConfig) ExternalOrigin() string {
 	if c.ExternalURL == nil {
 		return ""
 	}
-	// Derive the origin from scheme+host, dropping a port that equals the
-	// scheme's default (the Origin header omits it).
-	host := c.ExternalURL.Hostname()
-	if p := c.ExternalURL.Port(); p != "" {
+	u := c.ExternalURL
+	host := u.Hostname()
+	if strings.Contains(host, ":") {
+		// An IPv6 host must keep its brackets in a URL/Origin.
+		host = "[" + host + "]"
+	}
+	if p := u.Port(); p != "" {
 		defaultPort := "80"
-		if c.ExternalURL.Scheme == "https" {
+		if u.Scheme == "https" {
 			defaultPort = "443"
 		}
 		if p != defaultPort {
-			host = net.JoinHostPort(host, p)
+			host = host + ":" + p
 		}
 	}
-	return c.ExternalURL.Scheme + "://" + host
+	return u.Scheme + "://" + host
 }
 
 // IsProduction reports whether the mode is production.

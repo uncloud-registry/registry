@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -738,12 +739,25 @@ func hashLimiterKey(k string) string {
 }
 
 // loginEmail peels the email from a login/register form or JSON body without
-// breaking the handler: it reads and restores the body so the handler can parse
-// it again.
+// calling ParseForm, so a failed/malformed parse is never cached-and-masked for
+// the handler. It reads the buffered body and restores it (readBody), parses the
+// raw bytes directly, and leaves r.Body intact; the handler's own parse still
+// observes real parse errors.
 func loginEmail(r *http.Request) string {
 	if isFormContentType(r) {
-		_ = r.ParseForm()
-		return r.PostFormValue("email")
+		if isMultipartFormData(r) {
+			// Multipart is rejected earlier at the boundary; never reached.
+			return ""
+		}
+		body, err := readBody(r)
+		if err != nil {
+			return ""
+		}
+		values, perr := url.ParseQuery(string(body))
+		if perr != nil {
+			return ""
+		}
+		return values.Get("email")
 	}
 	body, err := readBody(r)
 	if err != nil {
@@ -781,20 +795,87 @@ func RequestIDFromContext(ctx context.Context) string {
 	return v
 }
 
+// requestIDRandom is the source of cryptographic randomness for request IDs. It
+// is an injectable package var so tests can force the crypto path to fail and
+// assert the deterministic process-unique fallback still yields a non-empty ID.
+var requestIDRandom = rand.Read
+
+// requestIDCounter backs the deterministic fallback (atomic count + time) so a
+// request ID can never be empty even when the entropy source fails.
+var requestIDCounter atomic.Uint64
+
 // newRequestID returns a fresh cryptographically random request ID (16 bytes,
-// hex-encoded). Failures to draw randomness propagate as an absent ID.
+// hex-encoded). If the entropy source fails it falls back to a deterministic,
+// process-unique value (atomic counter + time, hashed) so it is NEVER empty.
 func newRequestID() string {
 	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return ""
+	if _, err := requestIDRandom(buf); err == nil {
+		return hex.EncodeToString(buf)
 	}
-	return hex.EncodeToString(buf)
+	return fallbackRequestID()
 }
 
-// maxBodyBytes is the control-plane request-body cap (1 MiB). Any request
-// body larger than this is rejected with a 413 before it can be buffered into
-// memory at scale.
-const maxBodyBytes = 1 << 20
+// fallbackRequestID returns a non-empty, process-unique request ID derived from
+// an atomic counter plus the current time, hashed and hex-encoded. It is not
+// cryptographically random, but it never empties the correlator.
+func fallbackRequestID() string {
+	n := requestIDCounter.Add(1)
+	sum := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10) + ":" + strconv.FormatUint(n, 10)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// controlPlaneBodyLimit is the maximum request body the control plane accepts
+// (1 MiB). Larger bodies are rejected with 413 before any handler or parse.
+const controlPlaneBodyLimit = 1 << 20
+
+// maxBodyBytes is retained as an alias for backward-compatibility with the
+// existing body-bound tests.
+const maxBodyBytes = controlPlaneBodyLimit
+
+// methodMayHaveBody reports whether a request method can carry a body that must
+// be bounded before routing. Safe methods (GET/HEAD/OPTIONS) never read it.
+func methodMayHaveBody(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+// isMultipartFormData reports whether the request declares a multipart/form-data
+// body. The control plane rejects multipart entirely with 415.
+func isMultipartFormData(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data")
+}
+
+// bufferRequestBody bounds and restores a request body for body-capable
+// methods. It reads at most controlPlaneBodyLimit+1 bytes: if the body is
+// larger (known via ContentLength or actual read, including chunked) it returns
+// overflow=true with no side effects; otherwise it replaces r.Body with a fresh
+// reader over the exact bounded bytes so every later ParseForm/decode reads the
+// buffer. Safe methods (GET/HEAD/OPTIONS) leave the body untouched.
+func bufferRequestBody(r *http.Request) (overflow bool, err error) {
+	if !methodMayHaveBody(r.Method) {
+		return false, nil
+	}
+	if r.Body == nil {
+		return false, nil
+	}
+	if r.ContentLength > int64(controlPlaneBodyLimit) {
+		// Known oversized from Content-Length: reject without reading a byte.
+		return true, nil
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, controlPlaneBodyLimit+1))
+	if err != nil {
+		return false, err
+	}
+	if len(data) > controlPlaneBodyLimit {
+		return true, nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return false, nil
+}
 
 const (
 	headerCSP      = "Content-Security-Policy"
@@ -824,9 +905,28 @@ func (p *securityPolicy) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		securityHeaders(w.Header())
 
-		// Bound the request body before anything parses it. Overflow surfaces
-		// as a *http.MaxBytesError that bounded decode/parse helpers map to 413.
-		r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		// Multipart is never used by any control-plane handler, so reject it
+		// entirely with 415 before anything parses it: a multipart `_csrf`
+		// candidate can never be silently treated as absent NOR pass CSRF.
+		if isMultipartFormData(r) {
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "multipart form data is not supported"})
+			return
+		}
+
+		// Bound the request body BEFORE any route classification, parse, or
+		// handler: body-capable methods are buffered up to limit+1; overflow
+		// is an immediate 413 with no side effects (even on an unknown route);
+		// within-limit bodies are restored as the exact bounded bytes for every
+		// later form/JSON/multipart parse. Safe methods never read the body.
+		overflow, err := bufferRequestBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not read request body"})
+			return
+		}
+		if overflow {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+			return
+		}
 
 		rid := newRequestID()
 		w.Header().Set(requestIDHeader, rid)

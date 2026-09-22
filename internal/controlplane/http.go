@@ -1,7 +1,6 @@
 package controlplane
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -309,28 +308,43 @@ func (s *HTTPServer) handleRegistryToken(w http.ResponseWriter, r *http.Request)
 	scope := r.URL.Query().Get("scope")
 	token, err := s.Service.IssueRegistryToken(r.Context(), service, scope, username, password)
 	if err != nil {
-		status := http.StatusUnauthorized
-		message := err.Error()
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			// Registry for the requested host does not exist; the caller chose
-			// the host so this reveals nothing about users or credentials.
-			status = http.StatusNotFound
-			message = "registry not found"
-			s.logAuthFailure(r, "registry_not_found")
-		case errors.Is(err, errInvalidCredentials):
-			// Never distinguish unknown user from a wrong password.
-			message = errInvalidCredentials.Error()
+		// The response is derived ONLY from a safe internal class, NEVER from
+		// err.Error(): every class maps to a fixed generic public status+body
+		// with no DB/signing/error text, PII, token, or scope detail.
+		var cf *classifiedFailure
+		if errors.As(err, &cf) {
 			s.logAuthFailure(r, credentialCause(err))
-		default:
-			// Other failures (malformed scope, denied permission) are safe and
-			// generic; log a coarse cause without the error text.
-			s.logAuthFailure(r, "token_refused")
+			status, message := tokenFailureResponse(cf.class)
+			writeJSON(w, status, map[string]string{"error": message})
+			return
 		}
-		writeJSON(w, status, map[string]string{"error": message})
+		// An unclassified failure is treated as a backend fault: generic 503,
+		// stripped of any internal text.
+		s.logAuthFailure(r, "token_refused")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporary service failure"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"token": token})
+}
+
+// tokenFailureResponse maps a safe failure class to a fixed, generic public
+// status and message. No class ever embeds an internal error string, a
+// credential, a token, or scope details.
+func tokenFailureResponse(class tokenFailureClass) (int, string) {
+	switch class {
+	case tokenClassMalformed:
+		return http.StatusBadRequest, "invalid request"
+	case tokenClassForbidden:
+		return http.StatusForbidden, "access denied"
+	case tokenClassNotFound:
+		return http.StatusNotFound, "registry not found"
+	case tokenClassBackend:
+		return http.StatusServiceUnavailable, "temporary service failure"
+	case tokenClassSigning:
+		return http.StatusInternalServerError, "token could not be issued"
+	default: // tokenClassCredential
+		return http.StatusUnauthorized, errInvalidCredentials.Error()
+	}
 }
 
 func (s *HTTPServer) requireSessionUser(w http.ResponseWriter, r *http.Request) (int64, bool) {
