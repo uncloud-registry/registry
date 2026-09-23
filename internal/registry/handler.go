@@ -44,11 +44,20 @@ type Handler struct {
 	Authenticator  Authenticator
 	Staging        staging.Store
 	Publisher      publish.Publisher
-	SessionTTL     time.Duration
-	AuthRealm      string
+	// Preflight durably binds an EXPLICIT caller operation key to exactly one
+	// logical payload (registry + owner + repo + tag + manifest digest) in the
+	// control-plane operation store BEFORE any immutable object, feed, or
+	// staging write. A reused key with a changed payload is a 409 here — with
+	// zero object writes — and the durable binding survives process restarts.
+	// It is nil in modes without a control plane (in-memory/dev), where the
+	// feed read-back retry recognition still governs idempotency but no
+	// durable cross-request binding exists.
+	Preflight  publish.OperationBinder
+	SessionTTL time.Duration
+	AuthRealm  string
 }
 
-func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.Store, publisher publish.Publisher, authRealm string) http.Handler {
+func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.Store, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
 	return &Handler{
 		Resolver:       resolver,
 		Objects:        objects,
@@ -58,6 +67,7 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 		Authenticator:  authenticator,
 		Staging:        stageStore,
 		Publisher:      publisher,
+		Preflight:      preflight,
 		SessionTTL:     15 * time.Minute,
 		AuthRealm:      authRealm,
 	}
@@ -504,6 +514,34 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			// retry. Fall through to the normal publish path.
 		} else {
 			status, code, message := classifyPublicationError(verr)
+			writeError(w, status, code, message)
+			return
+		}
+	}
+
+	// Explicit-key PREFLIGHT binding BEFORE any immutable object write. The
+	// control plane durably reserves this operation key for exactly this
+	// logical payload (registry + owner + repo + tag + manifest digest), so a
+	// reused key with a DIFFERENT payload is a 409 here — before the manifest
+	// and draft-state objects are uploaded, before any feed write, and before
+	// any staging consumption — and the durable binding survives process
+	// restarts, so a reconstructed handler rejects the same conflict with
+	// zero writes. The already-published case was answered above, so a
+	// genuine retry never pays a binding call; a same-key-same-payload
+	// request whose feed has NOT advanced passes the binding (a reservation
+	// never blocks its matching commit) and proceeds to the normal publish
+	// path. The key grammar was validated at the top of this handler, so an
+	// invalid or oversized key never reaches the control plane.
+	if clientOperationID != "" && h.Preflight != nil {
+		if err := h.Preflight.Bind(r.Context(), publish.OperationBindingRequest{
+			OperationID:    clientOperationID,
+			RegistryID:     registryIdentity.RegistryID,
+			Owner:          registryIdentity.Owner,
+			Repo:           repo,
+			Tag:            reference,
+			ManifestDigest: manifestDigest,
+		}); err != nil {
+			status, code, message := classifyPublicationError(err)
 			writeError(w, status, code, message)
 			return
 		}

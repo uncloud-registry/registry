@@ -76,6 +76,7 @@ func buildMemoryHandler() (http.Handler, error) {
 			Objects: docs,
 			Feeds:   feeds,
 		},
+		nil,
 		authRealm,
 	), nil
 }
@@ -145,6 +146,11 @@ func buildBeeHandler() (http.Handler, error) {
 		Secret:     internalSecret,
 		HTTPClient: cpHTTPClient,
 	}
+	binder := &publish.ControlPlaneOperationBinder{
+		BaseURL:    cpURL,
+		Secret:     internalSecret,
+		HTTPClient: cpHTTPClient,
+	}
 
 	return registry.NewHandler(
 		resolve.RegistryResolver{
@@ -166,6 +172,7 @@ func buildBeeHandler() (http.Handler, error) {
 			Objects: objects,
 			Commits: committer,
 		},
+		binder,
 		authRealm,
 	), nil
 }

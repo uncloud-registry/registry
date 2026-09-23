@@ -715,6 +715,7 @@ func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *reso
 			Objects: docs,
 			Feeds:   feeds,
 		},
+		nil,
 		"https://auth.uncloud-registry.com/token",
 	)
 	return handler, issuer
@@ -967,6 +968,7 @@ func TestHandlerServesTwoHostsWithHostSpecificTokens(t *testing.T) {
 			Objects: docs,
 			Feeds:   feeds,
 		},
+		nil,
 		"https://auth.uncloud-registry.com/token",
 	)
 	server := httptest.NewServer(handler)

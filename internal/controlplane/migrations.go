@@ -363,6 +363,25 @@ var migrations = []migration{
 		Version: 14,
 		Apply:   installFeedSignerOperationStoreV14,
 	},
+	// Version 15 creates the durable preflight operation-key binding table
+	// (publication_bindings): one permanent row per explicit caller operation
+	// key, carrying the registry namespace FK and the fixed-size
+	// domain-separated hash of the FIVE typed binding fields (registry,
+	// owner, repo, tag, manifest digest). The operation_id primary key makes
+	// the atomic insert-or-ignore reserve a single binding winner under
+	// concurrency, and the row is never expired, so a reused key with a
+	// different payload conflicts forever (cross-request, cross-process).
+	// The table is pure forward DDL over a NEW table alongside the migration
+	// 9-14 feed-signer store — it never reads, mutates, or drops any
+	// migration 1-14 state, and installed its own byte-exact operation-ID
+	// identity triggers (the shared migration-14 predicate with distinct
+	// trigger names, since SQLite triggers are database-global). Any
+	// statement failure aborts the migration transaction atomically: version
+	// stays 14 and no schema object is installed (rollback-pinned by tests).
+	{
+		Version: 15,
+		Apply:   installPublicationBindingStore,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

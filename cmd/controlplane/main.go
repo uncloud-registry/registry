@@ -347,7 +347,7 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 			ResolveFeeds: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), nil),
 			Docs:         swarm.NewBeeDocumentStore(cfg.BeeAPIURL.String(), nil),
 		}
-		internal, err := controlplane.NewInternalFeedServer(signer, internalSecret, nil)
+		internal, err := controlplane.NewInternalFeedServer(signer, &controlplane.PublicationBinder{Store: store}, internalSecret, nil)
 		if err != nil {
 			return nil, err
 		}

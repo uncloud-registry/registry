@@ -24,18 +24,21 @@ func postFeedUpdate(t *testing.T, srv http.Handler, path, secret, body string) *
 }
 
 func newTestInternalServer(signer *FeedSigner) (*InternalFeedServer, error) {
-	return NewInternalFeedServer(signer, []byte(testInternalSecret), nil)
+	return NewInternalFeedServer(signer, &PublicationBinder{}, []byte(testInternalSecret), nil)
 }
 
 func TestNewInternalFeedServerRequiresSignerAndSecret(t *testing.T) {
-	if _, err := NewInternalFeedServer(nil, []byte(testInternalSecret), nil); err == nil {
+	if _, err := NewInternalFeedServer(nil, &PublicationBinder{}, []byte(testInternalSecret), nil); err == nil {
 		t.Fatal("expected error when signer is nil")
 	}
 	var empty *FeedSigner
-	if _, err := NewInternalFeedServer(empty, []byte(testInternalSecret), nil); err == nil {
+	if _, err := NewInternalFeedServer(empty, &PublicationBinder{}, []byte(testInternalSecret), nil); err == nil {
 		t.Fatal("expected error when signer is typed nil")
 	}
-	if _, err := NewInternalFeedServer(&FeedSigner{}, nil, nil); err == nil {
+	if _, err := NewInternalFeedServer(&FeedSigner{}, nil, []byte(testInternalSecret), nil); err == nil {
+		t.Fatal("expected error when binder is nil")
+	}
+	if _, err := NewInternalFeedServer(&FeedSigner{}, &PublicationBinder{}, nil, nil); err == nil {
 		t.Fatal("expected error when secret is empty")
 	}
 }
@@ -120,7 +123,7 @@ func TestInternalFeedServerHappyPath(t *testing.T) {
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
 
-	srv, err := NewInternalFeedServer(w.signer, []byte(testInternalSecret), nil)
+	srv, err := NewInternalFeedServer(w.signer, &PublicationBinder{Store: w.store}, []byte(testInternalSecret), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +151,7 @@ func TestInternalFeedServerErrorMapping(t *testing.T) {
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
-	srv, err := NewInternalFeedServer(w.signer, []byte(testInternalSecret), nil)
+	srv, err := NewInternalFeedServer(w.signer, &PublicationBinder{Store: w.store}, []byte(testInternalSecret), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

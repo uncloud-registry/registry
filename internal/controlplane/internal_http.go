@@ -18,30 +18,35 @@ import (
 // any decode.
 const internalFeedBodyLimit = 65536
 
-// InternalFeedServer serves the control plane's constrained internal feed-
-// signing endpoint. It is intended to be mounted on a SEPARATE internal
+// InternalFeedServer serves the control plane's constrained internal
+// feed-signing endpoints. It is intended to be mounted on a SEPARATE internal
 // listener (not the public router), so it can never inherit the public browser
-// CSRF/session assumptions. It accepts exactly one route: POST
-// /internal/v1/feed-updates. It authenticates with a dedicated credential
-// header compared in constant time, decodes a bounded strict-JSON request, and
-// returns only generic coarse statuses — never internal error text, secrets,
-// keys, or topology.
+// CSRF/session assumptions. It accepts exactly two routes on POST:
+// /internal/v1/feed-updates (the feed signer) and /internal/v1/operation-bindings
+// (the preflight operation-key binder). It authenticates with a dedicated
+// credential header compared in constant time, decodes bounded strict-JSON
+// requests, and returns only generic coarse statuses — never internal error
+// text, secrets, keys, or topology.
 type InternalFeedServer struct {
 	Signer *FeedSigner
+	Binder *PublicationBinder
 	Secret []byte
 	Logger *slog.Logger
 }
 
 // NewInternalFeedServer returns the internal feed server, failing closed on a
-// missing signer or empty secret.
-func NewInternalFeedServer(signer *FeedSigner, secret []byte, logger *slog.Logger) (*InternalFeedServer, error) {
+// missing signer, binder, or empty secret.
+func NewInternalFeedServer(signer *FeedSigner, binder *PublicationBinder, secret []byte, logger *slog.Logger) (*InternalFeedServer, error) {
 	if isNilDependency(signer) {
 		return nil, errors.New("internal feed server requires a signer")
+	}
+	if isNilDependency(binder) {
+		return nil, errors.New("internal feed server requires the publication binder")
 	}
 	if len(secret) == 0 {
 		return nil, errors.New("internal feed server requires the internal service credential")
 	}
-	return &InternalFeedServer{Signer: signer, Secret: append([]byte(nil), secret...), Logger: logger}, nil
+	return &InternalFeedServer{Signer: signer, Binder: binder, Secret: append([]byte(nil), secret...), Logger: logger}, nil
 }
 
 func (s *InternalFeedServer) logger() *slog.Logger {
@@ -51,56 +56,27 @@ func (s *InternalFeedServer) logger() *slog.Logger {
 	return slog.Default()
 }
 
-// ServeHTTP handles the single allowed route. Any other path or method is a
-// generic 404; a non-POST method on the route is 405.
+// ServeHTTP handles the two allowed routes. Any other path or method is a
+// generic 404; a non-POST method on a route is 405.
 func (s *InternalFeedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != publish.InternalFeedUpdatePath {
+	if r.Method != http.MethodPost {
+		switch r.URL.Path {
+		case publish.InternalFeedUpdatePath, publish.InternalOperationBindingPath:
+			w.Header().Set("Allow", "POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		http.NotFound(w, r)
 		return
 	}
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
+	switch r.URL.Path {
+	case publish.InternalFeedUpdatePath:
+		s.handleFeedUpdate(w, r)
+	case publish.InternalOperationBindingPath:
+		s.handleOperationBinding(w, r)
+	default:
+		http.NotFound(w, r)
 	}
-
-	// Authenticate with the dedicated credential header. Only exactly ONE
-	// non-blank value is accepted; duplicates (even identical) or a blank value
-	// are rejected. Comparison is constant-time and length-safe.
-	if !s.checkCredential(r) {
-		s.logger().Warn("internal credential rejected", "component", "controlplane-internal", "path", publish.InternalFeedUpdatePath)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	// Bound the body before any parse (known-length fast reject included).
-	if r.ContentLength > internalFeedBodyLimit {
-		_ = r.Body.Close()
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(r.Body, internalFeedBodyLimit+1))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
-		return
-	}
-
-	var req publish.FeedCommitRequest
-	if err := decodeStrictJSON(data, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
-		return
-	}
-
-	result, err := s.Signer.Commit(r.Context(), req)
-	if err != nil {
-		status := mapFeedSignerError(err)
-		if status == http.StatusServiceUnavailable {
-			s.logger().Warn("internal feed commit backend failure", "component", "controlplane-internal", "class", "backend")
-		}
-		writeJSON(w, status, map[string]string{"error": genericFeedSingErrorFor(status)})
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 // checkCredential verifies the request's dedicated internal credential header
@@ -128,6 +104,88 @@ func (s *InternalFeedServer) checkCredential(r *http.Request) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(got), s.Secret) == 1
+}
+
+// handleFeedUpdate serves POST /internal/v1/feed-updates.
+func (s *InternalFeedServer) handleFeedUpdate(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCredential(r) {
+		s.logger().Warn("internal credential rejected", "component", "controlplane-internal", "path", publish.InternalFeedUpdatePath)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	data, ok := s.readBoundedBody(w, r)
+	if !ok {
+		return
+	}
+
+	var req publish.FeedCommitRequest
+	if err := decodeStrictJSON(data, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+
+	result, err := s.Signer.Commit(r.Context(), req)
+	if err != nil {
+		status := mapFeedSignerError(err)
+		if status == http.StatusServiceUnavailable {
+			s.logger().Warn("internal feed commit backend failure", "component", "controlplane-internal", "class", "backend")
+		}
+		writeJSON(w, status, map[string]string{"error": genericFeedSignerErrorFor(status)})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleOperationBinding serves POST /internal/v1/operation-bindings: the
+// authenticated preflight reservation of an explicit caller operation key for
+// exactly one logical payload, decided BEFORE the data plane writes any
+// immutable object. A fresh or identical binding is 200; a reused key with a
+// different payload is 409; every failure maps to the same coarse statuses as
+// feed commits.
+func (s *InternalFeedServer) handleOperationBinding(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCredential(r) {
+		s.logger().Warn("internal credential rejected", "component", "controlplane-internal", "path", publish.InternalOperationBindingPath)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	data, ok := s.readBoundedBody(w, r)
+	if !ok {
+		return
+	}
+
+	var req publish.OperationBindingRequest
+	if err := decodeStrictJSON(data, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+
+	if err := s.Binder.Bind(r.Context(), req); err != nil {
+		status := mapFeedSignerError(err)
+		if status == http.StatusServiceUnavailable {
+			s.logger().Warn("internal operation binding backend failure", "component", "controlplane-internal", "class", "backend")
+		}
+		writeJSON(w, status, map[string]string{"error": genericFeedSignerErrorFor(status)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reserved"})
+}
+
+// readBoundedBody enforces the shared internal request-body bound (known-length
+// fast reject included) before any parse.
+func (s *InternalFeedServer) readBoundedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r.ContentLength > internalFeedBodyLimit {
+		_ = r.Body.Close()
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return nil, false
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, internalFeedBodyLimit+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return nil, false
+	}
+	return data, true
 }
 
 // decodeStrictJSON decodes a bounded request body strictly: duplicate members
@@ -164,9 +222,9 @@ func mapFeedSignerError(err error) int {
 	}
 }
 
-// genericFeedSingErrorFor returns the fixed generic body for an internal feed-
-// signer error status; it never carries internal text, secrets, or keys.
-func genericFeedSingErrorFor(status int) string {
+// genericFeedSignerErrorFor returns the fixed generic body for an internal
+// feed-signer error status; it never carries internal text, secrets, or keys.
+func genericFeedSignerErrorFor(status int) string {
 	switch status {
 	case http.StatusBadRequest:
 		return "invalid request"

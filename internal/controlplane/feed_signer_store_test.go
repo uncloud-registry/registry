@@ -118,8 +118,8 @@ func TestMigration10ConstrainHardenedSchemaOnFresh(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	v, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || v != 14 {
-		t.Fatalf("expected schema version 14, got %d (err %v)", v, err)
+	if err != nil || v != 15 {
+		t.Fatalf("expected schema version 15, got %d (err %v)", v, err)
 	}
 	cols := tableColumnsOf(t, db, "feed_signer_operations")
 	for _, want := range []string{"operation_id", "registry_id", "topic", "request_hash", "state", "result_json", "claim_token", "lease_until", "attempts", "created_at", "updated_at"} {
@@ -259,8 +259,8 @@ func TestMigration11HardensOldV10ActiveRows(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("migration 11 hardening old-v10 must succeed for valid rows: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 14 {
-		t.Fatalf("expected version 14, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 15 {
+		t.Fatalf("expected version 15, got %d (err %v)", v, err)
 	}
 	// Quarantine table re-created, triggers installed, valid row preserved.
 	if sqliteObjectCount(t, db, "table", "feed_signer_operations_legacy") != 1 {

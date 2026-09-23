@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/uncloud-registry/registry/internal/publish"
+	"github.com/uncloud-registry/registry/internal/registry"
 	"github.com/uncloud-registry/registry/internal/resolve"
 )
 
@@ -129,5 +131,63 @@ func TestRequireRegistryIDsFailClosed(t *testing.T) {
 		"b.test": {Host: "b.test", Owner: "0xbbb", RegistryID: 2},
 	}}); err != nil {
 		t.Fatalf("expected fully-mapped multi-host resolver to pass, got %v", err)
+	}
+}
+
+// TestOperationPreflightWiring pins the preflight binding wiring at the
+// process boundary: the Bee-mode handler is built with a durable
+// ControlPlaneOperationBinder aimed at the control-plane origin (so keyed
+// conflicts are rejected BEFORE object writes via the durable store), while
+// the identity-mode handler runs WITHOUT a preflight (no control plane) and
+// keeps the feed read-back retry recognition as its only idempotency rule.
+// Neither mode ever places a signing key in the registry process.
+func TestOperationPreflightWiring(t *testing.T) {
+	// Bee mode: the handler carries a control-plane binder.
+	t.Setenv("REGISTRY_BACKEND", "bee")
+	t.Setenv("BEE_API_URL", "http://bee.test")
+	t.Setenv("REGISTRY_OWNER_MAP", "registry.test=0xabcdefabcdefabcdefabcdefabcdefabcdefabcdef")
+	t.Setenv("REGISTRY_ID_MAP", "registry.test=7")
+	t.Setenv("CONTROLPLANE_URL", "http://127.0.0.1:8080")
+	t.Setenv("CONTROLPLANE_INTERNAL_SECRET_FILE", writeSecretFile(t))
+	t.Setenv("CONTROLPLANE_CA_BUNDLE_FILE", "")
+	t.Setenv("CONTROLPLANE_USE_SYSTEM_ROOTS", "")
+	beeAuthEnv(t)
+	h, err := buildBeeHandler()
+	if err != nil {
+		t.Fatalf("build bee handler: %v", err)
+	}
+	beeReg, ok := h.(*registry.Handler)
+	if !ok {
+		t.Fatalf("expected *registry.Handler, got %T", h)
+	}
+	if beeReg.Preflight == nil {
+		t.Fatal("Bee-mode handler must wire the durable operation preflight")
+	}
+	binder, ok := beeReg.Preflight.(*publish.ControlPlaneOperationBinder)
+	if !ok {
+		t.Fatalf("expected *publish.ControlPlaneOperationBinder preflight, got %T", beeReg.Preflight)
+	}
+	if binder.BaseURL != "http://127.0.0.1:8080" {
+		t.Fatalf("binder must target the control-plane origin, got %q", binder.BaseURL)
+	}
+	if beeReg.Publisher.Commits == nil {
+		t.Fatal("Bee-mode handler must wire the control-plane committer")
+	}
+
+	// Identity mode (no REGISTRY_BACKEND at all): no control plane, no
+	// preflight, and no signing key.
+	t.Setenv("REGISTRY_BACKEND", "")
+	t.Setenv("CONTROLPLANE_URL", "")
+	t.Setenv("CONTROLPLANE_INTERNAL_SECRET_FILE", "")
+	ih, err := buildHandler()
+	if err != nil {
+		t.Fatalf("build identity handler: %v", err)
+	}
+	idReg, ok := ih.(*registry.Handler)
+	if !ok {
+		t.Fatalf("expected *registry.Handler, got %T", ih)
+	}
+	if idReg.Preflight != nil {
+		t.Fatal("identity-mode handler must run without a durable preflight (no control plane)")
 	}
 }

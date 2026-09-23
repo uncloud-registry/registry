@@ -473,14 +473,21 @@ func TestExplicitIdempotencyKeySameRequestSucceedsThenVerifies(t *testing.T) {
 
 // TestExplicitIdempotencyKeyReuseWithDifferentPayloadConflicts pins the
 // cross-request reuse rule: reusing one operation key with a DIFFERENT
-// digest is a 409 MANIFEST_CONFLICT with zero feed writes and zero staging
-// consumption (the durable signer rejects the conflicting request server-side;
-// the data plane never advances the feed and never clears staging).
+// digest is a 409 with ZERO new object writes, zero feed writes, and zero
+// staging consumption. The conflict is decided at the durable key binding
+// BEFORE the publisher uploads the manifest or draft-state objects (the
+// counting uploader proves the second request never reaches the object
+// store), and the durable binding survives restarts (covered in depth by
+// TestExplicitKeyConflictSurvivesHandlerReconstruction).
 func TestExplicitIdempotencyKeyReuseWithDifferentPayloadConflicts(t *testing.T) {
 	const key = "client-t14-key-0002"
 	h, docs, feeds, issuer, serverURL := task14World(t)
 	committer := &scriptedCommitter{feeds: feeds, writeFeed: true, conflictAfter: 1}
 	h.Publisher.Commits = committer
+	binder := newDurableBindingStore()
+	h.Preflight = binder
+	counter := &countingObjectUploader{inner: docs}
+	h.Publisher.Objects = counter
 
 	configA := []byte(`{"architecture":"amd64"}`)
 	configADigest := stageBlob(t, serverURL, issuer, configA, "application/vnd.oci.image.config.v1+json")
@@ -524,6 +531,12 @@ func TestExplicitIdempotencyKeyReuseWithDifferentPayloadConflicts(t *testing.T) 
 	code, _ := decodeErrorPayload(t, bodyB)
 	if code != ErrorCodeManifestConflict {
 		t.Fatalf("expected MANIFEST_CONFLICT, got %q", code)
+	}
+	if counter.puts != 2 {
+		t.Fatalf("key-reuse conflict caused %d object writes, want exactly the first publication's 2 (manifest + state before the conflict is decided)", counter.puts)
+	}
+	if binder.conflicts != 1 {
+		t.Fatalf("expected exactly one durable binding conflict, got %d", binder.conflicts)
 	}
 	if feeds.Feeds[repoStateFeed()] != feedAfterFirst {
 		t.Fatal("key-reuse conflict must leave the feed exactly at the first publication")
