@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,17 @@ import (
 // feedSignerTestHash derives a deterministic [32]byte request hash for tests.
 func feedSignerTestHash(seed string) [32]byte {
 	return sha256.Sum256([]byte("feed-signer-test:" + seed))
+}
+
+// testClaimToken returns a fresh claim token via the real entropy source,
+// failing the test on an RNG error so callers stay concise.
+func testClaimToken(t *testing.T) string {
+	t.Helper()
+	tok, err := newClaimToken()
+	if err != nil {
+		t.Fatalf("newClaimToken: %v", err)
+	}
+	return tok
 }
 
 // tableColumnsOf returns the set of column names on a table via PRAGMA.
@@ -76,7 +89,7 @@ func seedFeedSignerRegistry(t *testing.T, store *Store) (Registry, string) {
 	owner := seedProvisioningOwner(t, store)
 	reg, err := store.CreateProvisionedRegistry(context.Background(), Registry{
 		Slug: "signertest", Host: "signer.registry.test", ENSName: "signer.eth",
-		OwnerUserID: owner.ID, FeedOwnerAddress: "0xsigner", DefaultStampBatchID: "batch-signer",
+		OwnerUserID: owner.ID, FeedOwnerAddress: testFeedOwner, DefaultStampBatchID: "batch-signer",
 		AnonymousPull: true,
 	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
 		[]byte(testAuthPayload), []byte(testStampPayload))
@@ -100,8 +113,8 @@ func TestMigration10ConstrainHardenedSchemaOnFresh(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	v, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || v != 10 {
-		t.Fatalf("expected schema version 10, got %d (err %v)", v, err)
+	if err != nil || v != 11 {
+		t.Fatalf("expected schema version 11, got %d (err %v)", v, err)
 	}
 	cols := tableColumnsOf(t, db, "feed_signer_operations")
 	for _, want := range []string{"operation_id", "registry_id", "topic", "request_hash", "state", "result_json", "claim_token", "lease_until", "attempts", "created_at", "updated_at"} {
@@ -143,42 +156,182 @@ func TestMigration10EmptyUpgradeFromM9(t *testing.T) {
 	}
 }
 
-// TestMigration10FailsClosedOnNonEmptyM9 proves migration 10 REFUSES to upgrade
-// a database carrying migration-9 rows (the control-plane registry_id and
-// canonical topic are not derivable from an m9 row, so carrying one forward
-// would fabricate them). It fails atomically: version stays 9, the row is
-// intact.
-func TestMigration10FailsClosedOnNonEmptyM9(t *testing.T) {
+// TestMigration10PreservesM9RowsInQuarantine proves migration 10 does NOT strand
+// migration-9 rows and does NOT fabricate their missing registry_id/topic:
+// every m9 row is preserved BYTE-FOR-BYTE in the constrained
+// feed_signer_operations_legacy quarantine table, the hardened ACTIVE table is
+// created empty, and the upgrade reaches the LATEST version (11) with the
+// quarantine still intact.
+func TestMigration10PreservesM9RowsInQuarantine(t *testing.T) {
 	db := openRawTestDB(t)
 	ctx := context.Background()
 	if err := applyMigrationsThrough(ctx, db, 9); err != nil {
 		t.Fatalf("apply through 9: %v", err)
 	}
 	legacyHash := feedSignerTestHash("legacy")
+	legacyResult := `{"operationID":"m9-legacy-op","feed":"feed://` + strings.Repeat("ab", 20) + `/` + strings.Repeat("cd", 32) + `","reference":"` + strings.Repeat("ef", 32) + `"}`
 	nowNs := timeToNanos(time.Now().UTC())
 	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
 		(operation_id, request_hash, state, result_json, created_at, updated_at)
-		values (?, ?, 'pending', null, ?, ?)`, "m9-legacy-op", legacyHash[:], nowNs, nowNs); err != nil {
+		values (?, ?, 'succeeded', ?, ?, ?)`, "m9-legacy-op", legacyHash[:], legacyResult, nowNs, nowNs); err != nil {
 		t.Fatalf("seed m9 row: %v", err)
 	}
-	if err := applyMigrationsThrough(ctx, db, 10); err == nil {
-		t.Fatal("expected migration 10 to fail closed on a non-empty migration-9 table")
+	if err := applyMigrationsThrough(ctx, db, 11); err != nil {
+		t.Fatalf("upgrade through 11 over non-empty m9: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 9 {
-		t.Fatalf("expected version to stay 9, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 11 {
+		t.Fatalf("expected version 11, got %d (err %v)", v, err)
 	}
-	var n int
-	if err := db.QueryRowContext(ctx, `select count(*) from feed_signer_operations`).Scan(&n); err != nil {
-		t.Fatalf("count: %v", err)
+	// The hardened ACTIVE table must exist and be EMPTY (an m9 row cannot be
+	// carried forward without inventing registry_id/topic).
+	if !tableColumnsOf(t, db, "feed_signer_operations")["registry_id"] {
+		t.Fatal("migration-10 table must carry registry_id")
 	}
-	if n != 1 {
-		t.Fatalf("expected the m9 legacy row to survive the failed upgrade, got %d rows", n)
+	var activeCount int
+	if err := db.QueryRowContext(ctx, `select count(*) from feed_signer_operations`).Scan(&activeCount); err != nil {
+		t.Fatalf("count active: %v", err)
+	}
+	if activeCount != 0 {
+		t.Fatalf("expected empty active table after quarantine, got %d rows", activeCount)
+	}
+	// The m9 row is preserved BYTE-FOR-BYTE in quarantine.
+	var (
+		gotHash            []byte
+		gotState, gotRes   string
+		gotCreated, gotUpd int64
+	)
+	if err := db.QueryRowContext(ctx, `select request_hash, state, result_json, created_at, updated_at
+		from feed_signer_operations_legacy where operation_id = 'm9-legacy-op'`).
+		Scan(&gotHash, &gotState, &gotRes, &gotCreated, &gotUpd); err != nil {
+		t.Fatalf("read quarantine row: %v", err)
+	}
+	var gotHashArr [32]byte
+	copy(gotHashArr[:], gotHash)
+	if gotHashArr != legacyHash || gotState != "succeeded" || gotRes != legacyResult ||
+		gotCreated != nowNs || gotUpd != nowNs {
+		t.Fatalf("quarantine row not preserved byte-for-byte: hash=%x state=%q result=%q created=%d upd=%d",
+			gotHashArr, gotState, gotRes, gotCreated, gotUpd)
 	}
 }
 
-// TestFeedSignerOperationReserveClaimCompleteLifecycle is the happy path:
-// reserve -> claim (won) -> complete -> succeeded with a claim-free canonical
-// result.
+// TestMigration11HardensOldV10ActiveRows simulates a database ALREADY stamped
+// with the OLD migration-10 schema (hardened active table, but WITHOUT the
+// quarantine table, and WITHOUT the result-integrity triggers), carrying a
+// VALID succeeded active row. Migration 11 must re-created the quarantine
+// table, install both triggers, and preserve the valid state/result exactly.
+func TestMigration11HardensOldV10ActiveRows(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 10); err != nil {
+		t.Fatalf("apply through 10: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	// Drop the quarantine table and any triggers to reproduce the OLD-m10
+	// physical state, then seed a VALID succeeded active row.
+	if _, err := db.ExecContext(ctx, `drop table feed_signer_operations_legacy`); err != nil {
+		t.Fatalf("drop quarantine to simulate old v10: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `drop trigger if exists feed_signer_result_integrity_ins`); err != nil {
+		t.Fatalf("drop ins trigger: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `drop trigger if exists feed_signer_result_integrity_upd`); err != nil {
+		t.Fatalf("drop upd trigger: %v", err)
+	}
+	reqHash := feedSignerTestHash("old-v10")
+	validResult := `{"operationID":"old-v10-op","feed":"` + topic + `","reference":"` + strings.Repeat("ab", 32) + `"}`
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('old-v10-op', ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		reg.ID, topic, reqHash[:], validResult, nowNs, nowNs); err != nil {
+		t.Fatalf("seed valid old-v10 active row: %v", err)
+	}
+
+	// Apply migrations: only 11 runs (already at 10). It must succeed.
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("migration 11 hardening old-v10 must succeed for valid rows: %v", err)
+	}
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 11 {
+		t.Fatalf("expected version 11, got %d (err %v)", v, err)
+	}
+	// Quarantine table re-created, triggers installed, valid row preserved.
+	if sqliteObjectCount(t, db, "table", "feed_signer_operations_legacy") != 1 {
+		t.Fatal("migration 11 must re-create the quarantine table for old-v10 databases")
+	}
+	if sqliteObjectCount(t, db, "trigger", "feed_signer_result_integrity_ins") != 1 ||
+		sqliteObjectCount(t, db, "trigger", "feed_signer_result_integrity_upd") != 1 {
+		t.Fatal("migration 11 must install both result-integrity triggers")
+	}
+	var (
+		gotState string
+		gotRes   []byte
+	)
+	if err := db.QueryRowContext(ctx, `select state, result_json from feed_signer_operations
+		where operation_id='old-v10-op'`).Scan(&gotState, &gotRes); err != nil {
+		t.Fatalf("read hardened old-v10 row: %v", err)
+	}
+	if gotState != "succeeded" || string(gotRes) != validResult {
+		t.Fatalf("valid old-v10 row not preserved: state=%q result=%s", gotState, gotRes)
+	}
+}
+
+// TestMigration11RollsBackOnMalformedOldV10 simulates an old-m10 database whose
+// active table carries a MALFORMED succeeded result (passes the loose v10 CHECK
+// but violates the v11 canonical contract). Migration 11 must fail ATOMICALLY:
+// version stays 10, every row and the schema are byte-identical, nothing is
+// altered.
+func TestMigration11RollsBackOnMalformedOldV10(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 10); err != nil {
+		t.Fatalf("apply through 10: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	if _, err := db.ExecContext(ctx, `drop trigger if exists feed_signer_result_integrity_ins`); err != nil {
+		t.Fatalf("drop ins trigger: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `drop trigger if exists feed_signer_result_integrity_upd`); err != nil {
+		t.Fatalf("drop upd trigger: %v", err)
+	}
+	// A malformed succeeded result: canonical-looking object but the reference
+	// is not 64 lowercase hex, so the v11 trigger must reject it.
+	reqHash := feedSignerTestHash("old-v10-bad")
+	badResult := `{"operationID":"old-v10-bad","feed":"` + topic + `","reference":"ZZ"}` // < 64 hex, not lowercase
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('old-v10-bad', ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		reg.ID, topic, reqHash[:], badResult, nowNs, nowNs); err != nil {
+		t.Fatalf("seed malformed old-v10 row (must pass loose v10 CHECK): %v", err)
+	}
+
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("migration 11 must fail when hardening encounters a malformed old-v10 row")
+	}
+	// Version stays 10 and the row is byte-identical (rollback was total).
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 10 {
+		t.Fatalf("version must stay 10 on malformed upgrade, got %d (err %v)", v, err)
+	}
+	var (
+		gotState string
+		gotRes   []byte
+	)
+	if err := db.QueryRowContext(ctx, `select state, result_json from feed_signer_operations
+		where operation_id='old-v10-bad'`).Scan(&gotState, &gotRes); err != nil {
+		t.Fatalf("read malformed row after rollback: %v", err)
+	}
+	if gotState != "succeeded" || string(gotRes) != badResult {
+		t.Fatalf("malformed row must be byte-identical after rollback: state=%q result=%s", gotState, gotRes)
+	}
+	// The quarantine table and triggers must NOT have survived the rollback.
+	if sqliteObjectCount(t, db, "trigger", "feed_signer_result_integrity_ins") != 0 {
+		t.Fatal("rollback must not leave the result-integrity trigger installed")
+	}
+}
 func TestFeedSignerOperationReserveClaimCompleteLifecycle(t *testing.T) {
 	store := newProvisioningStore(t)
 	reg, topic := seedFeedSignerRegistry(t, store)
@@ -194,7 +347,7 @@ func TestFeedSignerOperationReserveClaimCompleteLifecycle(t *testing.T) {
 		t.Fatalf("pending operation malformed after reserve: %+v", op)
 	}
 
-	token := newClaimToken()
+	token := testClaimToken(t)
 	won, err := store.ClaimFeedSignerOperation(ctx, "op-lifecycle", reqHash, token, time.Now().UTC().Add(time.Hour))
 	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
@@ -229,7 +382,7 @@ func TestFeedSignerOperationReleaseRequiresToken(t *testing.T) {
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-release", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
-	token := newClaimToken()
+	token := testClaimToken(t)
 	if won, err := store.ClaimFeedSignerOperation(ctx, "op-release", reqHash, token, time.Now().UTC().Add(time.Hour)); err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
@@ -262,11 +415,11 @@ func TestFeedSignerOperationExpiredLeaseTakeover(t *testing.T) {
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-takeover", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
-	oldToken := newClaimToken()
+	oldToken := testClaimToken(t)
 	if won, err := store.ClaimFeedSignerOperation(ctx, "op-takeover", reqHash, oldToken, time.Now().UTC().Add(-10*time.Minute)); err != nil || !won {
 		t.Fatalf("initial claim: won=%v err=%v", won, err)
 	}
-	newToken := newClaimToken()
+	newToken := testClaimToken(t)
 	won, err := store.ClaimFeedSignerOperation(ctx, "op-takeover", reqHash, newToken, time.Now().UTC().Add(time.Hour))
 	if err != nil || !won {
 		t.Fatalf("takeover claim: won=%v err=%v", won, err)
@@ -310,12 +463,12 @@ func TestFeedSignerOperationDistinctOpsShareActiveRepoClaimGate(t *testing.T) {
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-B", reg.ID, topic, hashB); err != nil {
 		t.Fatal(err)
 	}
-	tokenA := newClaimToken()
+	tokenA := testClaimToken(t)
 	if won, err := store.ClaimFeedSignerOperation(ctx, "op-A", hashA, tokenA, time.Now().UTC().Add(time.Hour)); err != nil || !won {
 		t.Fatalf("claim op-A: won=%v err=%v", won, err)
 	}
 	// op-B on the SAME registry+topic cannot claim while op-A holds the slot.
-	if won, err := store.ClaimFeedSignerOperation(ctx, "op-B", hashB, newClaimToken(), time.Now().UTC().Add(time.Hour)); err == nil && won {
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-B", hashB, testClaimToken(t), time.Now().UTC().Add(time.Hour)); err == nil && won {
 		t.Fatal("expected distinct-op claim on the same repo feed to be refused")
 	}
 	// op-A completes and frees the slot.
@@ -324,7 +477,7 @@ func TestFeedSignerOperationDistinctOpsShareActiveRepoClaimGate(t *testing.T) {
 		t.Fatalf("complete op-A: %v", err)
 	}
 	// op-B can now claim and complete.
-	tokenB := newClaimToken()
+	tokenB := testClaimToken(t)
 	if won, err := store.ClaimFeedSignerOperation(ctx, "op-B", hashB, tokenB, time.Now().UTC().Add(time.Hour)); err != nil || !won {
 		t.Fatalf("claim op-B after slot freed: won=%v err=%v", won, err)
 	}
@@ -346,7 +499,7 @@ func TestFeedSignerOperationCompleteIdempotentOnConcurrentSuccess(t *testing.T) 
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-idem", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
-	token := newClaimToken()
+	token := testClaimToken(t)
 	if won, err := store.ClaimFeedSignerOperation(ctx, "op-idem", reqHash, token, time.Now().UTC().Add(time.Hour)); err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
@@ -424,14 +577,210 @@ func TestFeedSignerOperationAdversarialCoherence(t *testing.T) {
 	}
 
 	// A well-formed direct-SQL succeeded row is accepted, proving the coherence
-	// is EXACT, not over-restrictive.
+	// is EXACT, not over-restrictive. The contract requires operationID to equal
+	// the row's operation_id, so the good fixture is built for the exact row id.
 	goodHash := feedSignerTestHash("good")
+	goodResult := `{"operationID":"op-adv-good","feed":"` + topic + `","reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
 	if _, err := store.DB.ExecContext(ctx, sqlPrefix+
-		`('op-adv-good', ?, ?, ?, 'succeeded', '`+validResult+`', null, null, 0, ?, ?)`,
+		`('op-adv-good', ?, ?, ?, 'succeeded', '`+goodResult+`', null, null, 0, ?, ?)`,
 		reg.ID, topic, goodHash[:], nowNs, nowNs); err != nil {
 		t.Fatalf("well-formed succeeded row rejected: %v", err)
 	}
 
 	// An extra field is allowed by SQL but rejected by the strict Go decoder
 	// (which is covered by the signer strict-decode tests).
+}
+
+// TestFeedSignerOperationStarvationExpiredDistinctRowCleared proves the
+// anti-starvation behavior: an EXPIRED processing row for a DIFFERENT
+// operation on the SAME registry+topic (a crashed owner) is atomically
+// released back to pending inside the claim transaction, so a distinct
+// operation can claim the repository feed's idle slot instead of being starved
+// across stores/processes. A LIVE distinct lease is never touched (the partial
+// unique index survives that case).
+func TestFeedSignerOperationStarvationExpiredDistinctRowCleared(t *testing.T) {
+	store := newProvisioningStore(t)
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ctx := context.Background()
+	hashA := feedSignerTestHash("starve-A")
+	hashB := feedSignerTestHash("starve-B")
+	if _, err := store.ReserveFeedSignerOperation(ctx, "op-A", reg.ID, topic, hashA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReserveFeedSignerOperation(ctx, "op-B", reg.ID, topic, hashB); err != nil {
+		t.Fatal(err)
+	}
+	// A crashed owner of op-A left an EXPIRED processing claim on the shared
+	// (registry, topic) slot.
+	tokenA := testClaimToken(t)
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-A", hashA, tokenA, time.Now().UTC().Add(-time.Minute)); err != nil || !won {
+		t.Fatalf("claim op-A: won=%v err=%v", won, err)
+	}
+	// op-B, a DISTINCT operation on the same feed, must NOT be starved: the
+	// claim transaction atomically clears op-A's expired processing claim and
+	// lets op-B take the idle slot.
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-B", hashB, testClaimToken(t), time.Now().UTC().Add(time.Hour)); err != nil || !won {
+		t.Fatalf("distinct op-B claim must clear expired op-A and win: won=%v err=%v", won, err)
+	}
+	opA, _ := store.GetFeedSignerOperation(ctx, "op-A")
+	if opA.State != FeedSignerOpPending || opA.ClaimToken != nil || opA.LeaseUntil != nil {
+		t.Fatalf("expired distinct op-A claim must have been cleared back to pending: %+v", opA)
+	}
+	opB, _ := store.GetFeedSignerOperation(ctx, "op-B")
+	if opB.State != FeedSignerOpProcessing || opB.ClaimToken == nil {
+		t.Fatalf("distinct op-B must be processing: %+v", opB)
+	}
+}
+
+// TestFeedSignerOperationStarvationKeepsLiveDistinctLease proves the
+// anti-starvation path NEVER evicts a LIVE owner: when a distinct operation
+// holds a current lease on the shared (registry, topic) slot, another claim
+// must fail (lost claim), not clear the live lease.
+func TestFeedSignerOperationStarvationKeepsLiveDistinctLease(t *testing.T) {
+	store := newProvisioningStore(t)
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ctx := context.Background()
+	hashA := feedSignerTestHash("live-A")
+	hashB := feedSignerTestHash("live-B")
+	if _, err := store.ReserveFeedSignerOperation(ctx, "op-A", reg.ID, topic, hashA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReserveFeedSignerOperation(ctx, "op-B", reg.ID, topic, hashB); err != nil {
+		t.Fatal(err)
+	}
+	tokenA := testClaimToken(t)
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-A", hashA, tokenA, time.Now().UTC().Add(time.Hour)); err != nil || !won {
+		t.Fatalf("claim op-A: won=%v err=%v", won, err)
+	}
+	// A LIVE distinct lease must block op-B (partial unique index), NOT be
+	// cleared by the anti-starvation release (which is conditional on expiry).
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-B", hashB, testClaimToken(t), time.Now().UTC().Add(time.Hour)); err == nil && won {
+		t.Fatal("distinct op-B must NOT claim while op-A's lease is live")
+	}
+	opA, _ := store.GetFeedSignerOperation(ctx, "op-A")
+	if opA.State != FeedSignerOpProcessing || opA.ClaimToken == nil || opA.LeaseUntil == nil {
+		t.Fatalf("live op-A lease must be preserved: %+v", opA)
+	}
+}
+
+// TestFeedSignerLeaseExtensionRejectsStaleToken proves the joined renewal
+// heartbeat is token-owned: a STALE token (already taken over) cannot extend
+// the lease, and ownership re-check fails closed BEFORE the external update.
+func TestFeedSignerLeaseExtensionRejectsStaleToken(t *testing.T) {
+	store := newProvisioningStore(t)
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ctx := context.Background()
+	reqHash := feedSignerTestHash("lease-stale")
+	if _, err := store.ReserveFeedSignerOperation(ctx, "op-lease", reg.ID, topic, reqHash); err != nil {
+		t.Fatal(err)
+	}
+	oldToken := testClaimToken(t)
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-lease", reqHash, oldToken, time.Now().UTC().Add(-5*time.Minute)); err != nil || !won {
+		t.Fatalf("initial claim: won=%v err=%v", won, err)
+	}
+	// Take the lease over with a new token.
+	if won, err := store.ClaimFeedSignerOperation(ctx, "op-lease", reqHash, testClaimToken(t), time.Now().UTC().Add(time.Hour)); err != nil || !won {
+		t.Fatalf("takeover claim: won=%v err=%v", won, err)
+	}
+	// The stale (old) token must be unable to extend the lease.
+	if err := store.ExtendFeedSignerLease(ctx, "op-lease", oldToken, time.Now().UTC().Add(time.Hour)); err == nil {
+		t.Fatal("stale token must fail to extend the lease")
+	}
+	// A current-owner extension succeeds.
+	op, _ := store.GetFeedSignerOperation(ctx, "op-lease")
+	if err := store.ExtendFeedSignerLease(ctx, "op-lease", *op.ClaimToken, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("current-owner extension failed: %v", err)
+	}
+	// Ownership re-check: stale token fails closed, current token passes.
+	if err := store.EnsureFeedSignerLeaseOwned(ctx, "op-lease", oldToken); err == nil {
+		t.Fatal("stale token must fail ownership re-check")
+	}
+	if err := store.EnsureFeedSignerLeaseOwned(ctx, "op-lease", *op.ClaimToken); err != nil {
+		t.Fatalf("current token must pass ownership re-check: %v", err)
+	}
+}
+
+// TestAdoptLegacyFeedSignerOperation drives the migration-9 quarantine adoption
+// gate: a PENDING legacy row with a matching hash becomes an active pending row
+// carrying the supplied registry_id/canonical topic; a SUCCEEDED legacy row
+// with a matching hash is strictly decoded/validated and becomes an active
+// succeeded row; a differing-hash legacy row is a CONFLICT and stays
+// quarantined; a malformed legacy succeeded row FAILS CLOSED and stays
+// quarantined. Never invent metadata, never silently delete.
+func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
+	store := newProvisioningStore(t)
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+	seed := func(opID, state, result string, hash [32]byte) {
+		t.Helper()
+		if _, err := store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+			(operation_id, request_hash, state, result_json, created_at, updated_at)
+			values (?, ?, ?, ?, ?, ?)`, opID, hash[:], state, sql.NullString{String: result, Valid: state == "succeeded"}, nowNs, nowNs); err != nil {
+			t.Fatalf("seed legacy %s: %v", opID, err)
+		}
+	}
+
+	// 1. Pending legacy row with matching hash -> active pending with supplied
+	//    registry/topic; quarantine row deleted.
+	hashPending := feedSignerTestHash("legacy-pending")
+	seed("leg-pending", "pending", "", hashPending)
+	topicPending := spec.RepoStateFeedRef(testFeedOwner, "otherrepo")
+	adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-pending", reg.ID, topicPending, ref, hashPending)
+	if err != nil || !adopted {
+		t.Fatalf("pending adoption: adopted=%v err=%v", adopted, err)
+	}
+	op, err := store.GetFeedSignerOperation(ctx, "leg-pending")
+	if err != nil || op.State != FeedSignerOpPending || op.RegistryID != reg.ID || op.Topic != topicPending || op.RequestHash != hashPending {
+		t.Fatalf("adopted pending row malformed: state=%q reg=%d topic=%q err=%v", op.State, op.RegistryID, op.Topic, err)
+	}
+	if err := store.DB.QueryRowContext(ctx, `select 1 from feed_signer_operations_legacy where operation_id='leg-pending'`).Scan(new(int)); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("adopted legacy row must be removed from quarantine: %v", err)
+	}
+
+	// 2. Succeeded legacy row with matching hash and canonical result -> active
+	//    succeeded; quarantine row deleted.
+	hashSuc := feedSignerTestHash("legacy-succeeded")
+	goodResult := `{"operationID":"leg-suc","feed":"` + topic + `","reference":"` + ref + `"}`
+	seed("leg-suc", "succeeded", goodResult, hashSuc)
+	adopted, err = store.AdoptLegacyFeedSignerOperation(ctx, "leg-suc", reg.ID, topic, ref, hashSuc)
+	if err != nil || !adopted {
+		t.Fatalf("succeeded adoption: adopted=%v err=%v", adopted, err)
+	}
+	op, err = store.GetFeedSignerOperation(ctx, "leg-suc")
+	if err != nil || op.State != FeedSignerOpSucceeded || string(op.ResultJSON) != goodResult {
+		t.Fatalf("adopted succeeded row malformed: state=%q result=%s err=%v", op.State, op.ResultJSON, err)
+	}
+
+	// 3. Differing hash -> conflict, legacy row stays quarantined, nothing in
+	//    active table.
+	hashConflict := feedSignerTestHash("legacy-conflict")
+	seed("leg-conflict", "pending", "", hashConflict)
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-conflict", reg.ID, topic, ref, feedSignerTestHash("different")); !errors.Is(err, errFeedSignerLegacyConflict) {
+		t.Fatalf("differing hash must conflict, got %v", err)
+	}
+	if n := legacyCount(t, store, "leg-conflict"); n != 1 {
+		t.Fatalf("conflicting legacy row must stay quarantined, got %d rows", n)
+	}
+
+	// 4. Malformed succeeded legacy result -> fail closed, stays quarantined.
+	hashMal := feedSignerTestHash("legacy-malformed")
+	seed("leg-mal", "succeeded", `{"operationID":"leg-mal","feed":"NOT_A_FEED","reference":"bad"}`, hashMal)
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, hashMal); !errors.Is(err, errFeedSignerLegacyMalformed) {
+		t.Fatalf("malformed legacy succeeded result must fail closed, got %v", err)
+	}
+	if n := legacyCount(t, store, "leg-mal"); n != 1 {
+		t.Fatalf("malformed legacy row must stay quarantined, got %d rows", n)
+	}
+}
+
+func legacyCount(t *testing.T, store *Store, opID string) int {
+	t.Helper()
+	var n int
+	if err := store.DB.QueryRowContext(context.Background(),
+		`select count(*) from feed_signer_operations_legacy where operation_id=?`, opID).Scan(&n); err != nil {
+		t.Fatalf("count legacy: %v", err)
+	}
+	return n
 }

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -115,6 +119,10 @@ func buildBeeHandler() (http.Handler, error) {
 	if err := credential.ValidateSecret(internalSecret); err != nil {
 		return nil, err
 	}
+	cpHTTPClient, err := buildControlPlaneHTTPClient(cpURL)
+	if err != nil {
+		return nil, err
+	}
 	if err := requireRegistryIDs(registryResolver); err != nil {
 		return nil, err
 	}
@@ -122,7 +130,7 @@ func buildBeeHandler() (http.Handler, error) {
 	committer := &publish.ControlPlaneCommitter{
 		BaseURL:    cpURL,
 		Secret:     internalSecret,
-		HTTPClient: http.DefaultClient,
+		HTTPClient: cpHTTPClient,
 	}
 
 	return registry.NewHandler(
@@ -147,6 +155,70 @@ func buildBeeHandler() (http.Handler, error) {
 		},
 		authRealm,
 	), nil
+}
+
+// buildControlPlaneHTTPClient builds the DEDICATED HTTP client the registry
+// uses to reach the control-plane internal feed-signing listener. It NEVER
+// mutates the process-global http.DefaultTransport: a private self-hosted
+// control plane is reached over an https URL authenticated by a PRIVATE CA
+// bundle, loaded and validated BEFORE the registry listener starts.
+//
+// For a loopback control-plane URL over plaintext http (or any http URL), the
+// client is ordinary (no TLS client config). For an https URL, the exact
+// origin determines the TLS ServerName and a dedicated transport clone carries:
+//   - RootCAs = the configured private/internal CA bundle (if
+//     CONTROLPLANE_CA_BUNDLE_FILE is set), so a self-hosted internal CA is
+//     trusted WITHOUT globally injecting it into the process pool; or the
+//     explicit system-roots-only mode (CONTROLPLANE_USE_SYSTEM_ROOTS=1),
+//   - MinVersion TLS1.2,
+//   - ServerName pinned from the exact origin host (defeats host spoofing).
+//
+// The two trust modes are mutually exclusive and require an https control-plane
+// URL. A malformed/empty CA bundle fails closed before the listener starts.
+func buildControlPlaneHTTPClient(cpURL string) (*http.Client, error) {
+	u, err := url.Parse(cpURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("CONTROLPLANE_URL must be a valid absolute URL")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return nil, fmt.Errorf("CONTROLPLANE_URL scheme must be http or https")
+	}
+
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	if u.Scheme != "https" {
+		// Plaintext url (loopback http): no TLS client config needed.
+		return &http.Client{Transport: base}, nil
+	}
+
+	caBundle := strings.TrimSpace(os.Getenv("CONTROLPLANE_CA_BUNDLE_FILE"))
+	useSystemRoots := strings.TrimSpace(os.Getenv("CONTROLPLANE_USE_SYSTEM_ROOTS")) == "1"
+	if caBundle != "" && useSystemRoots {
+		return nil, fmt.Errorf("CONTROLPLANE_CA_BUNDLE_FILE and CONTROLPLANE_USE_SYSTEM_ROOTS are mutually exclusive")
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: u.Hostname(), // from the EXACT origin host, never from SNI spoofing
+	}
+	switch {
+	case caBundle != "":
+		pool, err := credential.LoadCACertPool(caBundle)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.RootCAs = pool
+	case useSystemRoots:
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			return nil, errors.New("failed to load the system root CA pool")
+		}
+		tlsConfig.RootCAs = pool
+	default:
+		// No explicit trust source: use the process pool unchanged, but the
+		// dedicated transport still pins ServerName + MinVersion.
+	}
+	base.TLSClientConfig = tlsConfig
+	return &http.Client{Transport: base}, nil
 }
 
 // requireRegistryIDs fails closed unless every host the registry resolver can

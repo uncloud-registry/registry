@@ -37,8 +37,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 10 {
-		t.Fatalf("expected schema version 10, got %d", version)
+	if version != 11 {
+		t.Fatalf("expected schema version 11, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -75,8 +75,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 10 {
-		t.Fatalf("expected 10 migration rows, got %d", rows)
+	if rows != 11 {
+		t.Fatalf("expected 11 migration rows, got %d", rows)
 	}
 }
 
@@ -139,8 +139,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 10 {
-		t.Fatalf("expected schema version 10 after upgrade, got %d", version)
+	if version != 11 {
+		t.Fatalf("expected schema version 11 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -1134,8 +1134,8 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 10 {
-		t.Fatalf("expected version 10, got %d", version)
+	if version != 11 {
+		t.Fatalf("expected version 11, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
 	assertInviteDigestSchema(t, db)
@@ -1153,8 +1153,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 10 {
-			t.Fatalf("expected version 10, got %d", version)
+		if version != 11 {
+			t.Fatalf("expected version 11, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		assertInviteDigestSchema(t, db)
@@ -1168,8 +1168,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 10 {
-			t.Fatalf("expected version 10, got %d", version)
+		if version != 11 {
+			t.Fatalf("expected version 11, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1211,8 +1211,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 10 {
-			t.Fatalf("expected version 10, got %d", version)
+		if version != 11 {
+			t.Fatalf("expected version 11, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})
@@ -1264,5 +1264,95 @@ func TestMigrateLegacyFeedKeysFromV2CurrentSchema(t *testing.T) {
 	}
 	if _, err := service.FeedKeys.Decrypt(1, "0xfeed", EncryptedFeedKey{Ciphertext: ciphertext, Nonce: nonce, KeyVersion: int(version.Int64)}); err != nil {
 		t.Fatalf("migrated ciphertext must decrypt under the row's owner: %v", err)
+	}
+}
+
+// TestFeedSignerResultIntegrityTriggers rejects, at the DATABASE level
+// (migration-11 BEFORE INSERT and BEFORE UPDATE triggers), every malformed
+// succeeded result — exactly one invariant per case — while accepting a fully
+// canonical result. The strict Go decoder is defense-in-depth; these triggers
+// are the primary gate so a direct-SQL write can never fabricate a success.
+func TestFeedSignerResultIntegrityTriggers(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.ExecContext(ctx, `insert into users (email, password_hash, created_at) values (?, ?, ?)`,
+		"owner@example.com", "hash", now); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into registries
+		(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, created_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"sig", "sig.test", "sig.eth", 1, testFeedOwner, "", "batch-1", 1, now); err != nil {
+		t.Fatalf("seed registry: %v", err)
+	}
+	hx := func(c, n int) string { return strings.Repeat(string(rune(c)), n) }
+	owner := strings.Repeat("a", 40)
+	topic := "feed://" + owner + "/" + strings.Repeat("b", 64)
+	ref := strings.Repeat("c", 64)
+	regID := 1
+	nowNs := timeToNanos(time.Now().UTC())
+	base := func(opID, resultJSON string) string {
+		return `insert into feed_signer_operations
+			(operation_id, registry_id, topic, request_hash, state, result_json,
+			 claim_token, lease_until, attempts, created_at, updated_at)
+			values ('` + opID + `', ` + string(rune('0'+regID)) + `, '` + topic + `', X'` + hx('1', 64) + `', 'succeeded', '` + resultJSON + `', null, null, 0, ` + fmt.Sprintf("%d,%d", nowNs, nowNs) + `)`
+	}
+	canonical := `{"operationID":"ok","feed":"` + topic + `","reference":"` + ref + `"}`
+	upd := `update feed_signer_operations set result_json=? , state=?, claim_token=null, lease_until=null where operation_id=?`
+
+	reject := func(name, resultJSON string, isUpdate bool) {
+		t.Run(name, func(t *testing.T) {
+			if isUpdate {
+				if _, err := db.ExecContext(ctx, upd, resultJSON, "succeeded", "ok"); err == nil {
+					t.Fatalf("expected UPDATE trigger reject for %s", name)
+				}
+			} else {
+				if _, err := db.ExecContext(ctx, base("bad-"+name, resultJSON)); err == nil {
+					t.Fatalf("expected INSERT trigger reject for %s", name)
+				}
+			}
+		})
+	}
+
+	// A valid INSERT passes.
+	if _, err := db.ExecContext(ctx, base("ok", canonical)); err != nil {
+		t.Fatalf("canonical succeeded row rejected: %v", err)
+	}
+	// A valid UPDATE (canonical on an existing row) passes.
+	if _, err := db.ExecContext(ctx, upd, canonical, "succeeded", "ok"); err != nil {
+		t.Fatalf("canonical succeeded update rejected: %v", err)
+	}
+
+	// Each invariant, once.
+	reject("not-json", "nonsense", false)
+	reject("json-array", `["a","b","c"]`, false)
+	reject("duplicate-key", `{"operationID":"x","feed":"`+topic+`","reference":"`+ref+`","operationID":"x"}`, false)
+	reject("extra-field", `{"operationID":"x","feed":"`+topic+`","reference":"`+ref+`","extra":1}`, false)
+	reject("missing-key", `{"feed":"`+topic+`","reference":"`+ref+`"}`, false)
+	reject("op-id-mismatch", `{"operationID":"DIFFERENT","feed":"`+topic+`","reference":"`+ref+`"}`, false)
+	reject("noncanonical-feed-prefix", `{"operationID":"x","feed":"http://`+owner+`/`+strings.Repeat("b", 64)+`","reference":"`+ref+`"}`, false)
+	reject("fed-short-owner", `{"operationID":"x","feed":"feed://`+strings.Repeat("a", 39)+`/`+strings.Repeat("b", 64)+`","reference":"`+ref+`"}`, false)
+	reject("feed-extra-slash", `{"operationID":"x","feed":"feed://`+owner+`//`+strings.Repeat("b", 64)+`","reference":"`+ref+`"}`, false)
+	reject("feed-uppercase-owner", `{"operationID":"x","feed":"feed://`+strings.ToUpper(owner)+`/`+strings.Repeat("b", 64)+`","reference":"`+ref+`"}`, false)
+	reject("feed-uppercase-topic", `{"operationID":"x","feed":"feed://`+owner+`/`+strings.ToUpper(strings.Repeat("b", 64))+`","reference":"`+ref+`"}`, false)
+	reject("feed-query", `{"operationID":"x","feed":"feed://`+owner+`/`+strings.Repeat("b", 64)+`?x=1","reference":"`+ref+`"}`, false)
+	reject("ref-short", `{"operationID":"x","feed":"`+topic+`","reference":"abcd"}`, false)
+	reject("ref-long", `{"operationID":"x","feed":"`+topic+`","reference":"`+strings.Repeat("c", 65)+`"}`, false)
+	reject("ref-uppercase", `{"operationID":"x","feed":"`+topic+`","reference":"`+strings.ToUpper(strings.Repeat("c", 64))+`"}`, false)
+	reject("whitespace-json", `{ "operationID" : "x", "feed" : "`+topic+`", "reference" : "`+ref+`" }`, false)
+
+	// A pending row carrying a result is rejected; UPDATE path too.
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('pending-w-result','1','`+topic+`',X'`+hx('2', 64)+`', 'pending', '`+canonical+`', null, null, 0, ?, ?)`, nowNs, nowNs); err == nil {
+		t.Fatal("expected pending-with-result INSERT to be rejected")
+	}
+	if _, err := db.ExecContext(ctx, `update feed_signer_operations set state='pending', result_json=?, claim_token=null, lease_until=null where operation_id='ok'`, canonical); err == nil {
+		t.Fatal("expected pending-with-result UPDATE to be rejected")
 	}
 }

@@ -89,7 +89,6 @@ const CommitRequestMaxBody = 16384
 const (
 	operationIDMaxLen = 128
 	ownerMaxLen       = 128
-	topicMaxLen       = 256
 	batchIDMaxLen     = 128
 )
 
@@ -307,8 +306,12 @@ func validateCommitRequestShape(req FeedCommitRequest) error {
 	if req.Owner == "" || len(req.Owner) > ownerMaxLen {
 		return errors.New("owner must be non-empty and bounded")
 	}
-	if req.Topic == "" || len(req.Topic) > topicMaxLen {
-		return errors.New("topic must be non-empty and bounded")
+	// Topic must be EXACTLY the canonical full-feed wire form
+	// (feed://<40 lowercase hex owner>/<64 lowercase hex topic>). This runs
+	// BEFORE hashing or reservation so an invalid or non-canonical topic can
+	// never collapse into a valid request hash.
+	if _, _, err := ParseCanonicalFeed(req.Topic); err != nil {
+		return errors.New("topic must be a canonical full feed reference (feed://<40 lowercase hex owner>/<64 lowercase hex topic>)")
 	}
 	if !IsHexReference(req.Reference) {
 		return errors.New("reference must be a 64-hex immutable object reference")
@@ -344,36 +347,19 @@ func IsHexReference(s string) bool {
 	return true
 }
 
-// CanonicalTopic returns the canonical deterministic form of a repository
-// state feed reference: feed://<normalized-owner>/<lowercase topic hex>. It is
-// the shared canonical form the client, signer, and stored result all compare
-// against, so a casing/whitespace difference can never fabricate a mismatch.
-func CanonicalTopic(topic string) string {
-	const prefix = "feed://"
-	if !strings.HasPrefix(topic, prefix) {
-		return strings.ToLower(topic)
-	}
-	rest := topic[len(prefix):]
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		return prefix + spec.NormalizeOwner(rest[:i]) + "/" + strings.ToLower(rest[i+1:])
-	}
-	return prefix + spec.NormalizeOwner(rest)
-}
-
-// CanonicalReference returns the canonical lowercase form of a 64-hex object
-// reference.
-func CanonicalReference(ref string) string {
-	return strings.ToLower(ref)
-}
-
 // ValidateCommitResult enforces the bounded, canonical field contract on a
 // FeedCommitResult (used on both the wire response and the stored result).
+// Feed must be EXACTLY the canonical full-feed wire form and Reference the
+// canonical 64-lowercase-hex form — an invalid or non-canonical value is
+// rejected so a mismatched feed/reference can never be accepted as success.
 func ValidateCommitResult(result FeedCommitResult) error {
 	if result.OperationID == "" || len(result.OperationID) > operationIDMaxLen {
 		return errors.New("result operationID must be non-empty and bounded")
 	}
-	if result.Feed == "" || len(result.Feed) > topicMaxLen || result.Feed != CanonicalTopic(result.Feed) {
-		return errors.New("result feed must be a canonical feed reference")
+	// Feed must be EXACTLY the canonical full-feed wire form, not merely a
+	// lowercased string.
+	if _, _, err := ParseCanonicalFeed(result.Feed); err != nil {
+		return errors.New("result feed must be a canonical full feed reference (feed://<40 lowercase hex owner>/<64 lowercase hex topic>)")
 	}
 	if !IsHexReference(result.Reference) || result.Reference != CanonicalReference(result.Reference) {
 		return errors.New("result reference must be a canonical 64-hex value")

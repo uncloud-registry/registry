@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/publish"
@@ -96,6 +97,20 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
 	}
 
+	// Adopt any quarantined migration-9 row for this operation on this FIRST
+	// request (before reservation) — atomically, only when the incoming request
+	// hash matches the legacy request_hash. A differing hash is a hard conflict
+	// (a reused OperationID with different input); a malformed legacy succeeded
+	// result fails closed and stays quarantined. After a successful adoption the
+	// active row drives the same idempotency path as any fresh reservation.
+	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash)
+	if aerr != nil {
+		if errors.Is(aerr, errFeedSignerLegacyConflict) {
+			return publish.FeedCommitResult{}, errFeedSignerConflict
+		}
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: adopt legacy operation: %v", errFeedSignerBackend, aerr)
+	}
+
 	// Ensure a durable pending row exists for this operation. A reused
 	// OperationID with different input is a hard conflict.
 	op, err := s.Store.ReserveFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, reqHash)
@@ -122,7 +137,10 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 		case FeedSignerOpSucceeded:
 			return s.storedResult(op, req)
 		case FeedSignerOpPending:
-			token := newClaimToken()
+			token, terr := newClaimToken()
+			if terr != nil {
+				return publish.FeedCommitResult{}, fmt.Errorf("%w: claim token entropy: %v", errFeedSignerBackend, terr)
+			}
 			leaseUntil := time.Now().UTC().Add(feedSignerLeaseDuration)
 			won, cerr := s.Store.ClaimFeedSignerOperation(ctx, req.OperationID, reqHash, token, leaseUntil)
 			if cerr != nil {
@@ -148,7 +166,10 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 			}
 			// Expired lease (a crashed/uncertain prior attempt at this same
 			// operation): take it over with a fresh token and resolve.
-			token := newClaimToken()
+			token, terr := newClaimToken()
+			if terr != nil {
+				return publish.FeedCommitResult{}, fmt.Errorf("%w: claim token entropy: %v", errFeedSignerBackend, terr)
+			}
 			leaseUntil := time.Now().UTC().Add(feedSignerLeaseDuration)
 			won, cerr := s.Store.ClaimFeedSignerOperation(ctx, req.OperationID, reqHash, token, leaseUntil)
 			if cerr != nil {
@@ -165,8 +186,52 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 // runSignedCommit performs the guarded signing under a won claim and then
 // durably completes it (or conditionally releases on a definite pre-update
 // failure). An uncertain update failure keeps the lease until recovery.
+//
+// The ENTIRE validation+read+update operation runs under a single derived work
+// context bounded by feedSignerWorkTimeout (strictly shorter than the lease),
+// with a joined renewal heartbeat that extends the caller's own lease every
+// feedSignerRenewInterval. Every resolver/doc/updater call inherits the work
+// deadline. If the heartbeat fails to renew (a stale/defeated token, or a
+// takeover), the work context is cancelled immediately and completion is
+// prevented; the caller discovers the cancellation when the work loop returns.
 func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, claimToken string) (publish.FeedCommitResult, error) {
-	result, _, uncertain, err := s.signCommit(ctx, req)
+	workCtx, cancelWork := context.WithTimeout(ctx, feedSignerWorkTimeout)
+	defer cancelWork()
+
+	// Joined renewal heartbeat: extend our own lease (token-owned, conditional)
+	// every lease/3. A failure to renew cancels the work immediately.
+	heartbeatDone := make(chan struct{})
+	var renewOnce sync.Once
+	renew := func() {
+		renewOnce.Do(func() {
+			deadline := time.Now().UTC().Add(feedSignerLeaseDuration)
+			if err := s.Store.ExtendFeedSignerLease(workCtx, req.OperationID, claimToken, deadline); err != nil {
+				// Lost the lease: stop the work before any update/completion.
+				cancelWork()
+			}
+		})
+	}
+	go func() {
+		ticker := time.NewTicker(feedSignerRenewInterval)
+		defer ticker.Stop()
+		defer close(heartbeatDone)
+		for {
+			select {
+			case <-workCtx.Done():
+				return
+			case <-ticker.C:
+				renew()
+			}
+		}
+	}()
+
+	result, _, uncertain, err := s.signCommit(workCtx, req, claimToken)
+	// Stop the heartbeat now that the work returned (the deferred cancelWork
+	// also fires on every return path, but an explicit cancel here guarantees
+	// the heartbeat goroutine exits before we wait on it).
+	cancelWork()
+	<-heartbeatDone
+
 	if err != nil {
 		if !uncertain {
 			// Definite pre-update failure (malformed/not-ready/owner/topic/
@@ -176,6 +241,8 @@ func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommit
 		// Uncertain update failure is NOT released: the lease is kept until a
 		// later identical request reclaims it (after expiry) and resolves the
 		// target without a second advancement.
+		// If the work context was cancelled (renewal failure / timeout), that
+		// cancellation is the cause and surfaces as a retryable backend error.
 		return publish.FeedCommitResult{}, err
 	}
 	resultJSON, err := json.Marshal(result)
@@ -208,13 +275,16 @@ func (s *FeedSigner) storedResult(op FeedSignerOperation, req publish.FeedCommit
 }
 
 // signCommit performs the tight validation sequence and, only once every check
-// passes and the caller already owns the claim, the signed feed update. All
-// validation precedes the key/network use. done=true reports that the feed
-// already resolves to the target reference (uncertain-response recovery), so
-// the caller persists the result without a second advancement. uncertain=true
-// reports that the failure occurred DURING the network feed update (the update
-// may have partially/fully applied), so the caller keeps the lease.
-func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitRequest) (publish.FeedCommitResult, bool, bool, error) {
+// passes and the caller still owns the claim, the signed feed update. All
+// validation precedes the key/network use. Ownership of the claim (exact token
+// + live lease) is re-verified immediately BEFORE the external update, so a
+// defeated owner whose lease was taken over discovers it lost the claim before
+// touching the updater. done=true reports that the feed already resolves to the
+// target reference (uncertain-response recovery), so the caller persists the
+// result without a second advancement. uncertain=true reports that the failure
+// occurred DURING the network feed update (the update may have partially/fully
+// applied), so the caller keeps the lease.
+func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitRequest, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
 	reg, err := s.Store.FindRegistryByID(ctx, req.RegistryID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -258,8 +328,15 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 		return result, true, false, nil
 	}
 
-	// All validation passed and we own the claim; the key is now decryptable
-	// and the feed is signed. THIS is the only point a network update happens.
+	// All validation passed and we own the claim. Re-verify ownership at this
+	// instant so a defeated owner whose lease was taken over fails CLOSED before
+	// touching the key/network — after the updater starts, perfect cancellation
+	// is impossible, so a stale owner must be caught here.
+	if err := s.Store.EnsureFeedSignerLeaseOwned(ctx, req.OperationID, claimToken); err != nil {
+		return result, false, false, fmt.Errorf("%w: lost ownership before feed update: %v", errFeedSignerBackend, err)
+	}
+	// The key is now decryptable and the feed is signed. THIS is the only point
+	// a network update happens.
 	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference); err != nil {
 		return result, false, true, fmt.Errorf("%w: feed update: %v", errFeedSignerBackend, err)
 	}

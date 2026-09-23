@@ -282,14 +282,30 @@ var migrations = []migration{
 	// vocabulary with exact storage-class guards; an unpredictable claim_token
 	// and a future, bounded lease held ONLY in processing; result_json valid
 	// only on succeeded rows and only as the bounded exact-field JSON object;
-	// and attempts/timestamps. Existing migration-9 rows cannot be upgraded
-	// because registry_id and the canonical topic are not derivable from what
-	// migration 9 persisted — the migration therefore fails CLOSED whenever any
-	// row exists, and rebuilds only an empty table (the branch is unreleased, so
-	// a real database never carries migration 9).
+	// and attempts/timestamps. Migration-9 rows (which never carried registry_id
+	// or topic) are preserved BYTE-FOR-BYTE in the constrained
+	// feed_signer_operations_legacy quarantine table — never stranded, never
+	// fabricated — and adopted later by the store only when an incoming request
+	// hash matches (see ReserveFeedSignerOperation).
 	{
 		Version: 10,
 		Apply:   installFeedSignerOperationStoreV10,
+	},
+	// Version 11 hardens the active feed_signer_operations table with the
+	// DATABASE-level result-integrity contract: BEFORE INSERT and BEFORE UPDATE
+	// triggers reject a malformed succeeded result (must be canonical compact
+	// JSON of exactly the three UNIQUE keys {operationID, feed, reference}
+	// where operationID == row operation_id, feed is the canonical full-feed
+	// wire form, and reference is exactly 64 lowercase-hex), and reject any
+	// pending/processing row carrying a non-NULL result. It also ensures the
+	// quarantine table exists and atomically hardens any EXISTING active rows
+	// (from databases already stamped with the old migration-10 schema that
+	// lacked these triggers): a guarded self-update fires the UPDATE trigger
+	// per row, so a malformed legacy result aborts the migration and rolls back
+	// byte-identically with the version staying 10.
+	{
+		Version: 11,
+		Apply:   installFeedSignerOperationStoreV11,
 	},
 }
 

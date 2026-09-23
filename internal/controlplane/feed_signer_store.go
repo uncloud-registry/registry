@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -21,14 +22,34 @@ const (
 )
 
 // claimTokenBytes is the size of the unpredictable per-claim token. A client
-// only ever completes or releases its own claim by presenting the exact token
-// the claim wrote (constant-time compare); a stale or stolen token can never
-// complete or release the operation. 32 cryptorandom bytes, hex-encoded.
+// only ever completes, releases, or extends its own claim by presenting the
+// exact token the claim wrote (constant-time compare); a stale or stolen token
+// can never complete or release the operation. 32 cryptorandom bytes,
+// hex-encoded.
 const claimTokenBytes = 32
 
 // feedSignerLeaseDuration is how long a claim owns the network/key work before
 // the lease expires and an identical retry may take it over (crash recovery).
-const feedSignerLeaseDuration = 60 * time.Second
+// It MUST be strictly longer than feedSignerWorkTimeout below so a legitimate
+// owner can never be running when the lease becomes reclaimable: even a work
+// context that runs to its entire deadline stays comfortably inside the lease,
+// and the renewal heartbeat keeps the lease alive while it works.
+const feedSignerLeaseDuration = 2 * time.Minute
+
+// feedSignerWorkTimeout bounds the ENTIRE claimed validation+read+update
+// operation (resolver/doc/updater calls included) via one derived work context.
+// It is strictly shorter than feedSignerLeaseDuration, so a legitimate owner
+// with a working renewal heartbeat always holds a live lease; a work context
+// that dies before the lease expires can never be observed as both "still
+// running" and "lease already reclaimable".
+const feedSignerWorkTimeout = 30 * time.Second
+
+// feedSignerRenewInterval is the joined renewal heartbeat period, set to
+// lease/3: the owner extends its own lease (token-owned, conditional) every
+// interval. Each successful extension clears the takeover deadline; a failure
+// to renew (stale token / takeover) cancels the work context immediately so a
+// defeated owner never performs or completes the update.
+const feedSignerRenewInterval = feedSignerLeaseDuration / 3
 
 // feedSignerClaimMaxAttempts bounds how long a caller waits (polling) for a
 // concurrent owner to finish before returning a retryable backend error. It is
@@ -40,9 +61,34 @@ const feedSignerClaimMaxAttempts = 100
 // concurrent claim to complete.
 const feedSignerClaimPollInterval = 10 * time.Millisecond
 
-// feedSignerOperationTableSQLM9 is the migration-9 schema body, preserved
+// feedSignerLegacyTableSQL is the constrained QUARANTINE table that preserves
+// every migration-9 feed_signer_operations row BYTE-FOR-BYTE during migration
+// 10. Its columns and CHECKs mirror the migration-9 schema exactly, so the
+// insert-select copy can never lose, mutate, or "repair" an original value. A
+// quarantine row keeps its exact request_hash/state/result_json until an
+// adoption request supplies the control-plane registry_id and canonical topic
+// (which an m9 row never carried).
+const feedSignerLegacyTableSQL = `create table if not exists feed_signer_operations_legacy (
+	operation_id text primary key
+		check (typeof(operation_id) = 'text' and length(operation_id) between 1 and 128),
+	request_hash blob not null
+		check (typeof(request_hash) = 'blob' and length(request_hash) = 32),
+	state text not null
+		check (typeof(state) = 'text' and state in ('pending','succeeded')),
+	result_json text
+		check (result_json is null or (typeof(result_json) = 'text' and length(result_json) between 2 and 4096)),
+	created_at integer not null check (typeof(created_at) = 'integer'),
+	updated_at integer not null check (typeof(updated_at) = 'integer'),
+	check (state <> 'succeeded' or result_json is not null)
+)`
+
+// feedSignerLegacyColumns is the canonical quarantine read/copy column list,
+// identical to migration 9's column order.
+const feedSignerLegacyColumns = `operation_id, request_hash, state, result_json, created_at, updated_at`
+
+// feedSignerOperationTableSQL is the migration-9 schema body, preserved
 // verbatim so migration 9 (which MUST NOT be edited) still installs the
-// original table that migration 10 then rebuilds when it is empty.
+// original table that migration 10 then quarantines and rebuilds on empty.
 const feedSignerOperationTableSQLM9 = `CREATE TABLE feed_signer_operations (
 	operation_id text primary key
 		check (typeof(operation_id) = 'text' and length(operation_id) between 1 and 128),
@@ -138,19 +184,25 @@ var feedSignerOperationTableSQLV10 = `CREATE TABLE feed_signer_operations (
 const feedSignerActiveRepoClaimIndexSQL = `CREATE UNIQUE INDEX feed_signer_active_repo_claim
 	on feed_signer_operations(registry_id, topic) where state = 'processing'`
 
-// installFeedSignerOperationStoreV10 is migration 10's body. It REBUILDS the
-// migration-9 feed_signer_operations table around the hardened schema.
+// installFeedSignerOperationStoreV10 is migration 10's body (AMENDED). It
+// QUARANTINES every migration-9 feed_signer_operations row BYTE-FOR-BYTE into
+// the constrained feed_signer_operations_legacy table, then drops the
+// migration-9 table and installs the hardened active schema.
 //
-// Migration 9 created the table WITHOUT registry_id or topic, and a succeeded
-// migration-9 row stores only operationID/feed/reference in its result JSON —
-// the control-plane registry_id and the canonical repo topic are NOT derivable
-// from any of them. Inventing a registry/topic for an existing row would route
-// a retry against the wrong registry, so migration 10 fails CLOSED whenever
-// ANY migration-9 row exists: every such row is upgraded-by-refusal, because
-// none can be carried forward without fabrication. The branch is unreleased
-// (a real production database has never carried migration 9), so the only
-// legitimate inputs are empty (upgrade cleanly) and adversarial non-empty
-// (refuse atomically, version stays 9, nothing touched).
+// The migration-9 row set is never stranded and never fabricated: each m9 row
+// is preserved verbatim in quarantine (same request_hash/state/result_json/
+// timestamps) until a REQUEST supplies the control-plane registry_id and
+// canonical topic an m9 row never carried, at which point the store adopts the
+// row atomically only when the request hash matches (see
+// ReserveFeedSignerOperation). This replaces the earlier fail-closed behavior
+// (withhold the whole upgrade when any m9 row exists) with a strict
+// preserve-then-adopt upgrade that lets v9 databases with rows progress.
+//
+// Databases already stamped with the OLD migration-10 schema (which created
+// the hardened active table directly over an empty m9 table, without a
+// quarantine table or result triggers) reach the same final state via
+// migration 11, which creates the quarantine table if absent, installs the
+// result-integrity triggers, and hardens existing active rows atomically.
 func installFeedSignerOperationStoreV10(ctx context.Context, tx *sql.Tx) error {
 	// The migration-9 table must exist (it precedes 10 in the chain); if it is
 	// genuinely absent (impossible via the chain, but fail-closed regardless),
@@ -162,15 +214,19 @@ func installFeedSignerOperationStoreV10(ctx context.Context, tx *sql.Tx) error {
 	}
 
 	if exists != 0 {
-		var n int
-		if err := tx.QueryRowContext(ctx, `select count(*) from feed_signer_operations`).Scan(&n); err != nil {
-			return fmt.Errorf("migration 10: count existing feed signer operations: %w", err)
+		// Create the quarantine table (constrained, mirrors the m9 columns).
+		if _, err := tx.ExecContext(ctx, feedSignerLegacyTableSQL); err != nil {
+			return fmt.Errorf("migration 10: create quarantine table: %w", err)
 		}
-		if n != 0 {
-			return errors.New("migration 10: existing feed_signer_operations rows cannot be upgraded because the control-plane registry_id and canonical topic are not derivable; failing closed rather than inventing them")
+		// Copy every m9 row byte-for-byte into quarantine, then drop the m9
+		// table. The insert-select preserves column order exactly.
+		if _, err := tx.ExecContext(ctx,
+			`insert into feed_signer_operations_legacy (`+feedSignerLegacyColumns+`)
+				select `+feedSignerLegacyColumns+` from feed_signer_operations`); err != nil {
+			return fmt.Errorf("migration 10: preserve migration-9 rows: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `drop table feed_signer_operations`); err != nil {
-			return fmt.Errorf("migration 10: drop empty migration-9 table: %w", err)
+			return fmt.Errorf("migration 10: drop migration-9 table: %w", err)
 		}
 	}
 
@@ -179,6 +235,88 @@ func installFeedSignerOperationStoreV10(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, feedSignerActiveRepoClaimIndexSQL); err != nil {
 		return fmt.Errorf("migration 10: create active repo claim index: %w", err)
+	}
+	return nil
+}
+
+// feedSignerResultIntegrityTriggerSQL returns the two result-integrity
+// triggers (BEFORE INSERT and BEFORE UPDATE) that make the DATABASE itself
+// reject a malformed succeeded result on active feed_signer_operations rows.
+//
+// For a state='succeeded' row the result_json must be a canonical compact JSON
+// OBJECT carrying EXACTLY the three UNIQUE keys {operationID, feed,
+// reference} — no extras, no duplicates — where operationID equals the row's
+// operation_id, feed is exactly the canonical full-feed wire form
+// (feed://<40 lowercase hex owner>/<64 lowercase hex topic>), and reference is
+// exactly 64 lowercase-hex characters. Pending/processing rows must carry a
+// NULL result. The trigger aborts the INSERT/UPDATE otherwise, so a direct-SQL
+// write can never fabricate a success: the strict Go decoder stays as
+// defense-in-depth.
+func feedSignerResultIntegrityTriggerSQL() []string {
+	hx40 := strings.Repeat("[0-9a-f]", 40)
+	hx64 := strings.Repeat("[0-9a-f]", 64)
+	guard := `(
+		NEW.state = 'succeeded' and (
+			json_valid(NEW.result_json) = 0
+			or json_type(NEW.result_json) <> 'object'
+			or (select count(*) from json_each(NEW.result_json)) <> 3
+			or (select count(distinct key) from json_each(NEW.result_json)) <> 3
+			or json_type(NEW.result_json,'$.operationID') is not 'text'
+			or json_type(NEW.result_json,'$.feed') is not 'text'
+			or json_type(NEW.result_json,'$.reference') is not 'text'
+			or json_extract(NEW.result_json,'$.operationID') <> NEW.operation_id
+			or length(json_extract(NEW.result_json,'$.feed')) <> 112
+			or substr(json_extract(NEW.result_json,'$.feed'),1,7) <> 'feed://'
+			or substr(json_extract(NEW.result_json,'$.feed'),48,1) <> '/'
+			or substr(json_extract(NEW.result_json,'$.feed'),8,40) not glob '` + hx40 + `'
+			or substr(json_extract(NEW.result_json,'$.feed'),49,64) not glob '` + hx64 + `'
+			or length(json_extract(NEW.result_json,'$.reference')) <> 64
+			or json_extract(NEW.result_json,'$.reference') not glob '` + hx64 + `'
+			or json(NEW.result_json) <> NEW.result_json
+		)
+	) or (
+		NEW.state <> 'succeeded' and NEW.result_json is not null
+	)`
+	return []string{
+		`create trigger if not exists feed_signer_result_integrity_ins
+			before insert on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer succeeded result violates the result contract') where ` + guard + `; end`,
+		`create trigger if not exists feed_signer_result_integrity_upd
+			before update on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer succeeded result violates the result contract') where ` + guard + `; end`,
+	}
+}
+
+// installFeedSignerOperationStoreV11 is migration 11's body. It brings BOTH
+// databases that ran the amended migration 10 (fresh) and databases already
+// stamped with the OLD migration-10 schema to the identical final hardened
+// state:
+//
+//   - the quarantine feed_signer_operations_legacy table exists (idempotent),
+//   - the two result-integrity triggers are installed on the active table
+//     (idempotent, IF NOT EXISTS),
+//   - every EXISTING active row is hardened ATOMICALLY: a guarded self-update
+//     fires the UPDATE trigger for each row, so any malformed succeeded result
+//     aborts the migration and rolls back byte-for-byte (version stays 10,
+//     every row and the schema are untouched). Valid state/claims/results are
+//     preserved exactly.
+func installFeedSignerOperationStoreV11(ctx context.Context, tx *sql.Tx) error {
+	// 1. Quarantine table present for every upgraded database.
+	if _, err := tx.ExecContext(ctx, feedSignerLegacyTableSQL); err != nil {
+		return fmt.Errorf("migration 11: create quarantine table: %w", err)
+	}
+	// 2. Result-integrity triggers on the active table (idempotent).
+	for _, s := range feedSignerResultIntegrityTriggerSQL() {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("migration 11: create result-integrity trigger: %w", err)
+		}
+	}
+	// 3. Harden existing active rows atomically: the guarded self-update fires
+	//    the UPDATE trigger for EVERY row, with no value changed. A malformed
+	//    succeeded row aborts here, rolling the whole migration back
+	//    byte-identically (the old-m10 database stays at version 10 untouched).
+	if _, err := tx.ExecContext(ctx, `update feed_signer_operations set operation_id = operation_id`); err != nil {
+		return fmt.Errorf("migration 11: hardening existing feed signer operations failed: %w", err)
 	}
 	return nil
 }
@@ -274,35 +412,222 @@ func (s *Store) ReserveFeedSignerOperation(ctx context.Context, operationID stri
 	return op, nil
 }
 
+// sentinel errors for migration-9 legacy-row adoption. Both are data-free (no
+// registry/topic/request content) so a mishandled quarantine row never leaks
+// state.
+var (
+	errFeedSignerLegacyConflict  = errors.New("feed signer: legacy operation request hash differs; refusing to adopt")
+	errFeedSignerLegacyMalformed = errors.New("feed signer: legacy succeeded result is malformed; remains quarantined")
+)
+
+// AdoptLegacyFeedSignerOperation atomically adopts a quarantined migration-9
+// row into the hardened ACTIVE table on the FIRST same-OperationID request —
+// and only when the incoming request hash matches the legacy request_hash.
+//
+//   - pending: becomes an active PENDING row carrying the supplied
+//     control-plane registry_id and canonical topic.
+//   - succeeded: is STRICTLY decoded and validated against the operation ID,
+//     canonical topic, and canonical reference implied by the matching request
+//     hash (decodeStoredResult subsumes duplicate-member/unknown-field/trailing
+//     rejection and the strict feed/reference contract); only a fully valid
+//     result becomes an active SUCCEEDED row.
+//   - a differing request hash is a CONFLICT (the same OperationID was reused
+//     with different input).
+//   - a malformed legacy succeeded result FAILS CLOSED and stays quarantined.
+//
+// A quarantine row is deleted only after it is successfully adopted — state is
+// never invented and a row is never silently dropped. The gate is atomic: the
+// active-table read, the quarantine read/validate, the active insert, and the
+// quarantine delete all happen in one write transaction.
+func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash [32]byte) (adopted bool, err error) {
+	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		// Only adopt when the active table has no row for this operation.
+		var activeCount int
+		if err := c.QueryRowContext(ctx,
+			`select count(*) from feed_signer_operations where operation_id = ?`, operationID).Scan(&activeCount); err != nil {
+			return err
+		}
+		if activeCount != 0 {
+			return nil // already active; the caller's normal idempotency applies
+		}
+
+		var (
+			opID      string
+			hash      []byte
+			state     string
+			result    sql.NullString
+			createdNs int64
+			updatedNs int64
+		)
+		err := c.QueryRowContext(ctx,
+			`select `+feedSignerLegacyColumns+` from feed_signer_operations_legacy where operation_id = ?`, operationID).
+			Scan(&opID, &hash, &state, &result, &createdNs, &updatedNs)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // nothing quarantined for this operation
+		}
+		if err != nil {
+			return err
+		}
+		var legacyHash [32]byte
+		copy(legacyHash[:], hash)
+		if legacyHash != reqHash {
+			return errFeedSignerLegacyConflict
+		}
+
+		now := time.Now().UTC()
+		nowNanos := timeToNanos(now)
+		switch state {
+		case FeedSignerOpPending:
+			if _, err := c.ExecContext(ctx, `insert into feed_signer_operations
+				(operation_id, registry_id, topic, request_hash, state, result_json,
+				 claim_token, lease_until, attempts, created_at, updated_at)
+				values (?, ?, ?, ?, ?, null, null, null, 0, ?, ?)`,
+				operationID, registryID, topic, legacyHash[:], FeedSignerOpPending, nowNanos, nowNanos); err != nil {
+				return err
+			}
+		case FeedSignerOpSucceeded:
+			if !result.Valid {
+				return errFeedSignerLegacyMalformed
+			}
+			// Strict decode + validate against the operation ID / canonical
+			// topic / canonical reference implied by the matching request hash.
+			validated, derr := decodeStoredResult([]byte(result.String))
+			if derr != nil {
+				return errFeedSignerLegacyMalformed
+			}
+			if validated.OperationID != operationID || validated.Feed != topic || validated.Reference != reference {
+				return errFeedSignerLegacyMalformed
+			}
+			if _, err := c.ExecContext(ctx, `insert into feed_signer_operations
+				(operation_id, registry_id, topic, request_hash, state, result_json,
+				 claim_token, lease_until, attempts, created_at, updated_at)
+				values (?, ?, ?, ?, ?, ?, null, null, 0, ?, ?)`,
+				operationID, registryID, topic, legacyHash[:], FeedSignerOpSucceeded, result.String, nowNanos, nowNanos); err != nil {
+				return err
+			}
+		default:
+			return errFeedSignerLegacyMalformed
+		}
+
+		// Delete the quarantine row ONLY after a successful active insert.
+		if _, err := c.ExecContext(ctx,
+			`delete from feed_signer_operations_legacy where operation_id = ?`, operationID); err != nil {
+			return err
+		}
+		adopted = true
+		return nil
+	})
+	return adopted, err
+}
+
 // ClaimFeedSignerOperation atomically transitions a pending row to processing
 // (or reclaims an operation's own EXPIRED processing lease) under a fresh
-// unpredictable claim token and a future, bounded lease. The partial unique
-// index on (registry_id, topic) for processing means a DIFFERENT operation
-// targeting the same repository feed cannot also claim — its UPDATE raises a
-// uniqueness error (a "lost claim") returned as an error so the caller never
-// performs the network/key work.
+// unpredictable claim token and a future, bounded lease.
+//
+// The claim is a single write transaction that FIRST resets ANY expired
+// processing row for the same (registry_id, topic) — including one held by a
+// DIFFERENT operation ID — back to pending, then claims the requested row.
+// This removes distinct-operation starvation across stores/processes: a
+// crashed owner of a different operation cannot indefinitely block this
+// repository feed once its lease expires. Only an EXPIRED lease (lease_until
+// <= now, i.e. a crashed/uncertain prior attempt) is ever cleared; a live
+// lease is never touched, so a real owner cannot be evicted.
+//
+// The partial unique index on (registry_id, topic) for processing still means
+// a DIFFERENT operation targeting the same repository feed cannot claim while
+// a LIVE lease is held — its UPDATE raises a uniqueness error (a "lost claim")
+// returned as an error so the caller never performs the network/key work.
 //
 // It returns won=true exactly when THIS call is now the sole owner of the
 // request's network/key work. A concurrent identical request that lost the
 // claim gets won=false and must poll for the winner's stored result.
-func (s *Store) ClaimFeedSignerOperation(ctx context.Context, operationID string, reqHash [32]byte, claimToken string, leaseUntil time.Time) (bool, error) {
+func (s *Store) ClaimFeedSignerOperation(ctx context.Context, operationID string, reqHash [32]byte, claimToken string, leaseUntil time.Time) (won bool, err error) {
+	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		now := time.Now().UTC()
+		nowNanos := timeToNanos(now)
+		// First release ANY expired processing claim on the same repository
+		// feed (registry_id, topic), including a different operation ID,
+		// conditional on lease_until <= now. This removes distinct-op
+		// starvation: a crashed owner of another operation cannot hold the
+		// slot forever.
+		if _, err := c.ExecContext(ctx, `update feed_signer_operations
+			set state = 'pending', claim_token = null, lease_until = null, updated_at = ?
+			where registry_id = (select registry_id from feed_signer_operations where operation_id = ?)
+			  and topic = (select topic from feed_signer_operations where operation_id = ?)
+			  and state = 'processing' and lease_until is not null and lease_until <= ?`,
+			nowNanos, operationID, operationID, nowNanos); err != nil {
+			return err
+		}
+		// Then claim the requested row (pending, or this operation's own
+		// expired processing lease).
+		res, err := c.ExecContext(ctx, `update feed_signer_operations
+			set state = 'processing', claim_token = ?, lease_until = ?, updated_at = ?, attempts = attempts + 1
+			where operation_id = ? and request_hash = ?
+				and (state = 'pending' or (state = 'processing' and lease_until < ?))`,
+			claimToken, timeToNanos(leaseUntil), nowNanos, operationID, reqHash[:], nowNanos)
+		if err != nil {
+			// Includes the partial-unique-index violation when another
+			// operation holds a LIVE (registry_id, topic) processing claim:
+			// the caller is the loser and must NOT update.
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		won = n == 1
+		return nil
+	})
+	return won, err
+}
+
+// ExtendFeedSignerLease renews the caller's OWN claim by extending lease_until
+// to the fresh lease deadline, CONDITIONAL on the exact claim token still
+// owning the processing row. A stale or stolen token (already taken over by a
+// later claim, or the row no longer processing) matches zero rows and returns
+// an error, which the caller MUST treat as "lost the lease": it cancels its
+// work context immediately and does not complete. A live lease is never
+// extended beyond the configured duration — the new deadline is always exactly
+// now+feedSignerLeaseDuration, so a renewal cannot silently grow unbounded.
+func (s *Store) ExtendFeedSignerLease(ctx context.Context, operationID, claimToken string, leaseUntil time.Time) error {
 	nowNanos := timeToNanos(time.Now().UTC())
 	res, err := s.DB.ExecContext(ctx, `update feed_signer_operations
-		set state = 'processing', claim_token = ?, lease_until = ?, updated_at = ?, attempts = attempts + 1
-		where operation_id = ? and request_hash = ?
-			and (state = 'pending' or (state = 'processing' and lease_until < ?))`,
-		claimToken, timeToNanos(leaseUntil), nowNanos, operationID, reqHash[:], timeToNanos(time.Now().UTC()))
+		set lease_until = ?, updated_at = ?
+		where operation_id = ? and claim_token = ? and state = 'processing' and lease_until <= ?`,
+		timeToNanos(leaseUntil), nowNanos, operationID, claimToken, timeToNanos(leaseUntil))
 	if err != nil {
-		// Includes the partial-unique-index violation when another operation
-		// holds the (registry_id, topic) processing claim: the caller is the
-		// loser and must NOT update.
-		return false, err
+		return err
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, err
+		return err
 	}
-	return n == 1, nil
+	if n != 1 {
+		return errors.New("extend feed signer lease: claim is no longer owned")
+	}
+	return nil
+}
+
+// EnsureFeedSignerLeaseOwned verifies that the caller STILL owns the live
+// processing claim for an operation at this instant (exact token match AND a
+// lease that has not expired). It runs immediately before the external
+// network/key update and before completion so a defeated owner (whose lease was
+// taken over) discovers it has lost the claim BEFORE performing the update,
+// and fails closed. A nil error means the caller remains the sole owner.
+func (s *Store) EnsureFeedSignerLeaseOwned(ctx context.Context, operationID, claimToken string) error {
+	var state string
+	var lease sql.NullInt64
+	nowNanos := timeToNanos(time.Now().UTC())
+	err := s.DB.QueryRowContext(ctx, `select state, lease_until
+		from feed_signer_operations where operation_id = ? and claim_token = ?`,
+		operationID, claimToken).Scan(&state, &lease)
+	if err != nil {
+		return errors.New("ensure feed signer lease: claim is no longer owned")
+	}
+	if state != FeedSignerOpProcessing || !lease.Valid || lease.Int64 <= nowNanos {
+		return errors.New("ensure feed signer lease: claim is no longer owned")
+	}
+	return nil
 }
 
 // CompleteFeedSignerOperation transitions a processing operation to the
@@ -364,13 +689,16 @@ func (s *Store) ReleaseFeedSignerOperation(ctx context.Context, operationID stri
 }
 
 // newClaimToken returns an unpredictable 128-hex claim token from the
-// cryptorandom source, or panics only on a catastrophic RNG failure.
-func newClaimToken() string {
+// cryptorandom source. An entropy failure is a DATA-FREE backend error (never
+// a panic): a signer whose RNG is broken must fail its claim closed, returning
+// the generic backend sentinel, rather than crash the process or mint a weak
+// token.
+func newClaimToken() (string, error) {
 	buf := make([]byte, claimTokenBytes)
 	if _, err := rand.Read(buf); err != nil {
-		panic(fmt.Sprintf("claim token entropy source failed: %v", err))
+		return "", err
 	}
-	return hex.EncodeToString(buf)
+	return hex.EncodeToString(buf), nil
 }
 
 // claimTokenEqual reports whether two claim tokens are equal in constant time.

@@ -170,8 +170,8 @@ func defaultDeps() controlPlaneDeps {
 		newRegistryIssuer: func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error) {
 			return auth.NewRegistryTokenIssuer(priv, issuer, keyID)
 		},
-		loadTLSKeyPair:         tls.LoadX509KeyPair,
-		loadInternalTLSKeyPair: tls.LoadX509KeyPair,
+		loadTLSKeyPair:         credential.LoadTLSKeyPair,
+		loadInternalTLSKeyPair: credential.LoadTLSKeyPair,
 		openStore:              controlplane.OpenSQLite,
 		loadInternalSecret:     credential.LoadSecretFile,
 	}

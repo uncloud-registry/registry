@@ -21,6 +21,13 @@ func refHex(c byte) string {
 	return strings.Repeat(string(c), 64)
 }
 
+// testFeedOwner is a canonical 40-lowercase-hex feed-owner address used by
+// the signer/store fixtures, so the deterministic feed references derived from
+// it parse as EXACTLY canonical full-feed wire form
+// (feed://<40 lowercase hex owner>/<64 lowercase hex topic>) under the strict
+// validator.
+const testFeedOwner = "abababababababababababababababababababab"
+
 // testRepo is the repository name used by every feed-signer fixture document.
 const testRepo = "repo1"
 
@@ -57,7 +64,7 @@ func newFeedTestWorld(t *testing.T, req publish.FeedCommitRequest, dst feedDocSe
 	store := newProvisioningStore(t)
 	owner := seedProvisioningOwner(t, store)
 
-	feedOwner := "0xabcDEF1234"
+	feedOwner := testFeedOwner
 	newReg, err := store.CreateProvisionedRegistry(ctx, Registry{
 		Slug: "feedsigreg", Host: "feedsigreg.test", ENSName: "",
 		OwnerUserID: owner.ID, FeedOwnerAddress: feedOwner, DefaultStampBatchID: dst.stampRef,
@@ -130,7 +137,7 @@ func validCommitReq(registryID int64, batch string) publish.FeedCommitRequest {
 	return publish.FeedCommitRequest{
 		OperationID:        "op-1",
 		RegistryID:         registryID,
-		Owner:              "0xabcDEF1234",
+		Owner:              "0x" + testFeedOwner,
 		Topic:              "",
 		Reference:          refHex('a'),
 		BatchID:            batch,
@@ -189,15 +196,15 @@ func TestFeedSignerRegistryNotReady(t *testing.T) {
 	owner := seedProvisioningOwner(t, store)
 	provisioning, err := store.CreateProvisionedRegistry(ctx, Registry{
 		Slug: "notready", Host: "notready.test", ENSName: "",
-		OwnerUserID: owner.ID, FeedOwnerAddress: "0xabcDEF1234", DefaultStampBatchID: "batch-1",
+		OwnerUserID: owner.ID, FeedOwnerAddress: testFeedOwner, DefaultStampBatchID: "batch-1",
 		AnonymousPull: true,
 	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
 		[]byte(testAuthPayload), []byte(testStampPayload))
 	if err != nil {
 		t.Fatalf("create provisioned registry: %v", err)
 	}
-	repoTopic := spec.RepoStateFeedRef("0xabcDEF1234", testRepo)
-	stampFeed := spec.StampPolicyFeedRef("0xabcDEF1234")
+	repoTopic := spec.RepoStateFeedRef(testFeedOwner, testRepo)
+	stampFeed := spec.StampPolicyFeedRef(testFeedOwner)
 	feedStore := &MemoryRegistryFeedStore{Feeds: map[string]string{
 		repoTopic: refHex('b'),
 		stampFeed: refHex('c'),
@@ -506,7 +513,7 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 	}
 	newReg, err := store.CreateProvisionedRegistry(context.Background(), Registry{
 		Slug: "persist", Host: "persist.test", ENSName: "",
-		OwnerUserID: asd.ID, FeedOwnerAddress: "0xpersist", DefaultStampBatchID: "batch-1",
+		OwnerUserID: asd.ID, FeedOwnerAddress: testFeedOwner, DefaultStampBatchID: "batch-1",
 		AnonymousPull: true,
 	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
 		[]byte(testAuthPayload), []byte(testStampPayload))
@@ -517,8 +524,8 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 		t.Fatalf("mark ready: %v", err)
 	}
 
-	repoTopic := spec.RepoStateFeedRef("0xpersist", testRepo)
-	stampFeed := spec.StampPolicyFeedRef("0xpersist")
+	repoTopic := spec.RepoStateFeedRef(testFeedOwner, testRepo)
+	stampFeed := spec.StampPolicyFeedRef(testFeedOwner)
 	feedStore := &MemoryRegistryFeedStore{Feeds: map[string]string{repoTopic: refHex('b'), stampFeed: refHex('c')}}
 	docs := resolve.NewMemoryDocumentStore()
 	docs.Documents = map[string][]byte{
@@ -529,7 +536,7 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs}
 
 	req := validCommitReq(newReg.ID, "batch-1")
-	req.Owner = "0xpersist"
+	req.Owner = "0x" + testFeedOwner
 	req.Topic = repoTopic
 	if _, err := signer.Commit(context.Background(), req); err != nil {
 		t.Fatalf("first commit: %v", err)
@@ -674,7 +681,7 @@ func TestNormalizeFeedCommitHashCanonicalizesAndSeparates(t *testing.T) {
 // against duplicate members, unknown fields, trailing content, and
 // non-canonical field values.
 func TestDecodeStoredResultStrictUnit(t *testing.T) {
-	topic := "feed://abcdef/" + strings.Repeat("ab", 32)
+	topic := "feed://" + strings.Repeat("ab", 20) + "/" + strings.Repeat("cd", 32)
 	ref := strings.Repeat("ab", 32)
 	good := `{"operationID":"op-x","feed":"` + topic + `","reference":"` + ref + `"}`
 	if _, err := decodeStoredResult([]byte(good)); err != nil {
@@ -699,6 +706,11 @@ func TestDecodeStoredResultStrictUnit(t *testing.T) {
 // TestFeedSignerStoredResultStrictDecodeFailClosed proves the signer refuses a
 // stored succeeded row whose result JSON violates the strict decoder contract,
 // failing closed with a data-free backend error rather than fabricating success.
+// Rows that violate the DB-level result-integrity contract can no longer enter
+// the database at all (the migration-11 triggers reject them), so this test
+// also asserts that direct-SQL write is refused; the remaining case — a result
+// that is structurally canonical but semantically mismatched to the request —
+// is caught by the strict Go decoder.
 func TestFeedSignerStoredResultStrictDecodeFailClosed(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
@@ -712,27 +724,38 @@ func TestFeedSignerStoredResultStrictDecodeFailClosed(t *testing.T) {
 		t.Fatalf("reserve: %v", err)
 	}
 
-	cases := map[string]string{
+	// These results also violate the DB result-integrity triggers, so the
+	// direct-SQL write is itself refused (the strongest protection).
+	triggerRejected := map[string]string{
 		"duplicate-member": `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('a') + `","operationID":"` + req.OperationID + `"}`,
 		"unknown-field":    `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('a') + `","extra":true}`,
-		"wrong-reference":  `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('d') + `"}`,
 		"wrong-feed":       `{"operationID":"` + req.OperationID + `","feed":"feed://other/` + strings.Repeat("ab", 32) + `","reference":"` + refHex('a') + `"}`,
+		"uppercase-feed":   `{"operationID":"` + req.OperationID + `","feed":"` + strings.ToUpper(w.repoTopic) + `","reference":"` + refHex('a') + `"}`,
 	}
-	for name, resultJSON := range cases {
+	for name, resultJSON := range triggerRejected {
 		if _, err := w.store.DB.ExecContext(ctx, `update feed_signer_operations
 			set state='succeeded', result_json=?, claim_token=null, lease_until=null
-			where operation_id=?`, resultJSON, req.OperationID); err != nil {
-			t.Fatalf("%s: seed succeeded row: %v", name, err)
-		}
-		_, err := w.signer.Commit(ctx, req)
-		if !errors.Is(err, errFeedSignerBackend) {
-			t.Fatalf("%s: expected fail-closed backend error, got %v", name, err)
+			where operation_id=?`, resultJSON, req.OperationID); err == nil {
+			t.Fatalf("%s: expected DB result-integrity trigger to reject the write, got nil", name)
 		}
 		// Reset to pending so the next case re-drives the same path.
 		if _, err := w.store.DB.ExecContext(ctx, `update feed_signer_operations
 			set state='pending', result_json=null where operation_id=?`, req.OperationID); err != nil {
 			t.Fatalf("%s: reset row: %v", name, err)
 		}
+	}
+
+	// Structurally canonical (passes the DB triggers) but semantically wrong for
+	// the request: caught by the strict Go decoder, fail closed.
+	decoderRejected := `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + refHex('d') + `"}`
+	if _, err := w.store.DB.ExecContext(ctx, `update feed_signer_operations
+		set state='succeeded', result_json=?, claim_token=null, lease_until=null
+		where operation_id=?`, decoderRejected, req.OperationID); err != nil {
+		t.Fatalf("seed semantically-wrong succeeded row: %v", err)
+	}
+	_, err := w.signer.Commit(ctx, req)
+	if !errors.Is(err, errFeedSignerBackend) {
+		t.Fatalf("expected fail-closed backend error for semantically-wrong result, got %v", err)
 	}
 }
 
@@ -794,7 +817,7 @@ func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs ma
 	}
 	reg, err := stores[0].CreateProvisionedRegistry(ctx, Registry{
 		Slug: "sharedfeed", Host: "sharedfeed.test", ENSName: "",
-		OwnerUserID: owner.ID, FeedOwnerAddress: "0xshared", DefaultStampBatchID: "batch-1",
+		OwnerUserID: owner.ID, FeedOwnerAddress: testFeedOwner, DefaultStampBatchID: "batch-1",
 		AnonymousPull: true,
 	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
 		[]byte(testAuthPayload), []byte(testStampPayload))
@@ -814,7 +837,7 @@ func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs ma
 	}
 	return &sharedFeedWorld{
 		stores: stores, signers: signers, updater: updater, feeds: feeds, docs: docsStore,
-		reg: reg, topic: spec.RepoStateFeedRef("0xshared", testRepo),
+		reg: reg, topic: spec.RepoStateFeedRef(testFeedOwner, testRepo),
 	}
 }
 
@@ -824,7 +847,7 @@ func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs ma
 // happens. This is the cross-process/Store safety proof.
 func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
 	w := newSharedFeedWorld(t, 2,
-		map[string]string{spec.RepoStateFeedRef("0xshared", testRepo): refHex('b'), spec.StampPolicyFeedRef("0xshared"): refHex('c')},
+		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
 			refHex('a'): mustRepoDoc(t, testRepo, 1),
@@ -832,7 +855,7 @@ func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
 		})
 
 	req := validCommitReq(w.reg.ID, "batch-1")
-	req.Owner = "0xshared"
+	req.Owner = "0x" + testFeedOwner
 	req.Topic = w.topic
 	req.ExpectedGeneration = 0
 
@@ -875,7 +898,7 @@ func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
 // updates the feed.
 func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 	w := newSharedFeedWorld(t, 2,
-		map[string]string{spec.RepoStateFeedRef("0xshared", testRepo): refHex('b'), spec.StampPolicyFeedRef("0xshared"): refHex('c')},
+		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
 			refHex('a'): mustRepoDoc(t, testRepo, 1),
@@ -884,7 +907,7 @@ func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 
 	reqA := validCommitReq(w.reg.ID, "batch-1")
 	reqA.OperationID = "shared-op-A"
-	reqA.Owner = "0xshared"
+	reqA.Owner = "0x" + testFeedOwner
 	reqA.Topic = w.topic
 	reqA.Reference = refHex('a')
 	reqA.ExpectedGeneration = 0
@@ -946,7 +969,7 @@ func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
 	}
 	// Simulate the crashed attempt: it claimed with an already-expired lease and
 	// completed the network update (feed is at target) but never persisted.
-	if won, err := w.store.ClaimFeedSignerOperation(ctx, req.OperationID, hash, newClaimToken(), time.Now().UTC().Add(-time.Minute)); err != nil || !won {
+	if won, err := w.store.ClaimFeedSignerOperation(ctx, req.OperationID, hash, testClaimToken(t), time.Now().UTC().Add(-time.Minute)); err != nil || !won {
 		t.Fatalf("seed crashed claim: won=%v err=%v", won, err)
 	}
 

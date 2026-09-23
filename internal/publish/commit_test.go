@@ -24,7 +24,7 @@ func commitServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *Co
 func validCommit() FeedCommitRequest {
 	return FeedCommitRequest{
 		OperationID: "op-abc", RegistryID: 7,
-		Owner: "0xabcDEF", Topic: "feed://abcdef/0123",
+		Owner: "0xabcDEF", Topic: "feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
 		Reference: strings.Repeat("a", 64), BatchID: "batch-1", ExpectedGeneration: 0,
 	}
 }
@@ -61,7 +61,7 @@ func echoServer(t *testing.T, status int, respBody string, checkResults bool) *h
 }
 
 func TestControlPlaneCommitterHappyPath(t *testing.T) {
-	want := FeedCommitResult{OperationID: "op-abc", Feed: "feed://abcdef/0123", Reference: strings.Repeat("a", 64)}
+	want := FeedCommitResult{OperationID: "op-abc", Feed: "feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", Reference: strings.Repeat("a", 64)}
 	body, _ := json.Marshal(want)
 	srv := echoServer(t, 200, string(body), true)
 	c := &ControlPlaneCommitter{BaseURL: srv.URL, Secret: []byte(commitSecret), HTTPClient: srv.Client()}
@@ -195,11 +195,19 @@ func TestParseCommitBaseURLOrigin(t *testing.T) {
 func TestControlPlaneCommitterRejectsMismatchedResult(t *testing.T) {
 	valid := validCommit()
 	cases := map[string]string{
-		"operationID": `{"operationID":"other","feed":"feed://abcdef/0123","reference":"` + strings.Repeat("a", 64) + `"}`,
-		"feed":        `{"operationID":"op-abc","feed":"feed://other/0123","reference":"` + strings.Repeat("a", 64) + `"}`,
-		"reference":   `{"operationID":"op-abc","feed":"feed://abcdef/0123","reference":"` + strings.Repeat("b", 64) + `"}`,
-		"case":        `{"operationID":"op-abc","feed":"feed://abcdef/0123","reference":"` + strings.ToUpper(strings.Repeat("a", 64)) + `"}`,
-		"duplicate":   `{"operationID":"op-abc","operationID":"op-abc","feed":"feed://abcdef/0123","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"operationID": `{"operationID":"other","feed":"feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"feed":        `{"operationID":"op-abc","feed":"feed://0000000000000000000000000000000000000000/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"reference":   `{"operationID":"op-abc","feed":"feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","reference":"` + strings.Repeat("b", 64) + `"}`,
+		"case":        `{"operationID":"op-abc","feed":"feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","reference":"` + strings.ToUpper(strings.Repeat("a", 64)) + `"}`,
+		"duplicate":   `{"operationID":"op-abc","operationID":"op-abc","feed":"feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","reference":"` + strings.Repeat("a", 64) + `"}`,
+		// Malformed / non-canonical FEED values must never be accepted as a
+		// matching success, even when the reference matches.
+		"feed-short-owner":     `{"operationID":"op-abc","feed":"feed://abcd` + strings.Repeat("e", 36) + `/` + strings.Repeat("c", 64) + `","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"feed-no-slash":        `{"operationID":"op-abc","feed":"feed://` + strings.Repeat("b", 40) + strings.Repeat("c", 64) + `","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"feed-extra-slash":     `{"operationID":"op-abc","feed":"feed://` + strings.Repeat("b", 40) + `//` + strings.Repeat("c", 64) + `","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"feed-uppercase-owner": `{"operationID":"op-abc","feed":"feed://` + strings.ToUpper(strings.Repeat("b", 40)) + `/` + strings.Repeat("c", 64) + `","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"feed-uppercase-topic": `{"operationID":"op-abc","feed":"feed://` + strings.Repeat("b", 40) + `/` + strings.ToUpper(strings.Repeat("c", 64)) + `","reference":"` + strings.Repeat("a", 64) + `"}`,
+		"feed-query":           `{"operationID":"op-abc","feed":"feed://` + strings.Repeat("b", 40) + `/` + strings.Repeat("c", 64) + `?x=1","reference":"` + strings.Repeat("a", 64) + `"}`,
 	}
 	for name, body := range cases {
 		srv := echoServer(t, 200, body, false)
