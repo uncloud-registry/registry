@@ -81,6 +81,12 @@ type BeeSequenceFeedUpdater struct {
 	BaseURL    string
 	HTTPClient *http.Client
 	PrivateKey *ecdsa.PrivateKey
+
+	// createVerifyBackoff overrides beeFeedCreateVerifyBackoff for the
+	// post-write effective-feed read-back retry (Round 2: tests shorten it so
+	// the bounded retry loop runs fast; the documented production bound is the
+	// constant). Zero keeps the production default.
+	createVerifyBackoff time.Duration
 }
 
 // beeFeedResolveMaxBody bounds the feed resolve response body. A Swarm
@@ -354,6 +360,29 @@ const beeFeedWriteMaxBody = 512
 // hex chars; the bound rejects oversized or malformed values before any network
 // call while still allowing the bounded in-memory/symbolic test refs.
 const beeFeedWriteMaxRef = 256
+
+// beeFeedCreateVerifyMaxAttempts bounds the post-write effective-feed
+// read-back retries performed after a CREATE-ONLY SOC 201 (Round 2). Real Bee
+// may return 201 to BOTH writers of an identical zero-index SOC (pusher
+// duplicate coalescing) and may be briefly eventually consistent, so the
+// create-only updater proves its payload won by reading the effective feed
+// back before declaring success. A conclusive 404 (not yet visible) is the
+// ONLY retried outcome; malformed/5xx/decode/transport failures are
+// immediate dependency errors. Attempts x backoff stays comfortably inside
+// the 30s write work context.
+const beeFeedCreateVerifyMaxAttempts = 6
+
+// beeFeedCreateVerifyBackoff is the fixed pause between effective-feed
+// read-back attempts (the default when the updater's own createVerifyBackoff
+// field is zero). Five pauses of 200ms bound the retry delay to ~1s above the
+// per-request timeouts, and every retry is READ-ONLY: the chunk/SOC write is
+// never resubmitted.
+const beeFeedCreateVerifyBackoff = 200 * time.Millisecond
+
+// beeFeedCreateZeroIndex is the exact hex sequence index a create-only feed
+// MUST settle at: sequence zero. Any other index means the feed advanced —
+// this update is not (and cannot become) the zero-index creation.
+const beeFeedCreateZeroIndex = "0000000000000000"
 
 func defaultHTTPClient(client *http.Client) *http.Client {
 	if client != nil {
@@ -654,20 +683,26 @@ func parseChunkReferenceResponse(body []byte) ([]byte, error) {
 // URL carries the SOC signature in its query, so it must NEVER surface in an
 // error.
 //
-// CREATE-ONLY (Task 13) closes the lookup TOCTOU: the zero-index SOC
-// identifier is identical for every first writer on this feed, and Bee SOCs
-// are IMMUTABLE — the first accepted write pins the address. The verified Bee
-// contract (ethersphere/bee master pkg/api/soc.go socUploadHandler; openapi
-// Swarm.yaml) returns 201 for the stored writer and collapses EVERY
-// chunk-write failure — including the immutable-alias conflict — to 400
-// "chunk write error" (there is no 409 in the current contract). So on a
-// non-201 create-only response: an explicit 409 (some Bee versions / edge
-// layers surface the conflict that way) is a definite ErrFeedAlreadyExists,
-// and a 400 is disambiguated with the precise conditional probe
-// GET /soc/{owner}/{id} (socGetHandler: 200 + Swarm-Soc-Signature when the
-// SOC exists, 404 when absent): exists → ErrFeedAlreadyExists; absent or a
-// failed probe → the original dependency error. A lost creation race is thus
-// NEVER success and NEVER an overwrite.
+// CREATE-ONLY (Task 13) closes the lookup TOCTOU at the SOC layer, and Round
+// 2 adds the post-write read-back. The zero-index SOC identifier is identical
+// for every first writer on this feed, and Bee SOCs are IMMUTABLE — the first
+// accepted write pins the address. Real Bee (ethersphere/bee master
+// pkg/api/soc.go socUploadHandler; openapi Swarm.yaml) returns 201 for the
+// stored writer, collapses EVERY chunk-write failure — including the
+// immutable-alias conflict — to 400 "chunk write error" (no 409 in the
+// current contract), AND (Round 2 root fact) may return 201 to BOTH writers
+// of the identical SOC when the pusher coalesces the duplicate in-flight
+// operation. So a 201 here is never treated as proof this payload won: for a
+// create-only update the caller (Update) verifies the effective feed by
+// bounded read-back (see verifyCreateOnlyFeed) and only then reports success.
+// On a non-201 create-only response: an explicit 409 (some Bee versions /
+// edge layers surface the conflict that way) is a definite
+// ErrFeedAlreadyExists, and a 400 is disambiguated with the precise
+// conditional probe GET /soc/{owner}/{id} (socGetHandler: 200 + strictly
+// validated Swarm-Soc-Signature header + exact SOC JSON body when the SOC
+// exists, 404 when absent): exists → ErrFeedAlreadyExists; absent or a
+// failed/malformed probe → the original dependency error. A lost creation
+// race is thus NEVER success and NEVER an overwrite.
 func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, identifier []byte, signature []byte, chunkData []byte, batchID string, createOnly bool) error {
 	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
 		return errors.New("postage batch id is empty or exceeds the bound")
@@ -732,10 +767,21 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 // socExists probes whether a single-owner chunk already exists at the
 // immutable (owner, identifier) address — the PRECISE conditional mechanism
 // the create-only 400 disambiguation uses (ethersphere/bee pkg/api/soc.go
-// socGetHandler: 200 with the Swarm-Soc-Signature header when the SOC is
-// present, 404 when absent). The probe body is bounded-drained and never
-// returned; transport errors are sanitized (the URL never carries secrets)
-// and fail the probe (dependency error), never the classification.
+// socGetHandler: 200 when the SOC is present, 404 when absent).
+//
+// A 200 is existence ONLY if the response satisfies the actual Bee contract
+// (Round 2 hardening): exactly ONE valid Swarm-Soc-Signature header whose
+// value is the hex-encoded 65-byte secp256k1 recoverable signature (130 hex
+// chars decoding to exactly 65 bytes), AND the exact bounded JSON body shape
+// socGetHandler returns ({"reference":"<64 hex>"} — the SOC chunk's own
+// address). Duplicate or comma-joined signature headers, malformed /
+// wrong-size / oversized signature values, an oversized body, an unreadable
+// body, a redirect/3xx, a 5xx, or a transport failure all fail the probe as a
+// DEPENDENCY error — NEVER existence and NEVER ErrFeedAlreadyExists, because
+// an arbitrary intermediary 200 (captive proxy, gateway, cache) must never be
+// mistaken for the immutable SOC. Only a definitive Bee 404 is absence. The
+// body is bounded and always closed; errors are data-free (the requested
+// owner/identifier and any injected response text never surface).
 func (u *BeeSequenceFeedUpdater) socExists(ctx context.Context, owner string, identifier []byte) (bool, error) {
 	baseURL, err := u.writerBaseURL()
 	if err != nil {
@@ -754,17 +800,70 @@ func (u *BeeSequenceFeedUpdater) socExists(ctx context.Context, owner string, id
 		return false, sanitizeBeeTransportError(reqCtx, "soc probe request", err)
 	}
 	defer resp.Body.Close()
-	// Bounded drain so the connection can be reused; the SOC body is never
-	// consumed as a value.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+
 	switch resp.StatusCode {
-	case http.StatusOK:
-		return true, nil
 	case http.StatusNotFound:
+		// Definitive absence: drain a bounded amount so the connection can be
+		// reused; the body is never a value.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 		return false, nil
+	case http.StatusOK:
+		// The ONE acceptable presence shape: strict signature header AND the
+		// exact bounded JSON body. Anything else is a dependency error.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		if err != nil {
+			return false, sanitizeBeeTransportError(reqCtx, "read soc probe response body", err)
+		}
+		if len(body) > beeFeedWriteMaxBody {
+			return false, errors.New("soc probe response exceeded the bound")
+		}
+		if _, err := socSignatureHeader(resp.Header); err != nil {
+			return false, err
+		}
+		if _, err := parseChunkReferenceResponse(body); err != nil {
+			// The body is not the exact socGetHandler JSON shape the Bee
+			// contract defines for presence; never treat it as existence.
+			return false, errors.New("soc probe response body does not match the Bee SOC contract")
+		}
+		return true, nil
 	default:
+		// 3xx/4xx-other/5xx: drain a bounded amount for connection reuse and
+		// fail the probe as a dependency error, never existence.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 		return false, fmt.Errorf("soc probe failed with status %d", resp.StatusCode)
 	}
+}
+
+// socSignatureHeader strictly validates the Swarm-Soc-Signature header of a
+// GET /soc probe 200 response: EXACTLY ONE header line must be present
+// (duplicates fail closed, and a single comma/semicolon-joined line — a
+// smuggled second value — fails closed), bounded, and hex-decode to EXACTLY
+// 65 bytes (Bee's recoverable secp256k1 signature: 32-byte R, 32-byte S, 1
+// recovery byte — 130 hex chars). A missing, empty, malformed, wrong-size, or
+// oversized value is a data-free dependency error, never existence.
+func socSignatureHeader(h http.Header) ([]byte, error) {
+	values := h.Values("Swarm-Soc-Signature")
+	if len(values) != 1 {
+		return nil, errors.New("soc probe response must carry exactly one signature header")
+	}
+	v := strings.TrimSpace(values[0])
+	if v == "" {
+		return nil, errors.New("soc probe signature header is empty")
+	}
+	if len(v) > beeFeedWriteMaxRef {
+		return nil, errors.New("soc probe signature header exceeds the bound")
+	}
+	if strings.ContainsAny(v, ",;") {
+		return nil, errors.New("soc probe signature header is malformed")
+	}
+	if !isHexString(v, 130) {
+		return nil, errors.New("soc probe signature header is not a 65-byte signature")
+	}
+	raw, err := hex.DecodeString(v)
+	if err != nil {
+		return nil, errors.New("soc probe signature header is not a 65-byte signature")
+	}
+	return raw, nil
 }
 
 // writeRequestContext derives the per-request context for a writer call: it

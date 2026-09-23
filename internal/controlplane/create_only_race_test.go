@@ -91,47 +91,53 @@ func TestFeedSignerCreateOnlyRaceDetectedAsGenerationConflict(t *testing.T) {
 }
 
 // createOnlyRaceBee is the fake Bee for the two-independent-stores race. It
-// implements the REAL Bee surface the control plane talks to:
+// implements the REAL Bee surface the control plane talks to, under the
+// Round 2 root fact: the pusher COALESCES duplicate in-flight POST /soc
+// operations on the identical zero-index SOC, so BOTH writers receive 201
+// while only the FIRST payload is ever persisted (SOCs and feeds are
+// immutable):
 //
-//   - GET /feeds/<owner>/<topic>: 404 while absent; once the winner's SOC is
-//     stored, 200 with the winner's 32 raw binary payload bytes and the
-//     Swarm-Feed-Index "0000000000000000" (sequence zero — no advancement).
+//   - GET /feeds/<owner>/<topic>: 404 until the creation settles (both
+//     signers' resolve + updater lookups — four conclusive-absent reads —
+//     ordered by the SOC writergate below), then 200 with the WINNER's 32
+//     raw binary payload bytes and Swarm-Feed-Index "0000000000000000"
+//     (sequence zero — no advancement). Effective-feed read-backs are held
+//     until BOTH SOC POSTs completed, so the race is decided purely by the
+//     read-back, never by a manufactured 400.
 //   - GET /bzz/<ref>: immutable document reads (target repo docs, stamp doc).
-//   - POST /chunks: BARRIER — blocks until BOTH racing writers have arrived,
-//     then 201 with a deterministic content address per writer (bounded wait
-//     so a mechanism failure fails the test instead of hanging).
-//   - POST /soc/<owner>/<id>: ATOMICALLY accepts exactly ONE zero-index SOC
-//     (the identifier is identical for both writers) with 201; the loser gets
-//     the real Bee conflict, 400 "chunk write error" (ethersphere/bee master
-//     pkg/api/soc.go maps every chunk-write failure, including the immutable
-//     SOC alias conflict, to 400).
-//   - GET /soc/<owner>/<id>: 200 + Swarm-Soc-Signature when the winner's SOC
-//     exists (the precise conditional disambiguation), 404 otherwise.
+//   - POST /chunks: 201 with a deterministic content address per writer.
+//   - POST /soc/<owner>/<id>: WAITS until both signers' conclusive-absent
+//     lookups returned (so neither lookup can observe the winner), then
+//     ALWAYS 201 — the coalescing model — persisting ONLY the first payload
+//     atomically.
+//   - GET /soc/<owner>/<id>: the precise conditional probe (200 + strictly
+//     valid Swarm-Soc-Signature when present), kept for the separate
+//     400+valid-probe conflict path.
 type createOnlyRaceBee struct {
-	mu        sync.Mutex
-	repoPath  string
-	feeds     map[string][]byte // path -> 32 binary payload bytes
-	indexes   map[string]string
-	payloads  map[string][]byte // /bzz/<ref> -> document bytes
-	repo404   int
-	chunkSeen int
-	chunkRel  chan struct{}
-	soc201    int
-	soc400    int
-	socID     string
-	socWinner []byte
-	releaseAt int
+	mu          sync.Mutex
+	repoPath    string
+	feeds       map[string][]byte // path -> 32 binary payload bytes
+	indexes     map[string]string
+	payloads    map[string][]byte // /bzz/<ref> -> document bytes
+	lookupsDone chan struct{}
+	postsDone   chan struct{}
+	repo404     int
+	soc201      int
+	soc400      int
+	socWinner   []byte
+	readbacks   int
+	visible     bool
 }
 
 func newCreateOnlyRaceBee(t *testing.T, repoPath string, seedFeeds map[string][]byte, seedIndexes map[string]string, payloads map[string][]byte) (*createOnlyRaceBee, *httptest.Server) {
 	t.Helper()
 	b := &createOnlyRaceBee{
-		repoPath:  repoPath,
-		feeds:     map[string][]byte{},
-		indexes:   map[string]string{},
-		payloads:  payloads,
-		chunkRel:  make(chan struct{}),
-		releaseAt: 2, // exactly two racing writers
+		repoPath:    repoPath,
+		feeds:       map[string][]byte{},
+		indexes:     map[string]string{},
+		payloads:    payloads,
+		lookupsDone: make(chan struct{}),
+		postsDone:   make(chan struct{}),
 	}
 	for path, payload := range seedFeeds {
 		b.feeds[path] = payload
@@ -145,13 +151,39 @@ func newCreateOnlyRaceBee(t *testing.T, repoPath string, seedFeeds map[string][]
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/feeds/"):
 			b.mu.Lock()
+			visible := b.visible
+			isRepo := r.URL.Path == b.repoPath
 			payload, ok := b.feeds[r.URL.Path]
 			idx := b.indexes[r.URL.Path]
 			b.mu.Unlock()
-			if !ok {
+			if isRepo && !visible {
+				// Conclusive-absent sequence lookup (resolve + updater lookup
+				// per signer); the writergate below waits for all four.
 				b.mu.Lock()
 				b.repo404++
+				n := b.repo404
 				b.mu.Unlock()
+				if n >= 4 {
+					close(b.lookupsDone)
+				}
+				http.NotFound(w, r)
+				return
+			}
+			if isRepo {
+				// Effective-feed read-back: both SOC POSTs must have completed
+				// (and persisted the winner) before ANY read-back is answered,
+				// so both writers decide purely on the read-back result.
+				select {
+				case <-b.postsDone:
+				case <-time.After(30 * time.Second):
+				}
+				b.mu.Lock()
+				b.readbacks++
+				payload, ok = b.feeds[b.repoPath]
+				idx = b.indexes[b.repoPath]
+				b.mu.Unlock()
+			}
+			if !ok {
 				http.NotFound(w, r)
 				return
 			}
@@ -172,33 +204,23 @@ func newCreateOnlyRaceBee(t *testing.T, repoPath string, seedFeeds map[string][]
 		case r.Method == http.MethodPost && r.URL.Path == "/chunks":
 			body, _ := io.ReadAll(r.Body)
 			ref := chunkRefSHA(body)
-			b.mu.Lock()
-			b.chunkSeen++
-			n := b.chunkSeen
-			b.mu.Unlock()
-			if n >= b.releaseAt {
-				select {
-				case <-b.chunkRel:
-				default:
-					close(b.chunkRel)
-				}
-			} else if n < b.releaseAt {
-				select {
-				case <-b.chunkRel:
-				case <-time.After(30 * time.Second):
-				}
-			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = fmt.Fprintf(w, `{"reference":"%s"}`, ref)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/soc/"):
 			body, _ := io.ReadAll(r.Body)
-			id := strings.TrimPrefix(r.URL.Path, "/soc/")
+			// Coalescing writergate: BOTH signers must have seen absent
+			// lookups (4 repo 404s) before either SOC POST is processed, so
+			// the race really happens at the SOC layer with both lookups
+			// conclusive-absent.
+			select {
+			case <-b.lookupsDone:
+			case <-time.After(30 * time.Second):
+			}
 			b.mu.Lock()
-			if len(b.socWinner) == 0 {
+			b.soc201++
+			if b.socWinner == nil {
 				b.socWinner = body
-				b.socID = id
-				b.soc201++
 				// The winner's payload is the framed chunk: 8-byte span + the
 				// 32 raw reference bytes now stored at the repo feed
 				// (sequence zero).
@@ -206,24 +228,23 @@ func newCreateOnlyRaceBee(t *testing.T, repoPath string, seedFeeds map[string][]
 					b.feeds[b.repoPath] = body[8:]
 					b.indexes[b.repoPath] = "0000000000000000"
 				}
-				b.mu.Unlock()
-				w.WriteHeader(http.StatusCreated)
-				_, _ = w.Write([]byte(`{}`))
-				return
+				b.visible = true
 			}
-			b.soc400++
+			if b.soc201 == 2 {
+				close(b.postsDone)
+			}
 			b.mu.Unlock()
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"code":427,"message":"chunk write error"}`))
+			// REAL model: 201 to BOTH duplicate in-flight writers.
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{}`))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/soc/"):
-			id := strings.TrimPrefix(r.URL.Path, "/soc/")
 			b.mu.Lock()
-			winner := b.socID == id && len(b.socWinner) != 0
+			winner := len(b.socWinner) != 0
 			b.mu.Unlock()
 			if winner {
-				w.Header().Set("Swarm-Soc-Signature", refHex('f'))
+				w.Header().Set("Swarm-Soc-Signature", strings.Repeat("ab", 65))
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte("probe"))
+				_, _ = w.Write([]byte(`{"reference":"` + refHex('f') + `"}`))
 				return
 			}
 			http.NotFound(w, r)
@@ -240,15 +261,21 @@ func chunkRefSHA(body []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner proves the Bee
-// SOC-level TOCTOU closure end to end through TWO INDEPENDENT signer Stores
-// (separate on-disk databases — the shared-DB claim test alone is
-// insufficient, because the durable (registry, topic) claim gate cannot span
-// processes) with distinct first-push operation IDs sharing ONE fake Bee and
-// the same feed. Both signers see the missing feed and interleave at the
-// /chunks barrier; the fake Bee atomically accepts exactly ONE zero-index SOC;
-// exactly one logical success, the loser conflicts, and the final feed carries
-// the winner at sequence 0 (never sequence 1, never overwritten).
+// TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner proves the
+// Round 2 root fact end to end: real Bee may return 201 to BOTH duplicate
+// in-flight POST /soc operations on the identical zero-index SOC (pusher
+// duplicate coalescing), so 201 alone is never proof a payload won. TWO
+// INDEPENDENT signer Stores (separate on-disk databases — the shared-DB claim
+// test alone is insufficient, because the durable (registry, topic) claim
+// gate cannot span processes) with distinct first-push operation IDs share
+// ONE fake Bee and the same feed. Both signers see the missing feed and
+// interleave at the SOC layer; the fake Bee returns 201 to BOTH writers,
+// persisting exactly ONE zero-index SOC; each writer then reads the
+// effective feed back (the read-backs are held until both posts completed) —
+// the winner proves its own reference at sequence 0 and succeeds, the loser
+// observes the winner's reference and fails as a generation conflict; the
+// final feed carries the winner at sequence 0 (never sequence 1, never
+// overwritten). The loser's 400 is NEVER manufactured.
 func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 	// Two independent databases — process-like signer Stores.
 	storeA := mustOpenFileStore(t, filepath.Join(t.TempDir(), "race-a.db"))
@@ -369,14 +396,17 @@ func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 	if firstErr == nil || !errors.Is(firstErr, errFeedSignerGenerationConflict) {
 		t.Fatalf("the losing writer must fail with a generation conflict, got %v", firstErr)
 	}
-	if bee.soc201 != 1 {
-		t.Fatalf("fake Bee must atomically accept exactly ONE zero-index SOC, got %d", bee.soc201)
+	if bee.soc201 != 2 {
+		t.Fatalf("the coalescing model REQUIRES 201 to BOTH writers, got %d", bee.soc201)
 	}
-	if bee.soc400 != 1 {
-		t.Fatalf("the loser must receive exactly ONE SOC conflict, got %d", bee.soc400)
+	if bee.soc400 != 0 {
+		t.Fatalf("the both-201 model must never manufacture a 400 for the loser, got %d", bee.soc400)
 	}
 	if bee.repo404 != 4 {
 		t.Fatalf("both signers must see the missing feed (resolve + updater lookup each), got %d repo 404s", bee.repo404)
+	}
+	if bee.readbacks < 2 {
+		t.Fatalf("each signer must read the effective feed back after its 201, got %d read-backs", bee.readbacks)
 	}
 
 	// Final feed: the WINNER's payload at sequence zero — never sequence one,
@@ -400,4 +430,109 @@ func refBytesForTest(t *testing.T, ref string) []byte {
 		t.Fatalf("fixture ref must be 64 hex: %q (%v)", ref, err)
 	}
 	return raw
+}
+
+// uncertainCreateUpdater models the Round 2 uncertain outcome at the updater
+// boundary: the SOC POST returned 201 but the effective-feed read-back was
+// UNAVAILABLE (still 404 past the bound, 5xx, decode failure, deadline). The
+// write may have applied, so the updater returns an ordinary DEPENDENCY error
+// — never ErrFeedAlreadyExists (not a definite conflict) and never success.
+// The signer MUST respond by keeping its durable lease so a later retry
+// resolves the effective feed before any other update can advance it.
+type uncertainCreateUpdater struct{}
+
+func (uncertainCreateUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, _ string, _ string, _ string, createOnly bool) error {
+	if !createOnly {
+		return errors.New("uncertain create updater must only see create-only updates")
+	}
+	return errors.New("create-only feed verification: bee feed resolution failed")
+}
+
+// TestFeedSignerCreateOnlyUncertainUpdateKeepsLease proves the signer's
+// uncertain handling for the Round 2 root fact: when a create-only update's
+// SOC 201 cannot be verified by the effective-feed read-back (read-back
+// unavailable → an ordinary dependency error, NOT ErrFeedAlreadyExists), the
+// durable lease is KEPT — the operation stays processing — so a retry is
+// forced to resolve the effective feed before any other update can advance
+// it; a DIFFERENT first-push operation on the same feed is blocked while the
+// lease is live; and after the lease expires with the feed settled at the
+// target, an identical retry resolves IDEMPOTENTLY (done path) with ZERO
+// second advancement.
+func TestFeedSignerCreateOnlyUncertainUpdateKeepsLease(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+	// Generation-zero creation: the repository feed is conclusively absent.
+	delete(w.feedStore.Feeds, w.repoTopic)
+
+	// First attempt: create-only write goes out, read-back unavailable.
+	w.signer.Feeds = uncertainCreateUpdater{}
+	_, err := w.signer.Commit(ctx, req)
+	if !errors.Is(err, errFeedSignerBackend) {
+		t.Fatalf("unverifiable create-only write must surface as a backend (dependency) error, got %v", err)
+	}
+	if errors.Is(err, errFeedSignerGenerationConflict) {
+		t.Fatalf("an UNVERIFIABLE write is NOT a definite conflict, got %v", err)
+	}
+	// The lease is KEPT: the operation stays processing (never released to
+	// pending, never succeeded) with a live lease — the uncertain write is
+	// not resolved until a later retry re-resolves the effective feed.
+	op, err := w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if err != nil {
+		t.Fatalf("load operation: %v", err)
+	}
+	if op.State != FeedSignerOpProcessing {
+		t.Fatalf("uncertain create-only failure must keep the operation processing, got %q", op.State)
+	}
+	if op.LeaseUntil == nil || !op.LeaseUntil.After(time.Now()) {
+		t.Fatalf("uncertain failure must keep a live lease, got %v", op.LeaseUntil)
+	}
+
+	// A DIFFERENT first-push operation on the same feed is BLOCKED while the
+	// lease is live: its claim collides with the (registry, topic) processing
+	// gate, so it can never advance or overwrite the uncertain feed.
+	racing := req
+	racing.OperationID = "first-push-racing"
+	racing.Reference = refHex('d')
+	if _, err := w.signer.Commit(ctx, racing); !errors.Is(err, errFeedSignerBackend) {
+		t.Fatalf("a distinct operation must be blocked while the uncertain lease is live, got %v", err)
+	}
+	if _, ok := w.feedStore.Feeds[w.repoTopic]; ok {
+		t.Fatal("no operation may advance the feed while the uncertain lease is live")
+	}
+
+	// The uncertain write actually applied (as the fake Bee's 201 suggested):
+	// the feed now settles at the target. Age the lease (a crashed/uncertain
+	// attempt that never resolved) and retry the IDENTICAL request: it
+	// re-resolves, observes the feed already at the target, and completes
+	// WITHOUT a second advancement.
+	w.feedStore.Feeds[w.repoTopic] = publish.CanonicalReference(req.Reference) // settled externally
+	pastNanos := timeToNanos(time.Now().UTC().Add(-time.Minute))
+	if _, err := w.store.DB.ExecContext(ctx,
+		`update feed_signer_operations set lease_until = ? where operation_id = ?`, pastNanos, req.OperationID); err != nil {
+		t.Fatalf("age lease: %v", err)
+	}
+	counting := &countingFeedUpdater{inner: w.feedStore}
+	w.signer.Feeds = counting
+	result, err := w.signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("identical retry must resolve the uncertain creation: %v", err)
+	}
+	if result.OperationID != req.OperationID || result.Feed != req.Topic || result.Reference != publish.CanonicalReference(req.Reference) {
+		t.Fatalf("unexpected resolution result: %+v", result)
+	}
+	if got := counting.count(); got != 0 {
+		t.Fatalf("resolution must not re-run the external feed update, got %d", got)
+	}
+	op, err = w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if err != nil {
+		t.Fatalf("reload operation: %v", err)
+	}
+	if op.State != FeedSignerOpSucceeded {
+		t.Fatalf("the retried operation must settle as succeeded, got %q", op.State)
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/uncloud-registry/registry/internal/resolve"
@@ -137,7 +138,11 @@ func parseCanonicalFeedUpdateFeed(feed string) (owner string, topic string, err 
 // lookup NEVER triggers a write. A create-only update REQUIRES the lookup to
 // be a conclusive 404; a 200 with the feed present returns the stable
 // ErrFeedAlreadyExists sentinel. Create-only races that slip past the lookup
-// (two writers, both 404) are closed at the SOC layer (see uploadSOC).
+// (two writers, both 404) are closed at the SOC layer (see uploadSOC) AND —
+// Task 13 round 2 — by the post-write effective-feed read-back
+// (verifyCreateOnlyFeed): a create-only update reports success only after the
+// read-back proves index exactly zero and this update's canonical reference,
+// because real Bee may return 201 to both duplicate in-flight SOC writers.
 func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) error {
 	if u == nil || u.PrivateKey == nil {
 		return errors.New("feed updater signing key is not configured; refusing to sign feed updates")
@@ -222,7 +227,113 @@ func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) 
 	// (identical zero-index SOC identifier; Bee accepts the first writer and
 	// conflict-fails the second) maps to ErrFeedAlreadyExists, never to a
 	// silent overwrite and never to a success.
-	return u.uploadSOC(ctx, ownerHex, identifier, signature, chunkData, update.BatchID, update.CreateOnly)
+	if err := u.uploadSOC(ctx, ownerHex, identifier, signature, chunkData, update.BatchID, update.CreateOnly); err != nil {
+		return err
+	}
+
+	// Round 2: a CREATE-ONLY update reports success ONLY after the effective
+	// feed is verified by a bounded read-back (strict Task 11 binary
+	// ReadFeed contract): the current index is exactly sequence zero AND the
+	// current reference equals THIS update's canonical reference. Real Bee may
+	// return 201 to BOTH writers of the identical zero-index SOC (pusher
+	// duplicate coalescing), so 201 alone is never proof this payload won.
+	// Index nonzero or a different reference is the definitive lost race
+	// (ErrFeedAlreadyExists — generation conflict at the signer); an
+	// unavailable read-back after 201 is an uncertain dependency error (never
+	// success, never already-exists), so the signer keeps its durable lease
+	// until a later retry resolves the effective feed. Ordinary non-create
+	// updates remain read-after-write scope and are NOT re-read here.
+	if update.CreateOnly {
+		if err := u.verifyCreateOnlyFeed(ctx, ownerHex, topicHex, strings.ToLower(update.Reference)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyCreateOnlyFeed resolves the effective feed AFTER a create-only SOC
+// 201 and proves this update's payload won the creation: the current feed
+// index is exactly sequence zero AND the current reference is exactly this
+// update's canonical lowercase 64-hex reference. It reuses the strict
+// Task 11 binary ReadFeed contract (BeeFeedResolver.ReadFeed — exact 32-byte
+// payload, exactly one validated index header, bounded, data-free fail
+// closed) rather than duplicating any lenient parsing.
+//
+// Bee may be briefly eventually consistent after the 201, so the read-back is
+// RETRIED — READ-ONLY reads only, NEVER a resubmission of the chunk or SOC —
+// for a bounded number of attempts (beeFeedCreateVerifyMaxAttempts) with a
+// bounded backoff (beeFeedCreateVerifyBackoff / the updater's
+// createVerifyBackoff override), and only while the read conclusively 404s
+// (the feed not yet visible). The 404 retries run inside the caller's own
+// overall context/deadline (the signer's 30s work context), never beyond it.
+//
+// Outcomes:
+//   - index == sequence zero AND reference == canonicalRef → SUCCESS.
+//   - index nonzero OR reference different → ErrFeedAlreadyExists (the
+//     definite lost-race classification; the signer maps it to a generation
+//     conflict and releases its claim).
+//   - a 404 that persists past the retry bound, or any malformed/5xx/decode/
+//     transport/oversize failure, or caller-context cancellation during the
+//     retry → an UNCERTAIN dependency error (never success, never
+//     already-exists): the write may have applied but cannot be proven, so
+//     the signer keeps its durable lease until a later retry resolves the
+//     effective feed before any other update can advance it. Context
+//     cancellation/deadline sentinels are preserved data-free.
+//
+// When two racing creators submit the SAME reference (identical zero-index
+// payload), whichever writer verifies first observes the identical effective
+// feed: both may report idempotent success at sequence zero and no overwrite
+// is possible (the immutable SOC and feed payload are byte-identical). The
+// distinct-reference race, by contrast, yields exactly one winner.
+func (u *BeeSequenceFeedUpdater) verifyCreateOnlyFeed(ctx context.Context, owner string, topic string, canonicalRef string) error {
+	baseURL, err := u.writerBaseURL()
+	if err != nil {
+		return err
+	}
+	resolver := NewBeeFeedResolver(baseURL, u.writerClient())
+	feed := "feed://" + owner + "/" + topic
+	backoff := u.createVerifyBackoff
+	if backoff <= 0 {
+		backoff = beeFeedCreateVerifyBackoff
+	}
+	var lastNotFound error
+	for attempt := 0; attempt < beeFeedCreateVerifyMaxAttempts; attempt++ {
+		value, err := resolver.ReadFeed(ctx, feed)
+		if err == nil {
+			if value.Index != beeFeedCreateZeroIndex {
+				// Index nonzero: the feed advanced beyond sequence zero — this
+				// create-only update is not (and cannot become) the zero-index
+				// creation.
+				return fmt.Errorf("create-only feed update: %w", ErrFeedAlreadyExists)
+			}
+			if value.Reference != canonicalRef {
+				// Sequence zero holds a DIFFERENT reference: another creator
+				// won the creation race and its payload is effective.
+				return fmt.Errorf("create-only feed update: %w", ErrFeedAlreadyExists)
+			}
+			return nil
+		}
+		if !errors.Is(err, resolve.ErrFeedNotFound) {
+			// Malformed / 5xx / decode / transport / oversized: the write may
+			// have applied but cannot be proven. Uncertain dependency error.
+			return fmt.Errorf("create-only feed verification: %w", err)
+		}
+		// Conclusive 404: possibly eventual consistency — retry (read-only).
+		lastNotFound = err
+		if attempt+1 < beeFeedCreateVerifyMaxAttempts {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("create-only feed verification: %w", ctx.Err())
+			case <-timer.C:
+			}
+		}
+	}
+	// Retry bound exhausted with the feed still conclusively absent: the 201
+	// write cannot be verified. Uncertain dependency error — never success,
+	// never already-exists.
+	return fmt.Errorf("create-only feed verification: %w", lastNotFound)
 }
 
 // ReadFeed reads a Bee sequence feed back: GET /feeds/{owner}/{topic} serves
