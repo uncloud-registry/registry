@@ -1,6 +1,7 @@
 package publish
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -240,5 +241,67 @@ func TestControlPlaneCommitterTruncatedResponse(t *testing.T) {
 	c := &ControlPlaneCommitter{BaseURL: srv.URL, Secret: []byte(commitSecret), HTTPClient: srv.Client()}
 	if _, err := c.Commit(context.Background(), validCommit()); !errors.Is(err, ErrCommitBackend) {
 		t.Fatalf("truncated body must collapse to backend, got %v", err)
+	}
+}
+
+func TestCanonicalFeedCommitResultJSONByteExact(t *testing.T) {
+	result := FeedCommitResult{
+		OperationID: "op-1",
+		Feed:        "feed://" + strings.Repeat("a", 40) + "/" + strings.Repeat("b", 64),
+		Reference:   strings.Repeat("ab", 32),
+	}
+	if err := ValidateCommitResult(result); err != nil {
+		t.Fatalf("valid result must pass: %v", err)
+	}
+	want := `{"operationID":"op-1","feed":"` + result.Feed + `","reference":"` + result.Reference + `"}`
+	got := CanonicalFeedCommitResultJSON(result)
+	// Byte-for-byte equal to the concatenated canonical layout.
+	if string(got) != want {
+		t.Fatalf("canonical helper mismatch\n got %q\nwant %q", got, want)
+	}
+	// And byte-for-byte equal to what Go's json.Marshal emits (the fixed struct
+	// member order), so the DB trigger can reconstruct it with plain concatenation.
+	wantMarshal, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, wantMarshal) {
+		t.Fatalf("canonical helper must equal json.Marshal\n got %q\nwant %q", got, wantMarshal)
+	}
+	// The DB trigger requires EXACTLY the three keys in canonical order; verify
+	// there is no trailing whitespace/newline or escape noise.
+	if strings.ContainsAny(string(got), " \n\t") {
+		t.Fatalf("canonical form must be perfectly compact, got %q", got)
+	}
+}
+
+func TestOperationIDJSONSafeConstraint(t *testing.T) {
+	bad := []string{
+		`a"b`,    // double quote (escaped by json.Marshal -> would break byte-exact)
+		`a\\b`,   // backslash
+		"a\nb",   // newline
+		"a<b",    // '<' (escaped by Go json.Marshal)
+		"a>b",    // '>'
+		"a&b",    // '&'
+		"\u00e9", // non-ASCII
+	}
+	for _, opID := range bad {
+		req := validCommit()
+		req.OperationID = opID
+		if err := validateCommitRequestShape(req); err == nil {
+			t.Fatalf("operationID %q must be rejected by the JSON-safe constraint", opID)
+		}
+		res := FeedCommitResult{OperationID: opID, Feed: "feed://" + strings.Repeat("a", 40) + "/" + strings.Repeat("b", 64), Reference: strings.Repeat("ab", 32)}
+		if err := ValidateCommitResult(res); err == nil {
+			t.Fatalf("result operationID %q must be rejected by the JSON-safe constraint", opID)
+		}
+	}
+	// The stable legacy/alphanumeric ids remain accepted.
+	for _, opID := range []string{"op-1", "a", "other", "DIFFERENT"} {
+		req := validCommit()
+		req.OperationID = opID
+		if err := validateCommitRequestShape(req); err != nil {
+			t.Fatalf("operationID %q must be accepted: %v", opID, err)
+		}
 	}
 }

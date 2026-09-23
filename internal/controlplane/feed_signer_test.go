@@ -2,10 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -988,5 +990,194 @@ func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
 	op, _ := w.store.GetFeedSignerOperation(ctx, req.OperationID)
 	if op.State != FeedSignerOpSucceeded {
 		t.Fatalf("expected operation recovered to succeeded, got %q", op.State)
+	}
+}
+
+// m9HistoricalRequestHash independently reproduces the EXACT migration-9
+// (1e91614) delimiter-framed request hash from the RAW request fields, using
+// the historical algorithm directly (never the production legacyFeedCommitHash)
+// so the test pins the production function to the true historical bytes.
+func m9HistoricalRequestHash(req publish.FeedCommitRequest) [32]byte {
+	h := sha256.New()
+	h.Write([]byte("uncloud-registry-feed-commit-req:v1\x00"))
+	h.Write([]byte(req.OperationID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(req.RegistryID, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(req.Owner))
+	h.Write([]byte{0})
+	h.Write([]byte(req.Topic))
+	h.Write([]byte{0})
+	h.Write([]byte(req.Reference))
+	h.Write([]byte{0})
+	h.Write([]byte(req.BatchID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(req.ExpectedGeneration, 10)))
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// TestLegacyFeedCommitHashReproducesM9Bytes pins legacyFeedCommitHash to the
+// byte-exact migration-9 request hash: raw fields, historical order, 0x00
+// delimiter framing, decimal integers. Any divergence from the historical
+// algorithm would leave logically-identical migration-9 rows permanently
+// quarantined.
+func TestLegacyFeedCommitHashReproducesM9Bytes(t *testing.T) {
+	req := publish.FeedCommitRequest{
+		OperationID:        "op-m9",
+		RegistryID:         7,
+		Owner:              "0x" + testFeedOwner,
+		Topic:              "feed://" + strings.Repeat("ab", 20) + "/" + strings.Repeat("cd", 32),
+		Reference:          strings.Repeat("ef", 32),
+		BatchID:            "batch-1",
+		ExpectedGeneration: 3,
+	}
+	if got := legacyFeedCommitHash(req); got != m9HistoricalRequestHash(req) {
+		t.Fatalf("legacyFeedCommitHash diverged from historical m9 bytes:\n got %x\nwant %x", got, m9HistoricalRequestHash(req))
+	}
+	// The legacy hash must also DIFFER from the forward canonical hash when the
+	// historical framing / raw fields differ (owner normalization, topic
+	// canonicalization, reference lowercasing, length-prefix framing). This is
+	// the root cause of the round-2 finding: m9 rows cannot match the new hash.
+	if Modern := NormalizeFeedCommitHash(req); Modern == legacyFeedCommitHash(req) {
+		t.Fatal("legacy and modern hashes must differ for a raw request with unnormalized fields")
+	}
+}
+
+// TestFeedSignerAdoptsLegacyM9HashRow proves a quarantined migration-9
+// SUCCEEDED row whose stored request_hash was produced by the historical m9
+// delimiter-framed algorithm ADOPTS on the same logical request: the stored
+// canonical result is returned idempotently, the network/key update is NOT
+// re-run, and the quarantine row is deleted. This is the exact failure the
+// round-2 finding flagged (the old hash could not match the new request hash).
+func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	target := refHex('a')
+	ctx := context.Background()
+
+	// The stored m9 hash is the HISTORICAL delimiter-framed hash, not the modern one.
+	m9hash := m9HistoricalRequestHash(req)
+	if m9hash == NormalizeFeedCommitHash(req) {
+		t.Fatal("test requires the m9 hash to differ from the modern hash")
+	}
+	result := `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'succeeded', ?, ?, ?)`, req.OperationID, m9hash[:], result, nowNs, nowNs); err != nil {
+		t.Fatalf("seed m9 succeeded row: %v", err)
+	}
+
+	updater := &countingFeedUpdater{inner: w.feedStore}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	res, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("adopt+idempotent commit: %v", err)
+	}
+	if res.Feed != w.repoTopic || res.Reference != target || res.OperationID != req.OperationID {
+		t.Fatalf("adopted result mismatch: %+v", res)
+	}
+	// No second advancement: the stored succeeded result is returned directly.
+	if gotFeed := w.feedStore.Feeds[w.repoTopic]; gotFeed != refHex('b') {
+		t.Fatalf("feed must not be re-advanced on adoption, got %q", gotFeed)
+	}
+	if n := updater.count(); n != 0 {
+		t.Fatalf("adoption must not call the external updater, got %d calls", n)
+	}
+	// The quarantine row is deleted; the active row carries the stored bytes.
+	if legacyCount(t, w.store, req.OperationID) != 0 {
+		t.Fatal("quarantine row must be deleted after successful adoption")
+	}
+	op, err := w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if err != nil || op.State != FeedSignerOpSucceeded || string(op.ResultJSON) != result {
+		t.Fatalf("adopted active row malformed: state=%q result=%s err=%v", op.State, op.ResultJSON, err)
+	}
+}
+
+// TestFeedSignerAdoptsLegacyM9HashPendingRow proves a quarantined PENDING m9
+// row (historical hash) once adopted becomes an active pending row and the
+// request proceeds through the normal sign path exactly once.
+func TestFeedSignerAdoptsLegacyM9HashPendingRow(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	target := refHex('a')
+	ctx := context.Background()
+
+	m9hash := m9HistoricalRequestHash(req)
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'pending', null, ?, ?)`, req.OperationID, m9hash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("seed m9 pending row: %v", err)
+	}
+
+	updater := &countingFeedUpdater{inner: w.feedStore}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	res, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("adopt pending + sign: %v", err)
+	}
+	if res.Feed != w.repoTopic || res.Reference != target {
+		t.Fatalf("unexpected sign result: %+v", res)
+	}
+	if gotFeed := w.feedStore.Feeds[w.repoTopic]; gotFeed != target {
+		t.Fatalf("pending-adopt must sign once and advance the feed, got %q", gotFeed)
+	}
+	if n := updater.count(); n != 1 {
+		t.Fatalf("pending-adopt must sign exactly once, got %d", n)
+	}
+	if legacyCount(t, w.store, req.OperationID) != 0 {
+		t.Fatal("quarantine row must be deleted after successful pending adoption")
+	}
+	op, _ := w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if op.State != FeedSignerOpSucceeded {
+		t.Fatalf("pending-adopt should complete to succeeded, got %q", op.State)
+	}
+}
+
+// TestFeedSignerLegacyRowAdversarialNonMatch proves a quarantined row whose
+// stored hash matches NEITHER the current canonical hash NOR the exact m9 hash
+// is a hard CONFLICT and stays quarantined (never adopted, never deleted).
+func TestFeedSignerLegacyRowAdversarialNonMatch(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+
+	// A hash that is neither the modern nor the m9 hash of this request.
+	adversarial := feedSignerTestHash("adversarial-nonmatch")
+	if adversarial == NormalizeFeedCommitHash(req) || adversarial == m9HistoricalRequestHash(req) {
+		t.Fatal("test fixture must be a non-matching hash")
+	}
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'succeeded', ?, ?, ?)`, req.OperationID, adversarial[:],
+		`{"operationID":"`+req.OperationID+`","feed":"`+w.repoTopic+`","reference":"`+refHex('a')+`"}`, nowNs, nowNs); err != nil {
+		t.Fatalf("seed adversarial row: %v", err)
+	}
+
+	_, err := w.signer.Commit(ctx, req)
+	if !errors.Is(err, errFeedSignerConflict) {
+		t.Fatalf("expected conflict for a non-matching legacy row, got %v", err)
+	}
+	if legacyCount(t, w.store, req.OperationID) != 1 {
+		t.Fatal("adversarial non-matching row must remain quarantined")
+	}
+	if n := w.feedStore.Feeds[w.repoTopic]; n != refHex('b') {
+		t.Fatalf("feed must not advance on conflict, got %q", n)
 	}
 }

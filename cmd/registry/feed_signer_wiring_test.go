@@ -48,7 +48,7 @@ func TestBeeRegistryCannotSignLocally(t *testing.T) {
 	}
 
 	// With the URL but no shared secret file, it still fails closed.
-	t.Setenv("CONTROLPLANE_URL", "http://controlplane.internal:8080")
+	t.Setenv("CONTROLPLANE_URL", "http://127.0.0.1:8080")
 	if _, err := buildBeeHandler(); err == nil {
 		t.Fatal("expected Bee handler to fail closed without CONTROLPLANE_INTERNAL_SECRET_FILE")
 	}
@@ -70,6 +70,42 @@ func TestBeeRegistryCannotSignLocally(t *testing.T) {
 	}
 	if h == nil {
 		t.Fatal("expected a non-nil handler")
+	}
+}
+
+// TestBeeHandlerRejectsNonLoopbackHTTPControlPlane proves the STARTUP origin
+// validation fails closed: a plaintext http control-plane URL for a
+// NON-LOOPBACK host is rejected before a handler (and therefore before the
+// registry listener) is ever built — same policy as the request-time committer.
+func TestBeeHandlerRejectsNonLoopbackHTTPControlPlane(t *testing.T) {
+	t.Setenv("REGISTRY_BACKEND", "bee")
+	t.Setenv("BEE_API_URL", "http://bee.test")
+	t.Setenv("REGISTRY_OWNER_MAP", "registry.test=0xabcdefabcdefabcdefabcdefabcdefabcdefabcdef")
+	t.Setenv("REGISTRY_ID_MAP", "registry.test=7")
+	t.Setenv("CONTROLPLANE_INTERNAL_SECRET_FILE", writeSecretFile(t))
+	t.Setenv("CONTROLPLANE_CA_BUNDLE_FILE", "")
+	t.Setenv("CONTROLPLANE_USE_SYSTEM_ROOTS", "")
+	beeAuthEnv(t)
+
+	t.Setenv("CONTROLPLANE_URL", "http://controlplane.internal:8080")
+	if _, err := buildBeeHandler(); err == nil {
+		t.Fatal("expected startup to reject a non-loopback plaintext http control-plane URL")
+	}
+
+	// The same origin over https is a valid URL shape (trust mode decided
+	// separately), and a loopback http origin is accepted.
+	t.Setenv("CONTROLPLANE_URL", "https://controlplane.internal:8080")
+	if _, err := buildBeeHandler(); err == nil {
+		t.Fatal("expected startup to require exactly one trust mode for an https control-plane URL")
+	}
+	t.Setenv("CONTROLPLANE_USE_SYSTEM_ROOTS", "1")
+	if _, err := buildBeeHandler(); err != nil {
+		t.Fatalf("expected https origin with explicit system-roots trust to build: %v", err)
+	}
+	t.Setenv("CONTROLPLANE_URL", "http://127.0.0.1:8080")
+	t.Setenv("CONTROLPLANE_USE_SYSTEM_ROOTS", "")
+	if _, err := buildBeeHandler(); err != nil {
+		t.Fatalf("expected loopback http origin to build: %v", err)
 	}
 }
 

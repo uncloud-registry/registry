@@ -37,8 +37,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 11 {
-		t.Fatalf("expected schema version 11, got %d", version)
+	if version != 12 {
+		t.Fatalf("expected schema version 12, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -75,8 +75,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 11 {
-		t.Fatalf("expected 11 migration rows, got %d", rows)
+	if rows != 12 {
+		t.Fatalf("expected 12 migration rows, got %d", rows)
 	}
 }
 
@@ -139,8 +139,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 11 {
-		t.Fatalf("expected schema version 11 after upgrade, got %d", version)
+	if version != 12 {
+		t.Fatalf("expected schema version 12 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -1134,8 +1134,8 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 11 {
-		t.Fatalf("expected version 11, got %d", version)
+	if version != 12 {
+		t.Fatalf("expected version 12, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
 	assertInviteDigestSchema(t, db)
@@ -1153,8 +1153,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 11 {
-			t.Fatalf("expected version 11, got %d", version)
+		if version != 12 {
+			t.Fatalf("expected version 12, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		assertInviteDigestSchema(t, db)
@@ -1168,8 +1168,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 11 {
-			t.Fatalf("expected version 11, got %d", version)
+		if version != 12 {
+			t.Fatalf("expected version 12, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1211,8 +1211,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 11 {
-			t.Fatalf("expected version 11, got %d", version)
+		if version != 12 {
+			t.Fatalf("expected version 12, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})

@@ -287,6 +287,109 @@ func feedSignerResultIntegrityTriggerSQL() []string {
 	}
 }
 
+// feedSignerResultCanonicalTriggerSQL returns the TWO result-integrity
+// triggers (BEFORE INSERT and BEFORE UPDATE) installed by migration 12. They
+// REPLACE the migration-11 `json(...)`-based proof with BYTE-FOR-BYTE equality
+// against the single canonical Go result layout, because SQLite's json()
+// function minifies but PRESERVES member order and value spelling — so a
+// reordered-members object ({"feed":…,"operationID":…,…}), an escaped key
+// spelling ({"operation\u0049D":…}) or an escaped value spelling (feed:\/\/)
+// could satisfy the old `json(NEW.result_json) = NEW.result_json` proof. The
+// corrected triggers additionally require the stored result to be EXACTLY
+//
+//	{"operationID":"<opid>","feed":"feed://<40 hex>/<64 hex>","reference":"<64 hex>"}
+//
+// in that fixed key order, reconstructed in SQLite by plain string
+// concatenation (every accepted successor field is a JSON-safe literal, so the
+// concatenation is byte-identical to Go's json.Marshal — see
+// publish.CanonicalFeedCommitResultJSON).
+//
+// For a state='succeeded' row the result_json must be a canonical compact JSON
+// OBJECT carrying EXACTLY the three UNIQUE keys {operationID, feed,
+// reference} — no extras, no duplicates, no reordering, no whitespace, no
+// escaped spellings — where operationID equals the row's operation_id, feed is
+// exactly the canonical full-feed wire form (feed://<40 lowercase hex owner>/<64
+// lowercase hex topic>), reference is exactly 64 lowercase-hex characters, and
+// the whole document byte-matches the canonical layout. Pending/processing rows
+// must carry a NULL result. The trigger aborts the INSERT/UPDATE otherwise, so
+// a direct-SQL write can never fabricate a success; the strict Go decoder stays
+// as defense-in-depth.
+func feedSignerResultCanonicalTriggerSQL() []string {
+	hx40 := strings.Repeat("[0-9a-f]", 40)
+	hx64 := strings.Repeat("[0-9a-f]", 64)
+	// The byte-exact expected canonical JSON, built by concatenation from the
+	// row identity (operation_id) and the already-validated canonical
+	// feed/reference extracted from the JSON. Every field is JSON-safe (op id
+	// constrained, feed/reference lowercase hex), so no escaping is needed and
+	// this matches Go's json.Marshal byte-for-byte.
+	expected := `'{"operationID":"' || NEW.operation_id
+		|| '","feed":"' || json_extract(NEW.result_json,'$.feed')
+		|| '","reference":"' || json_extract(NEW.result_json,'$.reference') || '"}'`
+	guard := `(
+		NEW.state = 'succeeded' and (
+			json_valid(NEW.result_json) = 0
+			or json_type(NEW.result_json) <> 'object'
+			or (select count(*) from json_each(NEW.result_json)) <> 3
+			or (select count(distinct key) from json_each(NEW.result_json)) <> 3
+			or json_type(NEW.result_json,'$.operationID') is not 'text'
+			or json_type(NEW.result_json,'$.feed') is not 'text'
+			or json_type(NEW.result_json,'$.reference') is not 'text'
+			or json_extract(NEW.result_json,'$.operationID') <> NEW.operation_id
+			or length(json_extract(NEW.result_json,'$.feed')) <> 112
+			or substr(json_extract(NEW.result_json,'$.feed'),1,7) <> 'feed://'
+			or substr(json_extract(NEW.result_json,'$.feed'),48,1) <> '/'
+			or substr(json_extract(NEW.result_json,'$.feed'),8,40) not glob '` + hx40 + `'
+			or substr(json_extract(NEW.result_json,'$.feed'),49,64) not glob '` + hx64 + `'
+			or length(json_extract(NEW.result_json,'$.reference')) <> 64
+			or json_extract(NEW.result_json,'$.reference') not glob '` + hx64 + `'
+			or NEW.result_json <> ` + expected + `
+		)
+	) or (
+		NEW.state <> 'succeeded' and NEW.result_json is not null
+	)`
+	return []string{
+		`create trigger if not exists feed_signer_result_integrity_ins
+			before insert on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer succeeded result violates the canonical result contract') where ` + guard + `; end`,
+		`create trigger if not exists feed_signer_result_integrity_upd
+			before update on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer succeeded result violates the canonical result contract') where ` + guard + `; end`,
+	}
+}
+
+// installFeedSignerOperationStoreV12 is migration 12's body. It REPLACES the
+// migration-11 result-integrity triggers — whose `json(NEW.result_json) =
+// NEW.result_json` proof is insufficient because SQLite json() minifies but
+// preserves member order/spelling — with the corrected BYTE-EXACT canonical
+// triggers, then ATOMICALLY re-hardens every EXISTING succeeded row against the
+// corrected contract (a guarded self-update fires the new UPDATE trigger per
+// row), so a malformed/noncanonical existing row aborts the migration and rolls
+// back byte-identically with the version staying 11 and no data touched. Fresh
+// installs run 1→11→12 and reach version 12 with the corrected triggers in
+// place.
+func installFeedSignerOperationStoreV12(ctx context.Context, tx *sql.Tx) error {
+	// Drop the migration-11 trigs (same names, loose proof) and install the
+	// corrected byte-exact triggers under the same names.
+	for _, name := range []string{"feed_signer_result_integrity_ins", "feed_signer_result_integrity_upd"} {
+		if _, err := tx.ExecContext(ctx, `drop trigger if exists `+name); err != nil {
+			return fmt.Errorf("migration 12: drop migration-11 trigger %s: %w", name, err)
+		}
+	}
+	for _, s := range feedSignerResultCanonicalTriggerSQL() {
+		if _, err := tx.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("migration 12: install canonical result trigger: %w", err)
+		}
+	}
+	// Harden existing active rows atomically: the guarded self-update fires the
+	// new UPDATE trigger for EVERY row, with no value changed. A malformed or
+	// non-canonical succeeded row aborts here, rolling the whole migration back
+	// (the database stays at version 11 untouched).
+	if _, err := tx.ExecContext(ctx, `update feed_signer_operations set operation_id = operation_id`); err != nil {
+		return fmt.Errorf("migration 12: hardening existing feed signer operations failed: %w", err)
+	}
+	return nil
+}
+
 // installFeedSignerOperationStoreV11 is migration 11's body. It brings BOTH
 // databases that ran the amended migration 10 (fresh) and databases already
 // stamped with the OLD migration-10 schema to the identical final hardened
@@ -424,6 +527,14 @@ var (
 // row into the hardened ACTIVE table on the FIRST same-OperationID request —
 // and only when the incoming request hash matches the legacy request_hash.
 //
+// The stored request_hash is accepted when it equals EITHER the current
+// canonical request hash (reqHash) OR the exact historical migration-9 hash
+// (legacyReqHash, computed by legacyFeedCommitHash from the incoming request's
+// raw fields). Migration-9 rows were signed with the legacy delimiter-framed
+// algorithm, so a logically-identical legacy operation is recognized only when
+// its stored hash matches legacyReqHash; it must match under ONE of the two
+// algorithms to adopt.
+//
 //   - pending: becomes an active PENDING row carrying the supplied
 //     control-plane registry_id and canonical topic.
 //   - succeeded: is STRICTLY decoded and validated against the operation ID,
@@ -431,15 +542,15 @@ var (
 //     hash (decodeStoredResult subsumes duplicate-member/unknown-field/trailing
 //     rejection and the strict feed/reference contract); only a fully valid
 //     result becomes an active SUCCEEDED row.
-//   - a differing request hash is a CONFLICT (the same OperationID was reused
-//     with different input).
+//   - a differing request hash under BOTH algorithms is a CONFLICT (the same
+//     OperationID was reused with different input).
 //   - a malformed legacy succeeded result FAILS CLOSED and stays quarantined.
 //
 // A quarantine row is deleted only after it is successfully adopted — state is
 // never invented and a row is never silently dropped. The gate is atomic: the
 // active-table read, the quarantine read/validate, the active insert, and the
 // quarantine delete all happen in one write transaction.
-func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash [32]byte) (adopted bool, err error) {
+func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash, legacyReqHash [32]byte) (adopted bool, err error) {
 	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
 		// Only adopt when the active table has no row for this operation.
 		var activeCount int
@@ -470,7 +581,10 @@ func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID 
 		}
 		var legacyHash [32]byte
 		copy(legacyHash[:], hash)
-		if legacyHash != reqHash {
+		// Adopt only when the stored hash matches the current canonical request
+		// hash OR the exact historical migration-9 hash (see legacyFeedCommitHash).
+		// A row matching neither is a DIFFERENT logical request and conflicts.
+		if legacyHash != reqHash && legacyHash != legacyReqHash {
 			return errFeedSignerLegacyConflict
 		}
 
@@ -478,11 +592,15 @@ func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID 
 		nowNanos := timeToNanos(now)
 		switch state {
 		case FeedSignerOpPending:
+			// The ACTIVE row is written with the CURRENT canonical request hash
+			// (reqHash), so the rest of the modern reserve/claim/complete path
+			// compares against the modern hash; the legacy m9 hash was only a
+			// RECOGNITION key to prove this is a logically identical operation.
 			if _, err := c.ExecContext(ctx, `insert into feed_signer_operations
 				(operation_id, registry_id, topic, request_hash, state, result_json,
 				 claim_token, lease_until, attempts, created_at, updated_at)
 				values (?, ?, ?, ?, ?, null, null, null, 0, ?, ?)`,
-				operationID, registryID, topic, legacyHash[:], FeedSignerOpPending, nowNanos, nowNanos); err != nil {
+				operationID, registryID, topic, reqHash[:], FeedSignerOpPending, nowNanos, nowNanos); err != nil {
 				return err
 			}
 		case FeedSignerOpSucceeded:
@@ -502,7 +620,7 @@ func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID 
 				(operation_id, registry_id, topic, request_hash, state, result_json,
 				 claim_token, lease_until, attempts, created_at, updated_at)
 				values (?, ?, ?, ?, ?, ?, null, null, 0, ?, ?)`,
-				operationID, registryID, topic, legacyHash[:], FeedSignerOpSucceeded, result.String, nowNanos, nowNanos); err != nil {
+				operationID, registryID, topic, reqHash[:], FeedSignerOpSucceeded, result.String, nowNanos, nowNanos); err != nil {
 				return err
 			}
 		default:

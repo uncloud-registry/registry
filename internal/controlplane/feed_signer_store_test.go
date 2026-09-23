@@ -113,8 +113,8 @@ func TestMigration10ConstrainHardenedSchemaOnFresh(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	v, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || v != 11 {
-		t.Fatalf("expected schema version 11, got %d (err %v)", v, err)
+	if err != nil || v != 12 {
+		t.Fatalf("expected schema version 12, got %d (err %v)", v, err)
 	}
 	cols := tableColumnsOf(t, db, "feed_signer_operations")
 	for _, want := range []string{"operation_id", "registry_id", "topic", "request_hash", "state", "result_json", "claim_token", "lease_until", "attempts", "created_at", "updated_at"} {
@@ -249,12 +249,13 @@ func TestMigration11HardensOldV10ActiveRows(t *testing.T) {
 		t.Fatalf("seed valid old-v10 active row: %v", err)
 	}
 
-	// Apply migrations: only 11 runs (already at 10). It must succeed.
+	// Apply migrations: 11 (harden old-v10) and 12 (correct canonical triggers)
+	// both run (already at 10). Both must succeed for a valid row.
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("migration 11 hardening old-v10 must succeed for valid rows: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 11 {
-		t.Fatalf("expected version 11, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 12 {
+		t.Fatalf("expected version 12, got %d (err %v)", v, err)
 	}
 	// Quarantine table re-created, triggers installed, valid row preserved.
 	if sqliteObjectCount(t, db, "table", "feed_signer_operations_legacy") != 1 {
@@ -727,7 +728,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	hashPending := feedSignerTestHash("legacy-pending")
 	seed("leg-pending", "pending", "", hashPending)
 	topicPending := spec.RepoStateFeedRef(testFeedOwner, "otherrepo")
-	adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-pending", reg.ID, topicPending, ref, hashPending)
+	adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-pending", reg.ID, topicPending, ref, hashPending, hashPending)
 	if err != nil || !adopted {
 		t.Fatalf("pending adoption: adopted=%v err=%v", adopted, err)
 	}
@@ -744,7 +745,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	hashSuc := feedSignerTestHash("legacy-succeeded")
 	goodResult := `{"operationID":"leg-suc","feed":"` + topic + `","reference":"` + ref + `"}`
 	seed("leg-suc", "succeeded", goodResult, hashSuc)
-	adopted, err = store.AdoptLegacyFeedSignerOperation(ctx, "leg-suc", reg.ID, topic, ref, hashSuc)
+	adopted, err = store.AdoptLegacyFeedSignerOperation(ctx, "leg-suc", reg.ID, topic, ref, hashSuc, hashSuc)
 	if err != nil || !adopted {
 		t.Fatalf("succeeded adoption: adopted=%v err=%v", adopted, err)
 	}
@@ -757,7 +758,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	//    active table.
 	hashConflict := feedSignerTestHash("legacy-conflict")
 	seed("leg-conflict", "pending", "", hashConflict)
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-conflict", reg.ID, topic, ref, feedSignerTestHash("different")); !errors.Is(err, errFeedSignerLegacyConflict) {
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-conflict", reg.ID, topic, ref, feedSignerTestHash("different"), feedSignerTestHash("different")); !errors.Is(err, errFeedSignerLegacyConflict) {
 		t.Fatalf("differing hash must conflict, got %v", err)
 	}
 	if n := legacyCount(t, store, "leg-conflict"); n != 1 {
@@ -767,7 +768,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	// 4. Malformed succeeded legacy result -> fail closed, stays quarantined.
 	hashMal := feedSignerTestHash("legacy-malformed")
 	seed("leg-mal", "succeeded", `{"operationID":"leg-mal","feed":"NOT_A_FEED","reference":"bad"}`, hashMal)
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, hashMal); !errors.Is(err, errFeedSignerLegacyMalformed) {
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, hashMal, hashMal); !errors.Is(err, errFeedSignerLegacyMalformed) {
 		t.Fatalf("malformed legacy succeeded result must fail closed, got %v", err)
 	}
 	if n := legacyCount(t, store, "leg-mal"); n != 1 {
@@ -783,4 +784,143 @@ func legacyCount(t *testing.T, store *Store, opID string) int {
 		t.Fatalf("count legacy: %v", err)
 	}
 	return n
+}
+
+// TestFeedSignerResultCanonicalByteExactTriggers proves migration 12's
+// corrected DB result-integrity triggers enforce BYTE-FOR-BYTE equality to the
+// single canonical Go result layout on direct SQL. The old migration-11
+// `json(NEW.result_json) = NEW.result_json` proof minifies but PRESERVES member
+// order and spelling, so it ACCEPTED a reordered-members object, an escaped key
+// spelling (operation\u0049D), and an escaped value spelling (feed:\/\/). The
+// corrected trigger must reject all of those while accepting the genuine
+// canonical layout, on BOTH the INSERT and UPDATE paths.
+func TestFeedSignerResultCanonicalByteExactTriggers(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+
+	ins := func(opID, result string) error {
+		h := feedSignerTestHash(opID)
+		_, err := db.ExecContext(ctx, `insert into feed_signer_operations
+			(operation_id, registry_id, topic, request_hash, state, result_json,
+			 claim_token, lease_until, attempts, created_at, updated_at)
+			values (?, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+			opID, reg.ID, topic, h[:], result, nowNs, nowNs)
+		return err
+	}
+	upd := func(opID, result string) error {
+		_, err := db.ExecContext(ctx, `update feed_signer_operations
+			set state='succeeded', result_json=?, claim_token=null, lease_until=null
+			where operation_id = ?`, result, opID)
+		return err
+	}
+
+	canonical := `{"operationID":"ok-canon","feed":"` + topic + `","reference":"` + ref + `"}`
+	ch := feedSignerTestHash("ok-canon")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('ok-canon', ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		reg.ID, topic, ch[:], canonical, nowNs, nowNs); err != nil {
+		t.Fatalf("seed canonical row: %v", err)
+	}
+	// Canonical UPDATE accepted (byte-identical to Go's json.Marshal).
+	if err := upd("ok-canon", canonical); err != nil {
+		t.Fatalf("canonical update rejected: %v", err)
+	}
+
+	escapedFeed := `feed:\/\/` + strings.TrimPrefix(topic, "feed://")
+	// Each byte-exact violation carries the OPERATION ID that makes every
+	// semantic check pass, so ONLY the byte-exact equality clause can reject it.
+	cases := []struct {
+		name   string
+		result func(opID string) string
+	}{
+		{"reordered-members", func(opID string) string {
+			return `{"feed":"` + topic + `","operationID":"` + opID + `","reference":"` + ref + `"}`
+		}},
+		{"escaped-key", func(opID string) string {
+			return `{"operation\u0049D":"` + opID + `","feed":"` + topic + `","reference":"` + ref + `"}`
+		}},
+		{"escaped-feed-value", func(opID string) string {
+			return `{"operationID":"` + opID + `","feed":"` + escapedFeed + `","reference":"` + ref + `"}`
+		}},
+		{"whitespace", func(opID string) string {
+			return `{ "operationID" : "` + opID + `", "feed" : "` + topic + `", "reference" : "` + ref + `" }`
+		}},
+		{"duplicate-key", func(opID string) string {
+			return `{"operationID":"` + opID + `","feed":"` + topic + `","reference":"` + ref + `","operationID":"` + opID + `"}`
+		}},
+		{"extra-field", func(opID string) string {
+			return `{"operationID":"` + opID + `","feed":"` + topic + `","reference":"` + ref + `","extra":1}`
+		}},
+		{"wrong-op-id", func(opID string) string {
+			return `{"operationID":"DIFFERENT","feed":"` + topic + `","reference":"` + ref + `"}`
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+"/insert", func(t *testing.T) {
+			opID := "x-" + tc.name
+			if err := ins(opID, tc.result(opID)); err == nil {
+				t.Fatal("expected INSERT trigger reject; got nil")
+			}
+		})
+		t.Run(tc.name+"/update", func(t *testing.T) {
+			if err := upd("ok-canon", tc.result("ok-canon")); err == nil {
+				t.Fatal("expected UPDATE trigger reject; got nil")
+			}
+		})
+	}
+}
+
+// TestMigration12RejectsNonCanonicalV11RowRollsBack proves migration 12's
+// atomic hardening: a v11 database whose active succeeded row matches the loose
+// v11 `json()<>` proof but is NOT byte-canonical (reordered members — which
+// json() accepts) causes migration 12 to FAIL and roll back byte-identically:
+// the version stays 11, the row is untouched, and the v11 trigger remains
+// installed. No rewrite or deletion, ever.
+func TestMigration12RejectsNonCanonicalV11RowRollsBack(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 11); err != nil {
+		t.Fatalf("apply through v11: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+
+	// A reordered-members succeeded result passes the v11 trigger (json()
+	// preserves order) but violates the v12 BYTE-EXACT contract.
+	reordered := `{"feed":"` + topic + `","operationID":"v11-reordered","reference":"` + ref + `"}`
+	rh := feedSignerTestHash("v11-reordered")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('v11-reordered', ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		reg.ID, topic, rh[:], reordered, nowNs, nowNs); err != nil {
+		t.Fatalf("v11 must ACCEPT a reordered-members succeeded row (the round-2 defect): %v", err)
+	}
+
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("migration 12 must fail when hardening encounters a non-canonical v11 row")
+	}
+	// Version stays 11; the row is byte-identical (total rollback).
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 11 {
+		t.Fatalf("version must stay 11 on adversarial migration 12, got %d (err %v)", v, err)
+	}
+	var gotRes []byte
+	if err := db.QueryRowContext(ctx, `select result_json from feed_signer_operations
+		where operation_id='v11-reordered'`).Scan(&gotRes); err != nil {
+		t.Fatalf("read row after rollback: %v", err)
+	}
+	if string(gotRes) != reordered {
+		t.Fatalf("non-canonical row must be byte-identical after rollback: %s", gotRes)
+	}
 }

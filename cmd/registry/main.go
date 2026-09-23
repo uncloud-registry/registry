@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -163,42 +162,61 @@ func buildBeeHandler() (http.Handler, error) {
 // control plane is reached over an https URL authenticated by a PRIVATE CA
 // bundle, loaded and validated BEFORE the registry listener starts.
 //
-// For a loopback control-plane URL over plaintext http (or any http URL), the
-// client is ordinary (no TLS client config). For an https URL, the exact
-// origin determines the TLS ServerName and a dedicated transport clone carries:
-//   - RootCAs = the configured private/internal CA bundle (if
-//     CONTROLPLANE_CA_BUNDLE_FILE is set), so a self-hosted internal CA is
-//     trusted WITHOUT globally injecting it into the process pool; or the
-//     explicit system-roots-only mode (CONTROLPLANE_USE_SYSTEM_ROOTS=1),
-//   - MinVersion TLS1.2,
-//   - ServerName pinned from the exact origin host (defeats host spoofing).
+// The origin itself is validated by publish.ParseControlPlaneOrigin — the SAME
+// validator the request-time committer uses — so the two call sites cannot
+// drift: plaintext http is allowed only for a loopback host, and userinfo, path
+// (beyond "/"), query, fragment, and malformed/scoped forms are all rejected.
 //
-// The two trust modes are mutually exclusive and require an https control-plane
-// URL. A malformed/empty CA bundle fails closed before the listener starts.
+// TLS trust is strictly controlled:
+//   - Plaintext http (provably loopback after origin validation) requires NO
+//     trust mode; if either CONTROLPLANE_CA_BUNDLE_FILE or
+//     CONTROLPLANE_USE_SYSTEM_ROOTS is set, startup FAILS rather than
+//     silently ignoring an HTTPS-only trust setting on a plaintext origin.
+//   - An https control-plane URL requires EXACTLY ONE explicit trust mode: a
+//     non-empty CONTROLPLANE_CA_BUNDLE_FILE, XOR CONTROLPLANE_USE_SYSTEM_ROOTS=1.
+//     Missing BOTH fails startup (never silently falling back to the process
+//     root pool); having BOTH fails startup (never silently preferring one).
+//     CONTROLPLANE_USE_SYSTEM_ROOTS accepts only "1", "0", or unset — any other
+//     value (e.g. "true", "yes") fails startup rather than being read as false.
+//
+// For an https origin the TLS config carries a dedicated transport clone, the
+// chosen root pool, MinVersion TLS1.2, and ServerName pinned from the exact
+// origin host (defeats host spoofing). Errors carry no URL/data/path content.
 func buildControlPlaneHTTPClient(cpURL string) (*http.Client, error) {
-	u, err := url.Parse(cpURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("CONTROLPLANE_URL must be a valid absolute URL")
-	}
-	if u.Scheme != "https" && u.Scheme != "http" {
-		return nil, fmt.Errorf("CONTROLPLANE_URL scheme must be http or https")
+	origin, err := publish.ParseControlPlaneOrigin(cpURL)
+	if err != nil {
+		return nil, fmt.Errorf("CONTROLPLANE_URL: %w", err)
 	}
 
 	base := http.DefaultTransport.(*http.Transport).Clone()
-	if u.Scheme != "https" {
-		// Plaintext url (loopback http): no TLS client config needed.
+
+	caBundle := strings.TrimSpace(os.Getenv("CONTROLPLANE_CA_BUNDLE_FILE"))
+	useSystemRoots, boolErr := parseSystemRootsEnv()
+	if boolErr != nil {
+		return nil, boolErr
+	}
+
+	if !origin.IsHTTPS() {
+		// Provably loopback after origin validation. A CA bundle or system-roots
+		// trust setting is MEANINGLESS on plaintext http: fail startup rather
+		// than silently ignore an operator's HTTPS-only trust configuration.
+		if caBundle != "" || useSystemRoots {
+			return nil, errors.New("CONTROLPLANE_CA_BUNDLE_FILE and CONTROLPLANE_USE_SYSTEM_ROOTS are HTTPS-only settings and are rejected on a plaintext http control-plane URL")
+		}
 		return &http.Client{Transport: base}, nil
 	}
 
-	caBundle := strings.TrimSpace(os.Getenv("CONTROLPLANE_CA_BUNDLE_FILE"))
-	useSystemRoots := strings.TrimSpace(os.Getenv("CONTROLPLANE_USE_SYSTEM_ROOTS")) == "1"
+	// An https origin requires EXACTLY ONE explicit trust mode.
 	if caBundle != "" && useSystemRoots {
-		return nil, fmt.Errorf("CONTROLPLANE_CA_BUNDLE_FILE and CONTROLPLANE_USE_SYSTEM_ROOTS are mutually exclusive")
+		return nil, errors.New("CONTROLPLANE_CA_BUNDLE_FILE and CONTROLPLANE_USE_SYSTEM_ROOTS are mutually exclusive: an https control-plane URL requires exactly one explicit trust mode")
+	}
+	if caBundle == "" && !useSystemRoots {
+		return nil, errors.New("the https control-plane URL requires exactly one explicit trust mode: set CONTROLPLANE_CA_BUNDLE_FILE or CONTROLPLANE_USE_SYSTEM_ROOTS=1")
 	}
 
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		ServerName: u.Hostname(), // from the EXACT origin host, never from SNI spoofing
+		ServerName: origin.Hostname(), // from the EXACT origin host, never from SNI spoofing
 	}
 	switch {
 	case caBundle != "":
@@ -207,18 +225,30 @@ func buildControlPlaneHTTPClient(cpURL string) (*http.Client, error) {
 			return nil, err
 		}
 		tlsConfig.RootCAs = pool
-	case useSystemRoots:
+	default:
 		pool, err := x509.SystemCertPool()
 		if err != nil || pool == nil {
 			return nil, errors.New("failed to load the system root CA pool")
 		}
 		tlsConfig.RootCAs = pool
-	default:
-		// No explicit trust source: use the process pool unchanged, but the
-		// dedicated transport still pins ServerName + MinVersion.
 	}
 	base.TLSClientConfig = tlsConfig
 	return &http.Client{Transport: base}, nil
+}
+
+// parseSystemRootsEnv reads CONTROLPLANE_USE_SYSTEM_ROOTS into a strict boolean.
+// Only "1", "0", or an unset value are accepted; any other form (e.g. "true",
+// "yes", "on") fails closed rather than being silently read as false, so an
+// operator typo can never silently disable explicit system-roots trust.
+func parseSystemRootsEnv() (bool, error) {
+	switch strings.TrimSpace(os.Getenv("CONTROLPLANE_USE_SYSTEM_ROOTS")) {
+	case "", "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, errors.New("CONTROLPLANE_USE_SYSTEM_ROOTS must be 1, 0, or unset")
+	}
 }
 
 // requireRegistryIDs fails closed unless every host the registry resolver can

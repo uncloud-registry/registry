@@ -307,6 +307,20 @@ var migrations = []migration{
 		Version: 11,
 		Apply:   installFeedSignerOperationStoreV11,
 	},
+	// Version 12 replaces the migration-11 result-integrity triggers whose
+	// `json(NEW.result_json) = NEW.result_json` proof is insufficient (SQLite's
+	// json() minifies but PRESERVES member order and value spelling, so a
+	// reordered-members, escaped-key, or escaped-value result could satisfy it)
+	// with corrected BYTE-EXACT canonical triggers that require the stored
+	// result to equal, byte-for-byte, the single canonical Go layout
+	// {"operationID","feed","reference"} in that fixed order. It also atomically
+	// re-hardens every EXISTING succeeded row against the corrected contract, so
+	// a malformed/noncanonical existing row aborts and rolls back byte-identically
+	// with the version staying 11. Fresh installs run 1→11→12.
+	{
+		Version: 12,
+		Apply:   installFeedSignerOperationStoreV12,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

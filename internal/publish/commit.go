@@ -205,39 +205,87 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 	}
 }
 
-// parseCommitBaseURL validates and canonicalizes the internal feed-signing
+// ControlPlaneOrigin is a validated, canonical control-plane internal
+// feed-signing origin. It is shared by the request-time committer
+// (parseCommitBaseURL → NewControlPlaneCommitter) and the registry's STARTUP
+// client builder (cmd/registry buildControlPlaneHTTPClient) so the two can
+// never drift: the same scheme, host, userinfo/path/query/fragment and loopback
+// rules apply at both call sites. The precedence-of-http-over-loopback rule is
+// enforced once here; the TLS trust mode decision is deliberately NOT here
+// (trust is an operational concern layered above the origin).
+type ControlPlaneOrigin struct {
+	scheme   string // "http" or "https"
+	host     string // canonical "host[:port]"
+	hostname string // host without any port or IPv6 brackets
+}
+
+// Scheme returns "http" or "https".
+func (o ControlPlaneOrigin) Scheme() string { return o.scheme }
+
+// Host returns the canonical "host[:port]" origin host.
+func (o ControlPlaneOrigin) Host() string { return o.host }
+
+// Hostname returns the origin host without any port or IPv6 brackets — the
+// correct TLS ServerName (for an https origin) and the loopback test subject.
+func (o ControlPlaneOrigin) Hostname() string { return o.hostname }
+
+// IsHTTPS reports whether the origin uses plaintext http=false / https=true.
+func (o ControlPlaneOrigin) IsHTTPS() bool { return o.scheme == "https" }
+
+// IsLoopback reports whether the origin host is a loopback address/localhost.
+func (o ControlPlaneOrigin) IsLoopback() bool { return isLoopbackHost(o.hostname) }
+
+// String returns the canonical scheme://host[:port] origin.
+func (o ControlPlaneOrigin) String() string { return o.scheme + "://" + o.host }
+
+// ParseControlPlaneOrigin validates and canonicalizes an internal feed-signing
 // origin: absolute http(s), host required, no userinfo, no path beyond empty
 // or "/", no query, no fragment. Plaintext http is allowed ONLY for a loopback
-// host (127.0.0.0/8, ::1, or localhost); any other host must use https. The
-// returned value is the canonical scheme://host[:port] origin.
-func parseCommitBaseURL(raw string) (string, error) {
+// host (127.0.0.0/8, ::1, or localhost); any other host must use https. Malformed
+// and scoped (userinfo/path/query/fragment) forms are rejected. It returns the
+// canonical scheme://host[:port] origin. This is the SINGLE origin validator for
+// both request-time and startup control-plane wiring, so their policies cannot
+// drift. Errors carry no URL data.
+func ParseControlPlaneOrigin(raw string) (ControlPlaneOrigin, error) {
 	raw = strings.TrimRight(raw, "/")
 	if raw == "" {
-		return "", errors.New("control plane URL is not configured")
+		return ControlPlaneOrigin{}, errors.New("control plane URL is not configured")
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "", errors.New("control plane URL is not an absolute origin")
+		return ControlPlaneOrigin{}, errors.New("control plane URL is not an absolute origin")
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", errors.New("control plane URL must be http or https")
+		return ControlPlaneOrigin{}, errors.New("control plane URL must be http or https")
 	}
 	if u.User != nil {
-		return "", errors.New("control plane URL must not contain userinfo")
+		return ControlPlaneOrigin{}, errors.New("control plane URL must not contain userinfo")
 	}
 	if u.RawQuery != "" {
-		return "", errors.New("control plane URL must not contain a query")
+		return ControlPlaneOrigin{}, errors.New("control plane URL must not contain a query")
 	}
 	if u.Fragment != "" {
-		return "", errors.New("control plane URL must not contain a fragment")
+		return ControlPlaneOrigin{}, errors.New("control plane URL must not contain a fragment")
 	}
 	if p := u.EscapedPath(); p != "" && p != "/" {
-		return "", errors.New("control plane URL must be an origin with no path")
+		return ControlPlaneOrigin{}, errors.New("control plane URL must be an origin with no path")
 	}
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-		return "", errors.New("control plane URL uses plaintext http for a non-loopback host")
+		return ControlPlaneOrigin{}, errors.New("control plane URL uses plaintext http for a non-loopback host")
 	}
-	return u.Scheme + "://" + u.Host, nil
+	return ControlPlaneOrigin{scheme: u.Scheme, host: u.Host, hostname: u.Hostname()}, nil
+}
+
+// parseCommitBaseURL is the request-time wrapper over the shared origin
+// validator, returning the canonical origin string for the OLD commit path that
+// stores it. Both it and cmd/registry's startup builder call
+// ParseControlPlaneOrigin, so the policies are structurally identical.
+func parseCommitBaseURL(raw string) (string, error) {
+	o, err := ParseControlPlaneOrigin(raw)
+	if err != nil {
+		return "", err
+	}
+	return o.String(), nil
 }
 
 func isLoopbackHost(host string) bool {
@@ -297,8 +345,8 @@ func decodeCommitResult(data []byte, req FeedCommitRequest) (FeedCommitResult, e
 
 // validateCommitRequestShape applies the client-side bounded syntax contract.
 func validateCommitRequestShape(req FeedCommitRequest) error {
-	if req.OperationID == "" || len(req.OperationID) > operationIDMaxLen {
-		return errors.New("operationID must be non-empty and bounded")
+	if req.OperationID == "" || len(req.OperationID) > operationIDMaxLen || !isJSONSafeOperationID(req.OperationID) {
+		return errors.New("operationID must be non-empty, bounded, and a JSON-safe printable-ASCII identifier")
 	}
 	if req.RegistryID <= 0 {
 		return errors.New("registryID must be positive")
@@ -353,8 +401,8 @@ func IsHexReference(s string) bool {
 // canonical 64-lowercase-hex form — an invalid or non-canonical value is
 // rejected so a mismatched feed/reference can never be accepted as success.
 func ValidateCommitResult(result FeedCommitResult) error {
-	if result.OperationID == "" || len(result.OperationID) > operationIDMaxLen {
-		return errors.New("result operationID must be non-empty and bounded")
+	if result.OperationID == "" || len(result.OperationID) > operationIDMaxLen || !isJSONSafeOperationID(result.OperationID) {
+		return errors.New("result operationID must be non-empty, bounded, and a JSON-safe printable-ASCII identifier")
 	}
 	// Feed must be EXACTLY the canonical full-feed wire form, not merely a
 	// lowercased string.
@@ -365,6 +413,40 @@ func ValidateCommitResult(result FeedCommitResult) error {
 		return errors.New("result reference must be a canonical 64-hex value")
 	}
 	return nil
+}
+
+// isJSONSafeOperationID reports whether s is a JSON-safe printable-ASCII
+// operation identifier: every byte is ASCII printable 0x20..0x7e EXCEPT the
+// five bytes Go's default JSON encoder escapes (", \, <, >, &). Such a string
+// is emitted VERBATIM by json.Marshal — no \uXXXX, \n, \", or <>& escapes — so
+// the canonical succeeded result can be reconstructed byte-for-byte as a plain
+// SQLite concatenation, exactly what the DB result-integrity trigger requires.
+// It doubles as the stable OperationID alphabet Task 10's durable idempotency
+// accepts (a result's operationID must equal its request's, so constraining it
+// at the request ALSO keeps the stored result byte-exact).
+func isJSONSafeOperationID(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e ||
+			c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
+}
+
+// CanonicalFeedCommitResultJSON returns the EXACT canonical byte form of a
+// validated FeedCommitResult: the fixed Go struct field order (operationID,
+// feed, reference) with every value emitted as a JSON-safe literal. Because
+// operationID is constrained to a JSON-safe printable-ASCII alphabet and
+// feed/reference are lowercase-hex wire forms (no <, >, &, ", \, control, or
+// non-ASCII bytes), Go's json.Marshal would emit them VERBATIM with no
+// escaping — so this fixed concatenation IS byte-for-byte the canonical layout
+// every persisted result must match, and it is the exact string the DB
+// result-integrity trigger reconstructs in SQLite with plain concatenation.
+// Callers MUST have validated the result with ValidateCommitResult first.
+func CanonicalFeedCommitResultJSON(result FeedCommitResult) []byte {
+	return []byte(`{"operationID":"` + result.OperationID + `","feed":"` + result.Feed + `","reference":"` + result.Reference + `"}`)
 }
 
 // rejectDuplicateJSONMembers rejects duplicate member names anywhere in a JSON

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
@@ -99,11 +100,15 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 
 	// Adopt any quarantined migration-9 row for this operation on this FIRST
 	// request (before reservation) — atomically, only when the incoming request
-	// hash matches the legacy request_hash. A differing hash is a hard conflict
-	// (a reused OperationID with different input); a malformed legacy succeeded
-	// result fails closed and stays quarantined. After a successful adoption the
-	// active row drives the same idempotency path as any fresh reservation.
-	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash)
+	// hash matches either the current canonical request hash OR the exact
+	// historical migration-9 delimiter-framed hash (see legacyFeedCommitHash).
+	// The latter is how migration-9 rows were signed, so a logically identical
+	// legacy operation adopts; a differing hash under either algorithm is a
+	// hard conflict (a reused OperationID with different input); a malformed
+	// legacy succeeded result fails closed and stays quarantined. After a
+	// successful adoption the active row drives the same idempotency path as
+	// any fresh reservation.
+	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash, legacyFeedCommitHash(req))
 	if aerr != nil {
 		if errors.Is(aerr, errFeedSignerLegacyConflict) {
 			return publish.FeedCommitResult{}, errFeedSignerConflict
@@ -248,6 +253,13 @@ func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommit
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: encode result: %v", errFeedSignerBackend, err)
+	}
+	if !bytes.Equal(resultJSON, publish.CanonicalFeedCommitResultJSON(result)) {
+		// The canonical byte-exact form must be exactly what the DB trigger
+		// will accept; if json.Marshal escaped anything the request violated
+		// the JSON-safe contract and we fail closed rather than persist a
+		// non-canonical result.
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: result is not byte-canonical", errFeedSignerBackend)
 	}
 	if err := s.Store.CompleteFeedSignerOperation(ctx, req.OperationID, reqHash, claimToken, resultJSON); err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: persist result: %v", errFeedSignerBackend, err)
@@ -478,6 +490,45 @@ func writeHashInt(h io.Writer, v int64) {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], uint64(v))
 	h.Write(b[:])
+}
+
+// legacyFeedCommitHash reproduces the EXACT migration-9 (1e91614) request hash:
+// the ORIGINAL delimiter-framed SHA-256 over the RAW request fields in the
+// historical order (OperationID, RegistryID as decimal, Owner, Topic,
+// Reference, BatchID, ExpectedGeneration as decimal), each separated by a
+// single 0x00 byte, prefixed by the historical domain string. Migration-9
+// rows stored exactly this value in feed_signer_operations.request_hash, and
+// migration 10 quarantined those rows byte-for-byte.
+//
+// THIS FUNCTION IS MIGRATION-ONLY: it reproduces old bytes solely so
+// AdoptLegacyFeedSignerOperation can recognize and adopt a logically-identical
+// m9 row whose stored hash cannot match the length-prefixed
+// NormalizeFeedCommitHash. It MUST NOT be used to hash new requests
+// (NormalizeFeedCommitHash is the sole forward hashing function), and its
+// delimiter framing is deliberately never reintroduced for new rows — a NUL or
+// separator byte inside a value here can create field-boundary ambiguity,
+// which is exactly why the forward hash switched to fixed-width/length-prefix
+// framing. It hashes the RAW (un-normalized, as-supplied) owner/topic/
+// reference, precisely matching what migration 9 computed.
+func legacyFeedCommitHash(req publish.FeedCommitRequest) [32]byte {
+	h := sha256.New()
+	h.Write([]byte("uncloud-registry-feed-commit-req:v1\x00"))
+	h.Write([]byte(req.OperationID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(req.RegistryID, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(req.Owner))
+	h.Write([]byte{0})
+	h.Write([]byte(req.Topic))
+	h.Write([]byte{0})
+	h.Write([]byte(req.Reference))
+	h.Write([]byte{0})
+	h.Write([]byte(req.BatchID))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(req.ExpectedGeneration, 10)))
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
 // decodeStoredResult STRICTLY decodes a stored succeeded result JSON: duplicate
