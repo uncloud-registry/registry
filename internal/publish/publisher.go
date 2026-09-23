@@ -59,16 +59,6 @@ type Publisher struct {
 
 type DefaultBuilder struct{}
 
-type ociManifest struct {
-	SchemaVersion int `json:"schemaVersion"`
-	Config        struct {
-		Digest string `json:"digest"`
-	} `json:"config"`
-	Layers []struct {
-		Digest string `json:"digest"`
-	} `json:"layers"`
-}
-
 func (p Publisher) Publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string) (spec.RepoStateDocument, error) {
 	return p.publish(ctx, stateFeed, current, input, batchID, false, 0, "", "")
 }
@@ -84,6 +74,18 @@ func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current 
 }
 
 func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, error) {
+	// Strict pre-upload validation: parse the artifact, verify the
+	// handler-provided digest/size against the actual body, and confirm every
+	// referenced descriptor is available — ALL before the first object write.
+	// Invalid input must produce zero object puts and zero feed updates.
+	artifact, err := validateArtifactForPublish(input)
+	if err != nil {
+		return spec.RepoStateDocument{}, err
+	}
+	if err := validateManifestReferences(current, input, artifact); err != nil {
+		return spec.RepoStateDocument{}, err
+	}
+
 	manifestRef, err := p.Objects.Put(ctx, input.ManifestJSON, batchID)
 	if err != nil {
 		return spec.RepoStateDocument{}, fmt.Errorf("upload manifest bytes: %w", err)
@@ -132,7 +134,14 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 		return spec.RepoStateDocument{}, fmt.Errorf("build input missing repo, tag, or manifest digest")
 	}
 
-	if err := validateManifestReferences(current, input); err != nil {
+	// The builder stays self-validating for direct callers: it re-parses the
+	// artifact under the same strict contract the publish path enforces and
+	// confirms every referenced descriptor is available before building.
+	artifact, err := ParseArtifact(input.Manifest.MediaType, input.ManifestJSON)
+	if err != nil {
+		return spec.RepoStateDocument{}, fmt.Errorf("validate artifact: %w", err)
+	}
+	if err := validateManifestReferences(current, input, artifact); err != nil {
 		return spec.RepoStateDocument{}, err
 	}
 
@@ -160,35 +169,52 @@ func ComputeDigest(data []byte) string {
 	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
-func validateManifestReferences(current spec.RepoStateDocument, input BuildInput) error {
-	var manifest ociManifest
-	if err := json.Unmarshal(input.ManifestJSON, &manifest); err != nil {
-		return fmt.Errorf("decode manifest: %w", err)
+// validateArtifactForPublish strictly parses the manifest/index body and
+// enforces the caller contract at the earliest layer that holds BOTH the body
+// and the handler-provided descriptor: the computed body digest must equal
+// BuildInput.ManifestDigest and the actual body length must equal
+// BuildInput.Manifest.Size. A handler-derived descriptor can never disagree
+// unless wiring is broken, but a disagreeing descriptor is never accepted
+// silently. All failures are typed *ValidationError with no body echo.
+func validateArtifactForPublish(input BuildInput) (Artifact, error) {
+	artifact, err := ParseArtifact(input.Manifest.MediaType, input.ManifestJSON)
+	if err != nil {
+		return Artifact{}, err
 	}
-	if manifest.SchemaVersion != 2 {
-		return fmt.Errorf("unsupported manifest schema version: %d", manifest.SchemaVersion)
-	}
-
-	required := []string{}
-	if manifest.Config.Digest != "" {
-		required = append(required, manifest.Config.Digest)
-	}
-	for _, layer := range manifest.Layers {
-		if layer.Digest != "" {
-			required = append(required, layer.Digest)
+	if got := ComputeDigest(input.ManifestJSON); got != input.ManifestDigest {
+		return Artifact{}, &ValidationError{
+			Kind: ErrKindDigestMismatch,
+			Err:  fmt.Errorf("computed manifest body digest %s disagrees with the handler-provided digest %s", got, input.ManifestDigest),
 		}
 	}
+	if int64(len(input.ManifestJSON)) != input.Manifest.Size {
+		return Artifact{}, &ValidationError{
+			Kind: ErrKindSizeMismatch,
+			Err:  fmt.Errorf("manifest body is %d bytes but the handler-provided descriptor declares %d", len(input.ManifestJSON), input.Manifest.Size),
+		}
+	}
+	return artifact, nil
+}
 
-	for _, digest := range required {
-		if _, ok := current.Blobs[digest]; ok {
+// validateManifestReferences requires every descriptor referenced by the
+// artifact to be available: either in the current repository state or in the
+// caller's staged blob set. Index children are referenced manifests and only
+// resolve once index publication (Task 19) records them in repository state;
+// until then an index PUT fails here with zero writes rather than publishing
+// an index whose children cannot be served.
+func validateManifestReferences(current spec.RepoStateDocument, input BuildInput, artifact Artifact) error {
+	for _, ref := range artifact.References() {
+		if _, ok := current.Blobs[ref.Digest]; ok {
 			continue
 		}
-		if _, ok := input.StagedBlobs[digest]; ok {
+		if _, ok := input.StagedBlobs[ref.Digest]; ok {
 			continue
 		}
-		return fmt.Errorf("manifest references missing blob %q", digest)
+		return &ValidationError{
+			Kind: ErrKindMissingReference,
+			Err:  fmt.Errorf("manifest references blob %q that is neither in repository state nor staged", ref.Digest),
+		}
 	}
-
 	return nil
 }
 
