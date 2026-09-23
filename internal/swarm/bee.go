@@ -353,25 +353,40 @@ func defaultHTTPClient(client *http.Client) *http.Client {
 	return http.DefaultClient
 }
 
-// sanitizeBeeTransportError converts a transport failure (client.Do, response
-// body read) into a stable, DATA-FREE operation error. The raw error must
-// never be wrapped or echoed: a *url.Error carries the FULL request URL — for
-// the SOC upload that URL includes the signature query, and for feed
-// reads/lookups the owner/topic path segments — and a malicious RoundTripper
-// can smuggle arbitrary text (URLs, hostnames, owner/topic/batch/reference/
-// signature values) into its error. Only the safe internal context
-// cancellation/deadline outcomes keep their errors.Is signal by wrapping the
-// SENTINEL (never the transport error), so callers that need to distinguish a
-// cancelled or stalled request still can; everything else collapses to an
-// opaque fail-closed message. op must be a fixed internal constant, never
-// caller data.
-func sanitizeBeeTransportError(op string, err error) error {
+// sanitizeBeeTransportError converts a transport failure (request creation,
+// client.Do, response body read) into a stable, DATA-FREE operation error. The
+// raw error must never be wrapped or echoed: a *url.Error carries the FULL
+// request URL — for the SOC upload that URL includes the signature query, and
+// for feed reads/lookups the owner/topic path segments — and a malicious
+// RoundTripper can smuggle arbitrary text (URLs, hostnames,
+// owner/topic/batch/reference/signature values) into its error.
+//
+// The REQUEST CONTEXT is the sole authority for the context outcome: the safe
+// internal cancellation/deadline sentinels are preserved by wrapping
+// context.Canceled / context.DeadlineExceeded ONLY when the real derived
+// request context (the reqCtx the HTTP request and body read actually run
+// under) is done with that exact sentinel — never by trusting
+// errors.Is(untrustedErr, sentinel), because a malicious transport can forge
+// sentinel-wrapping errors while the request context is still live. When the
+// context is live, everything collapses to an opaque fail-closed message; when
+// the context is genuinely done, the returned error carries the TRUE sentinel
+// even if the transport error is unrelated or forged, so callers that need to
+// distinguish a genuinely cancelled or stalled request still can. A nil ctx
+// should not happen (call sites always pass the derived reqCtx) and fails
+// opaque. op must be a fixed internal constant, never caller data.
+func sanitizeBeeTransportError(ctx context.Context, op string, err error) error {
+	if ctx == nil {
+		return errors.New(op + " failed")
+	}
 	switch {
-	case errors.Is(err, context.Canceled):
+	case errors.Is(ctx.Err(), context.Canceled):
 		return fmt.Errorf("%s: %w", op, context.Canceled)
-	case errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return fmt.Errorf("%s: %w", op, context.DeadlineExceeded)
 	default:
+		// Context still live (or a non-standard ctx carried an unknown
+		// error): the untrusted transport error is NOT authority — neither
+		// its forged sentinels nor its text may survive sanitization.
 		return errors.New(op + " failed")
 	}
 }
@@ -438,12 +453,12 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		// The parse error names the offending URL; never wrap it.
-		return nil, errors.New("create feed lookup request failed")
+		return nil, sanitizeBeeTransportError(reqCtx, "create feed lookup request", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, sanitizeBeeTransportError("feed lookup request", err)
+		return nil, sanitizeBeeTransportError(reqCtx, "feed lookup request", err)
 	}
 	defer resp.Body.Close()
 
@@ -505,14 +520,14 @@ func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []by
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/chunks", bytes.NewReader(chunkData))
 	if err != nil {
 		// The parse error names the offending URL; never wrap it.
-		return nil, errors.New("create chunk upload request failed")
+		return nil, sanitizeBeeTransportError(reqCtx, "create chunk upload request", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, sanitizeBeeTransportError("chunk upload request", err)
+		return nil, sanitizeBeeTransportError(reqCtx, "chunk upload request", err)
 	}
 	defer resp.Body.Close()
 
@@ -523,7 +538,7 @@ func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []by
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 	if err != nil {
-		return nil, sanitizeBeeTransportError("read chunk upload response body", err)
+		return nil, sanitizeBeeTransportError(reqCtx, "read chunk upload response body", err)
 	}
 	if len(body) > beeFeedWriteMaxBody {
 		return nil, errors.New("chunk upload response exceeded the bound")
@@ -635,14 +650,14 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 	if err != nil {
 		// The parse error names the offending URL (which carries sig=...);
 		// never wrap it.
-		return errors.New("create soc upload request failed")
+		return sanitizeBeeTransportError(reqCtx, "create soc upload request", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return sanitizeBeeTransportError("soc upload request", err)
+		return sanitizeBeeTransportError(reqCtx, "soc upload request", err)
 	}
 	defer resp.Body.Close()
 

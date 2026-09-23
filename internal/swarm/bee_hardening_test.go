@@ -4,6 +4,16 @@ package swarm
 // response parsing, and typed-nil resolver safety. Every test here was written
 // FIRST against the pre-fix code and failed (RED), then the implementation was
 // hardened to make them pass (GREEN).
+//
+// Fix Round 2 RED suites: the request CONTEXT is the sole authority for the
+// context.Canceled / context.DeadlineExceeded outcome. A malicious transport
+// that forges sentinel-wrapping errors while the request context is live must
+// NOT get its sentinel preserved, and a genuinely cancelled / expired request
+// context must surface its own sentinel even when the transport error is
+// unrelated or forged. Every Round 2 test was written FIRST against the
+// round-1 sanitizer (which trusted errors.Is on the untrusted error) and
+// failed (RED); the sanitizer was then re-bound to the real derived request
+// context to make them pass (GREEN).
 
 import (
 	"context"
@@ -16,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
@@ -258,33 +269,301 @@ func TestBeeSequenceFeedUpdaterRequestCreationErrorsAreDataFree(t *testing.T) {
 	}
 }
 
-// ---- Context sentinels survive sanitization ----
+// ---- Round 2: the request CONTEXT is the sole sentinel authority ----
 
-func TestReadFeedTransportErrorPreservesContextSentinels(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name     string
-		sentinel error
-	}{
-		{"deadline exceeded", context.DeadlineExceeded},
-		{"canceled", context.Canceled},
-	} {
+// statusBodyFailTransport returns a response with the given status whose BODY
+// read always fails with the wrapped error, smuggling injected text into a
+// body-read error path (used for the chunk upload body-read sanitizer path).
+type statusBodyFailTransport struct {
+	status int
+	err    error
+}
+
+func (t statusBodyFailTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: t.status,
+		Header:     make(http.Header),
+		Body:       markerReadCloser{err: t.err},
+		Request:    req,
+	}, nil
+}
+
+// cancelledContext returns an already-cancelled context whose Err() is
+// deterministically context.Canceled.
+func cancelledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+// expiredContext returns an already-expired-deadline context whose Err() is
+// deterministically context.DeadlineExceeded (the deadline is in the past and
+// <-ctx.Done() guarantees the timer has fired before the caller uses it).
+func expiredContext() context.Context {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-10*time.Millisecond))
+	defer cancel()
+	<-ctx.Done()
+	return ctx
+}
+
+// forgedSentinelTransportErr is a fully attacker-controlled transport error: a
+// *url.Error carrying the full request URL (hostname, SOC signature query) and
+// injected marker text, whose inner error wraps BOTH context.Canceled and
+// context.DeadlineExceeded. Round 1 trusted errors.Is on this error and
+// preserved the forged sentinel; Round 2 must treat the request context as the
+// authority and ignore it.
+func forgedSentinelTransportErr() error {
+	return &url.Error{
+		URL: "https://" + dataFreeHost + "/soc/owner-" + dataFreeSigMarker + "/id?x=1&sig=" + dataFreeSigMarker,
+		Err: fmt.Errorf("%s: %w: %w", dataFreeText, context.Canceled, context.DeadlineExceeded),
+	}
+}
+
+// unrelatedAttackerTransportErr is a fully attacker-controlled transport error
+// that does NOT wrap any context sentinel: the classic data-leak shape with a
+// forged URL and injected marker text.
+func unrelatedAttackerTransportErr() error {
+	return &url.Error{
+		URL: "https://" + dataFreeHost + "/feeds/OWNERMARK/TOPICMARK",
+		Err: errors.New(dataFreeText),
+	}
+}
+
+// sentinelMatrixCase is one scenario in the Round 2 matrix.
+type sentinelMatrixCase struct {
+	name         string
+	ctx          context.Context
+	transportErr error
+	wantCanceled bool
+	wantDeadline bool
+}
+
+// requireSentinelMatrix runs the given path under the Round 2 sentinel matrix
+// and asserts, for each scenario, the exact errors.Is outcome AND that the
+// returned error is data-free (no attacker markers / URLs / signatures leak
+// through, even when a sentinel is preserved). run wires the transportErr into
+// whatever error path the path uses (client.Do failure, body-read failure) and
+// returns the sanitized error.
+func requireSentinelMatrix(t *testing.T, path string, markers []string, run func(ctx context.Context, transportErr error) error) {
+	t.Helper()
+	cases := []sentinelMatrixCase{
+		{"live context + forged sentinel error", context.Background(), forgedSentinelTransportErr(), false, false},
+		{"cancelled context + unrelated error", cancelledContext(), unrelatedAttackerTransportErr(), true, false},
+		{"cancelled context + forged error", cancelledContext(), forgedSentinelTransportErr(), true, false},
+		{"expired deadline + unrelated error", expiredContext(), unrelatedAttackerTransportErr(), false, true},
+		{"expired deadline + forged error", expiredContext(), forgedSentinelTransportErr(), false, true},
+	}
+	allMarkers := append(append([]string{}, markers...), dataFreeHost, dataFreeSigMarker, dataFreeText, "sig=")
+	for _, tc := range cases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			transportErr := &url.Error{
-				URL: "https://" + dataFreeHost + "/soc?id=1&sig=" + dataFreeSigMarker,
-				Err: tc.sentinel,
-			}
-			resolver := NewBeeFeedResolver("https://bee.invalid",
-				&http.Client{Transport: failTransport{transportErr}})
-			_, err := resolver.ReadFeed(context.Background(), "feed://owner/topic")
+			err := run(tc.ctx, tc.transportErr)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
-			if !errors.Is(err, tc.sentinel) {
-				t.Fatalf("errors.Is(%v) must survive sanitization, got: %v", tc.sentinel, err)
+			requireDataFree(t, err, path, allMarkers...)
+			if got := errors.Is(err, context.Canceled); got != tc.wantCanceled {
+				t.Fatalf("%s: errors.Is(context.Canceled) = %v, want %v (err: %v)", path, got, tc.wantCanceled, err)
 			}
-			if strings.Contains(err.Error(), dataFreeSigMarker) {
-				t.Fatalf("sanitized error must stay data-free, got: %v", err)
+			if got := errors.Is(err, context.DeadlineExceeded); got != tc.wantDeadline {
+				t.Fatalf("%s: errors.Is(context.DeadlineExceeded) = %v, want %v (err: %v)", path, got, tc.wantDeadline, err)
+			}
+		})
+	}
+}
+
+func TestReadFeedContextSentinelsFollowRequestContext(t *testing.T) {
+	t.Parallel()
+	t.Run("request", func(t *testing.T) {
+		requireSentinelMatrix(t, "ReadFeed request", []string{"OWNERMARK", "TOPICMARK", "bee.invalid"},
+			func(ctx context.Context, transportErr error) error {
+				resolver := NewBeeFeedResolver("https://bee.invalid",
+					&http.Client{Transport: failTransport{transportErr}})
+				_, err := resolver.ReadFeed(ctx, "feed://OWNERMARK/TOPICMARK")
+				return err
+			})
+	})
+	t.Run("body read", func(t *testing.T) {
+		requireSentinelMatrix(t, "ReadFeed body read", []string{"OWNERMARK", "TOPICMARK", "bee.invalid"},
+			func(ctx context.Context, transportErr error) error {
+				resolver := NewBeeFeedResolver("https://bee.invalid",
+					&http.Client{Transport: statusBodyFailTransport{http.StatusOK, transportErr}})
+				_, err := resolver.ReadFeed(ctx, "feed://OWNERMARK/TOPICMARK")
+				return err
+			})
+	})
+}
+
+func TestBeeSequenceFeedUpdaterLookupContextSentinelsFollowRequestContext(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	requireSentinelMatrix(t, "lookup request", []string{"OWNERMARK", "TOPICMARK", "bee.invalid"},
+		func(ctx context.Context, transportErr error) error {
+			updater := &BeeSequenceFeedUpdater{
+				BaseURL:    "https://bee.invalid",
+				HTTPClient: &http.Client{Transport: failTransport{transportErr}},
+				PrivateKey: privateKey,
+			}
+			_, err := updater.nextSequenceIndex(ctx, "OWNERMARK", "TOPICMARK")
+			return err
+		})
+}
+
+func TestBeeSequenceFeedUpdaterChunkContextSentinelsFollowRequestContext(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	batch := strings.Repeat("cd", 32)
+	markers := []string{"bee.invalid", batch}
+	t.Run("request", func(t *testing.T) {
+		requireSentinelMatrix(t, "chunk upload request", markers,
+			func(ctx context.Context, transportErr error) error {
+				updater := &BeeSequenceFeedUpdater{
+					BaseURL:    "https://bee.invalid",
+					HTTPClient: &http.Client{Transport: failTransport{transportErr}},
+					PrivateKey: privateKey,
+				}
+				_, err := updater.uploadChunk(ctx, []byte("data"), batch)
+				return err
+			})
+	})
+	t.Run("body read", func(t *testing.T) {
+		requireSentinelMatrix(t, "chunk upload body read", markers,
+			func(ctx context.Context, transportErr error) error {
+				updater := &BeeSequenceFeedUpdater{
+					BaseURL:    "https://bee.invalid",
+					HTTPClient: &http.Client{Transport: statusBodyFailTransport{http.StatusCreated, transportErr}},
+					PrivateKey: privateKey,
+				}
+				_, err := updater.uploadChunk(ctx, []byte("data"), batch)
+				return err
+			})
+	})
+}
+
+func TestBeeSequenceFeedUpdaterSOCContextSentinelsFollowRequestContext(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	batch := strings.Repeat("cd", 32)
+	requireSentinelMatrix(t, "soc upload request", []string{"bee.invalid", owner, batch},
+		func(ctx context.Context, transportErr error) error {
+			updater := &BeeSequenceFeedUpdater{
+				BaseURL:    "https://bee.invalid",
+				HTTPClient: &http.Client{Transport: failTransport{transportErr}},
+				PrivateKey: privateKey,
+			}
+			return updater.uploadSOC(ctx, owner, []byte{1, 2, 3}, []byte{4, 5, 6}, []byte("data"), batch)
+		})
+}
+
+// TestRequestCreationErrorsFollowRequestContext proves request-creation
+// failures (malformed base URL fails http.NewRequestWithContext) STILL route
+// through the sanitizer with the real derived context: a live context stays
+// opaque (no sentinel from the parse error), while a genuinely cancelled or
+// expired context surfaces ITS OWN sentinel. The parse error names the
+// offending URL (for SOC that URL carries sig=...), so it must never leak.
+func TestRequestCreationErrorsFollowRequestContext(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	base := "http://secret " + dataFreeSigMarker + ".invalid"
+	batch := strings.Repeat("cd", 32)
+	creationErr := func(run func(ctx context.Context) error) func(ctx context.Context, transportErr error) error {
+		return func(ctx context.Context, transportErr error) error { return run(ctx) }
+	}
+	markers := []string{dataFreeSigMarker, "http://secret", "sig="}
+	runs := []struct {
+		name string
+		run  func(ctx context.Context, transportErr error) error
+	}{
+		{"reader creation", creationErr(func(ctx context.Context) error {
+			resolver := NewBeeFeedResolver(base, &http.Client{Transport: failTransport{errors.New(dataFreeText)}})
+			_, err := resolver.ReadFeed(ctx, "feed://owner/topic")
+			return err
+		})},
+		{"lookup creation", creationErr(func(ctx context.Context) error {
+			updater := &BeeSequenceFeedUpdater{
+				BaseURL:    base,
+				HTTPClient: &http.Client{Transport: failTransport{errors.New(dataFreeText)}},
+				PrivateKey: privateKey,
+			}
+			_, err := updater.nextSequenceIndex(ctx, "abcd", "abcd")
+			return err
+		})},
+		{"chunk creation", creationErr(func(ctx context.Context) error {
+			updater := &BeeSequenceFeedUpdater{
+				BaseURL:    base,
+				HTTPClient: &http.Client{Transport: failTransport{errors.New(dataFreeText)}},
+				PrivateKey: privateKey,
+			}
+			_, err := updater.uploadChunk(ctx, []byte("data"), batch)
+			return err
+		})},
+		{"soc creation", creationErr(func(ctx context.Context) error {
+			updater := &BeeSequenceFeedUpdater{
+				BaseURL:    base,
+				HTTPClient: &http.Client{Transport: failTransport{errors.New(dataFreeText)}},
+				PrivateKey: privateKey,
+			}
+			return updater.uploadSOC(ctx, "abcd", []byte{1}, []byte{2}, []byte("data"), batch)
+		})},
+	}
+	for _, r := range runs {
+		r := r
+		t.Run(r.name, func(t *testing.T) {
+			requireSentinelMatrix(t, r.name, markers, r.run)
+		})
+	}
+}
+
+// TestSanitizeBeeTransportErrorContextIsAuthority pins the sanitizer's core
+// rule directly: ctx nil fails opaque; a live context NEVER preserves a
+// sentinel no matter what the untrusted error wraps; a done context ALWAYS
+// surfaces its own sentinel no matter how unrelated or forged the untrusted
+// error is.
+func TestSanitizeBeeTransportErrorContextIsAuthority(t *testing.T) {
+	t.Parallel()
+	forged := fmt.Errorf("%s: %w: %w", dataFreeText, context.Canceled, context.DeadlineExceeded)
+	plain := errors.New(dataFreeText)
+	cases := []struct {
+		name         string
+		ctx          context.Context
+		err          error
+		wantCanceled bool
+		wantDeadline bool
+	}{
+		{"nil context fails opaque", nil, forged, false, false},
+		{"live context + plain error is opaque", context.Background(), plain, false, false},
+		{"live context + forged sentinels is opaque", context.Background(), forged, false, false},
+		{"cancelled context + plain error", cancelledContext(), plain, true, false},
+		{"cancelled context + forged error", cancelledContext(), forged, true, false},
+		{"expired context + plain error", expiredContext(), plain, false, true},
+		{"expired context + forged error", expiredContext(), forged, false, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := sanitizeBeeTransportError(tc.ctx, "probe op", tc.err)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			requireDataFree(t, err, "sanitizer", dataFreeText)
+			if got := errors.Is(err, context.Canceled); got != tc.wantCanceled {
+				t.Fatalf("errors.Is(context.Canceled) = %v, want %v (err: %v)", got, tc.wantCanceled, err)
+			}
+			if got := errors.Is(err, context.DeadlineExceeded); got != tc.wantDeadline {
+				t.Fatalf("errors.Is(context.DeadlineExceeded) = %v, want %v (err: %v)", got, tc.wantDeadline, err)
 			}
 		})
 	}

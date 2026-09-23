@@ -236,12 +236,14 @@ func (r *BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue,
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
-		// The parse error names the offending URL; never wrap it.
-		return FeedValue{}, errors.New("create bee feed read request failed")
+		// The parse error names the offending URL; never wrap it. The
+		// derived request context stays the sentinel authority even on
+		// pre-HTTP request-construction failure.
+		return FeedValue{}, sanitizeBeeTransportError(reqCtx, "create bee feed read request", err)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return FeedValue{}, sanitizeBeeTransportError("bee feed read request", err)
+		return FeedValue{}, sanitizeBeeTransportError(reqCtx, "bee feed read request", err)
 	}
 	defer resp.Body.Close()
 
@@ -254,7 +256,7 @@ func (r *BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue,
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedResolveMaxBody+1))
 	if err != nil {
-		return FeedValue{}, sanitizeBeeTransportError("read bee feed response body", err)
+		return FeedValue{}, sanitizeBeeTransportError(reqCtx, "read bee feed response body", err)
 	}
 	if len(body) > beeFeedResolveMaxBody {
 		return FeedValue{}, errors.New("bee feed response exceeded the reference bound")
