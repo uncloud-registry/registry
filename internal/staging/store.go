@@ -18,7 +18,15 @@ type Store interface {
 	StageBlob(ctx context.Context, blob spec.StagedBlob) error
 	GetStagedBlob(ctx context.Context, uploadID string) (spec.StagedBlob, bool, error)
 	ListStagedBlobs(ctx context.Context, repo string, actor string) ([]spec.StagedBlob, error)
+	// ClearStagedBlobs removes every staged entry for the repo/actor pair.
 	ClearStagedBlobs(ctx context.Context, repo string, actor string) error
+	// ClearStagedBlobsByDigest removes ONLY the staged entries whose digests
+	// are in digests for the repo/actor pair; unrelated staged blobs are
+	// retained. Clearing an unknown digest is a no-op. This is the
+	// referenced-only consumption primitive: after a successful publication,
+	// exactly the digests the published manifest referenced are consumed while
+	// unrelated staged blobs survive for a later manifest.
+	ClearStagedBlobsByDigest(ctx context.Context, repo string, actor string, digests []string) error
 }
 
 type MemoryStore struct {
@@ -147,6 +155,27 @@ func (m *MemoryStore) ClearStagedBlobs(_ context.Context, repo string, actor str
 	for uploadID, blob := range m.staged {
 		if blob.Repo == repo && blob.Actor == actor {
 			delete(m.staged, uploadID)
+		}
+	}
+	return nil
+}
+
+// ClearStagedBlobsByDigest removes only the staged entries whose digest is in
+// digests for the given repo/actor pair, leaving every unrelated staged entry
+// in place. Unknown digests are ignored.
+func (m *MemoryStore) ClearStagedBlobsByDigest(_ context.Context, repo string, actor string, digests []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	wanted := make(map[string]struct{}, len(digests))
+	for _, digest := range digests {
+		wanted[digest] = struct{}{}
+	}
+	for uploadID, blob := range m.staged {
+		if blob.Repo == repo && blob.Actor == actor {
+			if _, ok := wanted[blob.Digest]; ok {
+				delete(m.staged, uploadID)
+			}
 		}
 	}
 	return nil

@@ -1296,9 +1296,9 @@ func TestBuildNextRejectsIndexPublication(t *testing.T) {
 
 // TestBuildNextPrefersCurrentRecordOverStagedGeneric proves the builder never
 // lets a staged unspecified (empty/octet-stream) record overwrite the richer
-// authoritative current record for the same digest, while still copying a
-// staged blob whose digest is NOT in current (Task 13 owns narrowing staged
-// copying broadly; this is only the same-digest overwrite safety).
+// authoritative current record for the same digest, and that staged blobs
+// whose digest is NEITHER in current NOR referenced by the next manifest (the
+// 'z' entry) are not copied at all — staged copying is referenced-only.
 func TestBuildNextPrefersCurrentRecordOverStagedGeneric(t *testing.T) {
 	current := spec.RepoStateDocument{Blobs: map[string]spec.BlobDescriptor{
 		dig('c'): {SwarmRef: "s-c-current", Size: 24, MediaType: ociConfigMT},
@@ -1322,8 +1322,8 @@ func TestBuildNextPrefersCurrentRecordOverStagedGeneric(t *testing.T) {
 	if got := next.Blobs[dig('a')]; got.SwarmRef != "s-a-current" || got.MediaType != ociLayerMT || got.Size != 1024 {
 		t.Fatalf("current layer record degraded by octet-stream staged entry: %+v", got)
 	}
-	if got, ok := next.Blobs[dig('z')]; !ok || got.SwarmRef != "s-z-staged" || got.Size != 7 {
-		t.Fatalf("staged blob not in current should still be copied, got %+v ok=%v", got, ok)
+	if got, ok := next.Blobs[dig('z')]; ok {
+		t.Fatalf("unreferenced staged blob must NOT be copied into next state, got %+v", got)
 	}
 }
 

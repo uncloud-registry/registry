@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/uncloud-registry/registry/internal/resolve"
 	"github.com/uncloud-registry/registry/internal/spec"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
@@ -88,7 +89,9 @@ func (m *MemoryRegistryFeedStore) ResolveFeed(_ context.Context, feed string) (s
 	defer m.mu.Unlock()
 	ref, ok := m.Feeds[feed]
 	if !ok {
-		return "", fmt.Errorf("feed %q not found", feed)
+		// Wrap the stable sentinel so the signer's generation-zero path can
+		// distinguish a conclusively absent feed from a real failure.
+		return "", fmt.Errorf("feed %q not found: %w", feed, resolve.ErrFeedNotFound)
 	}
 	return ref, nil
 }

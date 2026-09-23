@@ -391,7 +391,13 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		return
 	}
 
-	current, err := h.Resolver.ResolveRepoState(r.Context(), registryIdentity, repo)
+	// Safe first-publication resolution: a CONCLUSIVELY absent repository feed
+	// (generation zero, never written) is NOT an error — publication proceeds
+	// to create the repository as generation zero. Network, timeout, decode,
+	// integrity, and repo-mismatch failures stay typed errors. This optional
+	// resolution runs ONLY on the authorized manifest PUT path; pull and list
+	// paths keep the strict resolver and never synthesize missing state.
+	current, _, err := h.Resolver.ResolveRepoStateOptional(r.Context(), registryIdentity, repo)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", err.Error())
 		return
@@ -403,6 +409,22 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		return
 	}
 
+	// Parse the artifact at the handler boundary with the SAME strict routine
+	// the publisher runs (identical inputs → identical outcome), so the exact
+	// referenced digest set is known before staging selection and clearing:
+	// only referenced staged blobs enter the build input, and only they are
+	// consumed after a successful publication. Unrelated staged blobs stay
+	// staged.
+	artifact, err := publish.ParseArtifact(r.Header.Get("Content-Type"), body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", err.Error())
+		return
+	}
+	referencedDigests := make(map[string]struct{}, len(artifact.References()))
+	for _, ref := range artifact.References() {
+		referencedDigests[ref.Digest] = struct{}{}
+	}
+
 	stagedBlobs, err := h.Staging.ListStagedBlobs(r.Context(), repo, actor)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "MANIFEST_INVALID", err.Error())
@@ -410,6 +432,11 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	}
 	blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
 	for _, blob := range stagedBlobs {
+		// Referenced-only staging selection: staged blobs this manifest does
+		// not reference never enter the build input.
+		if _, isRef := referencedDigests[blob.Digest]; !isRef {
+			continue
+		}
 		blobMap[blob.Digest] = spec.BlobDescriptor{
 			SwarmRef:  blob.SwarmRef,
 			Size:      blob.Size,
@@ -436,7 +463,13 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		return
 	}
 
-	if err := h.Staging.ClearStagedBlobs(r.Context(), repo, actor); err != nil {
+	// Consume ONLY the staged digests the published manifest referenced;
+	// unrelated staged blobs remain staged for a later manifest.
+	consumed := make([]string, 0, len(referencedDigests))
+	for digest := range referencedDigests {
+		consumed = append(consumed, digest)
+	}
+	if err := h.Staging.ClearStagedBlobsByDigest(r.Context(), repo, actor, consumed); err != nil {
 		writeError(w, http.StatusInternalServerError, "MANIFEST_INVALID", err.Error())
 		return
 	}

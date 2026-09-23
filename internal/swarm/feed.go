@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
+	"github.com/uncloud-registry/registry/internal/resolve"
 )
 
 // FeedUpdate is the explicit, complete description of ONE sequence-feed
@@ -251,6 +252,12 @@ func (r *BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue,
 		// Drain a bounded amount (never the whole body) so the connection can
 		// be reused, but NEVER include the raw body in the returned error.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedResolveMaxBody+1))
+		if resp.StatusCode == http.StatusNotFound {
+			// A definitive 404 means the feed has never been written. Wrap the
+			// stable sentinel so the caller can distinguish a conclusively
+			// absent feed (generation-zero creation) from every other failure.
+			return FeedValue{}, fmt.Errorf("bee feed resolution failed with status %d: %w", resp.StatusCode, resolve.ErrFeedNotFound)
+		}
 		return FeedValue{}, fmt.Errorf("bee feed resolution failed with status %d", resp.StatusCode)
 	}
 

@@ -1876,3 +1876,184 @@ func TestFeedSignerMultiTagTwoRowsAmbiguity(t *testing.T) {
 		t.Fatalf("no active row may be created on ambiguity, got err=%v", err)
 	}
 }
+
+// --- Task 13: generation-zero first publication (create-if-absent) ---
+
+// TestFeedSignerGenerationZeroCreatesAbsentFeed proves the narrow
+// first-publication behavior: when the repository feed is CONCLUSIVELY absent
+// AND the request expects generation zero, the signer proceeds to create the
+// feed at the target reference (generation 1) instead of failing closed on the
+// missing feed. Everything else stays constrained: registry ready, owner
+// match, deterministic topic, batch permission — all still required.
+func TestFeedSignerGenerationZeroCreatesAbsentFeed(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	// The repository feed has never been written: remove it from the world.
+	delete(w.feedStore.Feeds, w.repoTopic)
+
+	result, err := w.signer.Commit(context.Background(), req)
+	if err != nil {
+		t.Fatalf("generation-zero first publication must create the feed: %v", err)
+	}
+	if result.Feed != req.Topic || result.Reference != publish.CanonicalReference(req.Reference) || result.OperationID != req.OperationID {
+		t.Fatalf("unexpected creation result: %+v", result)
+	}
+	// The feed was created at the target reference.
+	if got := w.feedStore.Feeds[w.repoTopic]; got != publish.CanonicalReference(req.Reference) {
+		t.Fatalf("repo feed not created: got %q want %q", got, req.Reference)
+	}
+	if got := w.feedStore.Batches[w.repoTopic]; got != req.BatchID {
+		t.Fatalf("creation must propagate the exact batch: got %q want %q", got, req.BatchID)
+	}
+}
+
+// TestFeedSignerGenerationZeroAlreadyCreatedFailsClosed proves a racing/earlier
+// first publication cannot be silently overwritten: once the feed EXISTS at
+// generation 1, a DIFFERENT first-push operation that still expects generation
+// zero fails closed with a generation conflict and the existing feed is never
+// touched.
+func TestFeedSignerGenerationZeroAlreadyCreatedFailsClosed(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+
+	// First publication creates the feed at generation 1.
+	first := refHex('a')
+	if _, err := w.signer.Commit(context.Background(), req); err != nil {
+		t.Fatalf("first publication: %v", err)
+	}
+	if got := w.feedStore.Feeds[w.repoTopic]; got != first {
+		t.Fatalf("first publication did not create the feed: %q", got)
+	}
+
+	// A second, DISTINCT operation publishes different content (different
+	// target) on the same feed still expecting generation zero: the feed now
+	// exists at generation 1, so it must fail closed as a generation conflict
+	// and never overwrite the existing feed.
+	staleRef := refHex('d')
+	w.docs.Documents[staleRef] = mustRepoDoc(t, testRepo, 1) // stale target would be gen 1
+	stale := req
+	stale.OperationID = "op-racing-first-push"
+	stale.Reference = staleRef
+	stale.ExpectedGeneration = 0
+	_, err := w.signer.Commit(context.Background(), stale)
+	if !errors.Is(err, errFeedSignerGenerationConflict) {
+		t.Fatalf("racing first push must fail closed with a generation conflict, got %v", err)
+	}
+	if got := w.feedStore.Feeds[w.repoTopic]; got != first {
+		t.Fatalf("racing first push overwrote the created feed: %q", got)
+	}
+}
+
+// TestFeedSignerMissingFeedNonZeroGenerationConflict proves the create path is
+// ONLY for generation zero: a conclusively absent feed with a NONZERO expected
+// generation is inconsistent and fails closed as a generation conflict (never
+// treated as creation, never as a success).
+func TestFeedSignerMissingFeedNonZeroGenerationConflict(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	req.ExpectedGeneration = 5
+	req.Reference = refHex('e')
+	w.docs.Documents[refHex('e')] = mustRepoDoc(t, testRepo, 6) // expected+1
+	req.Topic = w.repoTopic
+	delete(w.feedStore.Feeds, w.repoTopic)
+
+	_, err := w.signer.Commit(context.Background(), req)
+	if !errors.Is(err, errFeedSignerGenerationConflict) {
+		t.Fatalf("absent feed with nonzero expected generation must conflict, got %v", err)
+	}
+	if _, ok := w.feedStore.Feeds[w.repoTopic]; ok {
+		t.Fatal("absent feed must not be created for a nonzero expected generation")
+	}
+}
+
+// TestFeedSignerGenerationZeroWrongBatchFailsClosed proves the generation-zero
+// creation path does NOT relax the batch constraint: a batch not permitted by
+// the current stamp policy is the SAME validation/dependency error class as
+// before Task 13, the feed is NOT created, and nothing is marked successful.
+func TestFeedSignerGenerationZeroWrongBatchFailsClosed(t *testing.T) {
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+	})
+	req.RegistryID = w.registry.ID
+	req.BatchID = "not-the-policy-batch"
+	w.fillTopic(&req)
+	req.BatchID = "not-the-policy-batch"
+	delete(w.feedStore.Feeds, w.repoTopic)
+
+	_, err := w.signer.Commit(context.Background(), req)
+	if !errors.Is(err, errFeedSignerMalformed) {
+		t.Fatalf("wrong batch on generation-zero creation must stay the malformed/dependency error class, got %v", err)
+	}
+	if _, ok := w.feedStore.Feeds[w.repoTopic]; ok {
+		t.Fatal("feed must not be created when the batch is not permitted")
+	}
+}
+
+// TestFeedSignerConcurrentFirstPushesOneAdvancement proves simultaneous first
+// pushes (distinct operations, absent feed, both expecting generation zero)
+// never silently overwrite: exactly ONE publication succeeds, exactly ONE
+// external feed update happens, and the feed advances exactly once.
+func TestFeedSignerConcurrentFirstPushesOneAdvancement(t *testing.T) {
+	// Shared world with NO repo feed: only the stamp feed exists.
+	w := newSharedFeedWorld(t, 2,
+		map[string]string{spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
+		map[string][]byte{
+			refHex('a'): mustRepoDoc(t, testRepo, 1),
+			refHex('d'): mustRepoDoc(t, testRepo, 1),
+			refHex('c'): mustStampDoc(t, "batch-1"),
+		})
+
+	reqA := validCommitReq(w.reg.ID, "batch-1")
+	reqA.OperationID = "first-push-A"
+	reqA.Owner = "0x" + testFeedOwner
+	reqA.Topic = w.topic
+	reqA.Reference = refHex('a')
+	reqA.ExpectedGeneration = 0
+
+	reqB := reqA
+	reqB.OperationID = "first-push-B"
+	reqB.Reference = refHex('d')
+
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	done.Add(2)
+	var mu sync.Mutex
+	successes := 0
+	run := func(signer *FeedSigner, req publish.FeedCommitRequest) {
+		defer done.Done()
+		start.Wait()
+		if _, err := signer.Commit(context.Background(), req); err == nil {
+			mu.Lock()
+			successes++
+			mu.Unlock()
+		}
+	}
+	go run(w.signers[0], reqA)
+	go run(w.signers[1], reqB)
+	start.Done()
+	done.Wait()
+
+	if successes != 1 {
+		t.Fatalf("expected exactly one concurrent first push to succeed, got %d", successes)
+	}
+	if got := w.updater.count(); got != 1 {
+		t.Fatalf("expected exactly 1 external feed update across concurrent first pushes, got %d", got)
+	}
+	stored := w.feeds.Feeds[w.topic]
+	if stored != refHex('a') && stored != refHex('d') {
+		t.Fatalf("feed must point at ONE winner's reference, got %q", stored)
+	}
+}

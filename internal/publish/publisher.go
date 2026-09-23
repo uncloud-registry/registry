@@ -140,7 +140,8 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 	// same routine Publish uses — body digest/size/media coherence plus
 	// reference availability — so a direct caller with a wrong digest, size,
 	// or media type fails typed and leaves input/current unmutated.
-	if _, err := validateInputArtifact(current, input); err != nil {
+	artifact, err := validateInputArtifact(current, input)
+	if err != nil {
 		return spec.RepoStateDocument{}, err
 	}
 
@@ -154,14 +155,23 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 		Blobs:      cloneBlobMap(current.Blobs),
 	}
 
-	// Copy the staged blobs into the next state. Task 13 owns narrowing this
-	// to only the referenced staged blobs broadly; here we apply only the
-	// same-digest metadata-safety rule: a staged record MUST NOT overwrite a
-	// digest already present in current state, because current is the
-	// authoritative, richer record and a generic staged placeholder
-	// (empty/application/octet-stream) would otherwise degrade it.
+	// Copy staged blobs into the next state REFERENCED-ONLY: a staged blob is
+	// included iff the artifact references its digest. Unrelated staged blobs
+	// (pushed alongside, never referenced) stay OUT of repository state — they
+	// are retained in staging, not published. The same-digest metadata-safety
+	// rule still applies: a referenced staged record NEVER overwrites a digest
+	// already present in current state, because current is the authoritative,
+	// richer record and a generic staged placeholder (empty or
+	// application/octet-stream) would otherwise degrade it.
+	referenced := make(map[string]struct{}, len(artifact.References()))
+	for _, ref := range artifact.References() {
+		referenced[ref.Digest] = struct{}{}
+	}
 	for digest, desc := range input.StagedBlobs {
 		if _, exists := current.Blobs[digest]; exists {
+			continue
+		}
+		if _, isRef := referenced[digest]; !isRef {
 			continue
 		}
 		next.Blobs[digest] = desc

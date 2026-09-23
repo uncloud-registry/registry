@@ -421,6 +421,20 @@ func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.F
 func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) (bool, error) {
 	currentRef, err := s.ResolveFeeds.ResolveFeed(ctx, req.Topic)
 	if err != nil {
+		// Generation-zero first publication: a CONCLUSIVELY absent repo feed
+		// (never written) with ExpectedGeneration 0 is a creation, not a
+		// failure — the signer proceeds to verify the batch and stamp the
+		// first update at the target reference. Any OTHER feed-resolution
+		// failure (network, timeout, auth, decode) stays a backend error, and
+		// a missing feed with a NONZERO expected generation is inconsistent
+		// and fails closed as a generation conflict — the create path exists
+		// ONLY for generation zero.
+		if errors.Is(err, resolve.ErrFeedNotFound) {
+			if req.ExpectedGeneration != 0 {
+				return false, fmt.Errorf("%w: current repo feed is absent but the request expects generation %d", errFeedSignerGenerationConflict, req.ExpectedGeneration)
+			}
+			return false, nil
+		}
 		return false, fmt.Errorf("%w: current repo feed: %v", errFeedSignerBackend, err)
 	}
 	if swarm.CanonicalObjectRef(currentRef) == swarm.CanonicalObjectRef(req.Reference) {

@@ -198,6 +198,15 @@ func (s *BeeDocumentStore) readPath(ctx context.Context, path string) ([]byte, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusNotFound {
+			// A definitive 404 is the conclusively-absent outcome (a repo
+			// feed payload that has never been written, or a content chunk
+			// that does not exist). Wrap the stable sentinel so the optional
+			// resolver can distinguish absence from corruption/transport
+			// failures; the raw Bee body is never echoed.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			return nil, fmt.Errorf("bee read failed with status %d: %w", resp.StatusCode, resolve.ErrDocumentNotFound)
+		}
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("bee read failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
