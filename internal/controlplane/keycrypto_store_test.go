@@ -1392,9 +1392,15 @@ func (s stubFeedKeyDecryptor) WithDecryptedFeedKey(_ context.Context, _ int64, f
 func TestBeeRegistryFeedUpdaterBoundary(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
+	// Canonical values so the signer reaches the OWNER check (never a
+	// validation failure): the ref/batch are 64-hex and the feed owner is
+	// canonical 40-hex but does not match the arbitrary test key's owner.
+	canonicalFeed := "feed://1111111111111111111111111111111111111111/" + strings.Repeat("ab", 32)
+	hexRef := strings.Repeat("ab", 32)
+	hexBatch := strings.Repeat("cd", 32)
 	// No decryptor: refuse, never hand anything to the signer.
 	updater := BeeRegistryFeedUpdater{BaseURL: "http://bee.invalid", HTTPClient: nil}
-	err := updater.UpdateRegistryFeed(ctx, Registry{ID: 1}, "feed", "ref")
+	err := updater.UpdateRegistryFeed(ctx, Registry{ID: 1}, canonicalFeed, hexRef, hexBatch)
 	if err == nil {
 		t.Fatal("updater without a decryptor must fail closed")
 	}
@@ -1410,7 +1416,7 @@ func TestBeeRegistryFeedUpdaterBoundary(t *testing.T) {
 		BaseURL: "http://bee.invalid",
 		Keys:    stubFeedKeyDecryptor{key: key},
 	}
-	err = updater.UpdateRegistryFeed(ctx, Registry{ID: 1, FeedOwnerAddress: "0xfeed"}, "feed", "ref")
+	err = updater.UpdateRegistryFeed(ctx, Registry{ID: 1, FeedOwnerAddress: "0xfeed"}, canonicalFeed, hexRef, hexBatch)
 	if err == nil {
 		t.Fatal("expected the signer to fail on the unreachable bee endpoint")
 	}
@@ -1420,7 +1426,7 @@ func TestBeeRegistryFeedUpdaterBoundary(t *testing.T) {
 	// The decryptor's error propagates untouched.
 	decErr := errors.New("decryptor failure")
 	updater.Keys = stubFeedKeyDecryptor{err: decErr}
-	if err := updater.UpdateRegistryFeed(ctx, Registry{ID: 1}, "feed", "ref"); !errors.Is(err, decErr) {
+	if err := updater.UpdateRegistryFeed(ctx, Registry{ID: 1}, canonicalFeed, hexRef, hexBatch); !errors.Is(err, decErr) {
 		t.Fatalf("decryptor error must propagate: %v", err)
 	}
 }

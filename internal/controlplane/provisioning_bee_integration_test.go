@@ -3,6 +3,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,18 +18,20 @@ import (
 // beeIntegrationServer is a minimal in-memory Bee HTTP surface used to prove
 // the REAL reconcile path end-to-end: POST /bytes returns a deterministic
 // 64-hex ref for the uploaded payload, GET /bytes/<ref> returns the payload
-// back, and GET /feeds/<owner>/<topic> returns the RAW object reference
-// currently stored at that feed (the feed body IS the reference — no 8-byte
-// chunk prefix). This is the endpoint model the production resolver relies on.
+// back, and GET /feeds/<owner>/<topic> returns the RAW BINARY payload
+// currently stored at that feed (the Task 11 wire contract: the decoded
+// 32-byte reference, no ASCII hex, no 8-byte chunk prefix) plus the required
+// Swarm-Feed-Index header. This is the endpoint model the production
+// resolver relies on.
 type beeIntegrationServer struct {
 	mu       sync.Mutex
 	payloads map[string][]byte
-	feeds    map[string]string
+	feeds    map[string][]byte
 	seq      int
 }
 
 func newBeeIntegrationServer() *beeIntegrationServer {
-	return &beeIntegrationServer{payloads: map[string][]byte{}, feeds: map[string]string{}}
+	return &beeIntegrationServer{payloads: map[string][]byte{}, feeds: map[string][]byte{}}
 }
 
 // pathForFeedRef maps a feed://owner/topic reference to the /feeds/owner/topic
@@ -69,14 +72,20 @@ func (s *beeIntegrationServer) handler() http.Handler {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(payload)
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/feeds/"):
-			// The feed endpoint returns the raw object reference body.
-			ref, ok := s.feeds[r.URL.Path]
+			// The feed endpoint returns the raw BINARY payload: the 32 decoded
+			// reference bytes (Bee serves the chunk payload as
+			// application/octet-stream with the span stripped), plus the
+			// required index headers.
+			payload, ok := s.feeds[r.URL.Path]
 			if !ok {
 				http.NotFound(w, r)
 				return
 			}
+			w.Header().Set("Swarm-Feed-Index", "0000000000000000")
+			w.Header().Set("Swarm-Feed-Index-Next", "0000000000000001")
+			w.Header().Set("Content-Type", "application/octet-stream")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(ref))
+			_, _ = w.Write(payload)
 		default:
 			http.NotFound(w, r)
 		}
@@ -85,15 +94,20 @@ func (s *beeIntegrationServer) handler() http.Handler {
 
 // beeIntegrationFeeds writes a feed update into the SAME authoritative feed map
 // the HTTP server resolves from, so the updater's write is exactly what the
-// real resolver reads back over the wire.
+// real resolver reads back over the wire. The 64-hex reference is stored
+// DECODED (the binary 32-byte payload the Task 11 resolver reads).
 type beeIntegrationFeeds struct {
 	server *beeIntegrationServer
 }
 
-func (b *beeIntegrationFeeds) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string) error {
+func (b *beeIntegrationFeeds) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string) error {
+	raw, err := hex.DecodeString(ref)
+	if err != nil || len(raw) != 32 {
+		return fmt.Errorf("integration feed ref must be a 64-hex reference")
+	}
 	b.server.mu.Lock()
 	defer b.server.mu.Unlock()
-	b.server.feeds[pathForFeedRef(feed)] = ref
+	b.server.feeds[pathForFeedRef(feed)] = raw
 	return nil
 }
 
@@ -210,7 +224,15 @@ func TestProvisioningRealBeeResolverCatchesMisdirectedFeed(t *testing.T) {
 		} else {
 			feed = stampPolicyFeedRef(created.Registry)
 		}
-		beesrv.feeds[pathForFeedRef(feed)] = fmt.Sprintf("%064x", 999_999)
+		// Seed a WRONG (but valid) binary reference, simulating a mis-directed
+		// feed: the resolver reads raw binary, so the 64-hex ref must be
+		// decoded to its 32 bytes exactly as a real Task-11 feed payload.
+		wrong := fmt.Sprintf("%064x", 999_999)
+		raw, derr := hex.DecodeString(wrong)
+		if derr != nil {
+			t.Fatalf("decode seeded ref: %v", derr)
+		}
+		beesrv.feeds[pathForFeedRef(feed)] = raw
 	}
 	beesrv.mu.Unlock()
 

@@ -203,10 +203,11 @@ func (r *Reconciler) reconcileJob(ctx context.Context, job PublicationJob, worke
 	}
 
 	// Stage 2 — publish the feed pointing at the uploaded object. Skip when
-	// the feed ref is already persisted.
+	// the feed ref is already persisted. The registry's default stamp batch is
+	// the exact postage batch that also stamped the uploaded object.
 	if job.FeedRef == "" {
 		feed := r.feedRefForJob(reg, job.Kind)
-		if err := r.Feeds.UpdateRegistryFeed(ctx, reg, feed, job.ObjectRef); err != nil {
+		if err := r.Feeds.UpdateRegistryFeed(ctx, reg, feed, job.ObjectRef, reg.DefaultStampBatchID); err != nil {
 			return r.failRetryable(ctx, job, worker, now, "feed update failed")
 		}
 		if err := r.Store.SetPublicationFeedRef(ctx, job.ID, worker, feed); err != nil {

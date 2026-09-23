@@ -26,7 +26,7 @@ import (
 // see, simulating a no-op/forgotten-feeder. Completion must never happen.
 type noopFeedUpdater struct{}
 
-func (noopFeedUpdater) UpdateRegistryFeed(context.Context, Registry, string, string) error {
+func (noopFeedUpdater) UpdateRegistryFeed(context.Context, Registry, string, string, string) error {
 	return nil
 }
 

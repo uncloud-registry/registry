@@ -67,14 +67,14 @@ type failFeedUpdater struct {
 	mu      sync.Mutex
 }
 
-func (f *failFeedUpdater) UpdateRegistryFeed(c context.Context, reg Registry, feed, ref string) error {
+func (f *failFeedUpdater) UpdateRegistryFeed(c context.Context, reg Registry, feed, ref, batchID string) error {
 	f.mu.Lock()
 	shouldFail := f.failFor[feed]
 	f.mu.Unlock()
 	if shouldFail {
 		return errors.New("injected feed update failure")
 	}
-	return f.inner.UpdateRegistryFeed(c, reg, feed, ref)
+	return f.inner.UpdateRegistryFeed(c, reg, feed, ref, batchID)
 }
 
 func (f *failFeedUpdater) fail(feed string) { f.mu.Lock(); f.failFor[feed] = true; f.mu.Unlock() }
@@ -223,6 +223,15 @@ func TestProvisioningAuthSuccessThenStampFailureIsResumable(t *testing.T) {
 	}
 	if h.feeds.inner.Feeds[stampFeed] == "" {
 		t.Fatal("expected stamp feed to be published after recovery")
+	}
+	// Task 11: the reconciler must propagate the registry's EXACT postage
+	// batch into the updater for BOTH policy feeds — never a substitution.
+	authFeed := authPolicyFeedRef(reg)
+	if got := h.feedStore.Batches[authFeed]; got != reg.DefaultStampBatchID {
+		t.Fatalf("auth feed must be stamped with the registry batch: got %q want %q", got, reg.DefaultStampBatchID)
+	}
+	if got := h.feedStore.Batches[stampFeed]; got != reg.DefaultStampBatchID {
+		t.Fatalf("stamp feed must be stamped with the registry batch: got %q want %q", got, reg.DefaultStampBatchID)
 	}
 }
 

@@ -30,7 +30,7 @@ func (*panicObjectStore) Get(_ context.Context, _ string) ([]byte, error) {
 
 type panicFeedUpdater struct{}
 
-func (*panicFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, _, _ string) error {
+func (*panicFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, _, _, _ string) error {
 	panic("panicFeedUpdater.UpdateRegistryFeed must never be invoked")
 }
 
@@ -155,7 +155,7 @@ func (valueDocs) Get(_ context.Context, _ string) ([]byte, error)           { re
 
 type valueFeeds struct{}
 
-func (valueFeeds) UpdateRegistryFeed(_ context.Context, _ Registry, _, _ string) error {
+func (valueFeeds) UpdateRegistryFeed(_ context.Context, _ Registry, _, _, _ string) error {
 	return nil
 }
 

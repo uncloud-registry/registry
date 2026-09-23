@@ -3,6 +3,7 @@ package swarm
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"io"
 	"net/http"
@@ -109,7 +110,7 @@ func TestSubdomainENSRegistryResolver(t *testing.T) {
 	}
 }
 
-func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
+func TestBeeSequenceFeedUpdaterPublishesExplicitBatchBinarySOCUpdate(t *testing.T) {
 	t.Parallel()
 
 	privateKey, err := ethcrypto.GenerateKey()
@@ -118,14 +119,21 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 	}
 	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
 
-	// The ref below is an in-memory/symbolic object ref (Task 11 owns the
-	// binary 32-byte ref contract). Its feed CHUNK body must still be valid Bee
-	// wire framing: 8-byte little-endian span (payload length) + the payload
-	// bytes. This pins the exact span-prefixed body for BOTH /chunks and /soc.
-	const ref = "repo-state-ref"
-	wantChunk := append([]byte{
-		0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // span = 14 (len(ref))
-	}, []byte(ref)...)
+	// Task 11 contract: the reference is a 64-hex immutable object ref (32
+	// bytes) and the feed chunk payload is the 8-byte little-endian span (=32)
+	// followed by the DECODED BINARY 32 bytes — never the 64 ASCII hex chars.
+	const ref = "abababababababababababababababababababababababababababababababab"
+	const batch = "cdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdef"
+	refBytes, err := hex.DecodeString(ref)
+	if err != nil {
+		t.Fatalf("decode ref: %v", err)
+	}
+	// The exact wire body /chunks and /soc must receive: span = 32 (LE) then
+	// the decoded 32 binary bytes. Constructed explicitly so the test does not
+	// share a helper with the implementation under test.
+	wantChunk := make([]byte, 8+32)
+	binary.LittleEndian.PutUint64(wantChunk[:8], 32)
+	copy(wantChunk[8:], refBytes)
 
 	var gotChunkBody []byte
 	var gotSOCBody []byte
@@ -135,7 +143,7 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/feeds/"+owner+"/abcd":
+		case r.Method == http.MethodGet && r.URL.Path == "/feeds/"+owner+"/"+strings.Repeat("ab", 32):
 			http.NotFound(w, r)
 		case r.Method == http.MethodPost && r.URL.Path == "/chunks":
 			body, _ := io.ReadAll(r.Body)
@@ -164,18 +172,25 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 		t.Fatalf("create updater: %v", err)
 	}
 
-	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/abcd", ref); err != nil {
+	if err := updater.Update(context.Background(), FeedUpdate{
+		Feed:      "feed://" + owner + "/" + strings.Repeat("ab", 32),
+		Reference: ref,
+		BatchID:   batch,
+	}); err != nil {
 		t.Fatalf("update feed: %v", err)
 	}
 
-	// EVERY staging request must be a bounded, closed-body, exact-frame write.
-	// The /chunks body is the exact span-prefixed chunk for this ref...
+	// /chunks and /soc must receive the IDENTICAL exact binary framed body:
+	// 8-byte little-endian span = 32 + the decoded 32-byte reference. None of
+	// the 64 ASCII hex reference bytes may appear in the payload.
 	if !bytes.Equal(gotChunkBody, wantChunk) {
-		t.Fatalf("chunk body must be exact span-prefixed framing:\n got %x\nwant %x", gotChunkBody, wantChunk)
+		t.Fatalf("chunk body must be span=32 + decoded binary reference:\n got %x\nwant %x", gotChunkBody, wantChunk)
 	}
-	// ...and the SOC body carries the SAME span-prefixed chunk.
 	if !bytes.Equal(gotSOCBody, wantChunk) {
-		t.Fatalf("soc body must carry the same span-prefixed chunk:\n got %x\nwant %x", gotSOCBody, wantChunk)
+		t.Fatalf("soc body must carry the same span=32 + decoded binary reference:\n got %x\nwant %x", gotSOCBody, wantChunk)
+	}
+	if bytes.Contains(gotChunkBody, []byte(ref)) {
+		t.Fatal("chunk body must never carry the 64 ASCII hex reference bytes")
 	}
 	if gotSOCPath == "" {
 		t.Fatal("expected soc upload path")
@@ -189,7 +204,7 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 	// Sequence index use: the feed was not found, so the updater must use a
 	// zero (8-byte) next index and derive the SOC identifier from the topic +
 	// that zero index. The identifier is the hex of keccak(topic || zeros).
-	topicBytes, err := hex.DecodeString("abcd")
+	topicBytes, err := hex.DecodeString(strings.Repeat("ab", 32))
 	if err != nil {
 		t.Fatalf("decode topic: %v", err)
 	}
@@ -200,11 +215,16 @@ func TestBeeSequenceFeedUpdaterPublishesSOCUpdate(t *testing.T) {
 	if pathID != wantID {
 		t.Fatalf("soc identifier must derive from topic+zero next index:\n got %s\nwant %s", pathID, wantID)
 	}
-	// The batch id is currently the ref itself (baseline defect owned by Task 11,
-	// which introduces an explicit BatchID in FeedUpdate); it must still be
-	// bounded and non-empty on both endpoints.
-	if gotChunkBatch != ref || gotSOCBatch != ref {
-		t.Fatalf("batch id must equal the ref (Task 11 owns explicit batch): chunk=%q soc=%q", gotChunkBatch, gotSOCBatch)
+	// The EXPLICIT postage batch must be carried unchanged on BOTH endpoints
+	// and must never be substituted with the content reference.
+	if gotChunkBatch != batch {
+		t.Fatalf("chunk batch id must be the explicit batch, got %q", gotChunkBatch)
+	}
+	if gotSOCBatch != batch {
+		t.Fatalf("soc batch id must be the explicit batch, got %q", gotSOCBatch)
+	}
+	if gotChunkBatch == ref || gotSOCBatch == ref {
+		t.Fatal("batch id must never equal the content reference")
 	}
 }
 
@@ -220,8 +240,10 @@ func TestBeeSequenceFeedUpdaterRespectsNextIndexHeader(t *testing.T) {
 		t.Fatalf("generate private key: %v", err)
 	}
 	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
-	const topic = "abcd"
+	topic := strings.Repeat("ab", 32)  // 64 hex
 	const nextHex = "1122334455667788" // 8 bytes, non-zero
+	const ref = "abababababababababababababababababababababababababababababababab"
+	const batch = "cdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdef"
 
 	var gotSOCPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -248,8 +270,11 @@ func TestBeeSequenceFeedUpdaterRespectsNextIndexHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create updater: %v", err)
 	}
-	const ref = "repo-state-ref" // 13 bytes; bounded symbolic ref
-	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/"+topic, ref); err != nil {
+	if err := updater.Update(context.Background(), FeedUpdate{
+		Feed:      "feed://" + owner + "/" + topic,
+		Reference: ref,
+		BatchID:   batch,
+	}); err != nil {
 		t.Fatalf("update feed: %v", err)
 	}
 
@@ -284,7 +309,11 @@ func TestBeeSequenceFeedUpdaterOwnerMismatchFailsBeforeNetwork(t *testing.T) {
 		t.Fatalf("create updater: %v", err)
 	}
 	const wrongOwner = "ffffffffffffffffffffffffffffffffffffffff"
-	if err := updater.UpdateFeed(context.Background(), "feed://"+wrongOwner+"/abcd", "repo-state-ref"); err == nil {
+	if err := updater.Update(context.Background(), FeedUpdate{
+		Feed:      "feed://" + wrongOwner + "/" + strings.Repeat("ab", 32),
+		Reference: strings.Repeat("ab", 32),
+		BatchID:   strings.Repeat("cd", 32),
+	}); err == nil {
 		t.Fatal("expected an owner/signer mismatch to fail")
 	}
 	if touched {
@@ -298,7 +327,11 @@ func TestBeeSequenceFeedUpdaterOwnerMismatchFailsBeforeNetwork(t *testing.T) {
 func TestBeeSequenceFeedUpdaterZeroValueFailsClosed(t *testing.T) {
 	t.Parallel()
 	var updater BeeSequenceFeedUpdater
-	if err := updater.UpdateFeed(context.Background(), "feed://a/b", "ref"); err == nil {
+	if err := updater.Update(context.Background(), FeedUpdate{
+		Feed:      "feed://" + strings.Repeat("ab", 20) + "/" + strings.Repeat("ab", 32),
+		Reference: strings.Repeat("ab", 32),
+		BatchID:   strings.Repeat("cd", 32),
+	}); err == nil {
 		t.Fatal("expected a zero-value updater to fail closed")
 	}
 }
@@ -516,8 +549,149 @@ func TestBeeSequenceFeedUpdaterWriterRejectsOversizeRef(t *testing.T) {
 		t.Fatalf("create updater: %v", err)
 	}
 	big := strings.Repeat("a", beeFeedWriteMaxRef+1)
-	if err := updater.UpdateFeed(context.Background(), "feed://"+owner+"/abcd", big); err == nil {
+	if err := updater.Update(context.Background(), FeedUpdate{
+		Feed:      "feed://" + owner + "/" + strings.Repeat("ab", 32),
+		Reference: big,
+		BatchID:   strings.Repeat("cd", 32),
+	}); err == nil {
 		t.Fatal("expected an over-bound ref to be rejected")
+	}
+}
+
+// TestBeeSequenceFeedUpdaterRejectsMalformedBeforeNetwork proves malformed
+// reference, batch, and feed values are REJECTED before any network call: an
+// empty/bad reference, a batch that is not exactly 64 hex characters, and a
+// non-canonical feed all fail closed with zero requests issued to Bee.
+func TestBeeSequenceFeedUpdaterRejectsMalformedBeforeNetwork(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	goodRef := strings.Repeat("ab", 32)
+	goodBatch := strings.Repeat("cd", 32)
+
+	cases := []struct {
+		name  string
+		feed  string
+		ref   string
+		batch string
+	}{
+		{"empty reference", "feed://" + owner + "/" + strings.Repeat("ab", 32), "", goodBatch},
+		{"short reference", "feed://" + owner + "/" + strings.Repeat("ab", 32), strings.Repeat("ab", 31), goodBatch},
+		{"non-hex reference", "feed://" + owner + "/" + strings.Repeat("ab", 32), strings.Repeat("zz", 32), goodBatch},
+		{"empty batch", "feed://" + owner + "/" + strings.Repeat("ab", 32), goodRef, ""},
+		{"short batch", "feed://" + owner + "/" + strings.Repeat("ab", 32), goodRef, strings.Repeat("cd", 31)},
+		{"non-hex batch", "feed://" + owner + "/" + strings.Repeat("ab", 32), goodRef, strings.Repeat("zz", 32)},
+		{"oversize batch", "feed://" + owner + "/" + strings.Repeat("ab", 32), goodRef, strings.Repeat("cd", 33)},
+		{"non-canonical feed scheme", "http://" + owner + "/" + strings.Repeat("ab", 32), goodRef, goodBatch},
+		{"short topic", "feed://" + owner + "/abcd", goodRef, goodBatch},
+		{"uppercase owner", "feed://" + strings.ToUpper(owner) + "/" + strings.Repeat("ab", 32), goodRef, goodBatch},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var touched int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				touched++
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+			updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+			if err != nil {
+				t.Fatalf("create updater: %v", err)
+			}
+			if err := updater.Update(context.Background(), FeedUpdate{Feed: tc.feed, Reference: tc.ref, BatchID: tc.batch}); err == nil {
+				t.Fatalf("%s: expected rejection, got nil", tc.name)
+			}
+			if touched != 0 {
+				t.Fatalf("%s: validation must fail before any network call, got %d requests", tc.name, touched)
+			}
+		})
+	}
+}
+
+// TestBeeSequenceFeedUpdaterIndexFailuresFailClosedBeforeSOC proves the
+// sequence header is STRICTLY validated: a missing (on 200), malformed,
+// wrong-size, oversized, or duplicate Swarm-Feed-Index-Next header fails the
+// update BEFORE any /soc upload (the chunk staging upload may already have
+// happened, but the signed SOC — the value that actually advances the feed —
+// must never be sent).
+func TestBeeSequenceFeedUpdaterIndexFailuresFailClosedBeforeSOC(t *testing.T) {
+	t.Parallel()
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	topic := strings.Repeat("ab", 32)
+
+	cases := []struct {
+		name   string
+		seed   func(w http.ResponseWriter)
+		reason string
+	}{
+		{"missing header", func(w http.ResponseWriter) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}, "missing"},
+		{"malformed hex", func(w http.ResponseWriter) {
+			w.Header().Set("Swarm-Feed-Index-Next", "not-hex")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}, "malformed"},
+		{"wrong size", func(w http.ResponseWriter) {
+			w.Header().Set("Swarm-Feed-Index-Next", "00112233445566") // 7 bytes
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}, "wrong-size"},
+		{"oversized header", func(w http.ResponseWriter) {
+			w.Header().Set("Swarm-Feed-Index-Next", strings.Repeat("ab", beeFeedWriteMaxRef+1))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}, "oversized"},
+		{"duplicate header", func(w http.ResponseWriter) {
+			w.Header().Add("Swarm-Feed-Index-Next", "0000000000000001")
+			w.Header().Add("Swarm-Feed-Index-Next", "0000000000000002")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		}, "duplicate"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var socTouched bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/chunks":
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+				case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/soc/"+owner+"/"):
+					socTouched = true
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{}`))
+				default:
+					tc.seed(w)
+				}
+			}))
+			defer server.Close()
+			updater, err := NewBeeSequenceFeedUpdater(server.URL, server.Client(), hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+			if err != nil {
+				t.Fatalf("create updater: %v", err)
+			}
+			if err := updater.Update(context.Background(), FeedUpdate{
+				Feed:      "feed://" + owner + "/" + topic,
+				Reference: strings.Repeat("ab", 32),
+				BatchID:   strings.Repeat("cd", 32),
+			}); err == nil {
+				t.Fatalf("expected %s index to fail the update", tc.reason)
+			}
+			if socTouched {
+				t.Fatalf("%s index: SOC upload must never happen", tc.name)
+			}
+		})
 	}
 }
 
@@ -568,24 +742,45 @@ func hex64(b byte) string {
 	return string(buf)
 }
 
+// refBytes64 returns the 32 BINARY bytes a 64-hex reference decodes to — the
+// exact raw payload the production feed endpoint returns (Bee GET
+// /feeds/{owner}/{topic} serves the chunk payload as application/octet-stream
+// with the span stripped, so a Task-11 feed body is the decoded reference).
+func refBytes64(b byte) []byte {
+	out, err := hex.DecodeString(hex64(b))
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
 // feedRef builds a canonical feed reference for a given owner.
 func feedRef(owner string) string { return "feed://" + owner + "/aaaa" }
 
 // TestBeeFeedResolverResolvesFeedBodyAsReference is the core production feed
-// contract: the feed endpoint returns the raw object reference (NOT an 8-byte
-// chunk prefix). It reports 200 with exactly the reference body, and the
-// resolver returns its canonical (lowercased) form.
+// contract: GET /feeds/{owner}/{topic} returns the RAW BINARY payload of the
+// feed update (application/octet-stream, span stripped) — under Task 11 that
+// is the decoded 32-byte immutable reference, NOT ASCII hex and NOT an 8-byte
+// length-prefixed chunk. The resolver returns its normalized lowercase 64-hex
+// form.
 func TestBeeFeedResolverResolvesFeedBodyAsReference(t *testing.T) {
 	t.Parallel()
 	const owner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	// A 64-hex ref decoded to its 32 binary bytes; mixed case proves the
+	// read-back normalizes to lowercase hex.
 	const ref = "AaBbCcDdEeFf00112233445566778899aabbccddeeff00112233445566778899"
+	body, err := hex.DecodeString(ref)
+	if err != nil {
+		t.Fatalf("decode ref: %v", err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/feeds/"+owner+"/aaaa" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(ref))
+		_, _ = w.Write(body)
 	}))
 	defer server.Close()
 
@@ -607,8 +802,9 @@ func TestBeeFeedResolverNewConstructorNormalizesBaseURL(t *testing.T) {
 	const owner = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/feeds/"+owner+"/aaaa" {
+			w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(hex64('b')))
+			_, _ = w.Write(refBytes64('b'))
 			return
 		}
 		http.NotFound(w, r)
@@ -654,21 +850,34 @@ func TestBeeFeedResolverEmptyBodyRejects(t *testing.T) {
 	}
 }
 
-// TestBeeFeedResolverMalformedBodyRejects proves a non-64-hex (or wrong-length)
-// body is rejected.
+// TestBeeFeedResolverMalformedBodyRejects proves a body that is not EXACTLY 32
+// binary bytes (including the OLD pre-Task-11 ASCII-hex 64-byte representation)
+// is rejected: the reader must match the new binary feed payload exactly.
 func TestBeeFeedResolverMalformedBodyRejects(t *testing.T) {
 	t.Parallel()
-	for _, body := range []string{"short", strings.Repeat("g", 64), "not-hex!!!", hex64('a') + "extra"} {
-		body := body
-		t.Run(body, func(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"short text", []byte("short")},
+		{"empty", []byte("")},
+		{"31 bytes", refBytes64('a')[:31]},
+		{"33 bytes", append(append([]byte(nil), refBytes64('a')...), 0x00)},
+		{"old ascii hex representation", []byte(hex64('a'))},
+		{"ascii hex plus extra", []byte(hex64('a') + "extra")},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(body))
+				_, _ = w.Write(tc.body)
 			}))
 			defer server.Close()
 			resolver := NewBeeFeedResolver(server.URL, server.Client())
 			if _, err := resolver.ResolveFeed(context.Background(), feedRef("owner")); err == nil {
-				t.Fatalf("expected malformed body %q to be rejected", body)
+				t.Fatalf("expected malformed body %q to be rejected", tc.body)
 			}
 		})
 	}
@@ -678,10 +887,11 @@ func TestBeeFeedResolverMalformedBodyRejects(t *testing.T) {
 // reference bound is rejected rather than silently truncated.
 func TestBeeFeedResolverOversizeBodyRejects(t *testing.T) {
 	t.Parallel()
-	big := hex64('a') + strings.Repeat("0", beeFeedResolveMaxBody) // far over bound
+	big := append(append([]byte(nil), refBytes64('a')...), make([]byte, beeFeedResolveMaxBody)...) // far over bound
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(big))
+		_, _ = w.Write(big)
 	}))
 	defer server.Close()
 	resolver := NewBeeFeedResolver(server.URL, server.Client())
@@ -720,8 +930,9 @@ func TestBeeFeedResolverRespectsCallerDeadline(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-release // stall until released
+		w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(hex64('a')))
+		_, _ = w.Write(refBytes64('a'))
 	}))
 	// LIFO cleanup: release the stalled handler BEFORE the server closes, so
 	// server.Close() never waits on the handler goroutine.
@@ -751,8 +962,9 @@ func TestBeeFeedResolverCanceledContext(t *testing.T) {
 	defer close(release)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-release
+		w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(hex64('a')))
+		_, _ = w.Write(refBytes64('a'))
 	}))
 	defer server.Close()
 
@@ -799,16 +1011,19 @@ func TestBeeFeedResolverClosesBody(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		code int
-		body string
+		body []byte
 	}{
-		{"success", http.StatusOK, hex64('a')},
-		{"non-200", http.StatusBadRequest, "boom"},
+		{"success", http.StatusOK, refBytes64('a')},
+		{"non-200", http.StatusBadRequest, []byte("boom")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			closed := make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.code == http.StatusOK {
+					w.Header().Set("Swarm-Feed-Index", "0000000000000000")
+				}
 				w.WriteHeader(tc.code)
-				_, _ = w.Write([]byte(tc.body))
+				_, _ = w.Write(tc.body)
 			}))
 			defer server.Close()
 			rt := &bodyTrackingTransport{base: &http.Transport{Proxy: http.ProxyFromEnvironment},
@@ -835,8 +1050,9 @@ func TestBeeFeedResolverBaseURLPathEscaping(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.EscapedPath()
+		w.Header().Set("Swarm-Feed-Index", "0000000000000000")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(hex64('c')))
+		_, _ = w.Write(refBytes64('c'))
 	}))
 	defer server.Close()
 	resolver := NewBeeFeedResolver(server.URL, server.Client())

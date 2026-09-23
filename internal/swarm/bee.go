@@ -96,19 +96,34 @@ const beeFeedResolveMaxBody = 256
 // stalled or hung Bee node can never block reconciliation indefinitely.
 const beeFeedResolveTimeout = 30 * time.Second
 
-// BeeFeedResolver resolves a Swarm sequence feed to the object ref currently
+// ResolveFeed resolves a feed reference to the canonical object ref currently
 // stored at it. It is the read-back counterpart of BeeSequenceFeedUpdater:
-// GET /feeds/{owner}/{topic} returns the feed payload bytes directly — the raw
-// object reference the signer wrote as the chunk payload (NOT an 8-byte
-// length-prefixed chunk: the feed endpoint already unwraps the chunk, so the
-// response body IS the reference). ResolveFeed therefore parses the bounded
-// response body as the object reference itself, validating the exact nonempty
-// bounded 64-hex reference syntax the object store outputs, and returns its
-// canonical form. It never calls parseChunkData on a feed response because
-// there is no 8-byte prefix to strip. A reconciler uses this to PROVE a policy
-// feed points at the object it uploaded before marking a bootstrap job
+// GET /feeds/{owner}/{topic} returns the feed payload bytes directly — under
+// Task 11 the raw 32 binary bytes of the decoded immutable reference (Bee
+// serves the chunk payload as application/octet-stream, span stripped; NOT an
+// 8-byte length-prefixed chunk and NOT 64 ASCII hex characters). ResolveFeed
+// therefore decodes the exact bounded 32-byte binary payload to its
+// normalized lowercase 64-hex reference. A reconciler uses this to PROVE a
+// policy feed points at the object it uploaded before marking a bootstrap job
 // verified: a feed that was never published, points elsewhere, or was
-// overwritten with a different ref will not resolve to the expected object ref.
+// overwritten with a different ref will not resolve to the expected object
+// ref. It FAILS CLOSED on every unsafe outcome, is data-free in its returned
+// error, bounds success and error bodies, requires exactly 200, always closes
+// the body, and imposes a per-request timeout via the request context even
+// when the supplied client has none.
+func (r BeeFeedResolver) ResolveFeed(ctx context.Context, feed string) (string, error) {
+	value, err := r.ReadFeed(ctx, feed)
+	if err != nil {
+		return "", err
+	}
+	return value.Reference, nil
+}
+
+// BeeFeedResolver resolves a Swarm sequence feed to the object ref currently
+// stored at it: GET /feeds/{owner}/{topic} returns the feed payload bytes
+// directly (the raw binary chunk payload, span stripped — the decoded 32-byte
+// immutable reference under Task 11). NewBeeFeedResolver is the production
+// constructor.
 type BeeFeedResolver struct {
 	BaseURL    string
 	HTTPClient *http.Client
@@ -124,70 +139,6 @@ func NewBeeFeedResolver(baseURL string, client *http.Client) *BeeFeedResolver {
 		BaseURL:    strings.TrimRight(baseURL, "/"),
 		HTTPClient: defaultHTTPClient(client),
 	}
-}
-
-// ResolveFeed resolves a feed reference to the canonical object ref currently
-// stored at it. It FAILS CLOSED on every unsafe outcome, is data-free in its
-// returned error (never echoing a raw Bee body), bounds success and error
-// bodies, requires exactly 200, always closes the body, and imposes a
-// per-request timeout via the request context even when the supplied client
-// has none. It validates the body as exactly a nonempty 64-hex reference
-// (the object-store output contract) and returns its canonical (lowercased)
-// form so the reconciler's comparison is case-normalized.
-func (r BeeFeedResolver) ResolveFeed(ctx context.Context, feed string) (string, error) {
-	if strings.TrimSpace(r.BaseURL) == "" {
-		return "", errors.New("bee feed resolver: base URL is not configured")
-	}
-	baseURL := strings.TrimRight(r.BaseURL, "/")
-
-	owner, topic, err := parseFeedRef(feed)
-	if err != nil {
-		return "", fmt.Errorf("bee feed resolver: %w", err)
-	}
-	// Path-escape both parts so an unusual owner/topic (or a malicious one)
-	// can never smuggle a different path segment or query into the request.
-	path := "/feeds/" + url.PathEscape(owner) + "/" + url.PathEscape(topic)
-
-	client := defaultHTTPClient(r.HTTPClient)
-
-	// Per-request timeout even when the supplied client has none configured:
-	// derive a deadline sub-context unless the caller already imposed one.
-	reqCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		reqCtx, cancel = context.WithTimeout(ctx, beeFeedResolveTimeout)
-		defer cancel()
-	}
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+path, nil)
-	if err != nil {
-		return "", fmt.Errorf("create bee feed resolve request: %w", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("bee feed resolve request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		// Drain a bounded amount (never the whole body) so the connection can
-		// be reused, but NEVER include the raw body in the returned error.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedResolveMaxBody+1))
-		return "", fmt.Errorf("bee feed resolution failed with status %d", resp.StatusCode)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedResolveMaxBody+1))
-	if err != nil {
-		return "", fmt.Errorf("read bee feed response body: %w", err)
-	}
-	if len(body) > beeFeedResolveMaxBody {
-		return "", errors.New("bee feed resolution response exceeded the reference bound")
-	}
-	ref := strings.TrimSpace(string(body))
-	if !isBeeReference(ref) {
-		return "", errors.New("bee feed did not resolve to a valid object reference")
-	}
-	return CanonicalObjectRef(ref), nil
 }
 
 type beeReferenceResponse struct {
@@ -331,11 +282,11 @@ func (IdentityFeedResolver) ResolveFeed(_ context.Context, feed string) (string,
 	return feed, nil
 }
 
-func (d DisabledFeedUpdater) UpdateFeed(_ context.Context, feed string, ref string) error {
+func (d DisabledFeedUpdater) Update(_ context.Context, update FeedUpdate) error {
 	if d.Reason != "" {
 		return fmt.Errorf("%s", d.Reason)
 	}
-	return fmt.Errorf("feed updates are not configured for feed %q -> %q", feed, ref)
+	return fmt.Errorf("feed updates are not configured for feed %q -> %q", update.Feed, update.Reference)
 }
 
 func NewBeeSequenceFeedUpdater(baseURL string, client *http.Client, privateKeyHex string) (*BeeSequenceFeedUpdater, error) {
@@ -388,62 +339,6 @@ const beeFeedWriteMaxBody = 512
 // hex chars; the bound rejects oversized or malformed values before any network
 // call while still allowing the bounded in-memory/symbolic test refs.
 const beeFeedWriteMaxRef = 256
-
-func (u *BeeSequenceFeedUpdater) UpdateFeed(ctx context.Context, feed string, ref string) error {
-	if u == nil || u.PrivateKey == nil {
-		return errors.New("feed updater signing key is not configured; refusing to sign feed updates")
-	}
-	if len(ref) == 0 {
-		return errors.New("feed update reference is empty")
-	}
-	if len(ref) > beeFeedWriteMaxRef {
-		return errors.New("feed update reference exceeds the bound")
-	}
-
-	ownerHex, topicHex, err := parseFeedRef(feed)
-	if err != nil {
-		return err
-	}
-
-	expectedOwner := strings.ToLower(ethcrypto.PubkeyToAddress(u.PrivateKey.PublicKey).Hex()[2:])
-	if strings.ToLower(ownerHex) != expectedOwner {
-		return fmt.Errorf("feed owner %q does not match configured signer owner %q", ownerHex, expectedOwner)
-	}
-
-	topicBytes, err := hex.DecodeString(topicHex)
-	if err != nil {
-		return fmt.Errorf("decode feed topic: %w", err)
-	}
-
-	// The feed update's chunk payload is the 8-byte little-endian span followed
-	// by the current payload bytes — a valid Bee chunk wire format that the
-	// /chunks and /soc endpoints both accept and that round 2 mistakenly broke
-	// by sending raw ASCII ref bytes with no span. The payload itself is the
-	// object REFERENCE inline (the same bytes GET /feeds returns), not a
-	// content-addressed chunk address; the span is purely the wire length
-	// prefix Bee requires. Changing that payload to a binary 32-byte ref and
-	// carrying an explicit postage batch id are Task 11's scope
-	// (FeedUpdate{Feed,Reference,BatchID}); this task restores only the valid
-	// span-prefixed framing and preserves current interface behavior.
-	chunkData := makeChunkData([]byte(ref))
-	chunkRef, err := u.uploadChunk(ctx, chunkData, ref)
-	if err != nil {
-		return err
-	}
-
-	nextIndex, err := u.nextSequenceIndex(ctx, ownerHex, topicHex)
-	if err != nil {
-		return err
-	}
-
-	identifier := makeFeedIdentifier(topicBytes, nextIndex)
-	signature, err := signSOCIdentifier(identifier, chunkRef, u.PrivateKey)
-	if err != nil {
-		return err
-	}
-
-	return u.uploadSOC(ctx, ownerHex, identifier, signature, chunkData, ref)
-}
 
 func defaultHTTPClient(client *http.Client) *http.Client {
 	if client != nil {
@@ -530,12 +425,13 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 		return nil, fmt.Errorf("feed lookup failed with status %d", resp.StatusCode)
 	}
 
-	nextHex := strings.TrimSpace(resp.Header.Get("Swarm-Feed-Index-Next"))
-	if nextHex == "" {
-		return nil, errors.New("feed lookup response missing Swarm-Feed-Index-Next header")
-	}
-	if len(nextHex) > beeFeedWriteMaxRef {
-		return nil, errors.New("feed next index header exceeds the bound")
+	// The next sequence index is REQUIRED on a 200 and STRICTLY validated:
+	// exactly one header line, bounded hex decoding to exactly 8 bytes. A
+	// missing, malformed, duplicate, wrong-size, or oversized
+	// Swarm-Feed-Index-Next header fails closed BEFORE any SOC upload.
+	nextHex, err := feedIndexHeader(resp.Header, "Swarm-Feed-Index-Next")
+	if err != nil {
+		return nil, err
 	}
 
 	nextBytes, err := hex.DecodeString(nextHex)

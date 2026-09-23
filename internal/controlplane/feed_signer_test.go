@@ -212,6 +212,14 @@ func TestFeedSignerValidCommit(t *testing.T) {
 	if got := w.feedStore.Feeds[w.repoTopic]; got != target {
 		t.Fatalf("repo feed not advanced: got %q want %q", got, target)
 	}
+	// Task 11: the request's BatchID must propagate into the updater EXACTLY
+	// (and the updater must have been given the request's reference).
+	if got := w.feedStore.Batches[w.repoTopic]; got != req.BatchID {
+		t.Fatalf("updater must receive the exact request batch: got %q want %q", got, req.BatchID)
+	}
+	if got := w.feedStore.Feeds[w.repoTopic]; got != publish.CanonicalReference(req.Reference) {
+		t.Fatalf("updater must receive the exact request reference: got %q want %q", got, req.Reference)
+	}
 }
 
 func TestFeedSignerUnknownRegistry(t *testing.T) {
@@ -805,11 +813,11 @@ type countingFeedUpdater struct {
 	calls int
 }
 
-func (c *countingFeedUpdater) UpdateRegistryFeed(ctx context.Context, reg Registry, topic, ref string) error {
+func (c *countingFeedUpdater) UpdateRegistryFeed(ctx context.Context, reg Registry, topic, ref, batchID string) error {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
-	return c.inner.UpdateRegistryFeed(ctx, reg, topic, ref)
+	return c.inner.UpdateRegistryFeed(ctx, reg, topic, ref, batchID)
 }
 
 func (c *countingFeedUpdater) count() int {

@@ -12,8 +12,12 @@ import (
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
+// RegistryFeedUpdater writes a registry policy/repo feed update. batchID is
+// the exact Bee postage batch to stamp the update with; it is carried
+// unchanged into the swarm updater so the signer never substitutes the content
+// reference as the postage batch.
 type RegistryFeedUpdater interface {
-	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string) error
+	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string) error
 }
 
 type MembershipSubject struct {
@@ -50,13 +54,16 @@ type Publisher struct {
 // reconciliation resolves the SAME state the updater wrote. Tests may also
 // mutate Feeds directly to simulate an independent/overwritten feed mapping
 // (a mis-directed feed) and prove the reconciler refuses to complete a job
-// whose resolved ref does not equal the uploaded object ref.
+// whose resolved ref does not equal the uploaded object ref. Batches records
+// the exact batchID each feed was updated with, so tests can assert the
+// signer's batch propagation precisely.
 type MemoryRegistryFeedStore struct {
-	Feeds map[string]string
-	mu    sync.Mutex
+	Feeds   map[string]string
+	Batches map[string]string
+	mu      sync.Mutex
 }
 
-func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string) error {
+func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, batchID string) error {
 	if m == nil {
 		return errors.New("feed store is not configured")
 	}
@@ -65,7 +72,11 @@ func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Regist
 	if m.Feeds == nil {
 		m.Feeds = map[string]string{}
 	}
+	if m.Batches == nil {
+		m.Batches = map[string]string{}
+	}
 	m.Feeds[feed] = ref
+	m.Batches[feed] = batchID
 	return nil
 }
 
@@ -118,7 +129,7 @@ func (p Publisher) PublishRawAuthPolicy(ctx context.Context, registry Registry, 
 		return "", fmt.Errorf("upload auth policy document: %w", err)
 	}
 	feed := authPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
 		return "", fmt.Errorf("update auth policy feed: %w", err)
 	}
 	return feed, nil
@@ -134,7 +145,7 @@ func (p Publisher) PublishRawStampPolicy(ctx context.Context, registry Registry,
 		return "", fmt.Errorf("upload stamp policy document: %w", err)
 	}
 	feed := stampPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
 		return "", fmt.Errorf("update stamp policy feed: %w", err)
 	}
 	return feed, nil
@@ -165,7 +176,7 @@ func (p Publisher) publishAuthPolicy(ctx context.Context, registry Registry, mem
 		return "", fmt.Errorf("upload auth policy document: %w", err)
 	}
 	feed := authPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
 		return "", fmt.Errorf("update auth policy feed: %w", err)
 	}
 	return feed, nil
@@ -189,7 +200,7 @@ func (p Publisher) publishStampPolicy(ctx context.Context, registry Registry, me
 		return "", fmt.Errorf("upload stamp policy document: %w", err)
 	}
 	feed := stampPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
 		return "", fmt.Errorf("update stamp policy feed: %w", err)
 	}
 	return feed, nil
@@ -207,7 +218,7 @@ type MemoryRegistryFeedUpdater struct {
 	Feeds map[string]string
 }
 
-func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string) error {
+func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string) error {
 	m.Feeds[feed] = ref
 	return nil
 }
@@ -236,7 +247,7 @@ type BeeRegistryFeedUpdater struct {
 	Keys       FeedKeyDecryptor
 }
 
-func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string) error {
+func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string) error {
 	if b.Keys == nil {
 		return errors.New("registry feed key decryptor is not configured; refusing to sign feed updates with stored ciphertext")
 	}
@@ -245,6 +256,13 @@ func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry
 		if err != nil {
 			return err
 		}
-		return updater.UpdateFeed(ctx, feed, ref)
+		// The explicit postage batch flows through unchanged; the updater
+		// validates feed/owner/reference/batch strictly BEFORE any network
+		// call and never substitutes the content reference as the batch.
+		return updater.Update(ctx, swarm.FeedUpdate{
+			Feed:      feed,
+			Reference: ref,
+			BatchID:   batchID,
+		})
 	})
 }

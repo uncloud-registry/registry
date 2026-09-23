@@ -375,8 +375,10 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 		return result, false, false, fmt.Errorf("%w: lost ownership before feed update: %v", errFeedSignerBackend, err)
 	}
 	// The key is now decryptable and the feed is signed. THIS is the only point
-	// a network update happens.
-	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference); err != nil {
+	// a network update happens. The request's BatchID — already proven to equal
+	// the stamp-policy-selected batch — is the exact postage batch propagated
+	// into the updater.
+	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference, req.BatchID); err != nil {
 		return result, false, true, fmt.Errorf("%w: feed update: %v", errFeedSignerBackend, err)
 	}
 	return result, false, false, nil
