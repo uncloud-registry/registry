@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/spec"
 )
 
@@ -113,8 +115,8 @@ func TestMigration10ConstrainHardenedSchemaOnFresh(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	v, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || v != 12 {
-		t.Fatalf("expected schema version 12, got %d (err %v)", v, err)
+	if err != nil || v != 13 {
+		t.Fatalf("expected schema version 13, got %d (err %v)", v, err)
 	}
 	cols := tableColumnsOf(t, db, "feed_signer_operations")
 	for _, want := range []string{"operation_id", "registry_id", "topic", "request_hash", "state", "result_json", "claim_token", "lease_until", "attempts", "created_at", "updated_at"} {
@@ -254,8 +256,8 @@ func TestMigration11HardensOldV10ActiveRows(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("migration 11 hardening old-v10 must succeed for valid rows: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 12 {
-		t.Fatalf("expected version 12, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 13 {
+		t.Fatalf("expected version 13, got %d (err %v)", v, err)
 	}
 	// Quarantine table re-created, triggers installed, valid row preserved.
 	if sqliteObjectCount(t, db, "table", "feed_signer_operations_legacy") != 1 {
@@ -702,12 +704,24 @@ func TestFeedSignerLeaseExtensionRejectsStaleToken(t *testing.T) {
 }
 
 // TestAdoptLegacyFeedSignerOperation drives the migration-9 quarantine adoption
-// gate: a PENDING legacy row with a matching hash becomes an active pending row
-// carrying the supplied registry_id/canonical topic; a SUCCEEDED legacy row
-// with a matching hash is strictly decoded/validated and becomes an active
-// succeeded row; a differing-hash legacy row is a CONFLICT and stays
-// quarantined; a malformed legacy succeeded row FAILS CLOSED and stays
-// quarantined. Never invent metadata, never silently delete.
+// gate across BOTH identities that can key a quarantine row:
+//
+//   - CURRENT identity: a row keyed by the current operation ID must carry the
+//     CURRENT canonical request hash (reqHash) to be promoted;
+//   - HISTORICAL identity: a row keyed by the DERIVED historical migration-9
+//     operation ID (where old and new IDs DIFFER, the normal m9 case) must
+//     carry the exact historical request hash (legacyFeedCommitHashFor) to be
+//     validated.
+//
+// A pending row becomes an active pending row carrying the supplied
+// registry_id/canonical topic under the CURRENT operation ID; a succeeded row
+// is strictly decoded and promoted under the CURRENT operation ID with the
+// result REWRITTEN to the current operation ID (feed/reference unchanged); a
+// differing hash under either identity is a CONFLICT; a malformed legacy
+// succeeded result FAILS CLOSED; and TWO distinct valid candidates are an
+// AMBIGUITY that fails closed. A real m9 row keyed by the historical ID with an
+// m9 hash — which the round-3 code (hash over the CURRENT request with the
+// CURRENT op ID) missed — must now adopt.
 func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	store := newProvisioningStore(t)
 	reg, topic := seedFeedSignerRegistry(t, store)
@@ -723,56 +737,159 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 		}
 	}
 
-	// 1. Pending legacy row with matching hash -> active pending with supplied
-	//    registry/topic; quarantine row deleted.
-	hashPending := feedSignerTestHash("legacy-pending")
-	seed("leg-pending", "pending", "", hashPending)
-	topicPending := spec.RepoStateFeedRef(testFeedOwner, "otherrepo")
-	adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-pending", reg.ID, topicPending, ref, hashPending, hashPending)
-	if err != nil || !adopted {
-		t.Fatalf("pending adoption: adopted=%v err=%v", adopted, err)
+	// A concrete current request and its reconstructed historical twin (old and
+	// new operation IDs DIFFER — the normal case).
+	req := publish.FeedCommitRequest{
+		OperationID:        "current-op-1",
+		RegistryID:         reg.ID,
+		Owner:              "0x" + testFeedOwner,
+		Topic:              topic,
+		Reference:          ref,
+		BatchID:            "batch-1",
+		ExpectedGeneration: 4,
 	}
-	op, err := store.GetFeedSignerOperation(ctx, "leg-pending")
-	if err != nil || op.State != FeedSignerOpPending || op.RegistryID != reg.ID || op.Topic != topicPending || op.RequestHash != hashPending {
-		t.Fatalf("adopted pending row malformed: state=%q reg=%d topic=%q err=%v", op.State, op.RegistryID, op.Topic, err)
+	reqHash := NormalizeFeedCommitHash(req)
+	// The DERIVED historical operation ID for the same logical publication, and
+	// the exact historical request hash over the reconstructed historical
+	// request (OperationID := the historical value).
+	histID := legacyComputeOperationID(reg.ID, req.Owner, "repo1", "latest", "sha256:"+strings.Repeat("a", 64), req.ExpectedGeneration)
+	if histID == req.OperationID {
+		t.Fatal("test requires the historical and current operation IDs to differ")
 	}
-	if err := store.DB.QueryRowContext(ctx, `select 1 from feed_signer_operations_legacy where operation_id='leg-pending'`).Scan(new(int)); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("adopted legacy row must be removed from quarantine: %v", err)
-	}
-
-	// 2. Succeeded legacy row with matching hash and canonical result -> active
-	//    succeeded; quarantine row deleted.
-	hashSuc := feedSignerTestHash("legacy-succeeded")
-	goodResult := `{"operationID":"leg-suc","feed":"` + topic + `","reference":"` + ref + `"}`
-	seed("leg-suc", "succeeded", goodResult, hashSuc)
-	adopted, err = store.AdoptLegacyFeedSignerOperation(ctx, "leg-suc", reg.ID, topic, ref, hashSuc, hashSuc)
-	if err != nil || !adopted {
-		t.Fatalf("succeeded adoption: adopted=%v err=%v", adopted, err)
-	}
-	op, err = store.GetFeedSignerOperation(ctx, "leg-suc")
-	if err != nil || op.State != FeedSignerOpSucceeded || string(op.ResultJSON) != goodResult {
-		t.Fatalf("adopted succeeded row malformed: state=%q result=%s err=%v", op.State, op.ResultJSON, err)
+	histHash := legacyFeedCommitHashFor(histID, req)
+	histReq := req
+	histReq.OperationID = histID
+	if histHash != m9HistoricalRequestHash(histReq) {
+		t.Fatal("legacyFeedCommitHashFor must equal the independently-pinned m9 hash over the reconstructed historical request")
 	}
 
-	// 3. Differing hash -> conflict, legacy row stays quarantined, nothing in
-	//    active table.
-	hashConflict := feedSignerTestHash("legacy-conflict")
-	seed("leg-conflict", "pending", "", hashConflict)
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-conflict", reg.ID, topic, ref, feedSignerTestHash("different"), feedSignerTestHash("different")); !errors.Is(err, errFeedSignerLegacyConflict) {
-		t.Fatalf("differing hash must conflict, got %v", err)
+	// 1. PENDING CURRENT identity -> active pending under current ID + reqHash.
+	seed("current-pending", "pending", "", reqHash)
+	topicOther := spec.RepoStateFeedRef(testFeedOwner, "otherrepo")
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "current-pending", reg.ID, topicOther, ref, reqHash, "", reqHash); err != nil || !adopted {
+		t.Fatalf("current pending adoption: adopted=%v err=%v", adopted, err)
 	}
-	if n := legacyCount(t, store, "leg-conflict"); n != 1 {
-		t.Fatalf("conflicting legacy row must stay quarantined, got %d rows", n)
+	if op, err := store.GetFeedSignerOperation(ctx, "current-pending"); err != nil || op.State != FeedSignerOpPending || op.RegistryID != reg.ID || op.Topic != topicOther || op.RequestHash != reqHash {
+		t.Fatalf("adopted current pending row malformed: %+v err=%v", op, err)
+	}
+	if n := legacyCount(t, store, "current-pending"); n != 0 {
+		t.Fatalf("current pending quarantine row must be deleted, got %d", n)
 	}
 
-	// 4. Malformed succeeded legacy result -> fail closed, stays quarantined.
-	hashMal := feedSignerTestHash("legacy-malformed")
-	seed("leg-mal", "succeeded", `{"operationID":"leg-mal","feed":"NOT_A_FEED","reference":"bad"}`, hashMal)
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, hashMal, hashMal); !errors.Is(err, errFeedSignerLegacyMalformed) {
+	// 2. PENDING HISTORICAL identity (keyed by histID, m9 hash) -> active
+	//    pending under CURRENT ID; quarantine deleted.
+	seed(histID, "pending", "", histHash)
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, reg.ID, topic, ref, reqHash, histID, histHash); err != nil || !adopted {
+		t.Fatalf("historical pending adoption: adopted=%v err=%v", adopted, err)
+	}
+	op, err := store.GetFeedSignerOperation(ctx, req.OperationID)
+	if err != nil || op.State != FeedSignerOpPending || op.RegistryID != reg.ID || op.Topic != topic || op.RequestHash != reqHash {
+		t.Fatalf("historical-pending adopted active row malformed: %+v err=%v", op, err)
+	}
+	if n := legacyCount(t, store, histID); n != 0 {
+		t.Fatalf("historical pending quarantine row must be deleted, got %d", n)
+	}
+
+	// 3. SUCCEEDED CURRENT identity -> adopted with current result.
+	goodCurrent := `{"operationID":"suc-current","feed":"` + topic + `","reference":"` + ref + `"}`
+	seed("suc-current", "succeeded", goodCurrent, reqHash)
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "suc-current", reg.ID, topic, ref, reqHash, "", reqHash); err != nil || !adopted {
+		t.Fatalf("current succeeded adoption: adopted=%v err=%v", adopted, err)
+	}
+	if op, err := store.GetFeedSignerOperation(ctx, "suc-current"); err != nil || op.State != FeedSignerOpSucceeded || string(op.ResultJSON) != goodCurrent {
+		t.Fatalf("adopted current succeeded row malformed: state=%q result=%s err=%v", op.State, op.ResultJSON, err)
+	}
+
+	// 4. SUCCEEDED HISTORICAL identity: m9 result carried the HISTORICAL
+	//    OperationID; it is validated against the LEGACY row identity and
+	//    promoted with the result REWRITTEN to the CURRENT operation ID, feed/
+	//    reference unchanged. A DISTINCT current operation ID is used so this
+	//    step never collides with the active row promoted in step 2.
+	req2 := req
+	req2.OperationID = "current-op-2"
+	req2Hash := NormalizeFeedCommitHash(req2)
+	histID2 := legacyComputeOperationID(reg.ID, req2.Owner, "repo1", "latest", "sha256:"+strings.Repeat("d", 64), req2.ExpectedGeneration)
+	if histID2 == req2.OperationID || histID2 == histID {
+		t.Fatal("test requires distinct historical operation IDs")
+	}
+	histHash2 := legacyFeedCommitHashFor(histID2, req2)
+	histResult := `{"operationID":"` + histID2 + `","feed":"` + topic + `","reference":"` + ref + `"}`
+	seed(histID2, "succeeded", histResult, histHash2)
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req2.OperationID, reg.ID, topic, ref, req2Hash, histID2, histHash2); err != nil || !adopted {
+		t.Fatalf("historical succeeded adoption: adopted=%v err=%v", adopted, err)
+	}
+	op, err = store.GetFeedSignerOperation(ctx, req2.OperationID)
+	if err != nil || op.State != FeedSignerOpSucceeded {
+		t.Fatalf("historical-succeeded active row malformed: state=%q err=%v", op.State, err)
+	}
+	wantRewritten := `{"operationID":` + strconv.Quote(req2.OperationID) + `,"feed":"` + topic + `","reference":"` + ref + `"}`
+	if string(op.ResultJSON) != wantRewritten {
+		t.Fatalf("historical-succeeded result must be rewritten to the CURRENT operation ID, got %s want %s", op.ResultJSON, wantRewritten)
+	}
+	if n := legacyCount(t, store, histID2); n != 0 {
+		t.Fatalf("historical succeeded quarantine row must be deleted, got %d", n)
+	}
+
+	// 5. CONFLICT under the CURRENT identity: stored hash != reqHash.
+	seed("cur-conflict", "pending", "", feedSignerTestHash("different"))
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "cur-conflict", reg.ID, topic, ref, feedSignerTestHash("other"), "", feedSignerTestHash("other")); !errors.Is(err, errFeedSignerLegacyConflict) {
+		t.Fatalf("current differing hash must conflict, got %v", err)
+	}
+	if n := legacyCount(t, store, "cur-conflict"); n != 1 {
+		t.Fatalf("current conflict row must stay quarantined, got %d", n)
+	}
+
+	// 6. CONFLICT under the HISTORICAL identity: stored hash != historical hash.
+	//    The caller's operation ID is FRESH so the active-row short-circuit does
+	//    not hide the conflict.
+	seed(histID, "pending", "", feedSignerTestHash("not-the-m9-hash"))
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "hist-conflict-caller", reg.ID, topic, ref, feedSignerTestHash("caller-hash"), histID, histHash); !errors.Is(err, errFeedSignerLegacyConflict) {
+		t.Fatalf("historical differing hash must conflict, got %v", err)
+	}
+	if n := legacyCount(t, store, histID); n != 1 {
+		t.Fatalf("historical conflict row must stay quarantined, got %d", n)
+	}
+
+	// 7. A CURRENT-ID row carrying the OLD (m9) hash is incoherent: its claimed
+	//    identity (current) demands the NEW hash, so it is a CONFLICT, never
+	//    adopted (the round-3 "m9 hash over the current request" behavior).
+	seed("legacy-hash-current-id", "pending", "", m9HistoricalRequestHash(func() publish.FeedCommitRequest { r := req; r.OperationID = "legacy-hash-current-id"; return r }()))
+	_, err = store.AdoptLegacyFeedSignerOperation(ctx, "legacy-hash-current-id", reg.ID, topic, ref, reqHash, "", reqHash)
+	if !errors.Is(err, errFeedSignerLegacyConflict) {
+		t.Fatalf("current-ID row with old hash must conflict (coherent identity check), got %v", err)
+	}
+	if n := legacyCount(t, store, "legacy-hash-current-id"); n != 1 {
+		t.Fatalf("incoherent row must stay quarantined, got %d", n)
+	}
+
+	// 8. Malformed succeeded legacy result -> fail closed, stays quarantined.
+	seed("leg-mal", "succeeded", `{"operationID":"leg-mal","feed":"NOT_A_FEED","reference":"bad"}`, feedSignerTestHash("mal"))
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, feedSignerTestHash("mal"), "", feedSignerTestHash("mal")); !errors.Is(err, errFeedSignerLegacyMalformed) {
 		t.Fatalf("malformed legacy succeeded result must fail closed, got %v", err)
 	}
 	if n := legacyCount(t, store, "leg-mal"); n != 1 {
-		t.Fatalf("malformed legacy row must stay quarantined, got %d rows", n)
+		t.Fatalf("malformed legacy row must stay quarantined, got %d", n)
+	}
+
+	// 9. AMBIGUITY: TWO distinct valid candidates (one current, one historical)
+	//    -> fail closed, neither adopted, both stay quarantined. The caller's
+	//    operation ID is a FRESH id (no active row yet) so both candidates are
+	//    actually reachable.
+	dualCur := `{"operationID":"dual-cur","feed":"` + topic + `","reference":"` + ref + `"}`
+	dualCurHash := NormalizeFeedCommitHash(func() publish.FeedCommitRequest { r := req; r.OperationID = "dual-cur"; return r }())
+	seed("dual-cur", "succeeded", dualCur, dualCurHash)
+	dualHistID := legacyComputeOperationID(reg.ID, req.Owner, "dualtagrepo", "v2", "sha256:"+strings.Repeat("b", 64), req.ExpectedGeneration)
+	dualHistHash := legacyFeedCommitHashFor(dualHistID, req)
+	dualHistResult := `{"operationID":"` + dualHistID + `","feed":"` + topic + `","reference":"` + ref + `"}`
+	seed(dualHistID, "succeeded", dualHistResult, dualHistHash)
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "dual-cur", reg.ID, topic, ref, dualCurHash, dualHistID, dualHistHash); !errors.Is(err, errFeedSignerLegacyAmbiguous) {
+		t.Fatalf("two valid candidates must be an ambiguity that fails closed, got %v", err)
+	}
+	if n := legacyCount(t, store, "dual-cur"); n != 1 {
+		t.Fatalf("ambiguous current row must stay quarantined, got %d", n)
+	}
+	if n := legacyCount(t, store, dualHistID); n != 1 {
+		t.Fatalf("ambiguous historical row must stay quarantined, got %d", n)
 	}
 }
 

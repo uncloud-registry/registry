@@ -1,15 +1,19 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/uncloud-registry/registry/internal/publish"
 )
 
 // Feed signer operation states. A row progresses pending -> processing ->
@@ -390,6 +394,115 @@ func installFeedSignerOperationStoreV12(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
+// feedSignerOperationIDGrammarCond is the SQL predicate that is byte-parity with
+// publish.ValidateOperationID: it is TRUE exactly when an operation_id VIOLATES
+// the application operation-ID grammar (and so must abort the write). The valid
+// set is: non-empty, at most 128 code points, every character an ASCII printable
+// 0x20..0x7e EXCEPT the five Go-JSON-escaped punctation bytes `"`, `\`, `<`,
+// `>`, `&`, and therefore no controls (0x00..0x1f), no DEL (0x7f), and no
+// non-ASCII code point (>= U+0080, including U+2028/U+2029, which Go's JSON
+// encoder escapes).
+//
+// SQLite has no octet_length, so non-ASCII is detected by CODEPOINT range: GLOB
+// ranges operate on decoded characters, so `[char(128)-char(0x10ffff)]` matches
+// exactly a code point >= U+0080 without ever matching a high ASCII byte (the
+// classic GLOB mistake of trying to range raw bytes). The control grammar uses
+// `[char(1)-char(31)]` (never a char(0) low endpoint — a NUL in the PATTERN is
+// unreliable) plus an explicit `instr(..., char(0))` for the NUL byte itself.
+// Every operand is NULL-proof (the leading `IS NULL` term makes the whole OR
+// either 0 or 1, never NULL), so SQLite's three-valued logic can never bypass
+// the guard via a NULL or a malformed storage class.
+const feedSignerOperationIDGrammarCond = `(NEW.operation_id IS NULL
+	OR typeof(NEW.operation_id) <> 'text'
+	OR length(NEW.operation_id) < 1
+	OR length(NEW.operation_id) > 128
+	OR instr(NEW.operation_id, char(0)) > 0
+	OR NEW.operation_id glob '*[' || char(1) || '-' || char(31) || ']*'
+	OR NEW.operation_id glob '*[' || char(127) || ']*'
+	OR NEW.operation_id glob '*[' || char(128) || '-' || char(0x10ffff) || ']*'
+	OR instr(NEW.operation_id, '"') > 0
+	OR instr(NEW.operation_id, char(92)) > 0
+	OR instr(NEW.operation_id, '<') > 0
+	OR instr(NEW.operation_id, '>') > 0
+	OR instr(NEW.operation_id, '&') > 0)`
+
+// feedSignerOperationIDTriggerSQL returns the dedicated DB-level operation-ID
+// identity triggers (BEFORE INSERT and BEFORE UPDATE on feed_signer_operations).
+// They apply the full operation-ID grammar to EVERY active row regardless of
+// state — pending, processing, and succeeded alike — closing the direct-SQL gap
+// that (before migration 13) only constrained operation_id by type/length/bounds
+// in the table CHECK (the character-set grammar was only enforced implicitly
+// for succeeded rows via the result-integrity trigger's byte-exact
+// concatenation). A direct SQL write that tries to store an operation_id
+// violating publish.ValidateOperationID is aborted.
+func feedSignerOperationIDTriggerSQL() []string {
+	return []string{
+		`create trigger feed_signer_operation_id_ins
+			before insert on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer operation id violates the operation-ID grammar') where ` + feedSignerOperationIDGrammarCond + `; end`,
+		`create trigger feed_signer_operation_id_upd
+			before update on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer operation id violates the operation-ID grammar') where ` + feedSignerOperationIDGrammarCond + `; end`,
+	}
+}
+
+// installFeedSignerOperationStoreV13 is migration 13's body. It closes the
+// database operation-ID grammar gap by:
+//
+//  1. DROP-and-re-CREATE the dedicated operation-ID identity triggers (INSERT +
+//     UPDATE), so pending/processing/succeeded rows ALL obey the exact
+//     application grammar (bounded length + JSON-safe printable-ASCII set,
+//     rejecting quote/backslash/<,>,&/controls/DEL/non-ASCII) — the same grammar
+//     as publish.ValidateOperationID;
+//  2. REINSTALL the migration-12 byte-exact canonical-result triggers (drop +
+//     recreate) ONLY AFTER the identity triggers, so their byte-exact
+//     concatenation of NEW.operation_id into the canonical JSON runs only once
+//     the operation-id grammar has been proven for every row that reaches it;
+//  3. ATOMICALLY harden every existing active row via the guarded self-update,
+//     which fires the new UPDATE identity trigger (and result triggers) per
+//     row. Any schema-admitted old-v12 row whose operation_id violates the
+//     grammar aborts the migration and rolls back byte-identically: version
+//     stays 12, the triggers/schema/data are untouched, and no invalid active
+//     operational state is silently rewritten, deleted, or quarantined.
+//
+// Fresh installs run 1→12→13 and reach version 13 with the identity triggers
+// present; every valid v12 database (whose operation ids are the 64-hex forms
+// ComputeOperationID has always produced) upgrades cleanly.
+func installFeedSignerOperationStoreV13(ctx context.Context, tx *sql.Tx) error {
+	// 1. Drop any stale identity triggers and install the authoritative ones.
+	for _, name := range []string{"feed_signer_operation_id_ins", "feed_signer_operation_id_upd"} {
+		if _, err := tx.ExecContext(ctx, `drop trigger if exists `+name); err != nil {
+			return fmt.Errorf("migration 13: drop stale operation-id trigger %s: %w", name, err)
+		}
+	}
+	for _, stmt := range feedSignerOperationIDTriggerSQL() {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration 13: install operation-id identity trigger: %w", err)
+		}
+	}
+	// 2. Reinstall the byte-exact canonical-result triggers under the same names
+	//    migration 12 created, ordering the operation-id grammar first.
+	for _, name := range []string{"feed_signer_result_integrity_ins", "feed_signer_result_integrity_upd"} {
+		if _, err := tx.ExecContext(ctx, `drop trigger if exists `+name); err != nil {
+			return fmt.Errorf("migration 13: drop canonical-result trigger %s: %w", name, err)
+		}
+	}
+	for _, stmt := range feedSignerResultCanonicalTriggerSQL() {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration 13: install canonical-result trigger: %w", err)
+		}
+	}
+	// 3. Harden existing active rows atomically: the guarded self-update fires
+	//    the new UPDATE identity trigger (and result triggers) for EVERY row,
+	//    with no value changed. A row with a grammar-violating operation_id
+	//    aborts here, rolling the whole migration back (version stays 12, no
+	//    schema object, trigger, or data touched).
+	if _, err := tx.ExecContext(ctx, `update feed_signer_operations set operation_id = operation_id`); err != nil {
+		return fmt.Errorf("migration 13: hardening existing feed signer operations failed: %w", err)
+	}
+	return nil
+}
+
 // installFeedSignerOperationStoreV11 is migration 11's body. It brings BOTH
 // databases that ran the amended migration 10 (fresh) and databases already
 // stamped with the OLD migration-10 schema to the identical final hardened
@@ -515,87 +628,147 @@ func (s *Store) ReserveFeedSignerOperation(ctx context.Context, operationID stri
 	return op, nil
 }
 
-// sentinel errors for migration-9 legacy-row adoption. Both are data-free (no
+// sentinel errors for migration-9 legacy-row adoption. All are data-free (no
 // registry/topic/request content) so a mishandled quarantine row never leaks
 // state.
 var (
 	errFeedSignerLegacyConflict  = errors.New("feed signer: legacy operation request hash differs; refusing to adopt")
 	errFeedSignerLegacyMalformed = errors.New("feed signer: legacy succeeded result is malformed; remains quarantined")
+	errFeedSignerLegacyAmbiguous = errors.New("feed signer: multiple distinct legacy candidates match; refusing to adopt")
 )
 
 // AdoptLegacyFeedSignerOperation atomically adopts a quarantined migration-9
-// row into the hardened ACTIVE table on the FIRST same-OperationID request —
-// and only when the incoming request hash matches the legacy request_hash.
+// row into the hardened ACTIVE table on the FIRST same-logical-request call,
+// locating the quarantined row by the CURRENT operation ID OR the DERIVED
+// historical migration-9 operation ID (legacyOperationID).
 //
-// The stored request_hash is accepted when it equals EITHER the current
-// canonical request hash (reqHash) OR the exact historical migration-9 hash
-// (legacyReqHash, computed by legacyFeedCommitHash from the incoming request's
-// raw fields). Migration-9 rows were signed with the legacy delimiter-framed
-// algorithm, so a logically-identical legacy operation is recognized only when
-// its stored hash matches legacyReqHash; it must match under ONE of the two
-// algorithms to adopt.
+// A quarantined row is validated against the algorithm/identity it claims:
 //
-//   - pending: becomes an active PENDING row carrying the supplied
-//     control-plane registry_id and canonical topic.
-//   - succeeded: is STRICTLY decoded and validated against the operation ID,
-//     canonical topic, and canonical reference implied by the matching request
-//     hash (decodeStoredResult subsumes duplicate-member/unknown-field/trailing
-//     rejection and the strict feed/reference contract); only a fully valid
-//     result becomes an active SUCCEEDED row.
-//   - a differing request hash under BOTH algorithms is a CONFLICT (the same
-//     OperationID was reused with different input).
-//   - a malformed legacy succeeded result FAILS CLOSED and stays quarantined.
+//   - a row keyed by the CURRENT operation ID is the CURRENT identity and must
+//     carry the CURRENT canonical request hash (reqHash) to be promoted;
+//   - a row keyed by the DERIVED HISTORICAL operation ID is the HISTORICAL
+//     (migration-9) identity and must carry the exact historical request hash
+//     (legacyReqHash — legacyFeedCommitHash over the reconstructed historical
+//     request whose OperationID is the historical value) to be validated.
 //
-// A quarantine row is deleted only after it is successfully adopted — state is
-// never invented and a row is never silently dropped. The gate is atomic: the
-// active-table read, the quarantine read/validate, the active insert, and the
-// quarantine delete all happen in one write transaction.
-func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash, legacyReqHash [32]byte) (adopted bool, err error) {
+// The candidate set is resolved DETERMINISTICALLY:
+//   - zero candidates -> no-op (nothing quarantined for this operation);
+//   - a candidate whose stored hash does NOT match its claimed identity is a
+//     CONFLICT (the OperationID was reused with different input) and stays
+//     quarantined;
+//   - TWO distinct valid candidates (one current, one historical) is an
+//     AMBIGUITY that FAILS CLOSED with nothing adopted and nothing deleted, so
+//     a conflicting dual row can never accidentally adopt a different logical
+//     request;
+//   - exactly one valid candidate is adopted.
+//
+// pending: becomes an active PENDING row under the CURRENT operation ID and
+// CURRENT request hash, carrying the supplied registry_id and canonical topic,
+// so it then signs exactly once through the normal reserve/claim/complete path
+// (which carry the current OperationID + current hash).
+//
+// succeeded: its stored result is STRICTLY decoded and validated — the result
+// OperationID must equal the QUARANTINED row's own identity (a historical row's
+// m9 result carries the HISTORICAL OperationID), and Feed/Reference must equal
+// the current logical request — then promoted as an active SUCCEEDED row under
+// the CURRENT operation ID and CURRENT request hash, with an equivalent
+// canonical result REWRITTEN to the CURRENT operation ID (feed/reference
+// unchanged). No external feed re-update ever happens on adoption. The active
+// insert and the quarantine delete occur in ONE transaction; a malformed legacy
+// succeeded result fails closed and stays quarantined.
+func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash [32]byte, legacyOperationID string, legacyReqHash [32]byte) (adopted bool, err error) {
+	type legacyRow struct {
+		opID   string
+		hash   [32]byte
+		state  string
+		result sql.NullString
+	}
 	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
-		// Only adopt when the active table has no row for this operation.
+		// Only adopt when the active table has no row for the CURRENT operation
+		// ID; otherwise the caller's normal idempotency applies to the active row.
 		var activeCount int
 		if err := c.QueryRowContext(ctx,
 			`select count(*) from feed_signer_operations where operation_id = ?`, operationID).Scan(&activeCount); err != nil {
 			return err
 		}
 		if activeCount != 0 {
-			return nil // already active; the caller's normal idempotency applies
+			return nil
 		}
 
-		var (
-			opID      string
-			hash      []byte
-			state     string
-			result    sql.NullString
-			createdNs int64
-			updatedNs int64
-		)
-		err := c.QueryRowContext(ctx,
-			`select `+feedSignerLegacyColumns+` from feed_signer_operations_legacy where operation_id = ?`, operationID).
-			Scan(&opID, &hash, &state, &result, &createdNs, &updatedNs)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil // nothing quarantined for this operation
+		// Gather candidate quarantine rows by the current ID OR the derived
+		// historical ID (deduped when they coincide). The two-ID OR is the
+		// migration bridge for a real m9 row (keyed by the historical ID) that
+		// the current request (carrying the current ID) can never reach by key.
+		params := []any{operationID}
+		if legacyOperationID != "" && legacyOperationID != operationID {
+			params = append(params, legacyOperationID)
 		}
+		placeholders := "?" + strings.Repeat(", ?", len(params)-1)
+		rows, err := c.QueryContext(ctx,
+			`select `+feedSignerLegacyColumns+` from feed_signer_operations_legacy where operation_id in (`+placeholders+`)`,
+			params...)
 		if err != nil {
 			return err
 		}
-		var legacyHash [32]byte
-		copy(legacyHash[:], hash)
-		// Adopt only when the stored hash matches the current canonical request
-		// hash OR the exact historical migration-9 hash (see legacyFeedCommitHash).
-		// A row matching neither is a DIFFERENT logical request and conflicts.
-		if legacyHash != reqHash && legacyHash != legacyReqHash {
-			return errFeedSignerLegacyConflict
+		var cands []legacyRow
+		for rows.Next() {
+			var (
+				opID                 string
+				hash                 []byte
+				state                string
+				result               sql.NullString
+				createdNs, updatedNs int64
+			)
+			if err := rows.Scan(&opID, &hash, &state, &result, &createdNs, &updatedNs); err != nil {
+				rows.Close()
+				return err
+			}
+			var h [32]byte
+			copy(h[:], hash)
+			cands = append(cands, legacyRow{opID: opID, hash: h, state: state, result: result})
 		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(cands) == 0 {
+			return nil
+		}
+
+		// Classify every candidate against its claimed identity. A candidate is
+		// accepted only when its stored hash matches the algorithm of the row it
+		// keys (current identities must match reqHash; historical identities must
+		// match legacyReqHash); a mismatch is a hard conflict under BOTH
+		// algorithms and stays quarantined.
+		var valid []legacyRow
+		for _, cd := range cands {
+			switch {
+			case cd.opID == operationID:
+				if cd.hash != reqHash {
+					return errFeedSignerLegacyConflict
+				}
+			case legacyOperationID != "" && cd.opID == legacyOperationID:
+				if cd.hash != legacyReqHash {
+					return errFeedSignerLegacyConflict
+				}
+			default:
+				// A row matched the IN-list but is neither identity: incoherent.
+				return errFeedSignerLegacyConflict
+			}
+			valid = append(valid, cd)
+		}
+		// Two distinct valid candidates => ambiguity => fail closed.
+		if len(valid) != 1 {
+			return errFeedSignerLegacyAmbiguous
+		}
+		cd := valid[0]
 
 		now := time.Now().UTC()
 		nowNanos := timeToNanos(now)
-		switch state {
+		switch cd.state {
 		case FeedSignerOpPending:
-			// The ACTIVE row is written with the CURRENT canonical request hash
-			// (reqHash), so the rest of the modern reserve/claim/complete path
-			// compares against the modern hash; the legacy m9 hash was only a
-			// RECOGNITION key to prove this is a logically identical operation.
+			// Promote under the CURRENT operation ID and CURRENT request hash so
+			// the modern reserve/claim/complete path compares correctly.
 			if _, err := c.ExecContext(ctx, `insert into feed_signer_operations
 				(operation_id, registry_id, topic, request_hash, state, result_json,
 				 claim_token, lease_until, attempts, created_at, updated_at)
@@ -604,38 +777,64 @@ func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID 
 				return err
 			}
 		case FeedSignerOpSucceeded:
-			if !result.Valid {
+			if !cd.result.Valid {
 				return errFeedSignerLegacyMalformed
 			}
-			// Strict decode + validate against the operation ID / canonical
-			// topic / canonical reference implied by the matching request hash.
-			validated, derr := decodeStoredResult([]byte(result.String))
+			// Strict decode + validate against the QUARANTINED row's own
+			// identity and the current logical request's canonical feed/ref.
+			validated, derr := decodeStoredResult([]byte(cd.result.String))
 			if derr != nil {
 				return errFeedSignerLegacyMalformed
 			}
-			if validated.OperationID != operationID || validated.Feed != topic || validated.Reference != reference {
+			if validated.OperationID != cd.opID || validated.Feed != topic || validated.Reference != reference {
+				return errFeedSignerLegacyMalformed
+			}
+			// Rewrite an equivalent canonical result to the CURRENT operation ID
+			// (feed/reference unchanged) so the promoted active row carries the
+			// current identity the modern path expects and the byte-exact
+			// canonical-result trigger accepts.
+			rewritten := publish.FeedCommitResult{OperationID: operationID, Feed: validated.Feed, Reference: validated.Reference}
+			canonical := publish.CanonicalFeedCommitResultJSON(rewritten)
+			marshalled, merr := json.Marshal(rewritten)
+			if merr != nil || !bytes.Equal(marshalled, canonical) {
 				return errFeedSignerLegacyMalformed
 			}
 			if _, err := c.ExecContext(ctx, `insert into feed_signer_operations
 				(operation_id, registry_id, topic, request_hash, state, result_json,
 				 claim_token, lease_until, attempts, created_at, updated_at)
 				values (?, ?, ?, ?, ?, ?, null, null, 0, ?, ?)`,
-				operationID, registryID, topic, reqHash[:], FeedSignerOpSucceeded, result.String, nowNanos, nowNanos); err != nil {
+				operationID, registryID, topic, reqHash[:], FeedSignerOpSucceeded, string(canonical), nowNanos, nowNanos); err != nil {
 				return err
 			}
 		default:
 			return errFeedSignerLegacyMalformed
 		}
 
-		// Delete the quarantine row ONLY after a successful active insert.
+		// Delete the quarantined row ONLY after the active insert succeeded. The
+		// whole sequence (active-read, quarantine-read/validate, active-insert,
+		// quarantine-delete) is one transaction, so a failure rolls everything
+		// back and the legacy row is never stranded.
 		if _, err := c.ExecContext(ctx,
-			`delete from feed_signer_operations_legacy where operation_id = ?`, operationID); err != nil {
+			`delete from feed_signer_operations_legacy where operation_id = ?`, cd.opID); err != nil {
 			return err
 		}
 		adopted = true
 		return nil
 	})
 	return adopted, err
+}
+
+// LegacyOperationCount reports how many quarantined migration-9 rows remain
+// unpromoted. The signer uses it to decide whether the (potentially costly) doc
+// read that derives the historical operation ID is worth attempting: when zero
+// legacy rows remain (the steady state after every m9 row has been adopted), no
+// historical derivation is attempted and the commit path pays nothing extra.
+func (s *Store) LegacyOperationCount(ctx context.Context) (int, error) {
+	var n int
+	if err := s.DB.QueryRowContext(ctx, `select count(*) from feed_signer_operations_legacy`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ClaimFeedSignerOperation atomically transitions a pending row to processing

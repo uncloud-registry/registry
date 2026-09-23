@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
@@ -55,6 +56,10 @@ type feedDocSet struct {
 	targetRef  string
 	targetGen  int64
 	stampRef   string
+	// targetTags, when non-empty, is written into the TARGET repo-state doc's
+	// Tags map so migration-only legacy-operation-ID derivation can recover the
+	// tag/manifest digest, mirroring a real single-tag publication.
+	targetTags map[string]string
 }
 
 // newFeedTestWorld builds the fixture and a FeedSigner. req sets the request;
@@ -87,10 +92,14 @@ func newFeedTestWorld(t *testing.T, req publish.FeedCommitRequest, dst feedDocSe
 		repoTopic: dst.currentRef,
 		stampFeed: dst.stampRef,
 	}}
+	targetDoc := mustRepoDoc(t, testRepo, dst.targetGen)
+	if len(dst.targetTags) > 0 {
+		targetDoc = mustRepoDocWithTags(t, testRepo, dst.targetGen, dst.targetTags)
+	}
 	docs := resolve.NewMemoryDocumentStore()
 	docs.Documents = map[string][]byte{
 		dst.currentRef: mustRepoDoc(t, testRepo, dst.currentGen),
-		dst.targetRef:  mustRepoDoc(t, testRepo, dst.targetGen),
+		dst.targetRef:  targetDoc,
 		dst.stampRef:   mustStampDoc(t, req.BatchID),
 	}
 
@@ -114,6 +123,30 @@ func mustRepoDoc(t *testing.T, repo string, gen int64) []byte {
 	data, err := json.Marshal(doc)
 	if err != nil {
 		t.Fatalf("marshal repo doc: %v", err)
+	}
+	return data
+}
+
+func mustRepoDocWithTags(t *testing.T, repo string, gen int64, tags map[string]string) []byte {
+	t.Helper()
+	manifests := map[string]spec.ManifestDescriptor{}
+	for _, digest := range tags {
+		// The tag's digest must resolve to a manifest descriptor in the same
+		// document (spec.DecodeRepoStateDocument requires it); SwarmRef is a
+		// 64-hex immutable reference like every fixture reference.
+		manifests[digest] = spec.ManifestDescriptor{SwarmRef: refHex('e'), MediaType: "application/vnd.oci.image.manifest.v1+json", Size: 42}
+	}
+	doc := spec.RepoStateDocument{
+		Version:    1,
+		Repo:       repo,
+		Generation: gen,
+		Tags:       tags,
+		Manifests:  manifests,
+		Blobs:      map[string]spec.BlobDescriptor{},
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal repo doc with tags: %v", err)
 	}
 	return data
 }
@@ -1045,32 +1078,127 @@ func TestLegacyFeedCommitHashReproducesM9Bytes(t *testing.T) {
 	}
 }
 
+// m9HistoricalComputeOperationID independently reproduces the EXACT historical
+// migration-9 (1e91614 internal/publish/commit.go) ComputeOperationID from the
+// historical source bytes, never via the production legacyComputeOperationID,
+// so the test can pin the production function to true historical vectors.
+func m9HistoricalComputeOperationID(registryID int64, owner, repo, tag, manifestDigest string, expectedGeneration int64) string {
+	h := sha256.New()
+	h.Write([]byte("uncloud-registry-feed-commit-op:v1\x00"))
+	h.Write([]byte(strconv.FormatInt(registryID, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(owner))
+	h.Write([]byte{0})
+	h.Write([]byte(repo))
+	h.Write([]byte{0})
+	h.Write([]byte(tag))
+	h.Write([]byte{0})
+	h.Write([]byte(manifestDigest))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(expectedGeneration, 10)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// TestLegacyComputeOperationIDPinnedVectors pins the migration-only
+// legacyComputeOperationID to KNOWN byte vectors independently produced from
+// the historical migration-9 source (see m9HistoricalComputeOperationID and
+// the hardcoded digests below, each recomputed from the historical algorithm,
+// never from the production function). A divergence from the historical bytes
+// would leave every logically-identical quarantined m9 row permanently
+// unreachable by its historical operation ID.
+func TestLegacyComputeOperationIDPinnedVectors(t *testing.T) {
+	vec1 := struct {
+		reg   int64
+		owner string
+		repo  string
+		tag   string
+		dig   string
+		gen   int64
+		want  string
+	}{
+		7, "0x0123456789abcdef0123456789abcdef01234567", "repo1", "latest", "sha256:" + strings.Repeat("a", 64), 3,
+		"b92056ec1d82277befa718fb0878362b88890dba1c324dd109095baadfa5f44f",
+	}
+	vec2 := struct {
+		reg   int64
+		owner string
+		repo  string
+		tag   string
+		dig   string
+		gen   int64
+		want  string
+	}{
+		42, testFeedOwner, "moby/dock", "v1.0", "sha256:" + strings.Repeat("b", 64), 0,
+		"51620ff446e8a4299d9316de5fe26bb932df68ba8051df0aafe042ad1e8063cc",
+	}
+	for i, v := range []struct {
+		reg   int64
+		owner string
+		repo  string
+		tag   string
+		dig   string
+		gen   int64
+		want  string
+	}{vec1, vec2} {
+		got := legacyComputeOperationID(v.reg, v.owner, v.repo, v.tag, v.dig, v.gen)
+		if got != v.want {
+			t.Fatalf("vector %d: legacyComputeOperationID(%d,%q,%q,%q,%q,%d) = %s, want historical %s", i, v.reg, v.owner, v.repo, v.tag, v.dig, v.gen, got, v.want)
+		}
+		if ind := m9HistoricalComputeOperationID(v.reg, v.owner, v.repo, v.tag, v.dig, v.gen); got != ind {
+			t.Fatalf("vector %d: production %s diverges from independent historical calculator %s", i, got, ind)
+		}
+	}
+	// The historical and CURRENT operation IDs must DIFFER for the same logical
+	// publication (different framing) — the round-4 premise.
+	if legacyComputeOperationID(vec1.reg, vec1.owner, vec1.repo, vec1.tag, vec1.dig, vec1.gen) == publish.ComputeOperationID(vec1.reg, vec1.owner, vec1.repo, vec1.tag, vec1.dig, vec1.gen) {
+		t.Fatal("the historical and current operation IDs must differ for the same logical publication")
+	}
+}
+
 // TestFeedSignerAdoptsLegacyM9HashRow proves a quarantined migration-9
-// SUCCEEDED row whose stored request_hash was produced by the historical m9
-// delimiter-framed algorithm ADOPTS on the same logical request: the stored
-// canonical result is returned idempotently, the network/key update is NOT
-// re-run, and the quarantine row is deleted. This is the exact failure the
-// round-2 finding flagged (the old hash could not match the new request hash).
+// SUCCEEDED row keyed by the HISTORICAL migration-9 operation ID — the normal
+// m9 case, where the caller now sends the CURRENT operation ID and old/new IDs
+// DIFFER — ADOPTS on the same logical request: the m9 result (carrying the
+// historical operation ID) is validated against the legacy row identity and
+// promoted as an equivalent canonical result REWRITTEN to the CURRENT operation
+// ID (feed/reference unchanged), the stored result is returned idempotently,
+// the network/key update is NOT re-run, and the quarantine row is deleted. The
+// round-3 legacy hash (m9 framing over the CURRENT request with the CURRENT op
+// ID) never matches a real m9 row; the corrected bridging derives the
+// historical request (OperationID := the historical ID) for the historical
+// hash.
 func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
+	const testTag = "latest"
+	testDigest := "sha256:" + strings.Repeat("a", 64)
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{testTag: testDigest},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
 	target := refHex('a')
 	ctx := context.Background()
 
-	// The stored m9 hash is the HISTORICAL delimiter-framed hash, not the modern one.
-	m9hash := m9HistoricalRequestHash(req)
-	if m9hash == NormalizeFeedCommitHash(req) {
-		t.Fatal("test requires the m9 hash to differ from the modern hash")
+	// The EXACT historical m9 operation ID for this logical publication (owner,
+	// repo, tag, manifest digest, generation) — the row's real primary key.
+	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, testTag, testDigest, req.ExpectedGeneration)
+	if histID == req.OperationID {
+		t.Fatal("test requires old and new operation IDs to differ (the normal m9 case)")
 	}
-	result := `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
+	// The stored m9 hash was computed over the HISTORICAL request — the current
+	// request with OperationID := the historical ID (never the current ID).
+	histReq := req
+	histReq.OperationID = histID
+	m9hash := m9HistoricalRequestHash(histReq)
+	if m9hash == NormalizeFeedCommitHash(req) || m9hash == m9HistoricalRequestHash(req) {
+		t.Fatal("test requires the historical hash to differ from both current-hash variants")
+	}
+	result := `{"operationID":"` + histID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
 	nowNs := timeToNanos(time.Now().UTC())
 	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
 		(operation_id, request_hash, state, result_json, created_at, updated_at)
-		values (?, ?, 'succeeded', ?, ?, ?)`, req.OperationID, m9hash[:], result, nowNs, nowNs); err != nil {
+		values (?, ?, 'succeeded', ?, ?, ?)`, histID, m9hash[:], result, nowNs, nowNs); err != nil {
 		t.Fatalf("seed m9 succeeded row: %v", err)
 	}
 
@@ -1080,7 +1208,8 @@ func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("adopt+idempotent commit: %v", err)
 	}
-	if res.Feed != w.repoTopic || res.Reference != target || res.OperationID != req.OperationID {
+	// The returned result carries the CURRENT operation ID, unchanged feed/ref.
+	if res.OperationID != req.OperationID || res.Feed != w.repoTopic || res.Reference != target {
 		t.Fatalf("adopted result mismatch: %+v", res)
 	}
 	// No second advancement: the stored succeeded result is returned directly.
@@ -1090,34 +1219,50 @@ func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
 	if n := updater.count(); n != 0 {
 		t.Fatalf("adoption must not call the external updater, got %d calls", n)
 	}
-	// The quarantine row is deleted; the active row carries the stored bytes.
-	if legacyCount(t, w.store, req.OperationID) != 0 {
+	// The quarantine row is deleted; the active row carries the CURRENT-ID
+	// canonical result (rewritten from the historical result).
+	if legacyCount(t, w.store, histID) != 0 {
 		t.Fatal("quarantine row must be deleted after successful adoption")
 	}
 	op, err := w.store.GetFeedSignerOperation(ctx, req.OperationID)
-	if err != nil || op.State != FeedSignerOpSucceeded || string(op.ResultJSON) != result {
-		t.Fatalf("adopted active row malformed: state=%q result=%s err=%v", op.State, op.ResultJSON, err)
+	if err != nil || op.State != FeedSignerOpSucceeded {
+		t.Fatalf("adopted active row malformed: state=%q err=%v", op.State, err)
+	}
+	want := `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
+	if string(op.ResultJSON) != want {
+		t.Fatalf("adopted active result must be rewritten to the CURRENT operation ID, got %s want %s", op.ResultJSON, want)
 	}
 }
 
 // TestFeedSignerAdoptsLegacyM9HashPendingRow proves a quarantined PENDING m9
-// row (historical hash) once adopted becomes an active pending row and the
-// request proceeds through the normal sign path exactly once.
+// row keyed by the HISTORICAL operation ID (caller sends the current op ID,
+// old/new IDs differ) once adopted becomes an active pending row under the
+// CURRENT operation ID and the request proceeds through the normal sign path
+// exactly once.
 func TestFeedSignerAdoptsLegacyM9HashPendingRow(t *testing.T) {
+	const testTag = "latest"
+	testDigest := "sha256:" + strings.Repeat("b", 64)
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{testTag: testDigest},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
 	target := refHex('a')
 	ctx := context.Background()
 
-	m9hash := m9HistoricalRequestHash(req)
+	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, testTag, testDigest, req.ExpectedGeneration)
+	if histID == req.OperationID {
+		t.Fatal("test requires old and new operation IDs to differ (the normal m9 case)")
+	}
+	histReq := req
+	histReq.OperationID = histID
+	m9hash := m9HistoricalRequestHash(histReq)
 	nowNs := timeToNanos(time.Now().UTC())
 	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
 		(operation_id, request_hash, state, result_json, created_at, updated_at)
-		values (?, ?, 'pending', null, ?, ?)`, req.OperationID, m9hash[:], nowNs, nowNs); err != nil {
+		values (?, ?, 'pending', null, ?, ?)`, histID, m9hash[:], nowNs, nowNs); err != nil {
 		t.Fatalf("seed m9 pending row: %v", err)
 	}
 
@@ -1127,7 +1272,7 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("adopt pending + sign: %v", err)
 	}
-	if res.Feed != w.repoTopic || res.Reference != target {
+	if res.OperationID != req.OperationID || res.Feed != w.repoTopic || res.Reference != target {
 		t.Fatalf("unexpected sign result: %+v", res)
 	}
 	if gotFeed := w.feedStore.Feeds[w.repoTopic]; gotFeed != target {
@@ -1136,12 +1281,63 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRow(t *testing.T) {
 	if n := updater.count(); n != 1 {
 		t.Fatalf("pending-adopt must sign exactly once, got %d", n)
 	}
-	if legacyCount(t, w.store, req.OperationID) != 0 {
+	if legacyCount(t, w.store, histID) != 0 {
 		t.Fatal("quarantine row must be deleted after successful pending adoption")
 	}
 	op, _ := w.store.GetFeedSignerOperation(ctx, req.OperationID)
-	if op.State != FeedSignerOpSucceeded {
-		t.Fatalf("pending-adopt should complete to succeeded, got %q", op.State)
+	if op.State != FeedSignerOpSucceeded || op.RequestHash != NormalizeFeedCommitHash(req) {
+		t.Fatalf("pending-adopt should complete to succeeded under the current hash, got state=%q", op.State)
+	}
+}
+
+// TestFeedSignerLegacyDelimiterAmbiguityAdversary proves the delimiter-framed
+// m9 hash can never trick adoption into accepting a DIFFERENT logical request:
+// a quarantined row keyed by the derived historical ID whose stored hash was
+// produced by the historical framing over a request with a NUL-embedded field
+// (a different field split under 0x00 delimiter framing) cannot match the exact
+// historical hash of THIS request, so it is a hard CONFLICT, stays quarantined,
+// and the feed is never advanced — fail closed on the delimiter-ambiguity
+// adversary.
+func TestFeedSignerLegacyDelimiterAmbiguityAdversary(t *testing.T) {
+	const testTag = "latest"
+	testDigest := "sha256:" + strings.Repeat("c", 64)
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{testTag: testDigest},
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+
+	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, testTag, testDigest, req.ExpectedGeneration)
+	// The adversary constructs a DIFFERENT request whose owner field embeds a
+	// NUL, so the 0x00-delimiter framing splits fields differently. Its m9 hash
+	// must NOT equal this request's exact historical hash.
+	evilReq := req
+	evilReq.Owner = req.Owner + "\x00" + "evil"
+	evilReq.OperationID = histID
+	evilHash := m9HistoricalRequestHash(evilReq)
+	if evilHash == m9HistoricalRequestHash(func() publish.FeedCommitRequest { r := req; r.OperationID = histID; return r }()) {
+		t.Fatal("test fixture must produce a hash distinct from the genuine historical request hash")
+	}
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'succeeded', ?, ?, ?)`, histID, evilHash[:],
+		`{"operationID":"`+histID+`","feed":"`+w.repoTopic+`","reference":"`+refHex('a')+`"}`, nowNs, nowNs); err != nil {
+		t.Fatalf("seed delimiter-ambiguity adversary row: %v", err)
+	}
+
+	_, err := w.signer.Commit(ctx, req)
+	if !errors.Is(err, errFeedSignerConflict) {
+		t.Fatalf("expected conflict for the delimiter-ambiguity adversary, got %v", err)
+	}
+	if legacyCount(t, w.store, histID) != 1 {
+		t.Fatal("adversary row must remain quarantined")
+	}
+	if n := w.feedStore.Feeds[w.repoTopic]; n != refHex('b') {
+		t.Fatalf("feed must not advance on conflict, got %q", n)
 	}
 }
 

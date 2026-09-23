@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,16 +101,31 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	}
 
 	// Adopt any quarantined migration-9 row for this operation on this FIRST
-	// request (before reservation) — atomically, only when the incoming request
-	// hash matches either the current canonical request hash OR the exact
-	// historical migration-9 delimiter-framed hash (see legacyFeedCommitHash).
-	// The latter is how migration-9 rows were signed, so a logically identical
-	// legacy operation adopts; a differing hash under either algorithm is a
-	// hard conflict (a reused OperationID with different input); a malformed
-	// legacy succeeded result fails closed and stays quarantined. After a
-	// successful adoption the active row drives the same idempotency path as
-	// any fresh reservation.
-	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash, legacyFeedCommitHash(req))
+	// request (before reservation). A quarantined row is located atomically by
+	// the CURRENT operation ID OR the DERIVED historical migration-9 operation
+	// ID, and its stored request hash must match the algorithm/identity of the
+	// row it claims (see legacyComputeOperationID / deriveLegacyOperationID);
+	// a differing hash under either identity is a hard conflict (a reused
+	// OperationID with different input), a malformed legacy succeeded result
+	// fails closed and stays quarantined, and TWO distinct valid candidates are
+	// an ambiguity that fails closed (never accidentally adopt a different
+	// logical request). The historical ID is only ever derived here to RECOGNIZE
+	// a logically-identical m9 row; it is never used as a new active operation
+	// ID — the promoted active row always carries the CURRENT operation ID and
+	// CURRENT request hash. The round-3 legacy hash — the historical framing
+	// over the CURRENT request with the CURRENT operation ID — does NOT match a
+	// real m9 row (whose operation ID was the historical value), so it is
+	// replaced here by the historical hash over the reconstructed historical
+	// request (OperationID := the derived historical ID).
+	var legacyOpID string
+	var legacyHash [32]byte
+	if n, err := s.Store.LegacyOperationCount(ctx); err == nil && n > 0 {
+		if id, ok := s.deriveLegacyOperationID(ctx, req); ok {
+			legacyOpID = id
+			legacyHash = legacyFeedCommitHashFor(id, req)
+		}
+	}
+	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash, legacyOpID, legacyHash)
 	if aerr != nil {
 		if errors.Is(aerr, errFeedSignerLegacyConflict) {
 			return publish.FeedCommitResult{}, errFeedSignerConflict
@@ -529,6 +546,110 @@ func legacyFeedCommitHash(req publish.FeedCommitRequest) [32]byte {
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
+}
+
+// legacyFeedCommitHashFor reproduces the EXACT migration-9 request hash for a
+// request whose OperationID is EXACTLY opID. It constructs the historical
+// request — every field identical to the current request except OperationID,
+// which is the caller-supplied historical ID — and hashes it with the
+// delimiter-framed historical algorithm (legacyFeedCommitHash). A real
+// migration-9 row stored a hash computed over a request whose OperationID was
+// the HISTORICAL ComputeOperationID output, so only this historical-hash-over-
+// the-request-with-the-historical-ID byte sequence can ever match it. It only
+// ever runs in the adoption bridging path (never for new active operations,
+// which are hashed with NormalizeFeedCommitHash).
+func legacyFeedCommitHashFor(opID string, req publish.FeedCommitRequest) [32]byte {
+	histReq := req
+	histReq.OperationID = opID
+	return legacyFeedCommitHash(histReq)
+}
+
+// legacyComputeOperationID reproduces the EXACT historical migration-9
+// (1e91614 internal/publish/commit.go) ComputeOperationID: SHA-256 of the
+// original 0x00-delimited domain prefix and RAW fields (registryID as decimal,
+// owner, repo, tag, manifestDigest as supplied, expectedGeneration as decimal),
+// hex-encoded. It is pinned by test vectors independently recomputed from the
+// historical source.
+//
+// THIS FUNCTION IS MIGRATION-ONLY. It exists solely so
+// AdoptLegacyFeedSignerOperation can derive the historical operation ID that a
+// migration-9 row's operation_id primary key carried — which the current
+// length-prefixed ComputeOperationID no longer equals for the same logical
+// publication — and thereby locate and adopt the logically-identical
+// quarantined row. It MUST NOT derive identifiers for new active operations
+// (ComputeOperationID / NormalizeFeedCommitHash are the sole forward forms),
+// and its 0x00 delimiter framing carries the same field-boundary ambiguity the
+// forward format abandoned.
+func legacyComputeOperationID(registryID int64, owner, repo, tag, manifestDigest string, expectedGeneration int64) string {
+	h := sha256.New()
+	h.Write([]byte("uncloud-registry-feed-commit-op:v1\x00"))
+	h.Write([]byte(strconv.FormatInt(registryID, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(owner))
+	h.Write([]byte{0})
+	h.Write([]byte(repo))
+	h.Write([]byte{0})
+	h.Write([]byte(tag))
+	h.Write([]byte{0})
+	h.Write([]byte(manifestDigest))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(expectedGeneration, 10)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// deriveLegacyOperationID deterministically reconstructs the exact historical
+// migration-9 operation ID for the logical publication this request represents,
+// by recovering the repository identity from the referenced target repo-state
+// document:
+//
+//   - repo  = the target document's canonical Repo,
+//   - tag   = the single unambiguous tag the document carries (the tag the
+//     operation published — the manifest-Digest value, exactly as the data
+//     plane's ComputeOperationID argument),
+//   - manifestDigest = that tag's manifest digest, and
+//   - registry/owner/expectedGeneration from the request.
+//
+// It then applies the migration-only legacyComputeOperationID calculator. This
+// is only ever a RECOGNITION key to find a logically-identical quarantined m9
+// row keyed by that historical ID; it is never used as a new active operation
+// ID.
+//
+// It returns ok=false — and the caller then skips the historical-ID branch —
+// whenever the repository identity is not DETERMINISTICALLY recoverable here:
+// the document cannot be read at the request reference, the document has any
+// number of tags other than one (multiple tags would make the tag/digest
+// ambiguous, so deriving a wrong historical ID and potentially adopting a
+// different logical request is refused), or the single tag is malformed. This
+// is the fail-closed ambiguity guarantee the adoption path requires: a
+// multi-tag or unreadable repository simply cannot be bridged to an exact
+// historical ID and the m9 row stays quarantined rather than risk a wrong
+// adoption.
+func (s *FeedSigner) deriveLegacyOperationID(ctx context.Context, req publish.FeedCommitRequest) (string, bool) {
+	data, err := s.Docs.Read(ctx, req.Reference)
+	if err != nil {
+		return "", false
+	}
+	var doc struct {
+		Repo string            `json:"repo"`
+		Tags map[string]string `json:"tags"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return "", false
+	}
+	if doc.Repo == "" || len(doc.Tags) != 1 {
+		return "", false
+	}
+	var tag, digest string
+	var hasTag bool
+	for t, d := range doc.Tags {
+		tag, digest, hasTag = t, d, true
+	}
+	if !hasTag || tag == "" || digest == "" || !publish.IsHexReference(digest[strings.LastIndexByte(digest, ':')+1:]) {
+		// The manifest digest must be a 64-hex immutable reference (after any
+		// "sha256:" prefix); a malformed value cannot reproduce an exact ID.
+		return "", false
+	}
+	return legacyComputeOperationID(req.RegistryID, req.Owner, doc.Repo, tag, digest, req.ExpectedGeneration), true
 }
 
 // decodeStoredResult STRICTLY decodes a stored succeeded result JSON: duplicate

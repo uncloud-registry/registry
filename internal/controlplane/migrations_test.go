@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/uncloud-registry/registry/internal/publish"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -37,8 +39,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("expected schema version 12, got %d", version)
+	if version != 13 {
+		t.Fatalf("expected schema version 13, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -75,8 +77,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 12 {
-		t.Fatalf("expected 12 migration rows, got %d", rows)
+	if rows != 13 {
+		t.Fatalf("expected 13 migration rows, got %d", rows)
 	}
 }
 
@@ -139,8 +141,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("expected schema version 12 after upgrade, got %d", version)
+	if version != 13 {
+		t.Fatalf("expected schema version 13 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -1134,8 +1136,8 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 12 {
-		t.Fatalf("expected version 12, got %d", version)
+	if version != 13 {
+		t.Fatalf("expected version 13, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
 	assertInviteDigestSchema(t, db)
@@ -1153,8 +1155,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 12 {
-			t.Fatalf("expected version 12, got %d", version)
+		if version != 13 {
+			t.Fatalf("expected version 13, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		assertInviteDigestSchema(t, db)
@@ -1168,8 +1170,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 12 {
-			t.Fatalf("expected version 12, got %d", version)
+		if version != 13 {
+			t.Fatalf("expected version 13, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1211,8 +1213,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 12 {
-			t.Fatalf("expected version 12, got %d", version)
+		if version != 13 {
+			t.Fatalf("expected version 13, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})
@@ -1355,4 +1357,335 @@ func TestFeedSignerResultIntegrityTriggers(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `update feed_signer_operations set state='pending', result_json=?, claim_token=null, lease_until=null where operation_id='ok'`, canonical); err == nil {
 		t.Fatal("expected pending-with-result UPDATE to be rejected")
 	}
+}
+
+// TestMigration13OperationIDGrammarTriggers proves migration 13's dedicated
+// operation-ID identity triggers apply the FULL application grammar
+// (publish.ValidateOperationID) on EVERY active row — pending, processing, and
+// succeeded alike — via direct SQL, on BOTH the INSERT and UPDATE paths, and
+// that no SQLite evaluation trick (NULL, malformed storage class, embedded
+// NUL, escapes in the result) can bypass them.
+func TestMigration13OperationIDGrammarTriggers(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
+		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {
+		t.Fatal("migration 13 must install the operation-ID identity triggers")
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+	// The result JSON that is byte-canonical for a GIVEN operation id (Go-exact
+	// json.Marshal), so a rejection below can ONLY be the identity trigger.
+	canon := func(opID string) string {
+		return string(publish.CanonicalFeedCommitResultJSON(publish.FeedCommitResult{OperationID: opID, Feed: topic, Reference: ref}))
+	}
+	ins := func(opID, result string) error {
+		h := feedSignerTestHash("h-" + opID)
+		_, err := db.ExecContext(ctx, `insert into feed_signer_operations
+			(operation_id, registry_id, topic, request_hash, state, result_json,
+			 claim_token, lease_until, attempts, created_at, updated_at)
+			values (?, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+			opID, reg.ID, topic, h[:], result, nowNs, nowNs)
+		return err
+	}
+	// A pending row (NULL result — the migration-11/12 result triggers do not
+	// constrain old-v12 pending rows' operation_id, which is exactly the gap
+	// migration 13 closes) to exercise the UPDATE identity trigger.
+	updHash := feedSignerTestHash("upd-base")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('upd-base', ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+		reg.ID, topic, updHash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("seed updatable pending row: %v", err)
+	}
+	upd := func(opID string) error {
+		_, err := db.ExecContext(ctx, `update feed_signer_operations
+			set operation_id = ? where operation_id = 'upd-base'`, opID)
+		return err
+	}
+
+	forbidden := []string{
+		"a<b", "a>b", "a&b", `a"b`, `a\b`, // the five Go-JSON-escaped bytes
+		"a\x00b",                // NUL (never detectable via GLOB; instr must catch it)
+		"a	b", "a\nb", "a\x1fb", // controls
+		"a\x7fb",                         // DEL
+		"a\x80b", "a\u2028b", "a\u2029b", // non-ASCII (>= U+0080)
+		"",                       // empty
+		strings.Repeat("a", 129), // too long
+	}
+	for _, opID := range forbidden {
+		t.Run("insert/"+fmt.Sprintf("%q", opID), func(t *testing.T) {
+			if err := ins(opID, canon(opID)); err == nil {
+				t.Fatalf("INSERT with operation_id %q must be rejected by the identity trigger", opID)
+			}
+		})
+		t.Run("update/"+fmt.Sprintf("%q", opID), func(t *testing.T) {
+			if err := upd(opID); err == nil {
+				t.Fatalf("UPDATE to operation_id %q must be rejected by the identity trigger", opID)
+			}
+		})
+	}
+
+	// Direct SQL probe mirroring the reviewer: operation_id `a<b` with a LITERAL
+	// (unescaped) result fails at INSERT, and the Go-escaped result ALSO fails —
+	// because the row identity itself violates the grammar.
+	if err := ins(`a<b`, `{"operationID":"a<b","feed":"`+topic+`","reference":"`+ref+`"}`); err == nil {
+		t.Fatal("operation_id `a<b` with literal result must fail at INSERT")
+	}
+	if err := ins(`a<b`, `{"operationID":"a\u003cb","feed":"`+topic+`","reference":"`+ref+`"}`); err == nil {
+		t.Fatal("operation_id `a<b` with Go-escaped result must fail (row identity invalid)")
+	}
+
+	// NULL and malformed storage classes cannot bypass the grammar.
+	nulHash := feedSignerTestHash("nul")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values (NULL, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		reg.ID, topic, nulHash[:], canon("x"), nowNs, nowNs); err == nil {
+		t.Fatal("NULL operation_id must be rejected")
+	}
+	intHash := feedSignerTestHash("int")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values (42, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		reg.ID, topic, intHash[:], canon("x"), nowNs, nowNs); err == nil {
+		t.Fatal("non-text operation_id storage class must be rejected")
+	}
+
+	// Accepted punctuation/alphanumerics/current 64-hex forms pass both paths.
+	valid := []string{
+		strings.Repeat("a", 64),  // current ComputeOperationID form
+		"op-idA1-2.3_4:5",        // punctuation, no forbidden byte
+		strings.Repeat("a", 128), // exact upper bound
+		"~!%^()+,-./:=?@[]{|}~",  // printable 0x20..0x7e minus the five
+	}
+	for _, opID := range valid {
+		if err := ins(opID, canon(opID)); err != nil {
+			t.Fatalf("INSERT with valid operation_id %q must succeed: %v", opID, err)
+		}
+	}
+	// UPDATE path with valid ids (distinct from the inserted ones).
+	for _, opID := range []string{"upd-valid-1", "upd-" + strings.Repeat("a", 64)} {
+		if err := upd(opID); err != nil {
+			t.Fatalf("UPDATE to valid operation_id %q must succeed: %v", opID, err)
+		}
+	}
+}
+
+// TestMigration13OperationIDGrammarParityExhaustive proves SQL and Go agree
+// EXHAUSTIVELY on the operation-ID grammar: for every ASCII byte value, every
+// boundary/forbidden character embedded in a longer identifier, control runs,
+// non-ASCII code points (including U+0080 and U+2028/U+2029), and the length
+// bounds, `publish.ValidateOperationID` accepts exactly when the migration-13
+// SQL predicate accepts. NULL is invalid in SQL (no Go equivalent).
+func TestMigration13OperationIDGrammarParityExhaustive(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	pred := strings.ReplaceAll(feedSignerOperationIDGrammarCond, "NEW.operation_id", "operation_id")
+	q := `select ` + pred + ` from (select ? as operation_id)`
+	sqlBad := func(s any) int {
+		var bad int
+		if err := db.QueryRowContext(ctx, q, s).Scan(&bad); err != nil {
+			t.Fatalf("evaluate SQL predicate for %v: %v", s, err)
+		}
+		return bad
+	}
+
+	var cases []string
+	// Every single ASCII byte value, 0x00..0x7f.
+	for b := 0; b <= 0x7f; b++ {
+		cases = append(cases, string([]byte{byte(b)}))
+	}
+	// Boundary/forbidden characters embedded in a longer identifier.
+	for _, b := range []byte{0x00, 0x01, 0x09, 0x0a, 0x1f, 0x20, '"', '\\', '<', '>', '&', '~', 0x7f} {
+		cases = append(cases, "a"+string([]byte{b})+"b")
+	}
+	// Accepted punctuation and alphanumerics in context.
+	for _, s := range []string{"a-b_c.d:e", "A1-2.3_4:5", "0x9f", "hello world"} {
+		cases = append(cases, s)
+	}
+	// Non-ASCII code points (Go and SQLite both decode; >= U+0080 must reject,
+	// including the Go-JSON-escaped U+2028/U+2029).
+	for _, r := range []rune{0x80, 0x9f, 0xe9, 0xff, 0x2028, 0x2029, 0x4e2d, 0xfffd, 0x10ffff} {
+		cases = append(cases, "a"+string(r)+"b")
+	}
+	// Length bounds.
+	cases = append(cases, strings.Repeat("a", 128), strings.Repeat("a", 129))
+
+	for _, s := range cases {
+		goBad := publish.ValidateOperationID(s) != nil
+		sb := sqlBad(s)
+		if goBad != (sb == 1) {
+			t.Fatalf("parity mismatch for %q: Go valid=%v, SQL invalid=%d", s, !goBad, sb)
+		}
+	}
+	// A SQL NULL must be invalid (guard not bypassable via NULL).
+	if sb := sqlBad(nil); sb != 1 {
+		t.Fatalf("NULL operation_id must be invalid, SQL predicate=%d", sb)
+	}
+}
+
+// TestMigration13RejectsInvalidV12OperationIDRollsBack proves migration 13's
+// atomic hardening: a v12 database whose active PENDING row carries an
+// operation_id that violates the application grammar (migration 11/12 accepted
+// it — the result triggers only constrain state='succeeded' rows) causes
+// migration 13 to FAIL and roll back byte-identically: the version stays 12,
+// the offending row is untouched, and NO schema object/trigger is installed
+// (the module-level version record, sqlite_master, the row bytes, and the
+// migration count must all be byte-identical). No silent rewrite, deletion, or
+// quarantine of invalid active state, ever.
+func TestMigration13RejectsInvalidV12OperationIDRollsBack(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 12); err != nil {
+		t.Fatalf("apply through v12: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	nowNs := timeToNanos(time.Now().UTC())
+
+	// v12 ACCEPTS a grammar-violating operation_id on a pending row (NULL
+	// result): the round-3-era gap this migration closes.
+	badHash := feedSignerTestHash("a<b")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('a<b', ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+		reg.ID, topic, badHash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("v12 must admit a grammar-violating pending operation_id (the round-3-era gap): %v", err)
+	}
+
+	preSchema := dumpSQLiteSchema(t, db)
+	preRow := dumpOperationRow(t, db, "a<b")
+	preMigs := migrationCount(t, db)
+
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("migration 13 must fail when hardening encounters a grammar-violating v12 operation_id")
+	}
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 12 {
+		t.Fatalf("version must stay 12 on adversarial migration 13, got %d (err %v)", v, err)
+	}
+	if got := migrationCount(t, db); got != preMigs {
+		t.Fatalf("schema_migrations must be untouched after rollback: had %d, now %d", preMigs, got)
+	}
+	if !bytes.Equal(dumpSQLiteSchema(t, db), preSchema) {
+		t.Fatal("sqlite_master must be byte-identical after migration 13 rollback (no trigger/schema installed)")
+	}
+	if got := dumpOperationRow(t, db, "a<b"); !bytes.Equal(got, preRow) {
+		t.Fatalf("offending row must be byte-identical after rollback: %q", got)
+	}
+}
+
+// TestMigration13AcceptsValidV12OperationIDRowsUpgrade proves the supported
+// upgrade: every schema-admitted v12 active row whose operation_id obeys the
+// grammar (the 64-hex ComputeOperationID forms and valid punctuation) upgrades
+// to version 13 cleanly, with the identity triggers installed and every row
+// intact.
+func TestMigration13AcceptsValidV12OperationIDRowsUpgrade(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 12); err != nil {
+		t.Fatalf("apply through v12: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+
+	pendingIDs := []string{strings.Repeat("a", 64), "op-idA1-2.3_4:5"}
+	for _, opID := range pendingIDs {
+		ph := feedSignerTestHash(opID)
+		if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+			(operation_id, registry_id, topic, request_hash, state, result_json,
+			 claim_token, lease_until, attempts, created_at, updated_at)
+			values (?, ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+			opID, reg.ID, topic, ph[:], nowNs, nowNs); err != nil {
+			t.Fatalf("seed pending %q: %v", opID, err)
+		}
+	}
+	sucOp := strings.Repeat("b", 64)
+	sucResult := string(publish.CanonicalFeedCommitResultJSON(publish.FeedCommitResult{OperationID: sucOp, Feed: topic, Reference: ref}))
+	sh := feedSignerTestHash(sucOp)
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values (?, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		sucOp, reg.ID, topic, sh[:], sucResult, nowNs, nowNs); err != nil {
+		t.Fatalf("seed succeeded %q: %v", sucOp, err)
+	}
+
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("valid v12 rows must upgrade to 13: %v", err)
+	}
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 13 {
+		t.Fatalf("expected version 13, got %d (err %v)", v, err)
+	}
+	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
+		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {
+		t.Fatal("identity triggers must be installed after upgrade")
+	}
+	var gotSuc []byte
+	if err := db.QueryRowContext(ctx, `select result_json from feed_signer_operations where operation_id = ?`, sucOp).Scan(&gotSuc); err != nil {
+		t.Fatal(err)
+	}
+	if string(gotSuc) != sucResult {
+		t.Fatalf("succeeded row must be untouched by the upgrade: %s", gotSuc)
+	}
+}
+
+func dumpSQLiteSchema(t *testing.T, db *sql.DB) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	rows, err := db.Query(`select type, name, tbl_name, sql from sqlite_master order by type, name`)
+	if err != nil {
+		t.Fatalf("dump sqlite_master: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var typ, name, tbl string
+		var sql sql.NullString
+		if err := rows.Scan(&typ, &name, &tbl, &sql); err != nil {
+			t.Fatal(err)
+		}
+		buf.WriteString(typ + "|" + name + "|" + tbl + "|" + sql.String + "\n")
+	}
+	return buf.Bytes()
+}
+
+func dumpOperationRow(t *testing.T, db *sql.DB, opID string) []byte {
+	t.Helper()
+	var (
+		regID      int64
+		topic      string
+		hash       []byte
+		state      string
+		result     sql.NullString
+		created, _ int64
+	)
+	if err := db.QueryRow(`select registry_id, topic, request_hash, state, result_json, created_at, updated_at
+		from feed_signer_operations where operation_id = ?`, opID).
+		Scan(&regID, &topic, &hash, &state, &result, &created, &created); err != nil {
+		t.Fatalf("dump operation row %q: %v", opID, err)
+	}
+	return append([]byte(fmt.Sprintf("%d|%s|%x|%s|%s|%d|%d", regID, topic, hash, state, result.String, created, created)), 0)
+}
+
+func migrationCount(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(`select count(*) from schema_migrations`).Scan(&n); err != nil {
+		t.Fatalf("count schema_migrations: %v", err)
+	}
+	return n
 }

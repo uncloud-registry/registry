@@ -345,8 +345,8 @@ func decodeCommitResult(data []byte, req FeedCommitRequest) (FeedCommitResult, e
 
 // validateCommitRequestShape applies the client-side bounded syntax contract.
 func validateCommitRequestShape(req FeedCommitRequest) error {
-	if req.OperationID == "" || len(req.OperationID) > operationIDMaxLen || !isJSONSafeOperationID(req.OperationID) {
-		return errors.New("operationID must be non-empty, bounded, and a JSON-safe printable-ASCII identifier")
+	if err := ValidateOperationID(req.OperationID); err != nil {
+		return fmt.Errorf("%w: operationID must be non-empty, bounded, and a JSON-safe printable-ASCII identifier", err)
 	}
 	if req.RegistryID <= 0 {
 		return errors.New("registryID must be positive")
@@ -401,7 +401,7 @@ func IsHexReference(s string) bool {
 // canonical 64-lowercase-hex form — an invalid or non-canonical value is
 // rejected so a mismatched feed/reference can never be accepted as success.
 func ValidateCommitResult(result FeedCommitResult) error {
-	if result.OperationID == "" || len(result.OperationID) > operationIDMaxLen || !isJSONSafeOperationID(result.OperationID) {
+	if err := ValidateOperationID(result.OperationID); err != nil {
 		return errors.New("result operationID must be non-empty, bounded, and a JSON-safe printable-ASCII identifier")
 	}
 	// Feed must be EXACTLY the canonical full-feed wire form, not merely a
@@ -417,7 +417,7 @@ func ValidateCommitResult(result FeedCommitResult) error {
 
 // isJSONSafeOperationID reports whether s is a JSON-safe printable-ASCII
 // operation identifier: every byte is ASCII printable 0x20..0x7e EXCEPT the
-// five bytes Go's default JSON encoder escapes (", \, <, >, &). Such a string
+// five bytes Go's default JSON encoder escapes (\", \\, <, >, &). Such a string
 // is emitted VERBATIM by json.Marshal — no \uXXXX, \n, \", or <>& escapes — so
 // the canonical succeeded result can be reconstructed byte-for-byte as a plain
 // SQLite concatenation, exactly what the DB result-integrity trigger requires.
@@ -433,6 +433,33 @@ func isJSONSafeOperationID(s string) bool {
 		}
 	}
 	return true
+}
+
+// ValidateOperationID enforces the application operation-ID grammar on a
+// single candidate operation identifier. It is the single Go authority for
+// Task 10's operation-ID alphabet and is applied to BOTH the request's
+// OperationID (via ValidateCommitRequest) and the result's OperationID (via
+// ValidateCommitResult). A valid operation ID is:
+//
+//   - non-empty and at most operationIDMaxLen (128) bytes;
+//   - every byte an ASCII printable 0x20..0x7e except the five Go-JSON-escaped
+//     bytes `"`, `\`, `<`, `>`, `&`; and therefore
+//   - free of controls (0x00..0x1f), DEL (0x7f), and any non-ASCII byte
+//     (>= 0x80, including the JSON-escaping code points U+2028 / U+2029).
+//
+// The database operation-ID grammar (migration 13's identity triggers) is a
+// byte-parity mirror of THIS function — the two MUST agree on the same valid
+// set, which the parity tests prove exhaustively — so a persisted operation ID
+// can never be a value Go would reject, and json.Marshal always emits it
+// verbatim (the premise of the canonical-result byte-exact invariant).
+func ValidateOperationID(opID string) error {
+	if opID == "" || len(opID) > operationIDMaxLen {
+		return errors.New("operationID must be non-empty and bounded")
+	}
+	if !isJSONSafeOperationID(opID) {
+		return errors.New("operationID must be a bounded JSON-safe printable-ASCII identifier (no \", \\, <, >, &, controls, DEL, or non-ASCII)")
+	}
+	return nil
 }
 
 // CanonicalFeedCommitResultJSON returns the EXACT canonical byte form of a

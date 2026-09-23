@@ -321,6 +321,27 @@ var migrations = []migration{
 		Version: 12,
 		Apply:   installFeedSignerOperationStoreV12,
 	},
+	// Version 13 enforces the exact application operation-ID grammar on EVERY
+	// active feed_signer_operations row, regardless of state. It installs
+	// dedicated operation-ID IDENTITY triggers (BEFORE INSERT + BEFORE UPDATE)
+	// that reject any operation_id violating publish.ValidateOperationID
+	// (bounded length; only the JSON-safe printable-ASCII set, rejecting the
+	// five Go-JSON-escaped bytes `"`, `\`, `<`, `>`, `&`, all controls 0x00-0x1f
+	// including NUL, DEL, and every non-ASCII code point >= U+0080), closes the
+	// direct-SQL gap that previously left the character-set grammar unchecked
+	// for pending/processing rows, and reinstalls the migration-12 byte-exact
+	// canonical-result triggers only AFTER the identity triggers so their
+	// byte-exact operation_id concatenation is provably grammar-safe. It then
+	// ATOMICALLY hardens every existing active row (guarded self-update fires
+	// the new UPDATE trigger per row): a schema-admitted old-v12 row whose
+	// operation_id violates the grammar aborts the migration and rolls back
+	// byte-identically (version stays 12, no schema/trigger/data touched), while
+	// every valid v12 row (operation ids are the 64-hex forms ComputeOperationID
+	// has always produced) upgrades cleanly. Fresh installs run 1→12→13.
+	{
+		Version: 13,
+		Apply:   installFeedSignerOperationStoreV13,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

@@ -821,8 +821,8 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
 			got, err := CurrentSchemaVersion(ctx, db)
-			if err != nil || got != 12 {
-				t.Fatalf("expected schema version 12, got %d (err %v)", got, err)
+			if err != nil || got != 13 {
+				t.Fatalf("expected schema version 13, got %d (err %v)", got, err)
 			}
 			assertInviteDigestSchema(t, db)
 
@@ -1119,8 +1119,8 @@ func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("invite recipient normalization collision must not fail the migration: %v", err)
 		}
-		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 12 {
-			t.Fatalf("expected version 12, got %d (err %v)", got, err)
+		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 13 {
+			t.Fatalf("expected version 13, got %d (err %v)", got, err)
 		}
 		var emailA, emailB string
 		if err := db.QueryRowContext(ctx, `select email from registry_invites where id = 1`).Scan(&emailA); err != nil {
@@ -1273,8 +1273,8 @@ func TestInviteDigestMigrationNormalizesLegacyEmailsEveryVersion(t *testing.T) {
 			if err := ApplyMigrations(ctx, db); err != nil {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
-			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 12 {
-				t.Fatalf("expected schema version 12, got %d (err %v)", got, err)
+			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 13 {
+				t.Fatalf("expected schema version 13, got %d (err %v)", got, err)
 			}
 
 			// Users normalized to the canonical form.
@@ -1873,15 +1873,15 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 12 {
-		t.Fatalf("expected schema version 12 after repair, got %d", version)
+	if version != 13 {
+		t.Fatalf("expected schema version 13 after repair, got %d", version)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 9 {
-		t.Fatalf("expected exactly 9 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7 + forward 8 + forward 9 + forward 10 + forward 11 + forward 12), got %d", migCount)
+	if migCount != 10 {
+		t.Fatalf("expected exactly 10 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7 + forward 8 + forward 9 + forward 10 + forward 11 + forward 12 + forward 13), got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 
@@ -2001,8 +2001,8 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("re-apply migrations after repair: %v", err)
 	}
-	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 12 {
-		t.Fatalf("version must stay 12 on re-apply, got %d (err %v)", version, err)
+	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 13 {
+		t.Fatalf("version must stay 13 on re-apply, got %d (err %v)", version, err)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 }
@@ -2037,15 +2037,15 @@ func TestInviteMigrationV5FromCleanV4Schema(t *testing.T) {
 		t.Fatalf("apply migrations from clean v4: %v", err)
 	}
 	version, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || version != 12 {
-		t.Fatalf("expected schema version 12 from clean v4, got %d (err %v)", version, err)
+	if err != nil || version != 13 {
+		t.Fatalf("expected schema version 13 from clean v4, got %d (err %v)", version, err)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 12 {
-		t.Fatalf("expected 12 migration rows, got %d", migCount)
+	if migCount != 13 {
+		t.Fatalf("expected 13 migration rows, got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 	// Still protected after the reinstall, row unchanged.
