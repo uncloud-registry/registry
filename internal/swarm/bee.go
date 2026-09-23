@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -698,11 +699,12 @@ func parseChunkReferenceResponse(body []byte) ([]byte, error) {
 // On a non-201 create-only response: an explicit 409 (some Bee versions /
 // edge layers surface the conflict that way) is a definite
 // ErrFeedAlreadyExists, and a 400 is disambiguated with the precise
-// conditional probe GET /soc/{owner}/{id} (socGetHandler: 200 + strictly
-// validated Swarm-Soc-Signature header + exact SOC JSON body when the SOC
-// exists, 404 when absent): exists → ErrFeedAlreadyExists; absent or a
-// failed/malformed probe → the original dependency error. A lost creation
-// race is thus NEVER success and NEVER an overwrite.
+// conditional probe GET /soc/{owner}/{id} (socGetHandler: 200 +
+// application/octet-stream raw span-stripped 32-byte payload + strictly
+// validated Swarm-Soc-Signature header when the SOC exists, 404 when
+// absent): exists → ErrFeedAlreadyExists; absent or a failed/malformed
+// probe → the original dependency error. A lost creation race is thus NEVER
+// success and NEVER an overwrite.
 func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, identifier []byte, signature []byte, chunkData []byte, batchID string, createOnly bool) error {
 	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
 		return errors.New("postage batch id is empty or exceeds the bound")
@@ -767,21 +769,50 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 // socExists probes whether a single-owner chunk already exists at the
 // immutable (owner, identifier) address — the PRECISE conditional mechanism
 // the create-only 400 disambiguation uses (ethersphere/bee pkg/api/soc.go
-// socGetHandler: 200 when the SOC is present, 404 when absent).
+// socGetHandler, master + v2.5.0 + v2.4.x: 200 when the SOC is present, 404
+// when absent).
 //
-// A 200 is existence ONLY if the response satisfies the actual Bee contract
-// (Round 2 hardening): exactly ONE valid Swarm-Soc-Signature header whose
-// value is the hex-encoded 65-byte secp256k1 recoverable signature (130 hex
-// chars decoding to exactly 65 bytes), AND the exact bounded JSON body shape
-// socGetHandler returns ({"reference":"<64 hex>"} — the SOC chunk's own
-// address). Duplicate or comma-joined signature headers, malformed /
-// wrong-size / oversized signature values, an oversized body, an unreadable
-// body, a redirect/3xx, a 5xx, or a transport failure all fail the probe as a
-// DEPENDENCY error — NEVER existence and NEVER ErrFeedAlreadyExists, because
-// an arbitrary intermediary 200 (captive proxy, gateway, cache) must never be
-// mistaken for the immutable SOC. Only a definitive Bee 404 is absence. The
-// body is bounded and always closed; errors are data-free (the requested
-// owner/identifier and any injected response text never surface).
+// The presence 200 is validated against the REAL Bee wire contract (Round 3
+// correction — the earlier JSON-body expectation was wrong): socGetHandler
+// serves the chunk payload through the download handler as
+// application/octet-stream with the 8-byte span STRIPPED, plus exactly ONE
+// Swarm-Soc-Signature header whose value is the hex-encoded 65-byte
+// secp256k1 recoverable signature (130 hex chars). For this feed SOC the POST
+// body is the 8-byte span + the 32-byte reference, so the GET body is the
+// exact raw 32-byte reference payload. The body is read with a bounded
+// LimitReader(33) and must be EXACTLY 32 bytes — 0/31/33/oversized bodies
+// and read errors all fail closed, never silently truncated. Any 32 bytes
+// are a syntactically valid immutable feed payload, so the body is
+// deliberately NOT compared to the reference this write attempted: an
+// existing race winner legitimately differs and still proves the conflict.
+//
+// The signature is NOT cryptographically re-verified in-process: doing so
+// would require recomputing the chunk's Swarm content address (the BMT root
+// over the span-prefixed chunk, which the digest keccak256(identifier ||
+// chunkRef) binds), and this module deliberately does not reimplement BMT.
+// Existence instead relies on the exact signature-shape/body contract plus
+// the trust boundary of the configured Bee endpoint (the validated http(s)
+// origin from BEE_API_URL, typically TLS). Nothing from the response is
+// ever echoed.
+//
+// A 200 is existence ONLY when the content type is exactly
+// application/octet-stream (one header line, mime-parseable, NO parameters —
+// duplicate/absent/malformed/parameterized values fail closed), the
+// signature header is exactly valid, and the body is exactly 32 bytes.
+// A malformed 200, a redirect/3xx, a 5xx, a transport failure, or an
+// unreadable body all fail the probe as a DEPENDENCY error — NEVER existence
+// and NEVER ErrFeedAlreadyExists, because an arbitrary intermediary 200
+// (captive proxy, gateway, cache) must never be mistaken for the immutable
+// SOC. Only a definitive Bee 404 is absence. The body is bounded and always
+// closed; errors are data-free (the requested owner/identifier and any
+// injected response text never surface).
+//
+// VERSION NOTE: GET /soc exists on Bee master and the v2.5/v2.4 lines.
+// Older releases (v2.1, v1.18) may not expose the endpoint, so their probe
+// answers (404 / 405 / any other failure) stay CONSERVATIVE UNCERTAINTY —
+// the original 400 write failure remains the returned dependency error, and
+// a missing probe endpoint can never produce a false existence or a false
+// conflict.
 func (u *BeeSequenceFeedUpdater) socExists(ctx context.Context, owner string, identifier []byte) (bool, error) {
 	baseURL, err := u.writerBaseURL()
 	if err != nil {
@@ -808,22 +839,21 @@ func (u *BeeSequenceFeedUpdater) socExists(ctx context.Context, owner string, id
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 		return false, nil
 	case http.StatusOK:
-		// The ONE acceptable presence shape: strict signature header AND the
-		// exact bounded JSON body. Anything else is a dependency error.
-		body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
-		if err != nil {
-			return false, sanitizeBeeTransportError(reqCtx, "read soc probe response body", err)
-		}
-		if len(body) > beeFeedWriteMaxBody {
-			return false, errors.New("soc probe response exceeded the bound")
+		// The ONE acceptable presence shape: strict content type AND strict
+		// signature header AND the exact raw 32-byte payload. Anything else
+		// is a dependency error.
+		if err := socContentType(resp.Header); err != nil {
+			return false, err
 		}
 		if _, err := socSignatureHeader(resp.Header); err != nil {
 			return false, err
 		}
-		if _, err := parseChunkReferenceResponse(body); err != nil {
-			// The body is not the exact socGetHandler JSON shape the Bee
-			// contract defines for presence; never treat it as existence.
-			return false, errors.New("soc probe response body does not match the Bee SOC contract")
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 33))
+		if err != nil {
+			return false, sanitizeBeeTransportError(reqCtx, "read soc probe response body", err)
+		}
+		if len(body) != 32 {
+			return false, errors.New("soc probe response body is not a 32-byte immutable reference")
 		}
 		return true, nil
 	default:
@@ -832,6 +862,35 @@ func (u *BeeSequenceFeedUpdater) socExists(ctx context.Context, owner string, id
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 		return false, fmt.Errorf("soc probe failed with status %d", resp.StatusCode)
 	}
+}
+
+// socContentType strictly validates the Content-Type of a GET /soc probe 200
+// response: EXACTLY ONE header line must be present (duplicate lines reach
+// the client as multiple values and fail closed, and a single
+// comma-merged/smuggled value fails mime parsing), the value must parse with
+// mime.ParseMediaType, the media type must be exactly application/octet-stream
+// (case-insensitive), and it must carry NO parameters. Bee's socGetHandler
+// serves the SOC chunk payload through the download handler as a bare
+// application/octet-stream body, so an absent/empty value, a wrong type, a
+// parameterized value, or a malformed value is a data-free dependency error,
+// never existence. Errors never echo the header value.
+func socContentType(h http.Header) error {
+	values := h.Values("Content-Type")
+	if len(values) != 1 {
+		return errors.New("soc probe response must carry exactly one content type header")
+	}
+	v := strings.TrimSpace(values[0])
+	mediaType, params, err := mime.ParseMediaType(v)
+	if err != nil {
+		return errors.New("soc probe response content type is malformed")
+	}
+	if !strings.EqualFold(mediaType, "application/octet-stream") {
+		return errors.New("soc probe response content type is not application/octet-stream")
+	}
+	if len(params) != 0 {
+		return errors.New("soc probe response content type carries unexpected parameters")
+	}
+	return nil
 }
 
 // socSignatureHeader strictly validates the Swarm-Soc-Signature header of a

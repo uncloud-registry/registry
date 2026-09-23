@@ -1,6 +1,7 @@
 package swarm
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,9 +24,20 @@ import (
 // a present SOC.
 func socSigHex() string { return strings.Repeat("ab", 65) }
 
-// socProbeBody returns the exact JSON body Bee's socGetHandler serves on a
-// present SOC ({"reference":"<64 hex>"} — the SOC chunk's own address).
-func socProbeBody(ref string) []byte {
+// socProbePayload returns the exact raw body Bee serves on a present
+// GET /soc/{owner}/{id}: the span-stripped chunk payload delivered as
+// application/octet-stream through the download handler (contract: Bee
+// master/v2.5/v2.4 pkg/api/soc.go socGetHandler). For this feed SOC the POST
+// body is the 8-byte span + the 32-byte reference, so the GET body is the
+// bare 32 binary reference bytes — no JSON, no hex ASCII.
+func socProbePayload(b byte) []byte { return refBytes64(b) }
+
+// legacyJSONProbeBody is the OLD Round-2 fixture shape ({"reference":"<64
+// hex>"}) — real Bee NEVER serves JSON from socGetHandler (the payload goes
+// through the download handler as application/octet-stream); the strict
+// Round-3 probe must reject it as a dependency, and this fixture pins that
+// regression.
+func legacyJSONProbeBody(ref string) []byte {
 	return []byte(`{"reference":"` + ref + `"}`)
 }
 
@@ -233,16 +245,18 @@ func (b *createOnlyRaceBee) handler() http.Handler {
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{}`))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, socPath):
-			// The conditional probe stays realistic (200 + valid signature +
-			// exact SOC JSON body when present); the both-201 race never
-			// reaches it, but the "keep 400+valid probe" path uses it.
+			// The conditional probe stays realistic (200 + application/octet-stream
+			// + valid signature + the exact raw 32-byte span-stripped payload
+			// when present); the both-201 race never reaches it, but the "keep
+			// 400+valid probe" path uses it.
 			b.mu.Lock()
 			winner := b.socWinner != nil
 			b.mu.Unlock()
 			if winner {
+				w.Header().Set("Content-Type", "application/octet-stream")
 				w.Header().Set("Swarm-Soc-Signature", socSigHex())
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write(socProbeBody(hex64('f')))
+				_, _ = w.Write(socProbePayload('f'))
 				return
 			}
 			http.NotFound(w, r)
@@ -756,15 +770,21 @@ func TestBeeSequenceFeedUpdaterNonCreateSkipsReadBack(t *testing.T) {
 // TestBeeSequenceFeedUpdaterCreateOnly400ProbeHardened keeps the real Bee
 // 400-conflict path (socUploadHandler collapses the immutable-alias conflict
 // to 400 "chunk write error") and proves the disambiguating GET /soc probe
-// classifies EXACTLY per the actual Bee contract: a 200 is existence only
-// with exactly one valid Swarm-Soc-Signature header (130 hex chars = 65-byte
-// recoverable secp256k1 signature) AND the exact bounded JSON body
-// socGetHandler serves; every malformed shape, duplicate/comma header,
-// wrong-size/oversize signature, oversized body, 3xx/5xx, absent feed, and
-// transport/read failure is a DEPENDENCY error (never ErrFeedAlreadyExists),
-// so an attacker's intermediary 200 can never be mistaken for the immutable
-// SOC and can never leak body/signature/URL. The direct 409 mapping is also
-// pinned.
+// classifies EXACTLY per the REAL Bee contract (Round 3): a 200 is existence
+// ONLY with exactly one valid Content-Type header parsed to
+// application/octet-stream with no parameters, exactly one valid
+// Swarm-Soc-Signature header (130 hex chars = 65-byte recoverable secp256k1
+// signature), AND the exact raw 32-byte span-stripped payload the download
+// handler serves (NOT JSON — socGetHandler's presence body is the bare chunk
+// payload, so the OLD {"reference":...} fixture shape and every other length
+// are rejected). Missing/wrong/duplicate/parameterized/malformed content
+// type, duplicate/comma/malformed/wrong-size/oversize signature, a
+// 0/31/33/oversized body, a 3xx/5xx, an absent feed, and transport/read
+// failures are DEPENDENCY errors (never ErrFeedAlreadyExists), so an
+// attacker's intermediary 200 can never be mistaken for the immutable SOC
+// and can never leak body/signature/URL. Any OTHER valid 32-byte payload
+// (a race winner that differs from the attempted reference) still proves the
+// conflict. The direct 409 mapping is also pinned.
 func TestBeeSequenceFeedUpdaterCreateOnly400ProbeHardened(t *testing.T) {
 	t.Parallel()
 
@@ -775,20 +795,27 @@ func TestBeeSequenceFeedUpdaterCreateOnly400ProbeHardened(t *testing.T) {
 	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
 	topic := strings.Repeat("ab", 32)
 
-	validBody := socProbeBody(hex64('f'))
+	validBody := socProbePayload('f')
 	for _, tc := range []struct {
 		name        string
 		socStatus   int // POST /soc status (400 to force the probe, 409 direct conflict)
 		probeStatus int // GET /soc status
+		probeCTs    []string
 		probeSigs   []string
 		probeBody   []byte
 		wantAe      bool
 		wantDep     bool
 	}{
 		{
-			name:      "400 + valid signature header + exact body is already-exists",
+			name:      "400 + octet-stream + valid sig + exact raw 32-byte payload is already-exists",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{socSigHex()}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantAe: true,
+		},
+		{
+			name:      "valid differing winner payload (raw bytes differ from the attempted ref) still proves conflict",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: socProbePayload('d'),
 			wantAe: true,
 		},
 		{
@@ -797,63 +824,117 @@ func TestBeeSequenceFeedUpdaterCreateOnly400ProbeHardened(t *testing.T) {
 			wantAe: true,
 		},
 		{
+			name:      "probe 200 missing content type (auto text/plain) is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 wrong content type application/json is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/json"}, probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 duplicate content type header lines is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream", "application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 comma-merged content type is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream, application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 parameterized content type is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream; charset=utf-8"}, probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 malformed content type is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream; charset"}, probeSigs: []string{socSigHex()}, probeBody: validBody,
+			wantDep: true,
+		},
+		{
 			name:      "probe 200 missing signature is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: nil, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
 			name:      "probe 200 duplicate signature headers is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{socSigHex(), socSigHex()}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex(), socSigHex()}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
 			name:      "probe 200 comma-joined signature is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{socSigHex() + "," + socSigHex()}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex() + "," + socSigHex()}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
 			name:      "probe 200 wrong-size signature (32-byte hex) is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{hex64('f')}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{hex64('f')}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
 			name:      "probe 200 non-65-byte signature is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{strings.Repeat("ab", 66)}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{strings.Repeat("ab", 66)}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
 			name:      "probe 200 oversized signature value is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{strings.Repeat("ab", 200)}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{strings.Repeat("ab", 200)}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
 			name:      "probe 200 non-hex signature is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{strings.Repeat("zz", 65)}, probeBody: validBody,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{strings.Repeat("zz", 65)}, probeBody: validBody,
 			wantDep: true,
 		},
 		{
-			name:      "probe 200 valid signature + wrong body shape is dependency",
+			name:      "probe 200 empty body is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{socSigHex()}, probeBody: []byte(`{}`),
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()},
 			wantDep: true,
 		},
 		{
-			name:      "probe 200 valid signature + unknown body member is dependency",
+			name:      "probe 200 valid sig + 31-byte body is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{socSigHex()}, probeBody: []byte(`{"reference":"` + hex64('f') + `","extra":1}`),
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: validBody[:31],
 			wantDep: true,
 		},
 		{
-			name:      "probe 200 valid signature + oversized body is dependency",
+			name:      "probe 200 valid sig + 33-byte body is dependency",
 			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
-			probeSigs: []string{socSigHex()}, probeBody: bytesN(beeFeedWriteMaxBody + 1),
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: append(append([]byte(nil), validBody...), 0x00),
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 valid sig + oversized body is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: bytesN(beeFeedWriteMaxBody + 1),
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 valid sig + legacy JSON body shape is dependency (never JSON on the wire)",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: legacyJSONProbeBody(hex64('f')),
+			wantDep: true,
+		},
+		{
+			name:      "probe 200 valid sig + JSON body with unknown member is dependency",
+			socStatus: http.StatusBadRequest, probeStatus: http.StatusOK,
+			probeCTs: []string{"application/octet-stream"}, probeSigs: []string{socSigHex()}, probeBody: []byte(`{"reference":"` + hex64('f') + `","extra":1}`),
 			wantDep: true,
 		},
 		{
@@ -894,6 +975,9 @@ func TestBeeSequenceFeedUpdaterCreateOnly400ProbeHardened(t *testing.T) {
 					mu.Lock()
 					probeCalls++
 					mu.Unlock()
+					for _, v := range tc.probeCTs {
+						w.Header().Add("Content-Type", v)
+					}
 					for _, v := range tc.probeSigs {
 						w.Header().Add("Swarm-Soc-Signature", v)
 					}
@@ -1034,7 +1118,8 @@ func (t socProbeFailTransport) RoundTrip(r *http.Request) (*http.Response, error
 
 // socProbeReadFailTransport answers the GET /soc probe with a 200 whose body
 // read fails with the wrapped error (injected text) while forwarding every
-// other request to the base transport.
+// other request to the base transport. The content type and signature pass
+// the strict checks so the body-READ path itself is what fails.
 type socProbeReadFailTransport struct {
 	base *http.Transport
 	err  error
@@ -1043,6 +1128,7 @@ type socProbeReadFailTransport struct {
 func (t socProbeReadFailTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/soc/") {
 		h := make(http.Header)
+		h.Set("Content-Type", "application/octet-stream")
 		h.Set("Swarm-Soc-Signature", socSigHex())
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -1052,6 +1138,122 @@ func (t socProbeReadFailTransport) RoundTrip(r *http.Request) (*http.Response, e
 		}, nil
 	}
 	return t.base.RoundTrip(r)
+}
+
+// closeTrackingReadCloser wraps a body and records whether Close was ever
+// called — the probe contract test asserts the response body is ALWAYS
+// closed, on every outcome.
+type closeTrackingReadCloser struct {
+	rc     io.ReadCloser
+	closed *bool
+}
+
+func (c closeTrackingReadCloser) Read(p []byte) (int, error) { return c.rc.Read(p) }
+func (c closeTrackingReadCloser) Close() error {
+	*c.closed = true
+	return c.rc.Close()
+}
+
+// socProbeTrackedTransport answers the GET /soc probe with a 200 carrying the
+// strict-valid response (octet-stream + signature + raw 32-byte payload) via
+// a Close-tracking body — or, when readErr is non-nil, a body whose read
+// fails with it — and forwards every other request to the base transport.
+type socProbeTrackedTransport struct {
+	base    *http.Transport
+	closed  *bool
+	readErr error
+}
+
+func (t socProbeTrackedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/soc/") {
+		h := make(http.Header)
+		h.Set("Content-Type", "application/octet-stream")
+		h.Set("Swarm-Soc-Signature", socSigHex())
+		var rc io.ReadCloser
+		if t.readErr != nil {
+			rc = markerReadCloser{err: t.readErr}
+		} else {
+			rc = io.NopCloser(bytes.NewReader(socProbePayload('f')))
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     h,
+			Body:       closeTrackingReadCloser{rc: rc, closed: t.closed},
+			Request:    r,
+		}, nil
+	}
+	return t.base.RoundTrip(r)
+}
+
+// TestSocProbeBodyAlwaysClosed proves the GET /soc probe response body is
+// ALWAYS closed — on the strict-valid (already-exists) outcome AND on a
+// body-read failure — so no reader or pooled connection leaks regardless of
+// how the probe resolves.
+func TestSocProbeBodyAlwaysClosed(t *testing.T) {
+	t.Parallel()
+
+	privateKey, err := ethcrypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate private key: %v", err)
+	}
+	owner := strings.ToLower(ethcrypto.PubkeyToAddress(privateKey.PublicKey).Hex()[2:])
+	topic := strings.Repeat("ab", 32)
+	feedPath := "/feeds/" + owner + "/" + topic
+
+	for _, tc := range []struct {
+		name    string
+		readErr error // nil: strict-valid probe body; non-nil: read fails
+		wantAe  bool
+	}{
+		{"strict-valid probe body is closed after already-exists", nil, true},
+		{"failing probe body read is closed after dependency error", errors.New(dataFreeText), false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			var closed bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == feedPath:
+					http.NotFound(w, r)
+				case r.Method == http.MethodPost && r.URL.Path == "/chunks":
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"reference":"` + hex64('c') + `"}`))
+				case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/soc/"+owner+"/"):
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"code":427,"message":"chunk write error"}`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			transport := socProbeTrackedTransport{
+				base:    server.Client().Transport.(*http.Transport),
+				closed:  &closed,
+				readErr: tc.readErr,
+			}
+			updater, err := NewBeeSequenceFeedUpdater(server.URL, &http.Client{Transport: transport}, hex.EncodeToString(ethcrypto.FromECDSA(privateKey)))
+			if err != nil {
+				t.Fatalf("create updater: %v", err)
+			}
+			err = updater.Update(context.Background(), FeedUpdate{
+				Feed:       "feed://" + owner + "/" + topic,
+				Reference:  hex64('a'),
+				BatchID:    hex64('b'),
+				CreateOnly: true,
+			})
+			if tc.wantAe && !errors.Is(err, ErrFeedAlreadyExists) {
+				t.Fatalf("expected ErrFeedAlreadyExists, got %v", err)
+			}
+			if !tc.wantAe && err == nil {
+				t.Fatal("expected a dependency error, got nil")
+			}
+			requireDataFree(t, err, "tracked probe", owner, hex64('b'), hex64('a'), dataFreeText, "sig=", "/soc/")
+			if !closed {
+				t.Fatal("probe response body must be closed on every outcome")
+			}
+		})
+	}
 }
 
 // chunkContentRef derives a deterministic 64-hex content address for a chunk

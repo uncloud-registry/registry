@@ -110,8 +110,9 @@ func TestFeedSignerCreateOnlyRaceDetectedAsGenerationConflict(t *testing.T) {
 //     lookups returned (so neither lookup can observe the winner), then
 //     ALWAYS 201 — the coalescing model — persisting ONLY the first payload
 //     atomically.
-//   - GET /soc/<owner>/<id>: the precise conditional probe (200 + strictly
-//     valid Swarm-Soc-Signature when present), kept for the separate
+//   - GET /soc/<owner>/<id>: the precise conditional probe (200 +
+//     application/octet-stream + strictly valid Swarm-Soc-Signature + the raw
+//     32-byte span-stripped payload when present), kept for the separate
 //     400+valid-probe conflict path.
 type createOnlyRaceBee struct {
 	mu          sync.Mutex
@@ -242,9 +243,10 @@ func newCreateOnlyRaceBee(t *testing.T, repoPath string, seedFeeds map[string][]
 			winner := len(b.socWinner) != 0
 			b.mu.Unlock()
 			if winner {
+				w.Header().Set("Content-Type", "application/octet-stream")
 				w.Header().Set("Swarm-Soc-Signature", strings.Repeat("ab", 65))
 				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"reference":"` + refHex('f') + `"}`))
+				_, _ = w.Write(refBytesForTest(t, refHex('f')))
 				return
 			}
 			http.NotFound(w, r)
