@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -1004,5 +1007,83 @@ func TestHandlerServesTwoHostsWithHostSpecificTokens(t *testing.T) {
 	}
 	if got := getManifest("evil.example.test", tokenA); got != http.StatusUnauthorized {
 		t.Fatalf("valid token at a host outside the allowlist: status %d, want 401", got)
+	}
+}
+
+// TestManifestPutRejectsAttackerStoredMediaWithoutEcho drives a real
+// handleManifestPut where the staged blob's stored media type is attacker
+// controlled and malformed/conflicting. The 400 MANIFEST_INVALID response must
+// NOT echo the attacker marker anywhere (ValidationError.Error is data-free),
+// and the manifest body itself must be rejected before any manifest state is
+// recorded — the upload of the blob is the only side effect.
+func TestManifestPutRejectsAttackerStoredMediaWithoutEcho(t *testing.T) {
+	t.Parallel()
+
+	const marker = "EVILSTOREDMEDIATYPE_ATTACKER_7f3a"
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+
+	handler, issuer := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	pushAuth := func(req *http.Request) {
+		req.Host = testServiceHost
+		req.Header.Set("Authorization", registryBearer(t, issuer, "user:alice", testServiceHost, "backend/api", []auth.Action{auth.ActionPush}, time.Hour))
+	}
+
+	do := func(req *http.Request) (*http.Response, []byte) {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, body
+	}
+
+	// Stage a config blob whose stored media type is the attacker marker.
+	startReq, _ := http.NewRequest(http.MethodPost, server.URL+"/v2/backend/api/blobs/uploads/", nil)
+	pushAuth(startReq)
+	startResp, _ := do(startReq)
+	if startResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("start upload status %d", startResp.StatusCode)
+	}
+	uploadURL := server.URL + startResp.Header.Get("Location")
+
+	configBytes := []byte(`{"architecture":"amd64"}`)
+	configDigest := publish.ComputeDigest(configBytes)
+
+	patchReq, _ := http.NewRequest(http.MethodPatch, uploadURL, bytes.NewReader(configBytes))
+	pushAuth(patchReq)
+	patchResp, _ := do(patchReq)
+	if patchResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("patch upload status %d", patchResp.StatusCode)
+	}
+
+	finalizeReq, _ := http.NewRequest(http.MethodPut, uploadURL+"?digest="+configDigest, nil)
+	pushAuth(finalizeReq)
+	finalizeReq.Header.Set("Content-Type", marker) // attacker-controlled stored media type
+	finalizeResp, _ := do(finalizeReq)
+	if finalizeResp.StatusCode != http.StatusCreated {
+		t.Fatalf("finalize upload status %d", finalizeResp.StatusCode)
+	}
+
+	// Publish a manifest that references the staged blob with a VALID
+	// descriptor. The stored media type (marker) is malformed, so reference
+	// coherence must reject with a data-free 400 and zero manifest state.
+	manifestBody := []byte(`{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":` + fmt.Sprintf("%d", len(configBytes)) + `,"digest":"` + configDigest + `"},"layers":[]}`)
+	manifestReq, _ := http.NewRequest(http.MethodPut, server.URL+"/v2/backend/api/manifests/latest", bytes.NewReader(manifestBody))
+	pushAuth(manifestReq)
+	manifestReq.Header.Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+	manifestResp, manifestBodyBytes := do(manifestReq)
+
+	if manifestResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("manifest put status %d, want 400 (body: %s)", manifestResp.StatusCode, manifestBodyBytes)
+	}
+	if strings.Contains(string(manifestBodyBytes), marker) {
+		t.Fatalf("MANIFEST_INVALID response echoes attacker stored media marker %q: %s", marker, manifestBodyBytes)
 	}
 }

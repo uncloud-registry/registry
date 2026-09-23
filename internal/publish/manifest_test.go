@@ -852,8 +852,10 @@ func TestParseArtifactErrorsAreDataFree(t *testing.T) {
 	// The marker is attacker-controlled content inside the body; no error may
 	// echo it.
 	bodies := []string{
-		// Unknown field carrying the marker in its value.
+		// Unknown field carrying the marker in its VALUE.
 		fmt.Sprintf(`{"schemaVersion":2,"subject":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, marker, ociConfigMT, dig('c')),
+		// Unknown field whose KEY IS the marker (key must not become the path).
+		fmt.Sprintf(`{"schemaVersion":2,%q:1,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, marker, ociConfigMT, dig('c')),
 		// Duplicate member whose value is the marker.
 		fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, marker, marker, ociConfigMT, dig('c')),
 		// Trailing garbage with the marker.
@@ -978,7 +980,7 @@ func TestPublishValidatesBeforeAnyWrite(t *testing.T) {
 			wantKind: ErrKindMissingReference,
 		},
 		{
-			name: "index child manifest unavailable (deferred to Task 19)",
+			name: "non-empty index publication rejected before reference resolution (Task 19)",
 			mut: func(input BuildInput) BuildInput {
 				body := []byte(ociIndex())
 				input.ManifestJSON = body
@@ -988,7 +990,20 @@ func TestPublishValidatesBeforeAnyWrite(t *testing.T) {
 				input.StagedBlobs = map[string]spec.BlobDescriptor{}
 				return input
 			},
-			wantKind: ErrKindMissingReference,
+			wantKind: ErrKindUnsupportedPublication,
+		},
+		{
+			name: "empty index publication rejected (Task 19)",
+			mut: func(input BuildInput) BuildInput {
+				body := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, ociIndexMT))
+				input.ManifestJSON = body
+				input.ManifestDigest = ComputeDigest(body)
+				input.Manifest.MediaType = ociIndexMT
+				input.Manifest.Size = int64(len(body))
+				input.StagedBlobs = map[string]spec.BlobDescriptor{}
+				return input
+			},
+			wantKind: ErrKindUnsupportedPublication,
 		},
 	}
 
@@ -1171,6 +1186,14 @@ func TestPublishReferenceMetadata(t *testing.T) {
 			dig('c'): {SwarmRef: "s-c", Size: 24, MediaType: ociConfigMT},
 			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: "not a mediatype"},
 		}, wantKind: ErrKindMediaTypeMismatch},
+		{name: "staged conflicts even when current matches (both sources validated)", current: currentWithBlobs(configDesc, layerDesc), staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "stale-c", Size: 99, MediaType: "text/plain"},
+			dig('a'): {SwarmRef: "stale-a", Size: 1, MediaType: "text/plain"},
+		}, wantKind: ErrKindSizeMismatch},
+		{name: "staged concrete media conflicts when current matches", current: currentWithBlobs(configDesc, layerDesc), staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 24, MediaType: ociConfigMT},
+			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: "text/plain"},
+		}, wantKind: ErrKindMediaTypeMismatch},
 	}
 	for _, tc := range failCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1217,10 +1240,6 @@ func TestPublishReferenceMetadata(t *testing.T) {
 			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: blobGenericMediaType},
 		}},
 		{name: "concrete current and staged agree with descriptor", current: currentWithBlobs(configDesc, layerDesc), staged: map[string]spec.BlobDescriptor{}},
-		{name: "digest in both current+staged prefers current even when staged conflicts", current: currentWithBlobs(configDesc, layerDesc), staged: map[string]spec.BlobDescriptor{
-			dig('c'): {SwarmRef: "stale-c", Size: 99, MediaType: "text/plain"},
-			dig('a'): {SwarmRef: "stale-a", Size: 1, MediaType: "text/plain"},
-		}},
 	}
 	for _, tc := range successCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1234,6 +1253,182 @@ func TestPublishReferenceMetadata(t *testing.T) {
 			}
 			if objs.puts != 2 || feeds.updates != 1 {
 				t.Fatalf("coherent publish must write manifest+state and one feed, got puts=%d feeds=%d", objs.puts, feeds.updates)
+			}
+		})
+	}
+}
+
+// TestBuildNextRejectsIndexPublication proves direct BuildNext refuses ANY
+// index kind (empty and non-empty) with a typed unsupported-publication error
+// BEFORE deriving state or mutating current. Parser support for indexes is
+// unaffected; publication is gated until Task 19.
+func TestBuildNextRejectsIndexPublication(t *testing.T) {
+	bodies := []string{
+		fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, ociIndexMT),
+		ociIndex(),
+	}
+	for _, body := range bodies {
+		input := validBuildInput(t)
+		input.ManifestJSON = []byte(body)
+		input.ManifestDigest = ComputeDigest([]byte(body))
+		input.Manifest.MediaType = ociIndexMT
+		input.Manifest.Size = int64(len(body))
+		input.StagedBlobs = map[string]spec.BlobDescriptor{}
+
+		current := spec.RepoStateDocument{Generation: 7}
+		next, err := (DefaultBuilder{}).BuildNext(current, input)
+		if err == nil {
+			t.Fatal("expected direct BuildNext to reject index publication")
+		}
+		var ve *ValidationError
+		if !errors.As(err, &ve) || ve.Kind != ErrKindUnsupportedPublication {
+			t.Fatalf("expected unsupported_artifact_publication, got %v", err)
+		}
+		if next.Generation != 0 || next.Repo != "" {
+			t.Fatalf("BuildNext derived state on index rejection: %+v", next)
+		}
+		if current.Generation != 7 {
+			t.Fatalf("BuildNext mutated current: generation=%d", current.Generation)
+		}
+	}
+}
+
+// TestBuildNextPrefersCurrentRecordOverStagedGeneric proves the builder never
+// lets a staged unspecified (empty/octet-stream) record overwrite the richer
+// authoritative current record for the same digest, while still copying a
+// staged blob whose digest is NOT in current (Task 13 owns narrowing staged
+// copying broadly; this is only the same-digest overwrite safety).
+func TestBuildNextPrefersCurrentRecordOverStagedGeneric(t *testing.T) {
+	current := spec.RepoStateDocument{Blobs: map[string]spec.BlobDescriptor{
+		dig('c'): {SwarmRef: "s-c-current", Size: 24, MediaType: ociConfigMT},
+		dig('a'): {SwarmRef: "s-a-current", Size: 1024, MediaType: ociLayerMT},
+	}}
+	input := validBuildInput(t)
+	input.Manifest.SwarmRef = "swarm-ref-manifest"
+	input.StagedBlobs = map[string]spec.BlobDescriptor{
+		dig('c'): {SwarmRef: "s-c-staged", Size: 24},                                       // unspecified media
+		dig('a'): {SwarmRef: "s-a-staged", Size: 1024, MediaType: blobGenericMediaType},    // octet-stream generic
+		dig('z'): {SwarmRef: "s-z-staged", Size: 7, MediaType: "application/octet-stream"}, // unrelated staged blob
+	}
+
+	next, err := (DefaultBuilder{}).BuildNext(current, input)
+	if err != nil {
+		t.Fatalf("direct BuildNext with dual-source generic/rich: %v", err)
+	}
+	if got := next.Blobs[dig('c')]; got.SwarmRef != "s-c-current" || got.MediaType != ociConfigMT || got.Size != 24 {
+		t.Fatalf("current config record degraded by generic staged entry: %+v", got)
+	}
+	if got := next.Blobs[dig('a')]; got.SwarmRef != "s-a-current" || got.MediaType != ociLayerMT || got.Size != 1024 {
+		t.Fatalf("current layer record degraded by octet-stream staged entry: %+v", got)
+	}
+	if got, ok := next.Blobs[dig('z')]; !ok || got.SwarmRef != "s-z-staged" || got.Size != 7 {
+		t.Fatalf("staged blob not in current should still be copied, got %+v ok=%v", got, ok)
+	}
+}
+
+// TestPublishDualSourceKeepsCurrentRichRecord runs the same dual-source
+// generic/rich scenario through Publish and asserts the resulting next state,
+// not just write counts, keeps the current authoritative records.
+func TestPublishDualSourceKeepsCurrentRichRecord(t *testing.T) {
+	current := spec.RepoStateDocument{Blobs: map[string]spec.BlobDescriptor{
+		dig('c'): {SwarmRef: "s-c-current", Size: 24, MediaType: ociConfigMT},
+		dig('a'): {SwarmRef: "s-a-current", Size: 1024, MediaType: ociLayerMT},
+	}}
+	input := validBuildInput(t)
+	input.StagedBlobs = map[string]spec.BlobDescriptor{
+		dig('c'): {SwarmRef: "s-c-staged", Size: 24},
+		dig('a'): {SwarmRef: "s-a-staged", Size: 1024, MediaType: blobGenericMediaType},
+	}
+
+	objs := &countingObjects{}
+	feeds := &countingFeeds{}
+	p := Publisher{Builder: DefaultBuilder{}, Objects: objs, Feeds: feeds}
+	next, err := p.Publish(context.Background(), "feed://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", current, input, "batch-1")
+	if err != nil {
+		t.Fatalf("publish dual-source generic/rich: %v", err)
+	}
+	if got := next.Blobs[dig('c')]; got.SwarmRef != "s-c-current" || got.MediaType != ociConfigMT {
+		t.Fatalf("published state degraded config record: %+v", got)
+	}
+	if got := next.Blobs[dig('a')]; got.SwarmRef != "s-a-current" || got.MediaType != ociLayerMT {
+		t.Fatalf("published state degraded layer record: %+v", got)
+	}
+	if objs.puts != 2 || feeds.updates != 1 {
+		t.Fatalf("coherent dual-source publish writes: puts=%d feeds=%d", objs.puts, feeds.updates)
+	}
+}
+
+// TestPublishValidationErrorsAreDataFree proves the Publish path never echoes
+// attacker-controlled values (stored media type, digest, size, repo/tag)
+// through ValidationError.Error, even though the internal cause may retain
+// them for errors.Is/As. Each failing publication makes zero object writes and
+// zero feed updates.
+func TestPublishValidationErrorsAreDataFree(t *testing.T) {
+	const marker = "SECRETMEDIAMARKER42"
+	ctx := context.Background()
+	current := spec.RepoStateDocument{}
+
+	cases := []struct {
+		name string
+		mut  func(input BuildInput) BuildInput
+	}{
+		{
+			name: "stored blob media malformed",
+			mut: func(input BuildInput) BuildInput {
+				s := input.StagedBlobs[dig('a')]
+				s.SwarmRef = marker
+				s.MediaType = marker // malformed concrete stored type
+				input.StagedBlobs[dig('a')] = s
+				return input
+			},
+		},
+		{
+			name: "stored blob concrete media mismatch",
+			mut: func(input BuildInput) BuildInput {
+				s := input.StagedBlobs[dig('a')]
+				s.MediaType = "application/x-" + marker // well-formed but conflicting
+				input.StagedBlobs[dig('a')] = s
+				return input
+			},
+		},
+		{
+			name: "stored blob size mismatch",
+			mut: func(input BuildInput) BuildInput {
+				s := input.StagedBlobs[dig('c')]
+				s.SwarmRef = marker
+				s.Size = 999
+				input.StagedBlobs[dig('c')] = s
+				return input
+			},
+		},
+		{
+			name: "missing reference",
+			mut: func(input BuildInput) BuildInput {
+				input.StagedBlobs = map[string]spec.BlobDescriptor{}
+				return input
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			objs := &countingObjects{}
+			feeds := &countingFeeds{}
+			p := Publisher{Builder: DefaultBuilder{}, Objects: objs, Feeds: feeds}
+			input := tc.mut(validBuildInput(t))
+			_, err := p.Publish(ctx, "feed://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", current, input, "batch-1")
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if strings.Contains(err.Error(), marker) {
+				t.Fatalf("publish error echoes attacker marker %q: %q", marker, err.Error())
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected typed ValidationError, got %T: %v", err, err)
+			}
+			if objs.puts != 0 || feeds.updates != 0 {
+				t.Fatalf("validation failure caused writes: puts=%d feeds=%d", objs.puts, feeds.updates)
 			}
 		})
 	}

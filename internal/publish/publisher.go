@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime"
 	"strings"
@@ -153,7 +154,16 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 		Blobs:      cloneBlobMap(current.Blobs),
 	}
 
+	// Copy the staged blobs into the next state. Task 13 owns narrowing this
+	// to only the referenced staged blobs broadly; here we apply only the
+	// same-digest metadata-safety rule: a staged record MUST NOT overwrite a
+	// digest already present in current state, because current is the
+	// authoritative, richer record and a generic staged placeholder
+	// (empty/application/octet-stream) would otherwise degrade it.
 	for digest, desc := range input.StagedBlobs {
+		if _, exists := current.Blobs[digest]; exists {
+			continue
+		}
 		next.Blobs[digest] = desc
 	}
 	next.Manifests[input.ManifestDigest] = input.Manifest
@@ -185,17 +195,27 @@ func validateInputArtifact(current spec.RepoStateDocument, input BuildInput) (Ar
 	if err != nil {
 		return Artifact{}, err
 	}
-	if got := ComputeDigest(input.ManifestJSON); got != input.ManifestDigest {
+	// Publication gate: ParseArtifact accepts OCI indexes / Docker manifest
+	// lists (including empty ones), but their PUBLICATION is not supported
+	// until Task 19. Reject index kinds with a stable typed error here — BEFORE
+	// reference availability, state derivation, or any object/feed write — so
+	// both Publisher.publish and DefaultBuilder.BuildNext refuse index
+	// publication with zero writes. Parser support is deliberately separate.
+	if artifact.Kind == ArtifactKindIndex {
 		return Artifact{}, &ValidationError{
-			Kind: ErrKindDigestMismatch,
-			Err:  fmt.Errorf("computed manifest body digest %s disagrees with the handler-provided digest %s", got, input.ManifestDigest),
+			Kind: ErrKindUnsupportedPublication,
+			Err:  errors.New("index publication is not supported in v1 until Task 19"),
 		}
 	}
+	if got := ComputeDigest(input.ManifestJSON); got != input.ManifestDigest {
+		return Artifact{}, newValidationCause(ErrKindDigestMismatch, "",
+			"computed manifest body digest disagrees with the handler-provided digest",
+			fmt.Errorf("computed %s while handler declared %s", got, input.ManifestDigest))
+	}
 	if int64(len(input.ManifestJSON)) != input.Manifest.Size {
-		return Artifact{}, &ValidationError{
-			Kind: ErrKindSizeMismatch,
-			Err:  fmt.Errorf("manifest body is %d bytes but the handler-provided descriptor declares %d", len(input.ManifestJSON), input.Manifest.Size),
-		}
+		return Artifact{}, newValidationCause(ErrKindSizeMismatch, "",
+			"manifest body size disagrees with the handler-provided descriptor",
+			fmt.Errorf("body is %d bytes while handler declared %d", len(input.ManifestJSON), input.Manifest.Size))
 	}
 	if err := validateManifestReferences(current, input, artifact); err != nil {
 		return Artifact{}, err
@@ -213,10 +233,12 @@ const blobGenericMediaType = "application/octet-stream"
 
 // validateManifestReferences requires every descriptor referenced by the
 // artifact to resolve to a stored blob whose SIZE and MEDIA TYPE are coherent
-// with the descriptor. The authoritative record for a digest is the current
-// repository state entry when present (state reflects an already-accepted
-// artifact), otherwise the caller's staged blob set; a digest in both sources
-// is judged against the current-state record, which is preferred.
+// with the descriptor. For each digest EVERY present source is validated —
+// the current repository state record if present AND the caller's staged blob
+// set if present — because the builder writes both into the next state; a
+// size/media conflict in either source rejects even when the other source
+// matches or is the preferred record. current state remains the authoritative
+// record for the digest in state derivation (see BuildNext).
 //
 // Normed media-type contract:
 //   - the blob-upload transport does not reliably carry a media type
@@ -225,42 +247,42 @@ const blobGenericMediaType = "application/octet-stream"
 //   - any CONCRETE stored type is normalized via mime.ParseMediaType
 //     (case-insensitive, parameter-agnostic) and must equal the canonical
 //     descriptor media type — a concrete conflicting type (e.g. text/plain
-//     for a gzip layer) or a malformed stored type is a media-type mismatch;
-//   - an index child that is not yet in repository state fails as a missing
-//     reference until index publication (Task 19) records it.
+//     for a gzip layer) or a malformed stored type is a media-type mismatch.
 //
 // Any size or media-type conflict returns a typed error BEFORE any object
 // write, so the failed publication performs zero puts and zero feed updates.
 func validateManifestReferences(current spec.RepoStateDocument, input BuildInput, artifact Artifact) error {
 	for _, ref := range artifact.References() {
-		if stored, ok := current.Blobs[ref.Digest]; ok {
-			if err := checkReferenceMetadata(ref, stored); err != nil {
+		staged, inStaged := input.StagedBlobs[ref.Digest]
+		currentStored, inCurrent := current.Blobs[ref.Digest]
+		if !inCurrent && !inStaged {
+			return newValidationCause(ErrKindMissingReference, "",
+				"manifest references a blob that is neither in repository state nor staged",
+				fmt.Errorf("missing reference %s", ref.Digest))
+		}
+		if inCurrent {
+			if err := checkReferenceMetadata(ref, currentStored); err != nil {
 				return err
 			}
-			continue
 		}
-		staged, ok := input.StagedBlobs[ref.Digest]
-		if !ok {
-			return &ValidationError{
-				Kind: ErrKindMissingReference,
-				Err:  fmt.Errorf("manifest references blob %q that is neither in repository state nor staged", ref.Digest),
+		if inStaged {
+			if err := checkReferenceMetadata(ref, staged); err != nil {
+				return err
 			}
-		}
-		if err := checkReferenceMetadata(ref, staged); err != nil {
-			return err
 		}
 	}
 	return nil
 }
 
 // checkReferenceMetadata verifies one descriptor's size and media type against
-// its authoritative stored blob record.
+// one present stored blob record. Errors are data-free: the public message
+// never echoes the descriptor digest, stored size, or stored media type; those
+// details live only in the internal cause reachable via errors.Is/As.
 func checkReferenceMetadata(ref Descriptor, stored spec.BlobDescriptor) error {
 	if stored.Size != ref.Size {
-		return &ValidationError{
-			Kind: ErrKindSizeMismatch,
-			Err:  fmt.Errorf("blob %s is %d bytes in store but the manifest descriptor declares %d", ref.Digest, stored.Size, ref.Size),
-		}
+		return newValidationCause(ErrKindSizeMismatch, "",
+			"stored blob size disagrees with the manifest descriptor",
+			fmt.Errorf("blob %s stored %d while descriptor declares %d", ref.Digest, stored.Size, ref.Size))
 	}
 	if err := mediaTypesCoherent(ref.MediaType, stored.MediaType); err != nil {
 		return err
@@ -274,6 +296,8 @@ func checkReferenceMetadata(ref Descriptor, stored spec.BlobDescriptor) error {
 // stored types are the upload transport's unspecified placeholder and are
 // transparent; any concrete stored type must MIME-normalize equal the
 // descriptor's, and a concrete conflicting or malformed type is a mismatch.
+// Error messages are data-free: the stored/descriptor media-type values are
+// only retained in the internal cause.
 func mediaTypesCoherent(descriptorMediaType, storedMediaType string) error {
 	trimmed := strings.TrimSpace(storedMediaType)
 	if trimmed == "" {
@@ -281,26 +305,23 @@ func mediaTypesCoherent(descriptorMediaType, storedMediaType string) error {
 	}
 	norm, err := normalizeMediaType(trimmed)
 	if err != nil {
-		return &ValidationError{
-			Kind: ErrKindMediaTypeMismatch,
-			Err:  fmt.Errorf("stored blob media type %q is malformed and cannot be reconciled with descriptor kind %q", trimmed, descriptorMediaType),
-		}
+		return newValidationCause(ErrKindMediaTypeMismatch, "",
+			"stored blob media type is malformed and cannot be reconciled with the descriptor",
+			fmt.Errorf("stored %q while descriptor kind %q", trimmed, descriptorMediaType))
 	}
 	if norm == blobGenericMediaType {
 		return nil
 	}
 	want, err := normalizeMediaType(descriptorMediaType)
 	if err != nil {
-		return &ValidationError{
-			Kind: ErrKindMediaTypeMismatch,
-			Err:  fmt.Errorf("descriptor media type %q cannot be reconciled with the stored blob type", descriptorMediaType),
-		}
+		return newValidationCause(ErrKindMediaTypeMismatch, "",
+			"descriptor media type cannot be reconciled with the stored blob type",
+			fmt.Errorf("descriptor %q", descriptorMediaType))
 	}
 	if norm != want {
-		return &ValidationError{
-			Kind: ErrKindMediaTypeMismatch,
-			Err:  fmt.Errorf("blob media type %q disagrees with the manifest descriptor media type %q", trimmed, descriptorMediaType),
-		}
+		return newValidationCause(ErrKindMediaTypeMismatch, "",
+			"stored blob media type disagrees with the manifest descriptor media type",
+			fmt.Errorf("stored %q while descriptor %q", trimmed, descriptorMediaType))
 	}
 	return nil
 }

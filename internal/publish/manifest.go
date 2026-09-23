@@ -133,16 +133,24 @@ const (
 	ErrKindDigestMismatch         ValidationErrorKind = "digest_mismatch"
 	ErrKindSizeMismatch           ValidationErrorKind = "size_mismatch"
 	ErrKindMissingReference       ValidationErrorKind = "missing_reference"
+	// ErrKindUnsupportedPublication rejects publishing an index kind (empty or
+	// non-empty). Parser support for indexes is separate (ParseArtifact accepts
+	// them); their PUBLICATION is gated until Task 19 enables it.
+	ErrKindUnsupportedPublication ValidationErrorKind = "unsupported_artifact_publication"
 )
 
 // ValidationError is the typed artifact/publication validation failure. Its
-// message carries only a structural field path and a generic reason — never
-// the untrusted body or secrets — while Kind gives Task 14 a stable class for
-// public error mapping.
+// message carries only a stable Kind and a bounded structural field path with
+// a GENERIC reason — never untrusted body-member values, media types,
+// digests, repo/tag, or huge input. The optional internal cause may keep
+// detailed, attacker-influenced context for errors.Is/As and debugging, but it
+// is NEVER rendered by Error(), so no public string leaks the untrusted data.
+// Kind gives Task 14 a stable class for public error mapping.
 type ValidationError struct {
 	Kind  ValidationErrorKind
 	Field string
 	Err   error
+	cause error
 }
 
 func (e *ValidationError) Error() string {
@@ -152,16 +160,35 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("artifact validation: %s: %v", e.Field, e.Err)
 }
 
-func (e *ValidationError) Unwrap() error { return e.Err }
+// Cause exposes the internal detail retained for errors.Is/As and debugging.
+// It is deliberately never rendered by Error() so attacker-controlled values
+// cannot leak through the public string.
+func (e *ValidationError) Cause() error { return e.cause }
+
+func (e *ValidationError) Unwrap() []error {
+	if e.cause != nil {
+		return []error{e.Err, e.cause}
+	}
+	return []error{e.Err}
+}
 
 func newValidationError(kind ValidationErrorKind, field string, msg string) *ValidationError {
 	return &ValidationError{Kind: kind, Field: field, Err: errors.New(msg)}
+}
+
+func newValidationCause(kind ValidationErrorKind, field string, msg string, cause error) *ValidationError {
+	return &ValidationError{Kind: kind, Field: field, Err: errors.New(msg), cause: cause}
 }
 
 // errDuplicateMember marks a duplicate object member anywhere in the doc.
 // (The other numeric/null sentinels were removed when parsing moved to exact,
 // explicit checks that build their own typed errors.)
 var errDuplicateMember = errors.New("JSON object contains duplicate members")
+
+// unknownMemberMarker is the fixed structural path placeholder used in place of
+// an attacker-controlled unknown JSON member key, so the validation error's
+// Field remains a stable, bounded schema path and never echoes the key.
+const unknownMemberMarker = "<unknown-member>"
 
 // Exact, case-sensitive key vocabularies for each object shape. decoding is
 // done through map[string]json.RawMessage, whose keys are the JSON literal
@@ -218,7 +245,11 @@ func decodeObjectMembers(raw json.RawMessage, field string, known map[string]str
 	}
 	for k := range m {
 		if _, ok := known[k]; !ok {
-			return nil, newValidationError(ErrKindUnknownMember, joinPath(field, k), "unknown JSON member is not accepted")
+			// The unknown key name is untrusted attacker content and must NOT
+			// become part of the structural path (Field) rendered by Error().
+			// Use a fixed literal placeholder so the public error stays
+			// data-free while remaining a stable, bounded schema path.
+			return nil, newValidationError(ErrKindUnknownMember, joinPath(field, unknownMemberMarker), "unknown JSON member is not accepted")
 		}
 	}
 	return m, nil
