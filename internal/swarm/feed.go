@@ -161,7 +161,9 @@ func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) 
 
 	topicBytes, err := hex.DecodeString(topicHex)
 	if err != nil {
-		return fmt.Errorf("decode feed topic: %w", err)
+		// Unreachable after parseCanonicalFeedUpdateFeed validation; stay
+		// data-free rather than echoing hex-decode jargon.
+		return errors.New("decode feed topic failed")
 	}
 
 	// The Bee chunk body: 8-byte little-endian span (=32) followed by the 32
@@ -196,8 +198,17 @@ func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) 
 // (including the old ASCII-hex form and any oversized body), missing /
 // malformed / duplicated / wrong-size / oversized index header, unreadable
 // body, and a stalled request (per-request context deadline). Bodies are
-// bounded and always closed; errors never echo raw Bee bytes.
-func (r BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue, error) {
+// bounded and always closed; errors never echo raw Bee bytes, the request URL
+// (which names the owner/topic path segments), or the caller's feed value.
+// Transport, request-creation, and body-read failures are sanitized to stable
+// data-free messages; only the safe internal context cancellation/deadline
+// outcomes keep their errors.Is signal (the sentinel is wrapped, never the
+// transport error text). A nil receiver (typed nil) fails closed instead of
+// panicking.
+func (r *BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue, error) {
+	if r == nil {
+		return FeedValue{}, errors.New("bee feed resolver is not configured")
+	}
 	if strings.TrimSpace(r.BaseURL) == "" {
 		return FeedValue{}, errors.New("bee feed resolver: base URL is not configured")
 	}
@@ -205,7 +216,8 @@ func (r BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue, 
 
 	owner, topic, err := parseFeedRef(feed)
 	if err != nil {
-		return FeedValue{}, fmt.Errorf("bee feed resolver: %w", err)
+		// Data-free: never quote the caller's raw feed value.
+		return FeedValue{}, errors.New("bee feed resolver: invalid feed reference")
 	}
 	// Path-escape both parts so an unusual owner/topic (or a malicious one)
 	// can never smuggle a different path segment or query into the request.
@@ -224,11 +236,12 @@ func (r BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue, 
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
-		return FeedValue{}, fmt.Errorf("create bee feed read request: %w", err)
+		// The parse error names the offending URL; never wrap it.
+		return FeedValue{}, errors.New("create bee feed read request failed")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return FeedValue{}, fmt.Errorf("bee feed read request failed: %w", err)
+		return FeedValue{}, sanitizeBeeTransportError("bee feed read request", err)
 	}
 	defer resp.Body.Close()
 
@@ -241,7 +254,7 @@ func (r BeeFeedResolver) ReadFeed(ctx context.Context, feed string) (FeedValue, 
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedResolveMaxBody+1))
 	if err != nil {
-		return FeedValue{}, fmt.Errorf("read bee feed response body: %w", err)
+		return FeedValue{}, sanitizeBeeTransportError("read bee feed response body", err)
 	}
 	if len(body) > beeFeedResolveMaxBody {
 		return FeedValue{}, errors.New("bee feed response exceeded the reference bound")

@@ -110,8 +110,12 @@ const beeFeedResolveTimeout = 30 * time.Second
 // ref. It FAILS CLOSED on every unsafe outcome, is data-free in its returned
 // error, bounds success and error bodies, requires exactly 200, always closes
 // the body, and imposes a per-request timeout via the request context even
-// when the supplied client has none.
-func (r BeeFeedResolver) ResolveFeed(ctx context.Context, feed string) (string, error) {
+// when the supplied client has none. A nil receiver (typed nil) fails closed
+// instead of panicking.
+func (r *BeeFeedResolver) ResolveFeed(ctx context.Context, feed string) (string, error) {
+	if r == nil {
+		return "", errors.New("bee feed resolver is not configured")
+	}
 	value, err := r.ReadFeed(ctx, feed)
 	if err != nil {
 		return "", err
@@ -141,6 +145,8 @@ func NewBeeFeedResolver(baseURL string, client *http.Client) *BeeFeedResolver {
 	}
 }
 
+// beeReferenceResponse is the JSON wrapper the Bee object-store /bytes PUT
+// success response carries ({"reference": "<64 hex>"}).
 type beeReferenceResponse struct {
 	Reference string `json:"reference"`
 }
@@ -347,6 +353,29 @@ func defaultHTTPClient(client *http.Client) *http.Client {
 	return http.DefaultClient
 }
 
+// sanitizeBeeTransportError converts a transport failure (client.Do, response
+// body read) into a stable, DATA-FREE operation error. The raw error must
+// never be wrapped or echoed: a *url.Error carries the FULL request URL — for
+// the SOC upload that URL includes the signature query, and for feed
+// reads/lookups the owner/topic path segments — and a malicious RoundTripper
+// can smuggle arbitrary text (URLs, hostnames, owner/topic/batch/reference/
+// signature values) into its error. Only the safe internal context
+// cancellation/deadline outcomes keep their errors.Is signal by wrapping the
+// SENTINEL (never the transport error), so callers that need to distinguish a
+// cancelled or stalled request still can; everything else collapses to an
+// opaque fail-closed message. op must be a fixed internal constant, never
+// caller data.
+func sanitizeBeeTransportError(op string, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%s: %w", op, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%s: %w", op, context.DeadlineExceeded)
+	default:
+		return errors.New(op + " failed")
+	}
+}
+
 func normalizeBZZReference(ref string) string {
 	return strings.TrimPrefix(ref, "bzz://")
 }
@@ -355,7 +384,9 @@ func parseFeedRef(ref string) (owner string, topic string, err error) {
 	trimmed := strings.TrimPrefix(ref, "feed://")
 	parts := strings.SplitN(trimmed, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("invalid feed reference %q", ref)
+		// Data-free: never echo the caller's raw feed value (it may carry
+		// owner/topic markers that must not appear in logs or errors).
+		return "", "", errors.New("invalid feed reference")
 	}
 	return parts[0], parts[1], nil
 }
@@ -406,12 +437,13 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create feed lookup request: %w", err)
+		// The parse error names the offending URL; never wrap it.
+		return nil, errors.New("create feed lookup request failed")
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("feed lookup request failed: %w", err)
+		return nil, sanitizeBeeTransportError("feed lookup request", err)
 	}
 	defer resp.Body.Close()
 
@@ -436,14 +468,27 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 
 	nextBytes, err := hex.DecodeString(nextHex)
 	if err != nil {
-		return nil, fmt.Errorf("decode feed next index header: %w", err)
+		// Unreachable after feedIndexHeader validation; stay data-free.
+		return nil, errors.New("decode feed next index header failed")
 	}
 	if len(nextBytes) != 8 {
-		return nil, fmt.Errorf("unexpected feed next index length: %d", len(nextBytes))
+		// Unreachable after feedIndexHeader validation; stay data-free.
+		return nil, errors.New("feed response next index header is not an 8-byte sequence index")
 	}
 	return nextBytes, nil
 }
 
+// uploadChunk uploads the framed chunk body to /chunks and returns the
+// decoded 32-byte content address of the stored chunk (the reference the SOC
+// signature is computed over). The success response is parsed STRICTLY: a
+// 201 must carry exactly one JSON object with exactly one "reference" member,
+// a string of exactly 64 hex characters (32 bytes); duplicate reference
+// members, unknown members, non-string values, missing references,
+// empty/short/odd/long/non-hex references, and trailing JSON/tokens all fail
+// closed with data-free errors BEFORE the sequence lookup or SOC upload can
+// proceed. The body is bounded (limit+1 detect), always closed, and errors
+// never echo it; transport and request-creation failures are sanitized (the
+// request URL and any malicious RoundTripper text are never surfaced).
 func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []byte, batchID string) ([]byte, error) {
 	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
 		return nil, errors.New("postage batch id is empty or exceeds the bound")
@@ -459,14 +504,15 @@ func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []by
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+"/chunks", bytes.NewReader(chunkData))
 	if err != nil {
-		return nil, fmt.Errorf("create chunk upload request: %w", err)
+		// The parse error names the offending URL; never wrap it.
+		return nil, errors.New("create chunk upload request failed")
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("chunk upload request failed: %w", err)
+		return nil, sanitizeBeeTransportError("chunk upload request", err)
 	}
 	defer resp.Body.Close()
 
@@ -475,20 +521,99 @@ func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []by
 		return nil, fmt.Errorf("chunk upload failed with status %d", resp.StatusCode)
 	}
 
-	var payload beeReferenceResponse
-	if err := decodeBoundedJSON(resp.Body, &payload); err != nil {
-		return nil, err
-	}
-	if len(payload.Reference) == 0 || len(payload.Reference) > beeFeedWriteMaxRef {
-		return nil, errors.New("chunk upload response has an empty or oversized reference")
-	}
-	refBytes, err := hex.DecodeString(payload.Reference)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 	if err != nil {
-		return nil, fmt.Errorf("decode chunk reference: %w", err)
+		return nil, sanitizeBeeTransportError("read chunk upload response body", err)
 	}
-	return refBytes, nil
+	if len(body) > beeFeedWriteMaxBody {
+		return nil, errors.New("chunk upload response exceeded the bound")
+	}
+	return parseChunkReferenceResponse(body)
 }
 
+// parseChunkReferenceResponse STRICTLY parses a /chunks success response body
+// (already bounded by the caller): exactly one JSON object with exactly one
+// member "reference", whose value is a JSON string of exactly 64 hex
+// characters — the 32-byte Swarm content address of the uploaded chunk, which
+// becomes the chunk ref the SOC signature is computed over. Duplicate
+// "reference" members, unknown members, non-string values (numbers, booleans,
+// null, objects, arrays), a missing reference, references that are not
+// exactly 64 hex characters (empty, short, odd, long, non-hex), and any
+// trailing JSON/tokens after the object all fail closed with data-free errors
+// BEFORE the sequence lookup or SOC upload can proceed. The reference is
+// decoded to its 32 binary bytes. No raw response content is ever echoed.
+func parseChunkReferenceResponse(body []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, errors.New("chunk upload response is not a JSON object")
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, errors.New("chunk upload response is not a JSON object")
+	}
+	var (
+		ref    string
+		sawRef bool
+	)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, errors.New("chunk upload response is not a JSON object")
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, errors.New("chunk upload response is not a JSON object")
+		}
+		if key != "reference" {
+			return nil, errors.New("chunk upload response carries an unknown member")
+		}
+		if sawRef {
+			return nil, errors.New("chunk upload response repeats the reference member")
+		}
+		valTok, err := dec.Token()
+		if err != nil {
+			return nil, errors.New("chunk upload response reference is not a string")
+		}
+		value, ok := valTok.(string)
+		if !ok {
+			return nil, errors.New("chunk upload response reference is not a string")
+		}
+		ref = value
+		sawRef = true
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return nil, errors.New("chunk upload response is not a JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("chunk upload response has trailing data")
+	}
+	if !sawRef {
+		return nil, errors.New("chunk upload response is missing the reference member")
+	}
+	if len(ref) != 64 || !isHexString(ref, 64) {
+		return nil, errors.New("chunk upload response reference is not a 64-hex object reference")
+	}
+	raw, err := hex.DecodeString(strings.ToLower(ref))
+	if err != nil {
+		// Unreachable after the 64-hex check; stay data-free.
+		return nil, errors.New("chunk upload response reference is not a 64-hex object reference")
+	}
+	return raw, nil
+}
+
+// uploadSOC uploads the signed single-owner chunk to /soc/{owner}/{id}?sig=...
+// with the explicit postage batch. The SOC write completes with the 201
+// itself: the feed update has already been stored, so the response body
+// carries no value this flow consumes. Per the Bee contract (openapi
+// /soc/{owner}/{id} 201 -> ReferenceResponse; pkg/api/soc.go
+// jsonhttp.Created(w, socPostResponse{Reference: sch.Address()})) the 201 body
+// is the SOC chunk's OWN address — a deterministic function of the owner,
+// identifier, and payload this call constructed — not a return value the
+// writer depends on, so it is intentionally drained (bounded) and ignored
+// rather than validated. The body is bounded and always closed; errors never
+// echo it. Transport and request-creation failures are sanitized: the request
+// URL carries the SOC signature in its query, so it must NEVER surface in an
+// error.
 func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, identifier []byte, signature []byte, chunkData []byte, batchID string) error {
 	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
 		return errors.New("postage batch id is empty or exceeds the bound")
@@ -508,14 +633,16 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 	endpoint := fmt.Sprintf("%s/soc/%s/%s?sig=%s", baseURL, url.PathEscape(owner), hex.EncodeToString(identifier), hex.EncodeToString(signature))
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint, bytes.NewReader(chunkData))
 	if err != nil {
-		return fmt.Errorf("create soc upload request: %w", err)
+		// The parse error names the offending URL (which carries sig=...);
+		// never wrap it.
+		return errors.New("create soc upload request failed")
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("soc upload request failed: %w", err)
+		return sanitizeBeeTransportError("soc upload request", err)
 	}
 	defer resp.Body.Close()
 
@@ -523,7 +650,8 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 		return fmt.Errorf("soc upload failed with status %d", resp.StatusCode)
 	}
-	// Drain a bounded amount so the connection can be reused.
+	// Drain a bounded amount so the connection can be reused; see the SOC
+	// response contract note in the doc comment above — the body is ignored.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 	return nil
 }
@@ -537,23 +665,6 @@ func writeRequestContext(ctx context.Context) (context.Context, context.CancelFu
 		return context.WithCancel(ctx)
 	}
 	return context.WithTimeout(ctx, beeFeedWriteTimeout)
-}
-
-// decodeBoundedJSON decodes a JSON value from a bounded body read (limit+1
-// detect, so an oversized response is rejected rather than silently truncated)
-// and never buffers unbounded bytes.
-func decodeBoundedJSON(body io.Reader, dst any) error {
-	data, err := io.ReadAll(io.LimitReader(body, beeFeedWriteMaxBody+1))
-	if err != nil {
-		return fmt.Errorf("read bee response body: %w", err)
-	}
-	if len(data) > beeFeedWriteMaxBody {
-		return errors.New("bee response body exceeded the bound")
-	}
-	if err := json.Unmarshal(data, dst); err != nil {
-		return fmt.Errorf("decode bee response: %w", err)
-	}
-	return nil
 }
 
 // makeChunkData wraps the current payload bytes in Bee's chunk wire format: an
