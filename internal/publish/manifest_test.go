@@ -239,6 +239,172 @@ func TestParseArtifact(t *testing.T) {
 			wantErrKind: ErrKindMalformedJSON,
 		},
 
+		// Exact, case-sensitive keys (encoding/json's case-insensitive struct
+		// matching and null-to-zero coercion must not apply).
+		{
+			name:        "case-variant schemaVersion rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"SchemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "exact plus case-variant top-level member rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"SchemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "escaped root duplicate that decodes to same key rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"s\u0063hemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindDuplicateMember,
+		},
+		{
+			name:        "case-variant top-level mediaType rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"MediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociManifestMT, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "case-variant config key rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"Config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "case-variant layers key rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"Layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "case-variant manifests key rejected",
+			mediaType:   ociIndexMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"Manifests":[]}`, ociIndexMT),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:      "platform case-variant Variant key rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","Variant":"v8"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:      "platform case-variant os.version key rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"windows","OS.version":"10.0"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:      "platform case-variant os.features key rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","OS.features":["x"]}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "top-level mediaType null rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":null,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "descriptor case-variant MediaType key rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"MediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "descriptor case-variant Digest key rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"Digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "descriptor case-variant Size key rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"Size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:        "descriptor mediaType null rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":null,"size":24,"digest":%q},"layers":[]}`, dig('c')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "descriptor digest null rejected",
+			mediaType:   ociManifestMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":null},"layers":[]}`, ociConfigMT),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:      "descriptor Platform null rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"Platform":{"architecture":"amd64","os":"linux"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:      "platform case-variant Architecture key rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"Architecture":"amd64","os":"linux"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:      "platform case-variant OS key rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","OS":"linux"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
+		},
+		{
+			name:      "platform architecture null rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":null,"os":"linux"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:      "platform os null rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":null}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:      "platform os.features null rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":null}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+
 		// schemaVersion.
 		{
 			name:        "schemaVersion 1 rejected",
@@ -259,7 +425,7 @@ func TestParseArtifact(t *testing.T) {
 			mediaType:   ociManifestMT,
 			body:        fmt.Sprintf(`{"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, dig('c')),
 			wantErr:     true,
-			wantErrKind: ErrKindSchemaVersion,
+			wantErrKind: ErrKindMissingField,
 		},
 		{
 			name:        "schemaVersion float 2.0 rejected",
@@ -296,7 +462,7 @@ func TestParseArtifact(t *testing.T) {
 			mediaType:   ociManifestMT,
 			body:        `{"schemaVersion":2,"config":null,"layers":[]}`,
 			wantErr:     true,
-			wantErrKind: ErrKindMissingField,
+			wantErrKind: ErrKindWrongType,
 		},
 		{
 			name:        "config missing mediaType",
@@ -317,7 +483,7 @@ func TestParseArtifact(t *testing.T) {
 			mediaType:   ociManifestMT,
 			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24},"layers":[]}`, ociConfigMT),
 			wantErr:     true,
-			wantErrKind: ErrKindInvalidDigest,
+			wantErrKind: ErrKindMissingField,
 		},
 		{
 			name:        "config missing size",
@@ -338,7 +504,7 @@ func TestParseArtifact(t *testing.T) {
 			mediaType:   ociManifestMT,
 			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":null}`, ociConfigMT, dig('c')),
 			wantErr:     true,
-			wantErrKind: ErrKindMissingField,
+			wantErrKind: ErrKindWrongType,
 		},
 		{
 			name:        "layers wrong type rejected",
@@ -359,7 +525,7 @@ func TestParseArtifact(t *testing.T) {
 			mediaType:   ociManifestMT,
 			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":1024}]}`, ociConfigMT, dig('c'), ociLayerMT),
 			wantErr:     true,
-			wantErrKind: ErrKindInvalidDigest,
+			wantErrKind: ErrKindMissingField,
 		},
 		{
 			name:        "layer descriptor missing size",
@@ -464,14 +630,27 @@ func TestParseArtifact(t *testing.T) {
 			mediaType:   ociIndexMT,
 			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":null}`, ociIndexMT),
 			wantErr:     true,
-			wantErrKind: ErrKindMissingField,
+			wantErrKind: ErrKindWrongType,
 		},
 		{
-			name:        "index empty manifests rejected",
-			mediaType:   ociIndexMT,
-			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, ociIndexMT),
-			wantErr:     true,
-			wantErrKind: ErrKindInvalidShape,
+			name:      "oci index empty manifests valid (spec: size MAY be zero)",
+			mediaType: ociIndexMT,
+			body:      fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, ociIndexMT),
+			wantKind:  ArtifactKindIndex,
+			check: func(t *testing.T, a Artifact) {
+				if a.Manifests == nil || len(a.Manifests) != 0 {
+					t.Fatalf("expected an empty present manifests list, got %+v", a.Manifests)
+				}
+				if got := a.References(); len(got) != 0 {
+					t.Fatalf("empty index must have no references, got %+v", got)
+				}
+			},
+		},
+		{
+			name:      "docker manifest list empty manifests valid",
+			mediaType: dockerListMT,
+			body:      fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, dockerListMT),
+			wantKind:  ArtifactKindIndex,
 		},
 		{
 			name:      "index with config forbidden (manifest-only shape)",
@@ -521,7 +700,7 @@ func TestParseArtifact(t *testing.T) {
 			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":"linux/amd64"}]}`,
 				ociIndexMT, ociManifestMT, dig('b')),
 			wantErr:     true,
-			wantErrKind: ErrKindInvalidPlatform,
+			wantErrKind: ErrKindWrongType,
 		},
 		{
 			name:      "platform null rejected",
@@ -529,7 +708,7 @@ func TestParseArtifact(t *testing.T) {
 			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":null}]}`,
 				ociIndexMT, ociManifestMT, dig('b')),
 			wantErr:     true,
-			wantErrKind: ErrKindInvalidPlatform,
+			wantErrKind: ErrKindWrongType,
 		},
 		{
 			name:      "unknown platform member rejected",
@@ -537,7 +716,7 @@ func TestParseArtifact(t *testing.T) {
 			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","kube":"x"}}]}`,
 				ociIndexMT, ociManifestMT, dig('b')),
 			wantErr:     true,
-			wantErrKind: ErrKindInvalidPlatform,
+			wantErrKind: ErrKindUnknownMember,
 		},
 		{
 			name:      "platform on manifest config forbidden",
@@ -874,5 +1053,188 @@ func TestPublishValidArtifactWritesManifestStateAndFeedOnce(t *testing.T) {
 	}
 	if len(next.Blobs) != 2 {
 		t.Fatalf("expected both referenced blobs in state, got %+v", next.Blobs)
+	}
+}
+
+// TestBuildNextDirectCoherence proves that a DIRECT caller of
+// DefaultBuilder.BuildNext gets the SAME body/digest/size/media coherence and
+// reference-availability validation as the publish path, before any state is
+// derived — a wrong digest, size, media type, or staged metadata fails typed
+// and leaves input/current untouched.
+func TestBuildNextDirectCoherence(t *testing.T) {
+	current := spec.RepoStateDocument{Generation: 7}
+
+	cases := []struct {
+		name     string
+		mut      func(BuildInput) BuildInput
+		wantKind ValidationErrorKind
+	}{
+		{name: "wrong body digest", wantKind: ErrKindDigestMismatch,
+			mut: func(i BuildInput) BuildInput { i.ManifestDigest = dig('f'); return i }},
+		{name: "wrong body size", wantKind: ErrKindSizeMismatch,
+			mut: func(i BuildInput) BuildInput { i.Manifest.Size = int64(len(i.ManifestJSON)) + 1; return i }},
+		{name: "unsupported media type", wantKind: ErrKindUnsupportedMediaType,
+			mut: func(i BuildInput) BuildInput { i.Manifest.MediaType = "text/plain"; return i }},
+		{name: "staged blob size mismatch", wantKind: ErrKindSizeMismatch,
+			mut: func(i BuildInput) BuildInput {
+				s := i.StagedBlobs[dig('c')]
+				s.Size = 99
+				i.StagedBlobs[dig('c')] = s
+				return i
+			}},
+		{name: "staged concrete media mismatch", wantKind: ErrKindMediaTypeMismatch,
+			mut: func(i BuildInput) BuildInput {
+				s := i.StagedBlobs[dig('a')]
+				s.MediaType = "text/plain"
+				i.StagedBlobs[dig('a')] = s
+				return i
+			}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := tc.mut(validBuildInput(t))
+			next, err := (DefaultBuilder{}).BuildNext(current, input)
+			if err == nil {
+				t.Fatal("expected direct BuildNext to fail")
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected typed ValidationError, got %T: %v", err, err)
+			}
+			if ve.Kind != tc.wantKind {
+				t.Fatalf("expected kind %q, got %q (err %v)", tc.wantKind, ve.Kind, err)
+			}
+			// No state may be derived or the input description mutated.
+			if next.Version != 0 || next.Repo != "" || next.Generation != 0 {
+				t.Fatalf("BuildNext must not derive state on failure, got %+v", next)
+			}
+			if current.Generation != 7 {
+				t.Fatalf("BuildNext mutated current, generation=%d", current.Generation)
+			}
+		})
+	}
+}
+
+// TestBuildNextDirectValid proves a direct BuildNext with a valid input
+// succeeds and carries the parsed references into state.
+func TestBuildNextDirectValid(t *testing.T) {
+	input := validBuildInput(t)
+	input.Manifest.SwarmRef = "swarm-ref-manifest"
+	next, err := (DefaultBuilder{}).BuildNext(spec.RepoStateDocument{}, input)
+	if err != nil {
+		t.Fatalf("direct BuildNext: %v", err)
+	}
+	if next.Generation != 1 || len(next.Blobs) != 2 || next.Blobs[dig('c')].Size != 24 {
+		t.Fatalf("direct BuildNext state wrong: %+v", next)
+	}
+}
+
+// TestPublishReferenceMetadata exercises the reference size/media coherence
+// checks against both current-state and staged blob records. Failing cases
+// produce ZERO object writes; the current-state record is authoritative when a
+// digest exists both current and staged; unspecified (octet-stream/empty)
+// staged and current types are the upload transport's transparent placeholder.
+func TestPublishReferenceMetadata(t *testing.T) {
+	ctx := context.Background()
+
+	// currentWithBlobs returns a repo state carrying dig('c') and dig('a')
+	// with the given stored size/media type overrides.
+	currentWithBlobs := func(c, a spec.BlobDescriptor) spec.RepoStateDocument {
+		return spec.RepoStateDocument{Blobs: map[string]spec.BlobDescriptor{
+			dig('c'): c,
+			dig('a'): a,
+		}}
+	}
+	configDesc := spec.BlobDescriptor{SwarmRef: "s-c", Size: 24, MediaType: ociConfigMT}
+	layerDesc := spec.BlobDescriptor{SwarmRef: "s-a", Size: 1024, MediaType: ociLayerMT}
+
+	failCases := []struct {
+		name     string
+		current  spec.RepoStateDocument
+		staged   map[string]spec.BlobDescriptor
+		wantKind ValidationErrorKind
+	}{
+		{name: "current blob size mismatch", current: currentWithBlobs(
+			spec.BlobDescriptor{SwarmRef: "s-c", Size: 25, MediaType: ociConfigMT}, layerDesc), wantKind: ErrKindSizeMismatch},
+		{name: "current concrete media mismatch", current: currentWithBlobs(
+			spec.BlobDescriptor{SwarmRef: "s-c", Size: 24, MediaType: "text/plain"}, layerDesc), wantKind: ErrKindMediaTypeMismatch},
+		{name: "staged blob size mismatch", current: spec.RepoStateDocument{}, staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 99, MediaType: ociConfigMT},
+			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: ociLayerMT},
+		}, wantKind: ErrKindSizeMismatch},
+		{name: "staged concrete media mismatch", current: spec.RepoStateDocument{}, staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 24, MediaType: ociConfigMT},
+			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: "text/plain"},
+		}, wantKind: ErrKindMediaTypeMismatch},
+		{name: "staged malformed media rejected", current: spec.RepoStateDocument{}, staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 24, MediaType: ociConfigMT},
+			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: "not a mediatype"},
+		}, wantKind: ErrKindMediaTypeMismatch},
+	}
+	for _, tc := range failCases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := validBuildInput(t)
+			input.StagedBlobs = tc.staged
+			objs := &countingObjects{}
+			feeds := &countingFeeds{}
+			p := Publisher{Builder: DefaultBuilder{}, Objects: objs, Feeds: feeds}
+			_, err := p.Publish(ctx, "feed://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", tc.current, input, "batch-1")
+			if err == nil {
+				t.Fatal("expected publish to fail")
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected typed ValidationError, got %T: %v", err, err)
+			}
+			if ve.Kind != tc.wantKind {
+				t.Fatalf("expected kind %q, got %q (err %v)", tc.wantKind, ve.Kind, err)
+			}
+			if objs.puts != 0 || feeds.updates != 0 {
+				t.Fatalf("conflict caused writes: puts=%d feeds=%d", objs.puts, feeds.updates)
+			}
+		})
+	}
+
+	successCases := []struct {
+		name    string
+		current spec.RepoStateDocument
+		staged  map[string]spec.BlobDescriptor
+	}{
+		{name: "generic octet-stream staged accepted", current: spec.RepoStateDocument{}, staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 24, MediaType: "application/octet-stream"},
+			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: "application/octet-stream"},
+		}},
+		{name: "empty staged media type accepted", current: spec.RepoStateDocument{}, staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 24},
+			dig('a'): {SwarmRef: "s-a", Size: 1024},
+		}},
+		{name: "current octet-stream blob accepted", current: currentWithBlobs(
+			spec.BlobDescriptor{SwarmRef: "s-c", Size: 24, MediaType: "application/octet-stream"},
+			spec.BlobDescriptor{SwarmRef: "s-a", Size: 1024, MediaType: "application/octet-stream"}), staged: map[string]spec.BlobDescriptor{}},
+		{name: "descriptor media type is canonical over octet-stream", current: spec.RepoStateDocument{}, staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "s-c", Size: 24, MediaType: blobGenericMediaType},
+			dig('a'): {SwarmRef: "s-a", Size: 1024, MediaType: blobGenericMediaType},
+		}},
+		{name: "concrete current and staged agree with descriptor", current: currentWithBlobs(configDesc, layerDesc), staged: map[string]spec.BlobDescriptor{}},
+		{name: "digest in both current+staged prefers current even when staged conflicts", current: currentWithBlobs(configDesc, layerDesc), staged: map[string]spec.BlobDescriptor{
+			dig('c'): {SwarmRef: "stale-c", Size: 99, MediaType: "text/plain"},
+			dig('a'): {SwarmRef: "stale-a", Size: 1, MediaType: "text/plain"},
+		}},
+	}
+	for _, tc := range successCases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := validBuildInput(t)
+			input.StagedBlobs = tc.staged
+			objs := &countingObjects{}
+			feeds := &countingFeeds{}
+			p := Publisher{Builder: DefaultBuilder{}, Objects: objs, Feeds: feeds}
+			if _, err := p.Publish(ctx, "feed://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", tc.current, input, "batch-1"); err != nil {
+				t.Fatalf("expected publish to succeed: %v", err)
+			}
+			if objs.puts != 2 || feeds.updates != 1 {
+				t.Fatalf("coherent publish must write manifest+state and one feed, got puts=%d feeds=%d", objs.puts, feeds.updates)
+			}
+		})
 	}
 }

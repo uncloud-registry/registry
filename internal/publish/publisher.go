@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"mime"
+	"strings"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/spec"
@@ -75,14 +77,13 @@ func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current 
 
 func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, error) {
 	// Strict pre-upload validation: parse the artifact, verify the
-	// handler-provided digest/size against the actual body, and confirm every
-	// referenced descriptor is available — ALL before the first object write.
-	// Invalid input must produce zero object puts and zero feed updates.
-	artifact, err := validateArtifactForPublish(input)
-	if err != nil {
-		return spec.RepoStateDocument{}, err
-	}
-	if err := validateManifestReferences(current, input, artifact); err != nil {
+	// handler-provided digest/size/media against the actual body, and confirm
+	// every referenced descriptor's size and media type agree with its stored
+	// blob — ALL before the first object write. Invalid input must produce
+	// zero object puts and zero feed updates. validateInputArtifact is the
+	// SAME routine DefaultBuilder.BuildNext runs, so both entry points share
+	// one validation contract with no parse-twice drift.
+	if _, err := validateInputArtifact(current, input); err != nil {
 		return spec.RepoStateDocument{}, err
 	}
 
@@ -134,14 +135,11 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 		return spec.RepoStateDocument{}, fmt.Errorf("build input missing repo, tag, or manifest digest")
 	}
 
-	// The builder stays self-validating for direct callers: it re-parses the
-	// artifact under the same strict contract the publish path enforces and
-	// confirms every referenced descriptor is available before building.
-	artifact, err := ParseArtifact(input.Manifest.MediaType, input.ManifestJSON)
-	if err != nil {
-		return spec.RepoStateDocument{}, fmt.Errorf("validate artifact: %w", err)
-	}
-	if err := validateManifestReferences(current, input, artifact); err != nil {
+	// The builder stays self-validating for direct callers: it runs the exact
+	// same routine Publish uses — body digest/size/media coherence plus
+	// reference availability — so a direct caller with a wrong digest, size,
+	// or media type fails typed and leaves input/current unmutated.
+	if _, err := validateInputArtifact(current, input); err != nil {
 		return spec.RepoStateDocument{}, err
 	}
 
@@ -169,14 +167,20 @@ func ComputeDigest(data []byte) string {
 	return fmt.Sprintf("sha256:%x", sum[:])
 }
 
-// validateArtifactForPublish strictly parses the manifest/index body and
-// enforces the caller contract at the earliest layer that holds BOTH the body
-// and the handler-provided descriptor: the computed body digest must equal
-// BuildInput.ManifestDigest and the actual body length must equal
-// BuildInput.Manifest.Size. A handler-derived descriptor can never disagree
-// unless wiring is broken, but a disagreeing descriptor is never accepted
-// silently. All failures are typed *ValidationError with no body echo.
-func validateArtifactForPublish(input BuildInput) (Artifact, error) {
+// validateInputArtifact is the SINGLE shared validation routine for the whole
+// publication path. It strictly parses the manifest/index body, enforces the
+// caller contract at the earliest layer that holds BOTH the body and the
+// handler-provided descriptor (computed body digest must equal
+// BuildInput.ManifestDigest, actual body length must equal
+// BuildInput.Manifest.Size, and the top-level media type is exactly a
+// supported type), and confirms every referenced descriptor's stored blob is
+// present with a coherent size and media type. It is invoked by
+// Publisher.publish BEFORE the first object write and by
+// DefaultBuilder.BuildNext before any state is derived, so both entry points
+// share one contract with no parse-twice drift. It returns the validated
+// Artifact for callers that need it. All failures are typed *ValidationError
+// with no body echo.
+func validateInputArtifact(current spec.RepoStateDocument, input BuildInput) (Artifact, error) {
 	artifact, err := ParseArtifact(input.Manifest.MediaType, input.ManifestJSON)
 	if err != nil {
 		return Artifact{}, err
@@ -193,29 +197,122 @@ func validateArtifactForPublish(input BuildInput) (Artifact, error) {
 			Err:  fmt.Errorf("manifest body is %d bytes but the handler-provided descriptor declares %d", len(input.ManifestJSON), input.Manifest.Size),
 		}
 	}
+	if err := validateManifestReferences(current, input, artifact); err != nil {
+		return Artifact{}, err
+	}
 	return artifact, nil
 }
 
+// blobGenericMediaType is the Content-Type the blob-upload transport carries
+// when a client provides no meaningful media type. Docker and OCI clients
+// push blob bodies with Content-Type application/octet-stream (or none at
+// all), which does not carry the blob's real descriptor media type; a stored
+// blob with this value or an empty one is therefore the "unspecified"
+// placeholder in the reference-coherence contract.
+const blobGenericMediaType = "application/octet-stream"
+
 // validateManifestReferences requires every descriptor referenced by the
-// artifact to be available: either in the current repository state or in the
-// caller's staged blob set. Index children are referenced manifests and only
-// resolve once index publication (Task 19) records them in repository state;
-// until then an index PUT fails here with zero writes rather than publishing
-// an index whose children cannot be served.
+// artifact to resolve to a stored blob whose SIZE and MEDIA TYPE are coherent
+// with the descriptor. The authoritative record for a digest is the current
+// repository state entry when present (state reflects an already-accepted
+// artifact), otherwise the caller's staged blob set; a digest in both sources
+// is judged against the current-state record, which is preferred.
+//
+// Normed media-type contract:
+//   - the blob-upload transport does not reliably carry a media type
+//     (octet-stream / empty — see blobGenericMediaType), so an unspecified
+//     stored type is transparent and never conflicts;
+//   - any CONCRETE stored type is normalized via mime.ParseMediaType
+//     (case-insensitive, parameter-agnostic) and must equal the canonical
+//     descriptor media type — a concrete conflicting type (e.g. text/plain
+//     for a gzip layer) or a malformed stored type is a media-type mismatch;
+//   - an index child that is not yet in repository state fails as a missing
+//     reference until index publication (Task 19) records it.
+//
+// Any size or media-type conflict returns a typed error BEFORE any object
+// write, so the failed publication performs zero puts and zero feed updates.
 func validateManifestReferences(current spec.RepoStateDocument, input BuildInput, artifact Artifact) error {
 	for _, ref := range artifact.References() {
-		if _, ok := current.Blobs[ref.Digest]; ok {
+		if stored, ok := current.Blobs[ref.Digest]; ok {
+			if err := checkReferenceMetadata(ref, stored); err != nil {
+				return err
+			}
 			continue
 		}
-		if _, ok := input.StagedBlobs[ref.Digest]; ok {
-			continue
+		staged, ok := input.StagedBlobs[ref.Digest]
+		if !ok {
+			return &ValidationError{
+				Kind: ErrKindMissingReference,
+				Err:  fmt.Errorf("manifest references blob %q that is neither in repository state nor staged", ref.Digest),
+			}
 		}
-		return &ValidationError{
-			Kind: ErrKindMissingReference,
-			Err:  fmt.Errorf("manifest references blob %q that is neither in repository state nor staged", ref.Digest),
+		if err := checkReferenceMetadata(ref, staged); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// checkReferenceMetadata verifies one descriptor's size and media type against
+// its authoritative stored blob record.
+func checkReferenceMetadata(ref Descriptor, stored spec.BlobDescriptor) error {
+	if stored.Size != ref.Size {
+		return &ValidationError{
+			Kind: ErrKindSizeMismatch,
+			Err:  fmt.Errorf("blob %s is %d bytes in store but the manifest descriptor declares %d", ref.Digest, stored.Size, ref.Size),
+		}
+	}
+	if err := mediaTypesCoherent(ref.MediaType, stored.MediaType); err != nil {
+		return err
+	}
+	return nil
+}
+
+// mediaTypesCoherent reports whether a stored blob media type is coherent with
+// the canonical descriptor media type under the normalization contract
+// documented on validateManifestReferences. Empty and generic octet-stream
+// stored types are the upload transport's unspecified placeholder and are
+// transparent; any concrete stored type must MIME-normalize equal the
+// descriptor's, and a concrete conflicting or malformed type is a mismatch.
+func mediaTypesCoherent(descriptorMediaType, storedMediaType string) error {
+	trimmed := strings.TrimSpace(storedMediaType)
+	if trimmed == "" {
+		return nil
+	}
+	norm, err := normalizeMediaType(trimmed)
+	if err != nil {
+		return &ValidationError{
+			Kind: ErrKindMediaTypeMismatch,
+			Err:  fmt.Errorf("stored blob media type %q is malformed and cannot be reconciled with descriptor kind %q", trimmed, descriptorMediaType),
+		}
+	}
+	if norm == blobGenericMediaType {
+		return nil
+	}
+	want, err := normalizeMediaType(descriptorMediaType)
+	if err != nil {
+		return &ValidationError{
+			Kind: ErrKindMediaTypeMismatch,
+			Err:  fmt.Errorf("descriptor media type %q cannot be reconciled with the stored blob type", descriptorMediaType),
+		}
+	}
+	if norm != want {
+		return &ValidationError{
+			Kind: ErrKindMediaTypeMismatch,
+			Err:  fmt.Errorf("blob media type %q disagrees with the manifest descriptor media type %q", trimmed, descriptorMediaType),
+		}
+	}
+	return nil
+}
+
+// normalizeMediaType MIME-normalizes a media type so legitimate casing and
+// parameter variations compare equal. It returns an error for malformed input.
+func normalizeMediaType(s string) (string, error) {
+	mt, _, err := mime.ParseMediaType(s)
+	if err != nil {
+		return "", err
+	}
+	return mt, nil
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

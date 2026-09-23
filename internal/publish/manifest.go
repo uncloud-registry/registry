@@ -43,7 +43,9 @@ const (
 	// manifest: requires config and layers.
 	ArtifactKindManifest ArtifactKind = iota
 	// ArtifactKindIndex is an OCI image index / Docker manifest list:
-	// requires a non-empty manifests array and forbids the manifest-only
+	// requires a manifests array (which MAY be empty — both the OCI image
+	// index spec and the Docker manifest-list spec require the property but
+	// impose no non-empty minimum) and forbids the manifest-only
 	// (config/layers) shape.
 	ArtifactKindIndex
 )
@@ -156,89 +158,105 @@ func newValidationError(kind ValidationErrorKind, field string, msg string) *Val
 	return &ValidationError{Kind: kind, Field: field, Err: errors.New(msg)}
 }
 
-// untrusted-content sentinels returned by the strict numeric unmarshalers so
-// decode failures map to the correct kind instead of a generic wrong-type.
+// errDuplicateMember marks a duplicate object member anywhere in the doc.
+// (The other numeric/null sentinels were removed when parsing moved to exact,
+// explicit checks that build their own typed errors.)
+var errDuplicateMember = errors.New("JSON object contains duplicate members")
+
+// Exact, case-sensitive key vocabularies for each object shape. decoding is
+// done through map[string]json.RawMessage, whose keys are the JSON literal
+// keys as written — so a case variant ("SchemaVersion", "MediaType") never
+// matches and is rejected as an unknown member, and a null value arrives as
+// the raw token "null" and is rejected as the wrong type (never silently
+// coerced to a zero value).
 var (
-	errIntegerOverflow = errors.New("integer overflow")
-	errNotInteger      = errors.New("value must be a JSON integer")
-	errNullNotAllowed  = errors.New("null is not allowed")
-	// errDuplicateMember marks a duplicate object member anywhere in the doc.
-	errDuplicateMember = errors.New("JSON object contains duplicate members")
+	envelopeKnownKeys = map[string]struct{}{
+		"schemaVersion": {},
+		"mediaType":     {},
+		"config":        {},
+		"layers":        {},
+		"manifests":     {},
+	}
+	descriptorKnownKeys = map[string]struct{}{
+		"mediaType": {},
+		"digest":    {},
+		"size":      {},
+		"platform":  {},
+	}
+	platformKnownKeys = map[string]struct{}{
+		"architecture": {},
+		"os":           {},
+		"os.version":   {},
+		"os.features":  {},
+		"variant":      {},
+	}
 )
 
-// strictInt64 decodes a JSON integer ONLY: floats, exponents, strings, and
-// null are rejected, and values beyond int64 range surface as overflow.
-type strictInt64 int64
-
-func (n *strictInt64) UnmarshalJSON(data []byte) error {
-	if len(data) == 0 || data[0] == '"' || data[0] == 'n' {
-		return errNullNotAllowed
+func joinPath(base, part string) string {
+	if base == "" {
+		return part
 	}
-	v, err := strconv.ParseInt(string(data), 10, 64)
+	return base + "." + part
+}
+
+// isNullRaw reports whether raw is exactly the JSON token null.
+func isNullRaw(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// decodeObjectMembers decodes a JSON object into its exact-literal, case-
+// sensitive member map, rejecting any key outside the known vocabulary as an
+// unknown member. Duplicate members have already been rejected globally by
+// walkStrict. A non-object value (including null) is wrong type.
+func decodeObjectMembers(raw json.RawMessage, field string, known map[string]struct{}) (map[string]json.RawMessage, error) {
+	if isNullRaw(raw) {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON object, not null")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON object")
+	}
+	for k := range m {
+		if _, ok := known[k]; !ok {
+			return nil, newValidationError(ErrKindUnknownMember, joinPath(field, k), "unknown JSON member is not accepted")
+		}
+	}
+	return m, nil
+}
+
+// decodeRequiredString decodes a REQUIRED string field. A present null or any
+// non-string value is the wrong type — null never coalesces to an empty value.
+func decodeRequiredString(raw json.RawMessage, field string) (string, error) {
+	if isNullRaw(raw) {
+		return "", newValidationError(ErrKindWrongType, field, "value must be a string, not null")
+	}
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", newValidationError(ErrKindWrongType, field, "value must be a string")
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", newValidationError(ErrKindWrongType, field, "value must be a string")
+	}
+	return s, nil
+}
+
+// decodeStrictInt decodes an integer field EXACTLY: null, strings, floats,
+// and exponents are rejected; values beyond int64 range surface as overflow.
+func decodeStrictInt(raw json.RawMessage, field string) (int64, error) {
+	if isNullRaw(raw) {
+		return 0, newValidationError(ErrKindWrongType, field, "value must be a JSON integer, not null")
+	}
+	if len(raw) == 0 || raw[0] == '"' {
+		return 0, newValidationError(ErrKindWrongType, field, "value must be a JSON integer, not a string")
+	}
+	v, err := strconv.ParseInt(string(bytes.TrimSpace(raw)), 10, 64)
 	if err != nil {
 		if errors.Is(err, strconv.ErrRange) {
-			return errIntegerOverflow
+			return 0, newValidationError(ErrKindIntegerOverflow, field, "integer value exceeds the int64 range")
 		}
-		return errNotInteger
+		return 0, newValidationError(ErrKindWrongType, field, "value must be a JSON integer, not a floating-point number or other value")
 	}
-	*n = strictInt64(v)
-	return nil
-}
-
-// requiredInt64 is strictInt64 with presence tracking so a REQUIRED numeric
-// field (descriptor size) cannot be silently confused with an absent field.
-type requiredInt64 struct {
-	set bool
-	v   int64
-}
-
-func (n *requiredInt64) UnmarshalJSON(data []byte) error {
-	if len(data) == 0 || data[0] == '"' || data[0] == 'n' {
-		return errNullNotAllowed
-	}
-	v, err := strconv.ParseInt(string(data), 10, 64)
-	if err != nil {
-		if errors.Is(err, strconv.ErrRange) {
-			return errIntegerOverflow
-		}
-		return errNotInteger
-	}
-	n.set = true
-	n.v = v
-	return nil
-}
-
-// rawPlatform is the strict-decode shape for a descriptor platform. Unknown
-// platform members are rejected; architecture and os are required, and every
-// accepted string/array is bounded.
-type rawPlatform struct {
-	Architecture string   `json:"architecture"`
-	OS           string   `json:"os"`
-	OSVersion    string   `json:"os.version"`
-	OSFeatures   []string `json:"os.features"`
-	Variant      string   `json:"variant"`
-}
-
-// rawDescriptor is the strict-decode shape for a descriptor. annotations and
-// urls are NOT accepted (unknown-member rejection): v1 records only
-// mediaType/digest/size/platform. Platform is kept raw so its presence, null
-// value, and content can be validated distinctly.
-type rawDescriptor struct {
-	MediaType string          `json:"mediaType"`
-	Digest    string          `json:"digest"`
-	Size      requiredInt64   `json:"size"`
-	Platform  json.RawMessage `json:"platform"`
-}
-
-// rawEnvelope is the strict-decode shape for the whole artifact document. All
-// known fields are captured so shape rules (manifest vs index) can be
-// enforced explicitly; unknown top-level members are rejected.
-type rawEnvelope struct {
-	SchemaVersion strictInt64      `json:"schemaVersion"`
-	MediaType     string           `json:"mediaType"`
-	Config        *rawDescriptor   `json:"config"`
-	Layers        *[]rawDescriptor `json:"layers"`
-	Manifests     *[]rawDescriptor `json:"manifests"`
+	return v, nil
 }
 
 // ParseArtifact strictly parses and validates an OCI image manifest, Docker
@@ -251,10 +269,11 @@ type rawEnvelope struct {
 // Strictness contract:
 //   - body size bounded by MaxArtifactBodyBytes before any JSON decode;
 //   - single JSON object document: no duplicate members (nested included),
-//     no unknown members, no trailing content;
+//     no unknown members, no case-variant keys, no trailing content;
 //   - schemaVersion exactly 2 (never 2.0, never "2", never null);
-//   - manifests require config and layers; indexes require a non-empty
-//     manifests array and forbid config/layers;
+//   - manifests require config and layers; indexes require a present manifests
+//     array (which MAY be empty per the OCI and Docker manifest-list specs)
+//     and forbid config/layers;
 //   - every descriptor requires non-empty bounded mediaType, canonical
 //     lowercase "sha256:<64 lowercase hex>" digest, and present non-negative
 //     integer size;
@@ -270,7 +289,9 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 	}
 
 	// Duplicate-member and well-formedness check over the whole document,
-	// BEFORE any lenient decode could apply last-wins semantics.
+	// BEFORE any lenient decode could apply last-wins semantics. walkStrict
+	// tracks decoded (unescaped) keys, so an escaped spelling that decodes to
+	// an already-seen key is a duplicate.
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	if err := walkStrict(dec); err != nil {
@@ -300,71 +321,83 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 		return Artifact{}, newValidationError(ErrKindMalformedJSON, "",
 			"exactly one JSON document is allowed (trailing content rejected)")
 	}
-	sdec := json.NewDecoder(bytes.NewReader(first))
-	sdec.UseNumber()
-	sdec.DisallowUnknownFields()
-	var env rawEnvelope
-	if err := sdec.Decode(&env); err != nil {
-		return Artifact{}, mapDecodeError(err)
+
+	env, err := decodeObjectMembers(first, "", envelopeKnownKeys)
+	if err != nil {
+		return Artifact{}, err
 	}
 
-	if env.SchemaVersion != 2 {
-		return Artifact{}, newValidationError(ErrKindSchemaVersion, "schemaVersion",
-			"schemaVersion must be exactly 2")
+	// schemaVersion: required, strict integer, exactly 2.
+	svRaw, present := env["schemaVersion"]
+	if !present {
+		return Artifact{}, newValidationError(ErrKindMissingField, "schemaVersion", "schemaVersion is required")
 	}
-	if env.MediaType != "" && env.MediaType != mediaType {
-		return Artifact{}, newValidationError(ErrKindMediaTypeMismatch, "mediaType",
-			"embedded mediaType disagrees with the top-level media type")
+	sv, err := decodeStrictInt(svRaw, "schemaVersion")
+	if err != nil {
+		return Artifact{}, err
+	}
+	if sv != 2 {
+		return Artifact{}, newValidationError(ErrKindSchemaVersion, "schemaVersion", "schemaVersion must be exactly 2")
+	}
+
+	// Embedded mediaType: optional, but present-null or non-string is wrong
+	// type, and a non-empty value must agree with the top-level media type.
+	if mtRaw, present := env["mediaType"]; present {
+		mt, err := decodeRequiredString(mtRaw, "mediaType")
+		if err != nil {
+			return Artifact{}, err
+		}
+		if mt != "" && mt != mediaType {
+			return Artifact{}, newValidationError(ErrKindMediaTypeMismatch, "mediaType",
+				"embedded mediaType disagrees with the top-level media type")
+		}
 	}
 
 	a := Artifact{MediaType: mediaType, Kind: kind}
 	switch kind {
 	case ArtifactKindManifest:
-		if env.Config == nil {
-			return Artifact{}, newValidationError(ErrKindMissingField, "config",
-				"manifest requires a config descriptor")
+		cRaw, present := env["config"]
+		if !present {
+			return Artifact{}, newValidationError(ErrKindMissingField, "config", "manifest requires a config descriptor")
 		}
-		if env.Layers == nil {
-			return Artifact{}, newValidationError(ErrKindMissingField, "layers",
-				"manifest requires a layers array")
-		}
-		if env.Manifests != nil {
-			return Artifact{}, newValidationError(ErrKindInvalidShape, "manifests",
-				"an image manifest must not contain a manifests array (index-only shape)")
-		}
-		config, err := validateDescriptor(env.Config, "config", false)
+		config, err := decodeDescriptor(cRaw, "config", false)
 		if err != nil {
 			return Artifact{}, err
 		}
 		a.Config = &config
-		a.Layers = make([]Descriptor, 0, len(*env.Layers))
-		for i := range *env.Layers {
-			d, err := validateDescriptor(&(*env.Layers)[i], fmt.Sprintf("layers[%d]", i), false)
-			if err != nil {
-				return Artifact{}, err
-			}
-			a.Layers = append(a.Layers, d)
+		lRaw, present := env["layers"]
+		if !present {
+			return Artifact{}, newValidationError(ErrKindMissingField, "layers", "manifest requires a layers array")
+		}
+		layers, err := decodeDescriptorArray(lRaw, "layers", false)
+		if err != nil {
+			return Artifact{}, err
+		}
+		a.Layers = layers
+		if _, present := env["manifests"]; present {
+			return Artifact{}, newValidationError(ErrKindInvalidShape, "manifests",
+				"an image manifest must not contain a manifests array (index-only shape)")
 		}
 	case ArtifactKindIndex:
-		if env.Manifests == nil {
-			return Artifact{}, newValidationError(ErrKindMissingField, "manifests",
-				"index requires a manifests array")
+		mRaw, present := env["manifests"]
+		if !present {
+			return Artifact{}, newValidationError(ErrKindMissingField, "manifests", "index requires a manifests array")
 		}
-		if len(*env.Manifests) == 0 {
-			return Artifact{}, newValidationError(ErrKindInvalidShape, "manifests",
-				"index must reference at least one child manifest")
+		// manifests is REQUIRED to be present but MAY be an empty array: both
+		// the OCI image-index spec ("the size of the array MAY be zero") and
+		// the Docker manifest-list spec (no non-empty minimum) permit it.
+		manifests, err := decodeDescriptorArray(mRaw, "manifests", true)
+		if err != nil {
+			return Artifact{}, err
 		}
-		if env.Config != nil || env.Layers != nil {
-			return Artifact{}, newValidationError(ErrKindInvalidShape, "",
-				"an index must not contain config or layers (manifest-only shape)")
+		a.Manifests = manifests
+		if _, present := env["config"]; present {
+			return Artifact{}, newValidationError(ErrKindInvalidShape, "config",
+				"an index must not contain config (manifest-only shape)")
 		}
-		a.Manifests = make([]Descriptor, 0, len(*env.Manifests))
-		for i := range *env.Manifests {
-			d, err := validateDescriptor(&(*env.Manifests)[i], fmt.Sprintf("manifests[%d]", i), true)
-			if err != nil {
-				return Artifact{}, err
-			}
-			a.Manifests = append(a.Manifests, d)
+		if _, present := env["layers"]; present {
+			return Artifact{}, newValidationError(ErrKindInvalidShape, "layers",
+				"an index must not contain layers (manifest-only shape)")
 		}
 	}
 
@@ -381,46 +414,92 @@ var supportedArtifactMediaTypes = map[string]ArtifactKind{
 	MediaTypeDockerManifestList: ArtifactKindIndex,
 }
 
-// validateDescriptor applies the strict descriptor contract.
-func validateDescriptor(raw *rawDescriptor, field string, allowPlatform bool) (Descriptor, error) {
-	if raw == nil {
-		return Descriptor{}, newValidationError(ErrKindMissingField, field,
-			"descriptor is required")
+// decodeDescriptorArray decodes a descriptor array. A present null or any
+// non-array is the wrong type; each element must itself be an object
+// descriptor (never null).
+func decodeDescriptorArray(raw json.RawMessage, field string, allowPlatform bool) ([]Descriptor, error) {
+	if isNullRaw(raw) {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array, not null")
 	}
-	if raw.MediaType == "" {
-		return Descriptor{}, newValidationError(ErrKindMissingField, field+".mediaType",
-			"descriptor mediaType must be non-empty")
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array")
 	}
-	if len(raw.MediaType) > maxDescriptorMediaTypeLen {
-		return Descriptor{}, newValidationError(ErrKindInvalidShape, field+".mediaType",
-			fmt.Sprintf("descriptor mediaType exceeds the %d-byte bound", maxDescriptorMediaTypeLen))
+	out := make([]Descriptor, 0, len(items))
+	for i, item := range items {
+		itemField := fmt.Sprintf("%s[%d]", field, i)
+		if isNullRaw(item) || len(item) == 0 || item[0] != '{' {
+			return nil, newValidationError(ErrKindWrongType, itemField, "descriptor must be a JSON object, not null")
+		}
+		d, err := decodeDescriptor(item, itemField, allowPlatform)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
 	}
-	if !isCanonicalDigest(raw.Digest) {
-		return Descriptor{}, newValidationError(ErrKindInvalidDigest, field+".digest",
-			"digest must be the canonical lowercase form sha256:<64 lowercase hex>")
-	}
-	if !raw.Size.set {
-		return Descriptor{}, newValidationError(ErrKindMissingField, field+".size",
-			"descriptor size is required")
-	}
-	if raw.Size.v < 0 {
-		return Descriptor{}, newValidationError(ErrKindInvalidSize, field+".size",
-			"descriptor size must be non-negative")
+	return out, nil
+}
+
+// decodeDescriptor applies the strict descriptor contract with exact key and
+// type enforcement.
+func decodeDescriptor(raw json.RawMessage, field string, allowPlatform bool) (Descriptor, error) {
+	members, err := decodeObjectMembers(raw, field, descriptorKnownKeys)
+	if err != nil {
+		return Descriptor{}, err
 	}
 
-	d := Descriptor{
-		MediaType: raw.MediaType,
-		Digest:    raw.Digest,
-		Size:      raw.Size.v,
+	mRaw, present := members["mediaType"]
+	if !present {
+		return Descriptor{}, newValidationError(ErrKindMissingField, joinPath(field, "mediaType"), "descriptor mediaType is required")
 	}
-	if len(raw.Platform) == 0 {
+	mediaType, err := decodeRequiredString(mRaw, joinPath(field, "mediaType"))
+	if err != nil {
+		return Descriptor{}, err
+	}
+	if mediaType == "" {
+		return Descriptor{}, newValidationError(ErrKindMissingField, joinPath(field, "mediaType"), "descriptor mediaType must be non-empty")
+	}
+	if len(mediaType) > maxDescriptorMediaTypeLen {
+		return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "mediaType"),
+			fmt.Sprintf("descriptor mediaType exceeds the %d-byte bound", maxDescriptorMediaTypeLen))
+	}
+
+	dRaw, present := members["digest"]
+	if !present {
+		return Descriptor{}, newValidationError(ErrKindMissingField, joinPath(field, "digest"), "descriptor digest is required")
+	}
+	digest, err := decodeRequiredString(dRaw, joinPath(field, "digest"))
+	if err != nil {
+		return Descriptor{}, err
+	}
+	if !isCanonicalDigest(digest) {
+		return Descriptor{}, newValidationError(ErrKindInvalidDigest, joinPath(field, "digest"),
+			"digest must be the canonical lowercase form sha256:<64 lowercase hex>")
+	}
+
+	sRaw, present := members["size"]
+	if !present {
+		return Descriptor{}, newValidationError(ErrKindMissingField, joinPath(field, "size"), "descriptor size is required")
+	}
+	size, err := decodeStrictInt(sRaw, joinPath(field, "size"))
+	if err != nil {
+		return Descriptor{}, err
+	}
+	if size < 0 {
+		return Descriptor{}, newValidationError(ErrKindInvalidSize, joinPath(field, "size"), "descriptor size must be non-negative")
+	}
+
+	d := Descriptor{MediaType: mediaType, Digest: digest, Size: size}
+
+	pRaw, present := members["platform"]
+	if !present {
 		return d, nil
 	}
 	if !allowPlatform {
-		return Descriptor{}, newValidationError(ErrKindInvalidShape, field+".platform",
+		return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "platform"),
 			"platform is only valid on index child manifests")
 	}
-	p, err := decodePlatform(raw.Platform, field+".platform")
+	p, err := decodePlatform(pRaw, joinPath(field, "platform"))
 	if err != nil {
 		return Descriptor{}, err
 	}
@@ -430,58 +509,87 @@ func validateDescriptor(raw *rawDescriptor, field string, allowPlatform bool) (D
 
 // decodePlatform strictly decodes and bounds an index-child platform.
 func decodePlatform(raw json.RawMessage, field string) (*Platform, error) {
-	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, newValidationError(ErrKindInvalidPlatform, field,
-			"platform must be an object, not null")
+	members, err := decodeObjectMembers(raw, field, platformKnownKeys)
+	if err != nil {
+		return nil, err
 	}
-	pd := json.NewDecoder(bytes.NewReader(raw))
-	pd.UseNumber()
-	pd.DisallowUnknownFields()
-	var rp rawPlatform
-	if err := pd.Decode(&rp); err != nil {
-		return nil, newValidationError(ErrKindInvalidPlatform, field,
-			"platform must be an object with only known members")
+
+	aRaw, present := members["architecture"]
+	if !present {
+		return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "architecture"), "platform architecture is required")
 	}
-	if err := pd.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, newValidationError(ErrKindInvalidPlatform, field,
-			"platform must be a single object value")
+	architecture, err := decodeRequiredString(aRaw, joinPath(field, "architecture"))
+	if err != nil {
+		return nil, err
 	}
-	if rp.Architecture == "" {
-		return nil, newValidationError(ErrKindInvalidPlatform, field+".architecture",
-			"platform architecture is required")
+	if architecture == "" {
+		return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "architecture"), "platform architecture is required")
 	}
-	if rp.OS == "" {
-		return nil, newValidationError(ErrKindInvalidPlatform, field+".os",
-			"platform os is required")
+
+	oRaw, present := members["os"]
+	if !present {
+		return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "os"), "platform os is required")
 	}
+	osv, err := decodeRequiredString(oRaw, joinPath(field, "os"))
+	if err != nil {
+		return nil, err
+	}
+	if osv == "" {
+		return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "os"), "platform os is required")
+	}
+
+	p := &Platform{Architecture: architecture, OS: osv}
+
+	if vRaw, present := members["os.version"]; present {
+		s, err := decodeRequiredString(vRaw, joinPath(field, "os.version"))
+		if err != nil {
+			return nil, err
+		}
+		p.OSVersion = s
+	}
+	if vRaw, present := members["variant"]; present {
+		s, err := decodeRequiredString(vRaw, joinPath(field, "variant"))
+		if err != nil {
+			return nil, err
+		}
+		p.Variant = s
+	}
+	if fRaw, present := members["os.features"]; present {
+		if isNullRaw(fRaw) {
+			return nil, newValidationError(ErrKindWrongType, joinPath(field, "os.features"), "value must be a JSON array of strings, not null")
+		}
+		var feats []string
+		if err := json.Unmarshal(fRaw, &feats); err != nil {
+			return nil, newValidationError(ErrKindWrongType, joinPath(field, "os.features"), "value must be a JSON array of strings")
+		}
+		if feats == nil {
+			feats = []string{}
+		}
+		if len(feats) > maxPlatformFeatures {
+			return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "os.features"),
+				fmt.Sprintf("platform os.features exceeds %d entries", maxPlatformFeatures))
+		}
+		p.OSFeatures = feats
+	}
+
 	for name, v := range map[string]string{
-		"architecture": rp.Architecture,
-		"os":           rp.OS,
-		"os.version":   rp.OSVersion,
-		"variant":      rp.Variant,
+		"architecture": p.Architecture,
+		"os":           p.OS,
+		"os.version":   p.OSVersion,
+		"variant":      p.Variant,
 	} {
 		if len(v) > maxPlatformStringLen {
-			return nil, newValidationError(ErrKindInvalidPlatform, field+"."+name,
+			return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, name),
 				fmt.Sprintf("platform %s exceeds the %d-byte bound", name, maxPlatformStringLen))
 		}
 	}
-	if len(rp.OSFeatures) > maxPlatformFeatures {
-		return nil, newValidationError(ErrKindInvalidPlatform, field+".os.features",
-			fmt.Sprintf("platform os.features exceeds %d entries", maxPlatformFeatures))
-	}
-	for i, f := range rp.OSFeatures {
+	for i, f := range p.OSFeatures {
 		if len(f) > maxPlatformStringLen {
 			return nil, newValidationError(ErrKindInvalidPlatform, fmt.Sprintf("%s.os.features[%d]", field, i),
 				fmt.Sprintf("platform os.features entry exceeds the %d-byte bound", maxPlatformStringLen))
 		}
 	}
-	return &Platform{
-		Architecture: rp.Architecture,
-		OS:           rp.OS,
-		OSVersion:    rp.OSVersion,
-		OSFeatures:   rp.OSFeatures,
-		Variant:      rp.Variant,
-	}, nil
+	return p, nil
 }
 
 // rejectConflictingDescriptors fails the artifact when the same digest
@@ -522,25 +630,6 @@ func rejectConflictingDescriptors(a Artifact) error {
 		}
 	}
 	return nil
-}
-
-// mapDecodeError converts a strict-decode failure into the correct typed
-// kind, preserving integer-overflow and unknown-member precision.
-func mapDecodeError(err error) error {
-	switch {
-	case errors.Is(err, errIntegerOverflow):
-		return newValidationError(ErrKindIntegerOverflow, "",
-			"integer value exceeds the int64 range")
-	case errors.Is(err, errNotInteger), errors.Is(err, errNullNotAllowed):
-		return newValidationError(ErrKindWrongType, "",
-			"numeric fields must be JSON integers, not strings, floats, or null")
-	case strings.Contains(err.Error(), "unknown field"):
-		return newValidationError(ErrKindUnknownMember, "",
-			"unknown JSON member is not accepted")
-	default:
-		return newValidationError(ErrKindWrongType, "",
-			"field has the wrong JSON type")
-	}
 }
 
 // walkStrict validates the whole body token stream: well-formed JSON with no
