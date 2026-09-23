@@ -17,8 +17,17 @@ import (
 // the exact Bee postage batch to stamp the update with; it is carried
 // unchanged into the swarm updater so the signer never substitutes the content
 // reference as the postage batch.
+//
+// createOnly is the EXPLICIT creation intent (Task 13): true means the update
+// is the feed's FIRST write only — an already-existing feed must surface as
+// swarm.ErrFeedAlreadyExists (through errors.Is) with ZERO write side
+// effects; a lost creation race at the immutable SOC layer maps to the same
+// sentinel, never to an overwrite or a success. false keeps the strict
+// next-index advance contract. Implementations MUST never leak URLs/bodies
+// through the returned error, and MUST treat a non-404/non-conflict failure
+// as an ordinary dependency error.
 type RegistryFeedUpdater interface {
-	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string) error
+	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string, createOnly bool) error
 }
 
 type MembershipSubject struct {
@@ -64,7 +73,7 @@ type MemoryRegistryFeedStore struct {
 	mu      sync.Mutex
 }
 
-func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, batchID string) error {
+func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, batchID string, createOnly bool) error {
 	if m == nil {
 		return errors.New("feed store is not configured")
 	}
@@ -75,6 +84,17 @@ func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Regist
 	}
 	if m.Batches == nil {
 		m.Batches = map[string]string{}
+	}
+	// Create-only models the swarm contract: an existing feed is the stable
+	// ErrFeedAlreadyExists BEFORE any write; a lost race (absent at lookup,
+	// present at write) is the same sentinel — never an overwrite.
+	if createOnly {
+		if _, exists := m.Feeds[feed]; exists {
+			return fmt.Errorf("create-only feed update: %w", swarm.ErrFeedAlreadyExists)
+		}
+		if _, exists := m.Batches[feed]; exists {
+			return fmt.Errorf("create-only feed update: %w", swarm.ErrFeedAlreadyExists)
+		}
 	}
 	m.Feeds[feed] = ref
 	m.Batches[feed] = batchID
@@ -132,7 +152,7 @@ func (p Publisher) PublishRawAuthPolicy(ctx context.Context, registry Registry, 
 		return "", fmt.Errorf("upload auth policy document: %w", err)
 	}
 	feed := authPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update auth policy feed: %w", err)
 	}
 	return feed, nil
@@ -148,7 +168,7 @@ func (p Publisher) PublishRawStampPolicy(ctx context.Context, registry Registry,
 		return "", fmt.Errorf("upload stamp policy document: %w", err)
 	}
 	feed := stampPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update stamp policy feed: %w", err)
 	}
 	return feed, nil
@@ -179,7 +199,7 @@ func (p Publisher) publishAuthPolicy(ctx context.Context, registry Registry, mem
 		return "", fmt.Errorf("upload auth policy document: %w", err)
 	}
 	feed := authPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update auth policy feed: %w", err)
 	}
 	return feed, nil
@@ -203,7 +223,7 @@ func (p Publisher) publishStampPolicy(ctx context.Context, registry Registry, me
 		return "", fmt.Errorf("upload stamp policy document: %w", err)
 	}
 	feed := stampPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update stamp policy feed: %w", err)
 	}
 	return feed, nil
@@ -221,7 +241,7 @@ type MemoryRegistryFeedUpdater struct {
 	Feeds map[string]string
 }
 
-func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string) error {
+func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string, _ bool) error {
 	m.Feeds[feed] = ref
 	return nil
 }
@@ -250,7 +270,7 @@ type BeeRegistryFeedUpdater struct {
 	Keys       FeedKeyDecryptor
 }
 
-func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string) error {
+func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string, createOnly bool) error {
 	if b.Keys == nil {
 		return errors.New("registry feed key decryptor is not configured; refusing to sign feed updates with stored ciphertext")
 	}
@@ -262,10 +282,14 @@ func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry
 		// The explicit postage batch flows through unchanged; the updater
 		// validates feed/owner/reference/batch strictly BEFORE any network
 		// call and never substitutes the content reference as the batch.
+		// createOnly carries the creation intent (ErrFeedAlreadyExists
+		// semantics) through the raw sentinel — the error carries no URL or
+		// body content.
 		return updater.Update(ctx, swarm.FeedUpdate{
-			Feed:      feed,
-			Reference: ref,
-			BatchID:   batchID,
+			Feed:       feed,
+			Reference:  ref,
+			BatchID:    batchID,
+			CreateOnly: createOnly,
 		})
 	})
 }

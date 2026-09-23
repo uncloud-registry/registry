@@ -25,11 +25,28 @@ import (
 // be exactly 64 hex characters (32 bytes); BatchID must be exactly 64 hex
 // characters (the exact Bee SwarmAddress postage-batch syntax). Anything else
 // is rejected with a data-free error and ZERO requests issued to Bee.
+//
+// CreateOnly is the explicit creation intent (Task 13): when true, Update
+// writes the feed's FIRST update ONLY — the sequence lookup must be a
+// conclusive 404 (never written), the strict next-index contract is followed
+// for the zero index, and any observation that the feed (or its immutable
+// zero-index SOC) already exists returns the stable ErrFeedAlreadyExists
+// sentinel BEFORE any /chunks or /soc write. The lookup is performed before
+// the chunk upload so a create-only update against an existing feed has ZERO
+// write side effects.
 type FeedUpdate struct {
-	Feed      string
-	Reference string
-	BatchID   string
+	Feed       string
+	Reference  string
+	BatchID    string
+	CreateOnly bool
 }
+
+// ErrFeedAlreadyExists is the stable typed outcome of a CREATE-ONLY feed
+// update that lost the creation race: the feed (or its immutable zero-index
+// single-owner chunk) already exists. It is NEVER a success and NEVER an
+// overwrite; the caller decides retry/conflict semantics. It carries no
+// payload/URL/body data — only its identity.
+var ErrFeedAlreadyExists = errors.New("feed already exists")
 
 // FeedValue is the parsed result of reading a Bee sequence feed back:
 // Reference is the normalized lowercase 64-hex immutable reference stored at
@@ -114,6 +131,13 @@ func parseCanonicalFeedUpdateFeed(feed string) (owner string, topic string, err 
 // validated (404 = zero index; missing on 200, malformed, duplicate, wrong
 // size, or oversized headers fail closed before any SOC upload), matching the
 // writer's bounded-I/O / timeout / closed-body / data-free-error contract.
+//
+// Task 13 (round 1): the sequence lookup runs BEFORE the chunk upload, so a
+// create-only update against an existing feed (200 lookup) or an errored
+// lookup NEVER triggers a write. A create-only update REQUIRES the lookup to
+// be a conclusive 404; a 200 with the feed present returns the stable
+// ErrFeedAlreadyExists sentinel. Create-only races that slip past the lookup
+// (two writers, both 404) are closed at the SOC layer (see uploadSOC).
 func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) error {
 	if u == nil || u.PrivateKey == nil {
 		return errors.New("feed updater signing key is not configured; refusing to sign feed updates")
@@ -171,12 +195,19 @@ func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) 
 	// BINARY decoded reference bytes — identical bytes for /chunks and /soc.
 	// The 64 ASCII hex characters never appear in the payload.
 	chunkData := makeChunkData(refBytes)
-	chunkRef, err := u.uploadChunk(ctx, chunkData, update.BatchID)
+
+	// Sequence lookup FIRST (Task 13): the create-only contract requires the
+	// lookup outcome — conclusive 404 (never written) versus 200 (exists /
+	// ErrFeedAlreadyExists) — BEFORE any write side effect. For a regular
+	// update this is the same strict next-index lookup as before, just
+	// reordered ahead of the chunk upload (which cannot race it: the SOC is
+	// still written only after /chunks succeeds).
+	nextIndex, err := u.nextSequenceIndex(ctx, ownerHex, topicHex, update.CreateOnly)
 	if err != nil {
 		return err
 	}
 
-	nextIndex, err := u.nextSequenceIndex(ctx, ownerHex, topicHex)
+	chunkRef, err := u.uploadChunk(ctx, chunkData, update.BatchID)
 	if err != nil {
 		return err
 	}
@@ -187,7 +218,11 @@ func (u *BeeSequenceFeedUpdater) Update(ctx context.Context, update FeedUpdate) 
 		return err
 	}
 
-	return u.uploadSOC(ctx, ownerHex, identifier, signature, chunkData, update.BatchID)
+	// createOnly is forwarded so a lost race at the immutable SOC layer
+	// (identical zero-index SOC identifier; Bee accepts the first writer and
+	// conflict-fails the second) maps to ErrFeedAlreadyExists, never to a
+	// silent overwrite and never to a success.
+	return u.uploadSOC(ctx, ownerHex, identifier, signature, chunkData, update.BatchID, update.CreateOnly)
 }
 
 // ReadFeed reads a Bee sequence feed back: GET /feeds/{owner}/{topic} serves

@@ -367,7 +367,7 @@ func TestBeeSequenceFeedUpdaterWriterErrorIsDataFree(t *testing.T) {
 		t.Fatalf("create updater: %v", err)
 	}
 	// feed lookup (GET) error
-	if _, err := updater.nextSequenceIndex(context.Background(), owner, "abcd"); err != nil {
+	if _, err := updater.nextSequenceIndex(context.Background(), owner, "abcd", false); err != nil {
 		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), strings.Repeat("x", 8)) {
 			t.Fatalf("feed lookup error must not leak the raw body: %v", err)
 		}
@@ -379,7 +379,7 @@ func TestBeeSequenceFeedUpdaterWriterErrorIsDataFree(t *testing.T) {
 		}
 	}
 	// soc upload error
-	if err := updater.uploadSOC(context.Background(), owner, []byte{1, 2}, []byte{3, 4}, []byte("data"), "batch"); err != nil {
+	if err := updater.uploadSOC(context.Background(), owner, []byte{1, 2}, []byte{3, 4}, []byte("data"), "batch", false); err != nil {
 		if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), strings.Repeat("x", 8)) {
 			t.Fatalf("soc upload error must not leak the raw body: %v", err)
 		}
@@ -419,7 +419,7 @@ func TestBeeSequenceFeedUpdaterWriterClosesBody(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{}`))
 		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
-			if _, err := u.nextSequenceIndex(context.Background(), owner, "abcd"); err != nil {
+			if _, err := u.nextSequenceIndex(context.Background(), owner, "abcd", false); err != nil {
 				t.Fatalf("feed lookup: %v", err)
 			}
 		}},
@@ -427,13 +427,13 @@ func TestBeeSequenceFeedUpdaterWriterClosesBody(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte("boom"))
 		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
-			_, _ = u.nextSequenceIndex(context.Background(), owner, "abcd")
+			_, _ = u.nextSequenceIndex(context.Background(), owner, "abcd", false)
 		}},
 		{"soc success", func(t *testing.T, w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{}`))
 		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
-			if err := u.uploadSOC(context.Background(), owner, []byte{1}, []byte{2, 3, 4, 5}, []byte("data"), "batch"); err != nil {
+			if err := u.uploadSOC(context.Background(), owner, []byte{1}, []byte{2, 3, 4, 5}, []byte("data"), "batch", false); err != nil {
 				t.Fatalf("soc upload: %v", err)
 			}
 		}},
@@ -441,7 +441,7 @@ func TestBeeSequenceFeedUpdaterWriterClosesBody(t *testing.T) {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte("boom"))
 		}, func(t *testing.T, u *BeeSequenceFeedUpdater) {
-			_ = u.uploadSOC(context.Background(), owner, []byte{1}, []byte{2, 3, 4, 5}, []byte("data"), "batch")
+			_ = u.uploadSOC(context.Background(), owner, []byte{1}, []byte{2, 3, 4, 5}, []byte("data"), "batch", false)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -497,7 +497,7 @@ func TestBeeSequenceFeedUpdaterWriterStalledRespectsDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := updater.nextSequenceIndex(ctx, owner, "abcd"); err == nil {
+	if _, err := updater.nextSequenceIndex(ctx, owner, "abcd", false); err == nil {
 		<-started
 		t.Fatal("expected a stalled lookup to time out")
 	}

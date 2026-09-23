@@ -100,7 +100,7 @@ type beeIntegrationFeeds struct {
 	server *beeIntegrationServer
 }
 
-func (b *beeIntegrationFeeds) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string) error {
+func (b *beeIntegrationFeeds) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string, _ bool) error {
 	raw, err := hex.DecodeString(ref)
 	if err != nil || len(raw) != 32 {
 		return fmt.Errorf("integration feed ref must be a 64-hex reference")

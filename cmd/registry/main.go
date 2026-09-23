@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -84,9 +85,22 @@ func buildBeeHandler() (http.Handler, error) {
 	if beeURL == "" {
 		return nil, fmt.Errorf("BEE_API_URL is required when REGISTRY_BACKEND=bee")
 	}
+	// Fail closed BEFORE any listener/client: the Bee base URL must be an
+	// absolute http(s) ORIGIN (no userinfo/path/query/fragment).
+	if err := validateBeeBaseURL(beeURL); err != nil {
+		return nil, fmt.Errorf("BEE_API_URL: %w", err)
+	}
 	docs := swarm.NewBeeDocumentStore(beeURL, http.DefaultClient)
 	objects := swarm.NewBeeObjectStore(beeURL, http.DefaultClient)
-	feeds := swarm.IdentityFeedResolver{}
+	// Production Bee read layering (Task 13): repository/auth/stamp feeds are
+	// resolved through the BeeFeedResolver — GET /feeds/{owner}/{topic}
+	// returns the 32 RAW BINARY payload bytes (with the required index
+	// headers), which it decodes to the canonical immutable 64-hex reference.
+	// The BeeDocumentStore serves ONLY immutable /bzz/{ref} document reads,
+	// and BeeObjectStore serves objects. IdentityFeedResolver is NEVER used in
+	// Bee mode: its in-memory identity pairing exists for identity mode and
+	// would mis-decode binary feed payloads.
+	feeds := swarm.NewBeeFeedResolver(beeURL, http.DefaultClient)
 	authRealm := envOrDefault("REGISTRY_AUTH_REALM", "https://auth.uncloud-registry.com/token")
 	authenticator, err := buildAuthenticator()
 	if err != nil {
@@ -154,6 +168,30 @@ func buildBeeHandler() (http.Handler, error) {
 		},
 		authRealm,
 	), nil
+}
+
+// validateBeeBaseURL rejects anything but an absolute http/https ORIGIN with
+// no userinfo, query, fragment, or non-root path — enforced BEFORE the
+// registry listener or any Bee client is built (task-13 config fail-closed).
+// The error is data-free (never echoes the offending URL).
+func validateBeeBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("BEE_API_URL is not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("BEE_API_URL must be an absolute http or https URL")
+	}
+	if u.Host == "" {
+		return errors.New("BEE_API_URL must include a host")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("BEE_API_URL must be an origin with no userinfo, query, or fragment")
+	}
+	if p := u.EscapedPath(); p != "" && p != "/" {
+		return errors.New("BEE_API_URL must be an origin with no path")
+	}
+	return nil
 }
 
 // buildControlPlaneHTTPClient builds the DEDICATED HTTP client the registry

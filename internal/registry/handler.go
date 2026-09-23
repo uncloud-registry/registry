@@ -397,10 +397,28 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	// integrity, and repo-mismatch failures stay typed errors. This optional
 	// resolution runs ONLY on the authorized manifest PUT path; pull and list
 	// paths keep the strict resolver and never synthesize missing state.
-	current, _, err := h.Resolver.ResolveRepoStateOptional(r.Context(), registryIdentity, repo)
+	//
+	// Task 13 (round 1): the handler BRANCHES on found — when the feed is
+	// conclusively absent it constructs the EXACT generation-zero document
+	// (version 1, the canonical REQUEST repo, generation 0, NON-NIL empty
+	// Tags/Manifests/Blobs maps) BEFORE handing it to the Publisher/Builder.
+	// A found=true state is passed through UNCHANGED. The constructed maps are
+	// fresh per request, so concurrent first pushes can never alias each
+	// other's state.
+	current, found, err := h.Resolver.ResolveRepoStateOptional(r.Context(), registryIdentity, repo)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", err.Error())
 		return
+	}
+	if !found {
+		current = spec.RepoStateDocument{
+			Version:    1,
+			Repo:       repo,
+			Generation: 0,
+			Tags:       map[string]string{},
+			Manifests:  map[string]spec.ManifestDescriptor{},
+			Blobs:      map[string]spec.BlobDescriptor{},
+		}
 	}
 
 	body, err := io.ReadAll(r.Body)

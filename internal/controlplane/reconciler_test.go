@@ -67,14 +67,14 @@ type failFeedUpdater struct {
 	mu      sync.Mutex
 }
 
-func (f *failFeedUpdater) UpdateRegistryFeed(c context.Context, reg Registry, feed, ref, batchID string) error {
+func (f *failFeedUpdater) UpdateRegistryFeed(c context.Context, reg Registry, feed, ref, batchID string, createOnly bool) error {
 	f.mu.Lock()
 	shouldFail := f.failFor[feed]
 	f.mu.Unlock()
 	if shouldFail {
 		return errors.New("injected feed update failure")
 	}
-	return f.inner.UpdateRegistryFeed(c, reg, feed, ref, batchID)
+	return f.inner.UpdateRegistryFeed(c, reg, feed, ref, batchID, createOnly)
 }
 
 func (f *failFeedUpdater) fail(feed string) { f.mu.Lock(); f.failFor[feed] = true; f.mu.Unlock() }

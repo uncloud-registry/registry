@@ -813,11 +813,11 @@ type countingFeedUpdater struct {
 	calls int
 }
 
-func (c *countingFeedUpdater) UpdateRegistryFeed(ctx context.Context, reg Registry, topic, ref, batchID string) error {
+func (c *countingFeedUpdater) UpdateRegistryFeed(ctx context.Context, reg Registry, topic, ref, batchID string, createOnly bool) error {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
-	return c.inner.UpdateRegistryFeed(ctx, reg, topic, ref, batchID)
+	return c.inner.UpdateRegistryFeed(ctx, reg, topic, ref, batchID, createOnly)
 }
 
 func (c *countingFeedUpdater) count() int {

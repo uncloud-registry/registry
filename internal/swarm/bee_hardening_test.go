@@ -223,7 +223,7 @@ func TestBeeSequenceFeedUpdaterTransportErrorsAreDataFree(t *testing.T) {
 
 	t.Run("lookup", func(t *testing.T) {
 		u := newUpdater()
-		_, err := u.nextSequenceIndex(context.Background(), "OWNERMARK", "TOPICMARK")
+		_, err := u.nextSequenceIndex(context.Background(), "OWNERMARK", "TOPICMARK", false)
 		requireDataFree(t, err, "lookup transport error", append(markers, "OWNERMARK", "TOPICMARK")...)
 	})
 	t.Run("chunk", func(t *testing.T) {
@@ -233,7 +233,7 @@ func TestBeeSequenceFeedUpdaterTransportErrorsAreDataFree(t *testing.T) {
 	})
 	t.Run("soc", func(t *testing.T) {
 		u := newUpdater()
-		err := u.uploadSOC(context.Background(), owner, []byte{1, 2, 3, 4}, []byte{5, 6, 7, 8}, []byte("data"), batch)
+		err := u.uploadSOC(context.Background(), owner, []byte{1, 2, 3, 4}, []byte{5, 6, 7, 8}, []byte("data"), batch, false)
 		requireDataFree(t, err, "soc transport error", markers...)
 	})
 }
@@ -252,7 +252,7 @@ func TestBeeSequenceFeedUpdaterRequestCreationErrorsAreDataFree(t *testing.T) {
 		HTTPClient: &http.Client{Transport: failTransport{errors.New(dataFreeText)}},
 		PrivateKey: privateKey,
 	}
-	if _, err := u.nextSequenceIndex(context.Background(), "abcd", "abcd"); err != nil {
+	if _, err := u.nextSequenceIndex(context.Background(), "abcd", "abcd", false); err != nil {
 		requireDataFree(t, err, "lookup request creation", dataFreeSigMarker, "http://secret")
 	} else {
 		t.Fatal("expected lookup request creation to fail")
@@ -262,7 +262,7 @@ func TestBeeSequenceFeedUpdaterRequestCreationErrorsAreDataFree(t *testing.T) {
 	} else {
 		t.Fatal("expected chunk request creation to fail")
 	}
-	if err := u.uploadSOC(context.Background(), "abcd", []byte{1}, []byte{2}, []byte("data"), "batch"); err != nil {
+	if err := u.uploadSOC(context.Background(), "abcd", []byte{1}, []byte{2}, []byte("data"), "batch", false); err != nil {
 		requireDataFree(t, err, "soc request creation", dataFreeSigMarker, "http://secret", "sig=")
 	} else {
 		t.Fatal("expected soc request creation to fail")
@@ -407,7 +407,7 @@ func TestBeeSequenceFeedUpdaterLookupContextSentinelsFollowRequestContext(t *tes
 				HTTPClient: &http.Client{Transport: failTransport{transportErr}},
 				PrivateKey: privateKey,
 			}
-			_, err := updater.nextSequenceIndex(ctx, "OWNERMARK", "TOPICMARK")
+			_, err := updater.nextSequenceIndex(ctx, "OWNERMARK", "TOPICMARK", false)
 			return err
 		})
 }
@@ -461,7 +461,7 @@ func TestBeeSequenceFeedUpdaterSOCContextSentinelsFollowRequestContext(t *testin
 				HTTPClient: &http.Client{Transport: failTransport{transportErr}},
 				PrivateKey: privateKey,
 			}
-			return updater.uploadSOC(ctx, owner, []byte{1, 2, 3}, []byte{4, 5, 6}, []byte("data"), batch)
+			return updater.uploadSOC(ctx, owner, []byte{1, 2, 3}, []byte{4, 5, 6}, []byte("data"), batch, false)
 		})
 }
 
@@ -498,7 +498,7 @@ func TestRequestCreationErrorsFollowRequestContext(t *testing.T) {
 				HTTPClient: &http.Client{Transport: failTransport{errors.New(dataFreeText)}},
 				PrivateKey: privateKey,
 			}
-			_, err := updater.nextSequenceIndex(ctx, "abcd", "abcd")
+			_, err := updater.nextSequenceIndex(ctx, "abcd", "abcd", false)
 			return err
 		})},
 		{"chunk creation", creationErr(func(ctx context.Context) error {
@@ -516,7 +516,7 @@ func TestRequestCreationErrorsFollowRequestContext(t *testing.T) {
 				HTTPClient: &http.Client{Transport: failTransport{errors.New(dataFreeText)}},
 				PrivateKey: privateKey,
 			}
-			return updater.uploadSOC(ctx, "abcd", []byte{1}, []byte{2}, []byte("data"), batch)
+			return updater.uploadSOC(ctx, "abcd", []byte{1}, []byte{2}, []byte("data"), batch, false)
 		})},
 	}
 	for _, r := range runs {
@@ -669,8 +669,10 @@ func TestChunkUploadStrictResponseParsing(t *testing.T) {
 }
 
 // TestChunkMalformedResponseStopsBeforeFurtherRequests proves a malformed
-// /chunks success response fails the WHOLE update before any sequence lookup or
-// SOC upload: only the /chunks request may be issued.
+// /chunks success response fails the WHOLE update before any SOC upload:
+// since Task 13 reordered the sequence lookup BEFORE the chunk upload, the
+// only requests issued are the sequence lookup (read-only) and the /chunks
+// POST — never the /soc write.
 func TestChunkMalformedResponseStopsBeforeFurtherRequests(t *testing.T) {
 	t.Parallel()
 	privateKey, err := ethcrypto.GenerateKey()
@@ -730,8 +732,10 @@ func TestChunkMalformedResponseStopsBeforeFurtherRequests(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if len(requests) != 1 || requests[0] != "POST /chunks" {
-				t.Fatalf("malformed /chunks response must stop before lookup/SOC, got %d requests: %v",
+			// Sequence lookup (read-only, first) + /chunks only; the malformed
+			// /chunks response must stop before the SOC write.
+			if len(requests) != 2 || requests[0] != "GET /feeds/"+owner+"/"+strings.Repeat("ab", 32) || requests[1] != "POST /chunks" {
+				t.Fatalf("malformed /chunks response must stop before the SOC write, got %d requests: %v",
 					len(requests), requests)
 			}
 		})
@@ -784,13 +788,13 @@ func TestBeeSequenceFeedUpdaterTypedNilFailsClosed(t *testing.T) {
 	}); err == nil {
 		t.Fatal("typed-nil updater Update must fail closed, not panic")
 	}
-	if _, err := u.nextSequenceIndex(context.Background(), "abcd", "abcd"); err == nil {
+	if _, err := u.nextSequenceIndex(context.Background(), "abcd", "abcd", false); err == nil {
 		t.Fatal("typed-nil updater lookup must fail closed, not panic")
 	}
 	if _, err := u.uploadChunk(context.Background(), []byte("data"), "batch"); err == nil {
 		t.Fatal("typed-nil updater chunk must fail closed, not panic")
 	}
-	if err := u.uploadSOC(context.Background(), "abcd", []byte{1}, []byte{2}, []byte("data"), "batch"); err == nil {
+	if err := u.uploadSOC(context.Background(), "abcd", []byte{1}, []byte{2}, []byte("data"), "batch", false); err == nil {
 		t.Fatal("typed-nil updater soc must fail closed, not panic")
 	}
 }

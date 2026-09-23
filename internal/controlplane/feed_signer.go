@@ -347,7 +347,11 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 	}
 
 	// Current feed + repo identity + generation (definite pre-update).
-	done, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
+	// create=true means the repo feed is CONCLUSIVELY absent and this is a
+	// generation-zero creation: the updater receives the explicit creation
+	// intent (Task 13), so a racing creator that wins the CONCURRENT create
+	// surfaces as ErrFeedAlreadyExists instead of an overwrite or a success.
+	done, create, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
 	if err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
@@ -378,7 +382,17 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 	// a network update happens. The request's BatchID — already proven to equal
 	// the stamp-policy-selected batch — is the exact postage batch propagated
 	// into the updater.
-	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference, req.BatchID); err != nil {
+	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference, req.BatchID, create); err != nil {
+		if errors.Is(err, swarm.ErrFeedAlreadyExists) {
+			// A create-only update observed an EXISTING feed: a racing creator
+			// won the creation race. This is a DEFINITE no-write by OUR
+			// operation — the feed at the topic is not ours, so it is a
+			// generation conflict, NEVER a success, NEVER the second
+			// advancement. The claim is released (there is nothing to retry on
+			// our side): a later retry re-resolves the REAL feed and conflicts
+			// against it again. No URL/body is ever leaked through the error.
+			return result, false, false, errFeedSignerGenerationConflict
+		}
 		return result, false, true, fmt.Errorf("%w: feed update: %v", errFeedSignerBackend, err)
 	}
 	return result, false, false, nil
@@ -417,8 +431,11 @@ func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.F
 // immutable object reader, requiring current generation == ExpectedGeneration
 // and the repo identity matching the target's repo. done=true means the current
 // feed already resolves to the requested Reference (a prior uncertain update
-// succeeded), which is reported idempotently.
-func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) (bool, error) {
+// succeeded), which is reported idempotently. create=true means the repo feed
+// is CONCLUSIVELY absent (never written) with ExpectedGeneration==0 — a
+// generation-zero creation whose updater MUST receive the explicit creation
+// intent (Task 13).
+func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) (done bool, create bool, err error) {
 	currentRef, err := s.ResolveFeeds.ResolveFeed(ctx, req.Topic)
 	if err != nil {
 		// Generation-zero first publication: a CONCLUSIVELY absent repo feed
@@ -431,41 +448,41 @@ func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCom
 		// ONLY for generation zero.
 		if errors.Is(err, resolve.ErrFeedNotFound) {
 			if req.ExpectedGeneration != 0 {
-				return false, fmt.Errorf("%w: current repo feed is absent but the request expects generation %d", errFeedSignerGenerationConflict, req.ExpectedGeneration)
+				return false, false, fmt.Errorf("%w: current repo feed is absent but the request expects generation %d", errFeedSignerGenerationConflict, req.ExpectedGeneration)
 			}
-			return false, nil
+			return false, true, nil
 		}
-		return false, fmt.Errorf("%w: current repo feed: %v", errFeedSignerBackend, err)
+		return false, false, fmt.Errorf("%w: current repo feed: %v", errFeedSignerBackend, err)
 	}
 	if swarm.CanonicalObjectRef(currentRef) == swarm.CanonicalObjectRef(req.Reference) {
 		curData, err := s.Docs.Read(ctx, currentRef)
 		if err != nil {
-			return false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+			return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 		}
 		curDoc, err := spec.DecodeRepoStateDocument(curData)
 		if err != nil {
-			return false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+			return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 		}
 		if curDoc.Repo != targetRepo {
-			return false, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
+			return false, false, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
 		}
-		return true, nil
+		return true, false, nil
 	}
 	curData, err := s.Docs.Read(ctx, currentRef)
 	if err != nil {
-		return false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+		return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 	}
 	curDoc, err := spec.DecodeRepoStateDocument(curData)
 	if err != nil {
-		return false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+		return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 	}
 	if curDoc.Repo != targetRepo {
-		return false, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
+		return false, false, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
 	}
 	if curDoc.Generation != req.ExpectedGeneration {
-		return false, errFeedSignerGenerationConflict
+		return false, false, errFeedSignerGenerationConflict
 	}
-	return false, nil
+	return false, false, nil
 }
 
 // verifyBatch resolves the registry's deterministic stamp-policy feed, decodes

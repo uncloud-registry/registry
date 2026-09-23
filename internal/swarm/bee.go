@@ -443,7 +443,14 @@ func (u *BeeSequenceFeedUpdater) writerBaseURL() (string, error) {
 	return strings.TrimRight(u.BaseURL, "/"), nil
 }
 
-func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner string, topic string) ([]byte, error) {
+// nextSequenceIndex reads the next sequence index for the feed. A conclusive
+// 404 (never written) is the zero index; every non-404 failure is a wrapped,
+// data-free dependency error. In CREATE-ONLY mode a 200 is the definitive
+// already-existing outcome: the feed EXISTS, so the update must not proceed —
+// the stable ErrFeedAlreadyExists sentinel is returned BEFORE any /chunks or
+// /soc write (zero write side effects). Non-404 lookup failures stay
+// dependency errors, never an already-exists classification.
+func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner string, topic string, createOnly bool) ([]byte, error) {
 	if len(owner) > beeFeedWriteMaxRef || len(topic) > beeFeedWriteMaxRef {
 		return nil, errors.New("feed owner or topic exceeds the bound")
 	}
@@ -473,6 +480,14 @@ func (u *BeeSequenceFeedUpdater) nextSequenceIndex(ctx context.Context, owner st
 
 	if resp.StatusCode == http.StatusNotFound {
 		return make([]byte, 8), nil
+	}
+	if createOnly && resp.StatusCode == http.StatusOK {
+		// The feed EXISTS: a create-only update must never touch it. The 200
+		// BEARS the feed's index headers, so drain a bounded amount and return
+		// the stable sentinel — no write has happened (the lookup runs before
+		// /chunks; see Update).
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		return nil, fmt.Errorf("create-only feed update: %w", ErrFeedAlreadyExists)
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Drain a bounded amount (never the whole body) so the connection can
@@ -638,7 +653,22 @@ func parseChunkReferenceResponse(body []byte) ([]byte, error) {
 // echo it. Transport and request-creation failures are sanitized: the request
 // URL carries the SOC signature in its query, so it must NEVER surface in an
 // error.
-func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, identifier []byte, signature []byte, chunkData []byte, batchID string) error {
+//
+// CREATE-ONLY (Task 13) closes the lookup TOCTOU: the zero-index SOC
+// identifier is identical for every first writer on this feed, and Bee SOCs
+// are IMMUTABLE — the first accepted write pins the address. The verified Bee
+// contract (ethersphere/bee master pkg/api/soc.go socUploadHandler; openapi
+// Swarm.yaml) returns 201 for the stored writer and collapses EVERY
+// chunk-write failure — including the immutable-alias conflict — to 400
+// "chunk write error" (there is no 409 in the current contract). So on a
+// non-201 create-only response: an explicit 409 (some Bee versions / edge
+// layers surface the conflict that way) is a definite ErrFeedAlreadyExists,
+// and a 400 is disambiguated with the precise conditional probe
+// GET /soc/{owner}/{id} (socGetHandler: 200 + Swarm-Soc-Signature when the
+// SOC exists, 404 when absent): exists → ErrFeedAlreadyExists; absent or a
+// failed probe → the original dependency error. A lost creation race is thus
+// NEVER success and NEVER an overwrite.
+func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, identifier []byte, signature []byte, chunkData []byte, batchID string, createOnly bool) error {
 	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
 		return errors.New("postage batch id is empty or exceeds the bound")
 	}
@@ -672,12 +702,69 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 
 	if resp.StatusCode != http.StatusCreated {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		if createOnly {
+			switch resp.StatusCode {
+			case http.StatusConflict:
+				// Definite conflict: the immutable (owner, identifier) already
+				// holds another writer's chunk, and THIS write did not apply.
+				return fmt.Errorf("create-only feed update: %w", ErrFeedAlreadyExists)
+			case http.StatusBadRequest:
+				// Ambiguous: current Bee maps EVERY chunk-write failure —
+				// including the racing creator's immutable-SOC alias conflict —
+				// to 400 "chunk write error". Disambiguate with the precise
+				// conditional probe: if the zero-index SOC now exists, the
+				// other writer won the race; otherwise this is a genuine write
+				// failure (dependency error).
+				exists, perr := u.socExists(ctx, owner, identifier)
+				if perr == nil && exists {
+					return fmt.Errorf("create-only feed update: %w", ErrFeedAlreadyExists)
+				}
+			}
+		}
 		return fmt.Errorf("soc upload failed with status %d", resp.StatusCode)
 	}
 	// Drain a bounded amount so the connection can be reused; see the SOC
 	// response contract note in the doc comment above — the body is ignored.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
 	return nil
+}
+
+// socExists probes whether a single-owner chunk already exists at the
+// immutable (owner, identifier) address — the PRECISE conditional mechanism
+// the create-only 400 disambiguation uses (ethersphere/bee pkg/api/soc.go
+// socGetHandler: 200 with the Swarm-Soc-Signature header when the SOC is
+// present, 404 when absent). The probe body is bounded-drained and never
+// returned; transport errors are sanitized (the URL never carries secrets)
+// and fail the probe (dependency error), never the classification.
+func (u *BeeSequenceFeedUpdater) socExists(ctx context.Context, owner string, identifier []byte) (bool, error) {
+	baseURL, err := u.writerBaseURL()
+	if err != nil {
+		return false, err
+	}
+	client := u.writerClient()
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+"/soc/"+url.PathEscape(owner)+"/"+hex.EncodeToString(identifier), nil)
+	if err != nil {
+		return false, sanitizeBeeTransportError(reqCtx, "create soc probe request", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, sanitizeBeeTransportError(reqCtx, "soc probe request", err)
+	}
+	defer resp.Body.Close()
+	// Bounded drain so the connection can be reused; the SOC body is never
+	// consumed as a value.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("soc probe failed with status %d", resp.StatusCode)
+	}
 }
 
 // writeRequestContext derives the per-request context for a writer call: it
