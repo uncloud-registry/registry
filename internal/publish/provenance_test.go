@@ -8,6 +8,71 @@ import (
 	"github.com/uncloud-registry/registry/internal/spec"
 )
 
+// TestLegacyPublishMovesProvenanceTagSucceeds proves the legacy Publish path
+// (no operation identity) can MOVE a tag that already carries durable
+// publication provenance end-to-end: the stale provenance entry is REMOVED for
+// the operated tag (never retained with the old digest — retaining it would
+// make the derived document violate its own digest-coherence validation AFTER
+// the manifest object was uploaded), unrelated tags' entries are retained
+// verbatim, and the committed document still decodes and validates.
+func TestLegacyPublishMovesProvenanceTagSucceeds(t *testing.T) {
+	current := spec.RepoStateDocument{
+		Version:    1,
+		Repo:       "backend/api",
+		Generation: 2,
+		Tags:       map[string]string{"latest": dig('1'), "stable": dig('2')},
+		Manifests: map[string]spec.ManifestDescriptor{
+			dig('1'): {SwarmRef: "r-old", MediaType: ociManifestMT, Size: 10},
+			dig('2'): {SwarmRef: "r-stable", MediaType: ociManifestMT, Size: 11},
+		},
+		Blobs: map[string]spec.BlobDescriptor{},
+		TagPublications: map[string]spec.TagPublication{
+			"latest": {OperationID: "op-prev-latest", Generation: 2, Digest: dig('1')},
+			"stable": {OperationID: "op-stable", Generation: 1, Digest: dig('2')},
+		},
+	}
+	if err := current.Validate(); err != nil {
+		t.Fatalf("fixture current state must validate: %v", err)
+	}
+
+	input := validBuildInput(t)
+	input.Manifest.SwarmRef = "swarm-ref-manifest-new"
+	// input.OperationID deliberately left empty: the legacy publication path.
+
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	p := Publisher{Builder: DefaultBuilder{}, Objects: docs, Feeds: feeds}
+	feed := spec.RepoStateFeedRef("0xaliceowner", "backend/api")
+
+	if _, err := p.Publish(context.Background(), feed, current, input, "batch-1"); err != nil {
+		t.Fatalf("legacy publish moving a provenance-bearing tag must succeed: %v", err)
+	}
+
+	// The committed document decodes, validates, and carries the moved tag
+	// mapping WITHOUT the stale entry; the unrelated entry survives.
+	stateRef := feeds.Feeds[feed]
+	data, err := docs.Read(context.Background(), stateRef)
+	if err != nil {
+		t.Fatalf("read committed state: %v", err)
+	}
+	doc, err := spec.DecodeRepoStateDocument(data)
+	if err != nil {
+		t.Fatalf("decode committed state: %v", err)
+	}
+	if doc.Tags[input.Tag] != input.ManifestDigest {
+		t.Fatalf("moved tag must point at the new digest: %+v", doc.Tags)
+	}
+	if _, ok := doc.TagPublications[input.Tag]; ok {
+		t.Fatalf("legacy publish must REMOVE the operated tag's stale provenance entry, got %+v", doc.TagPublications[input.Tag])
+	}
+	if got := doc.TagPublications["stable"]; got != current.TagPublications["stable"] {
+		t.Fatalf("unrelated tag provenance must be retained verbatim: %+v", got)
+	}
+	if err := doc.Validate(); err != nil {
+		t.Fatalf("committed legacy-moved state must validate: %v", err)
+	}
+}
+
 // TestBuildNextRecordsPublicationProvenance proves DefaultBuilder persists
 // the durable per-tag publication provenance entry (operation ID + applied
 // generation + digest) for the published tag when the input carries an

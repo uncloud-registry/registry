@@ -119,6 +119,7 @@ func TestInternalFeedServerHappyPath(t *testing.T) {
 	req := validCommitReq(0, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)

@@ -289,6 +289,13 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 			Generation:  next.Generation,
 			Digest:      input.ManifestDigest,
 		}
+	} else {
+		// Legacy publication (no operation identity): the operated tag's OLD
+		// provenance entry — if any — is REMOVED. Retaining it would leave the
+		// stale entry's digest disagreeing with the new tag mapping and fail
+		// document validation AFTER the manifest object was uploaded. Unrelated
+		// tags' entries are already cloned and never aliased above.
+		delete(next.TagPublications, input.Tag)
 	}
 
 	return next, next.Validate()

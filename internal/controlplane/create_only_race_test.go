@@ -51,6 +51,7 @@ func TestFeedSignerCreateOnlyRaceDetectedAsGenerationConflict(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -324,6 +325,17 @@ func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 	if regA != regB {
 		t.Fatalf("independent stores must resolve the SAME registry identity for the race, got %d vs %d", regA, regB)
 	}
+	// The data-plane preflight: each operation key is durably bound to its
+	// exact payload IN ITS OWN store's database, mirroring independent
+	// processes — the signer's identity authentication reads the binding.
+	if _, err := storeA.ReservePublicationBinding(ctx, "first-push-A", regA,
+		NormalizePublicationBindingHash(regA, "0x"+feedOwner, testRepo, "latest", "sha256:"+refHex('a'))); err != nil {
+		t.Fatalf("bind first-push-A: %v", err)
+	}
+	if _, err := storeB.ReservePublicationBinding(ctx, "first-push-B", regB,
+		NormalizePublicationBindingHash(regB, "0x"+feedOwner, testRepo, "latest", "sha256:"+refHex('d'))); err != nil {
+		t.Fatalf("bind first-push-B: %v", err)
+	}
 
 	repoTopic := spec.RepoStateFeedRef(feedOwner, testRepo)
 	stampFeed := spec.StampPolicyFeedRef(feedOwner)
@@ -334,9 +346,13 @@ func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 		map[string][]byte{pathForFeedRef(stampFeed): refBytesForTest(t, stampRef)},
 		map[string]string{pathForFeedRef(stampFeed): "0000000000000000"},
 		map[string][]byte{
-			refHex('a'): mustRepoDoc(t, testRepo, 1), // target doc for op A (gen 1 = 0+1)
-			refHex('d'): mustRepoDoc(t, testRepo, 1), // target doc for op B
-			stampRef:    mustStampDoc(t, testRaceBatch),
+			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
+				map[string]string{"latest": "sha256:" + refHex('a')},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-A", Generation: 1, Digest: "sha256:" + refHex('a')}}), // target doc for op A (gen 1 = 0+1)
+			refHex('d'): mustRepoDocWithPubs(t, testRepo, 1,
+				map[string]string{"latest": "sha256:" + refHex('d')},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-B", Generation: 1, Digest: "sha256:" + refHex('d')}}), // target doc for op B
+			stampRef: mustStampDoc(t, testRaceBatch),
 		})
 
 	feedResolver := swarm.NewBeeFeedResolver(srv.URL, srv.Client())
@@ -464,6 +480,7 @@ func TestFeedSignerCreateOnlyUncertainUpdateKeepsLease(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)

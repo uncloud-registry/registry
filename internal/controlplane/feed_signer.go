@@ -341,7 +341,7 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 	}
 
 	// Topic proof + canonical target document + generation (definite pre-update).
-	targetRepo, err := s.verifyTopicFromReference(ctx, req, reg)
+	targetRepo, targetDoc, err := s.verifyTopicFromReference(ctx, req, reg)
 	if err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
@@ -351,13 +351,24 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 	// generation-zero creation: the updater receives the explicit creation
 	// intent (Task 13), so a racing creator that wins the CONCURRENT create
 	// surfaces as ErrFeedAlreadyExists instead of an overwrite or a success.
-	done, create, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
+	done, create, curDoc, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
 	if err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
 	// Stamp policy / batch proof (definite pre-update).
 	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
+		return publish.FeedCommitResult{}, false, false, err
+	}
+
+	// Operation provenance authentication (definite pre-update): the request
+	// is authenticated against the EXACT tag-publication transition the
+	// immutable documents record — NOT against feed-reference readback, which
+	// can only prove bytes, never op provenance — and the operation identity
+	// is proven generated or durably bound. A forged, stale, zero, multiple,
+	// or unbound provenance fails closed HERE, before any external feed
+	// update, so the retry handler can never trust an attacker-overlaid entry.
+	if err := s.authenticatePublicationProvenance(ctx, req, targetRepo, targetDoc, curDoc, done); err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
@@ -401,30 +412,31 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 // verifyTopicFromReference decodes and validates the immutable target document
 // and proves the requested Topic is the FULL deterministic repo-state feed ref
 // of the document's own canonical Repo under the registry's normalized owner. It
-// returns the canonical repo name. An arbitrary, non-deterministic, auth-policy,
-// or stamp-policy topic is rejected BEFORE the key is touched or any feed is
-// written.
-func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.FeedCommitRequest, reg Registry) (string, error) {
+// returns the canonical repo name AND the decoded target document (the exact
+// immutable bytes this operation would publish). An arbitrary,
+// non-deterministic, auth-policy, or stamp-policy topic is rejected BEFORE the
+// key is touched or any feed is written.
+func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.FeedCommitRequest, reg Registry) (string, spec.RepoStateDocument, error) {
 	data, err := s.Docs.Read(ctx, req.Reference)
 	if err != nil {
-		return "", fmt.Errorf("%w: target reference: %v", errFeedSignerBackend, err)
+		return "", spec.RepoStateDocument{}, fmt.Errorf("%w: target reference: %v", errFeedSignerBackend, err)
 	}
 	doc, err := spec.DecodeRepoStateDocument(data)
 	if err != nil {
-		return "", fmt.Errorf("%w: target is not a valid repo state document: %v", errFeedSignerMalformed, err)
+		return "", spec.RepoStateDocument{}, fmt.Errorf("%w: target is not a valid repo state document: %v", errFeedSignerMalformed, err)
 	}
 	derived := spec.RepoStateFeedRef(spec.NormalizeOwner(reg.FeedOwnerAddress), doc.Repo)
 	if derived != req.Topic {
-		return "", fmt.Errorf("%w: topic is not the deterministic reference for the repository in the target document", errFeedSignerMalformed)
+		return "", spec.RepoStateDocument{}, fmt.Errorf("%w: topic is not the deterministic reference for the repository in the target document", errFeedSignerMalformed)
 	}
 	// Target generation must be exactly ExpectedGeneration+1, overflow-safe.
 	if req.ExpectedGeneration == math.MaxInt64 {
-		return "", errFeedSignerGenerationConflict
+		return "", spec.RepoStateDocument{}, errFeedSignerGenerationConflict
 	}
 	if doc.Generation != req.ExpectedGeneration+1 {
-		return "", errFeedSignerGenerationConflict
+		return "", spec.RepoStateDocument{}, errFeedSignerGenerationConflict
 	}
-	return doc.Repo, nil
+	return doc.Repo, doc, nil
 }
 
 // resolveCurrentFeed re-reads the current repo feed via the resolver and the
@@ -434,8 +446,10 @@ func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.F
 // succeeded), which is reported idempotently. create=true means the repo feed
 // is CONCLUSIVELY absent (never written) with ExpectedGeneration==0 — a
 // generation-zero creation whose updater MUST receive the explicit creation
-// intent (Task 13).
-func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) (done bool, create bool, err error) {
+// intent (Task 13). It also returns the decoded CURRENT document (nil on the
+// creation path) so the caller can authenticate the exact tag-publication
+// transition recorded between the two immutable states.
+func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) (done bool, create bool, curDoc *spec.RepoStateDocument, err error) {
 	currentRef, err := s.ResolveFeeds.ResolveFeed(ctx, req.Topic)
 	if err != nil {
 		// Generation-zero first publication: a CONCLUSIVELY absent repo feed
@@ -448,41 +462,41 @@ func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCom
 		// ONLY for generation zero.
 		if errors.Is(err, resolve.ErrFeedNotFound) {
 			if req.ExpectedGeneration != 0 {
-				return false, false, fmt.Errorf("%w: current repo feed is absent but the request expects generation %d", errFeedSignerGenerationConflict, req.ExpectedGeneration)
+				return false, false, nil, fmt.Errorf("%w: current repo feed is absent but the request expects generation %d", errFeedSignerGenerationConflict, req.ExpectedGeneration)
 			}
-			return false, true, nil
+			return false, true, nil, nil
 		}
-		return false, false, fmt.Errorf("%w: current repo feed: %v", errFeedSignerBackend, err)
+		return false, false, nil, fmt.Errorf("%w: current repo feed: %v", errFeedSignerBackend, err)
 	}
 	if swarm.CanonicalObjectRef(currentRef) == swarm.CanonicalObjectRef(req.Reference) {
 		curData, err := s.Docs.Read(ctx, currentRef)
 		if err != nil {
-			return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+			return false, false, nil, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 		}
-		curDoc, err := spec.DecodeRepoStateDocument(curData)
+		decodedCur, err := spec.DecodeRepoStateDocument(curData)
 		if err != nil {
-			return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+			return false, false, nil, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 		}
-		if curDoc.Repo != targetRepo {
-			return false, false, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
+		if decodedCur.Repo != targetRepo {
+			return false, false, nil, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
 		}
-		return true, false, nil
+		return true, false, &decodedCur, nil
 	}
 	curData, err := s.Docs.Read(ctx, currentRef)
 	if err != nil {
-		return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+		return false, false, nil, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 	}
-	curDoc, err := spec.DecodeRepoStateDocument(curData)
+	decodedCur, err := spec.DecodeRepoStateDocument(curData)
 	if err != nil {
-		return false, false, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
+		return false, false, nil, fmt.Errorf("%w: current repo document: %v", errFeedSignerBackend, err)
 	}
-	if curDoc.Repo != targetRepo {
-		return false, false, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
+	if decodedCur.Repo != targetRepo {
+		return false, false, nil, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
 	}
-	if curDoc.Generation != req.ExpectedGeneration {
-		return false, false, errFeedSignerGenerationConflict
+	if decodedCur.Generation != req.ExpectedGeneration {
+		return false, false, nil, errFeedSignerGenerationConflict
 	}
-	return false, false, nil
+	return false, false, &decodedCur, nil
 }
 
 // verifyBatch resolves the registry's deterministic stamp-policy feed, decodes
@@ -511,6 +525,147 @@ func (s *FeedSigner) verifyBatch(ctx context.Context, req publish.FeedCommitRequ
 		return fmt.Errorf("%w: batch is not permitted by the current stamp policy", errFeedSignerMalformed)
 	}
 	return nil
+}
+
+// authenticatePublicationProvenance is the signer's AUTHORITATIVE
+// authentication of the operated tag publication. It compares the current and
+// next immutable repo-state documents to identify EXACTLY ONE
+// tag-publication transition for this operation and requires that transition's
+// provenance entry to record the request's operation ID at the NEXT
+// generation with the resulting tag digest — rejecting zero-mutation,
+// multi-mutation, forged, stale, or copied entries as malformed BEFORE any
+// external feed update. On the already-advanced recovery path (done=true,
+// current == target) the single provenance entry recording this exact
+// operation at the document's own generation is identified instead; a legacy
+// document with no provenance record fails closed. It then binds the
+// semantic request identity (authenticateOperationIdentity): in no case can an
+// arbitrary internal request pair a forged document ID with a chosen request
+// ID. All errors are data-free sentinel-wrapped failures.
+func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req publish.FeedCommitRequest, targetRepo string, targetDoc spec.RepoStateDocument, curDoc *spec.RepoStateDocument, done bool) error {
+	if hasDuplicateOperationAttribution(targetDoc.TagPublications) {
+		// One operation identity recorded by TWO tags is never produced by a
+		// legitimate publication sequence and defeats every single-entry
+		// identification below.
+		return fmt.Errorf("%w: duplicate operation attribution in target document", errFeedSignerMalformed)
+	}
+
+	if done {
+		// current == target: identify the operated tag as the SINGLE
+		// provenance entry recording EXACTLY this operation at the document's
+		// own generation and mapping to its recorded digest.
+		var operated string
+		for tag, entry := range targetDoc.TagPublications {
+			if entry.OperationID != req.OperationID {
+				continue
+			}
+			if entry.Generation != targetDoc.Generation {
+				continue
+			}
+			if targetDoc.Tags[tag] != entry.Digest {
+				continue
+			}
+			if operated != "" {
+				return fmt.Errorf("%w: multiple provenance entries record this operation", errFeedSignerMalformed)
+			}
+			operated = tag
+		}
+		if operated == "" {
+			return fmt.Errorf("%w: no provenance entry records this operation at the target generation", errFeedSignerMalformed)
+		}
+		return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, targetDoc.TagPublications[operated].Digest)
+	}
+
+	var cur spec.RepoStateDocument
+	if curDoc != nil {
+		cur = *curDoc
+	}
+	// The transition cur → target must touch EXACTLY ONE tag — in its mapping,
+	// its provenance entry, or both. Two tags changing means two publications
+	// packed into one document; none changing means this operation has no
+	// record at all. Either is malformed.
+	changing := make(map[string]struct{}, 2)
+	for tag, entry := range targetDoc.TagPublications {
+		if curEntry, exists := cur.TagPublications[tag]; !exists || curEntry != entry {
+			changing[tag] = struct{}{}
+		}
+	}
+	for tag, digest := range targetDoc.Tags {
+		if curDigest, exists := cur.Tags[tag]; !exists || curDigest != digest {
+			changing[tag] = struct{}{}
+		}
+	}
+	if len(changing) != 1 {
+		return fmt.Errorf("%w: target document mutates %d tags, expected exactly one", errFeedSignerMalformed, len(changing))
+	}
+	var operated string
+	for tag := range changing {
+		operated = tag
+	}
+	entry, ok := targetDoc.TagPublications[operated]
+	if !ok {
+		return fmt.Errorf("%w: operated tag has no provenance record", errFeedSignerMalformed)
+	}
+	if entry.OperationID != req.OperationID {
+		return fmt.Errorf("%w: provenance operation does not match the request operation", errFeedSignerMalformed)
+	}
+	if entry.Generation != targetDoc.Generation {
+		return fmt.Errorf("%w: provenance generation does not match the target generation", errFeedSignerMalformed)
+	}
+	if entry.Digest != targetDoc.Tags[operated] {
+		return fmt.Errorf("%w: provenance digest does not match the operated tag mapping", errFeedSignerMalformed)
+	}
+	return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, entry.Digest)
+}
+
+// authenticateOperationIdentity proves the request's operation identity is NOT
+// attacker-selected. A GENERATED identity must exactly equal the deterministic
+// recomputation of the established ComputeOperationID domain over
+// (registry ID, owner, repo, operated tag, digest, expected generation) — the
+// same pure derivation the data plane uses, so the signer accepts it WITHOUT
+// any durable binding. ANY other identity is an EXPLICIT caller key and must
+// have a permanent publication binding row (the data plane's preflight
+// reservation) whose stored hash equals the derived binding hash over
+// (registry, owner, repo, tag, digest): a MISSING binding is malformed, a
+// MISMATCHED binding (or foreign registry) is a conflict. The two classes are
+// decided without attacker-controlled ambiguity, and both fail before any
+// external feed update. Errors are data-free (fixed sentinel + fixed message).
+func (s *FeedSigner) authenticateOperationIdentity(ctx context.Context, req publish.FeedCommitRequest, targetRepo, operatedTag, digest string) error {
+	if req.OperationID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
+		// Generated identity: the deterministic recomputation over the exact
+		// immutable transition authenticates it — the request could not have
+		// chosen this ID without naming this publication.
+		return nil
+	}
+	binding, err := s.Store.GetPublicationBinding(ctx, req.OperationID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: operation identity is not durably bound to this publication", errFeedSignerMalformed)
+		}
+		return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
+	}
+	if binding.RegistryID != req.RegistryID {
+		return fmt.Errorf("%w: operation identity is bound to another registry", errFeedSignerConflict)
+	}
+	if binding.BindingHash != NormalizePublicationBindingHash(req.RegistryID, req.Owner, targetRepo, operatedTag, digest) {
+		return fmt.Errorf("%w: operation identity is bound to a different publication", errFeedSignerConflict)
+	}
+	return nil
+}
+
+// hasDuplicateOperationAttribution reports whether any operation identity in
+// the document's provenance records appears for MORE THAN ONE tag — a pattern
+// no legitimate publication sequence produces (entries are replaced per tag,
+// every identity is unique per operation) and which would defeat
+// single-entry identification.
+func hasDuplicateOperationAttribution(pubs map[string]spec.TagPublication) bool {
+	byOp := make(map[string]string, len(pubs)) // operation ID -> tag
+	for tag, entry := range pubs {
+		if _, exists := byOp[entry.OperationID]; exists {
+			return true
+		}
+		byOp[entry.OperationID] = tag
+	}
+	return false
 }
 
 // NormalizeFeedCommitHash derives the deterministic domain-separated SHA-256 of

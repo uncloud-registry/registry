@@ -98,6 +98,25 @@ func newFeedTestWorld(t *testing.T, req publish.FeedCommitRequest, dst feedDocSe
 	if len(dst.targetTags) > 0 {
 		targetDoc = mustRepoDocWithTags(t, testRepo, dst.targetGen, dst.targetTags)
 	}
+	if len(dst.targetTags) == 1 {
+		// A REAL single-tag publication: the target document records the
+		// operation's provenance entry at the target generation, and the world
+		// durably binds the request's operation identity to that exact payload
+		// (the data plane's preflight reservation, migration 15). Under the
+		// provenance-authentication contract the signer authenticates BOTH the
+		// tag-publication transition and the operation identity; without them
+		// every fixture request would fail closed before any external update.
+		var tag, digest string
+		for tg, dg := range dst.targetTags {
+			tag, digest = tg, dg
+		}
+		targetDoc = mustRepoDocWithPubs(t, testRepo, dst.targetGen, dst.targetTags,
+			map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: dst.targetGen, Digest: digest}})
+		if _, err := store.ReservePublicationBinding(ctx, req.OperationID, newReg.ID,
+			NormalizePublicationBindingHash(newReg.ID, req.Owner, testRepo, tag, digest)); err != nil {
+			t.Fatalf("seed publication binding: %v", err)
+		}
+	}
 	docs := resolve.NewMemoryDocumentStore()
 	docs.Documents = map[string][]byte{
 		dst.currentRef: mustRepoDoc(t, testRepo, dst.currentGen),
@@ -153,6 +172,33 @@ func mustRepoDocWithTags(t *testing.T, repo string, gen int64, tags map[string]s
 	return data
 }
 
+// mustRepoDocWithPubs marshals a repo-state document with tag mappings AND an
+// explicit per-tag publication-provenance map — the exact shape the real data
+// plane commits for a provenance-bearing publication. A nil pubs yields the
+// legacy shape (the field is omitted by the struct's omitempty), identical to
+// mustRepoDocWithTags.
+func mustRepoDocWithPubs(t *testing.T, repo string, gen int64, tags map[string]string, pubs map[string]spec.TagPublication) []byte {
+	t.Helper()
+	manifests := map[string]spec.ManifestDescriptor{}
+	for _, digest := range tags {
+		manifests[digest] = spec.ManifestDescriptor{SwarmRef: refHex('e'), MediaType: "application/vnd.oci.image.manifest.v1+json", Size: 42}
+	}
+	doc := spec.RepoStateDocument{
+		Version:         1,
+		Repo:            repo,
+		Generation:      gen,
+		Tags:            tags,
+		Manifests:       manifests,
+		Blobs:           map[string]spec.BlobDescriptor{},
+		TagPublications: pubs,
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal repo doc with provenance: %v", err)
+	}
+	return data
+}
+
 func mustStampDoc(t *testing.T, batch string) []byte {
 	t.Helper()
 	doc := spec.StampPolicyDocument{
@@ -194,7 +240,8 @@ func TestFeedSignerValidCommit(t *testing.T) {
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0,
 		targetRef: refHex('a'), targetGen: 1,
-		stampRef: refHex('c'),
+		stampRef:   refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -226,6 +273,7 @@ func TestFeedSignerUnknownRegistry(t *testing.T) {
 	req := validCommitReq(923131, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	w.fillTopic(&req)
 	_, err := w.signer.Commit(context.Background(), req)
@@ -280,6 +328,7 @@ func TestFeedSignerOwnerMismatchBeforeKeyOrNetwork(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	req.Owner = "0xffffffffffffffffffffffffffffffffffffffff" // different owner
@@ -299,6 +348,7 @@ func TestFeedSignerNonDeterministicTopic(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	req.Topic = "feed://" + strings.Repeat("0", 40) + "/deadbeef" // arbitrary, non-deterministic
@@ -315,6 +365,7 @@ func TestFeedSignerAuthPolicyTopicRejected(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	req.Topic = spec.AuthPolicyFeedRef(w.registry.FeedOwnerAddress)
@@ -358,6 +409,7 @@ func TestFeedSignerOverflowGenerationRejected(t *testing.T) {
 	req.ExpectedGeneration = math.MaxInt64
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	req.Topic = w.repoTopic // deliberately NOT calling fillTopic (it would reset the generation)
@@ -389,6 +441,7 @@ func TestFeedSignerStampRepoOverrideBatch(t *testing.T) {
 	req := validCommitReq(1, "overridden-batch")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	// The default policy batch is "batch-1"; add a repo override that permits
 	// "overridden-batch" for the target repo.
@@ -414,6 +467,7 @@ func TestFeedSignerIdempotentIdenticalRequest(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -438,12 +492,13 @@ func TestFeedSignerIdempotentIdenticalRequest(t *testing.T) {
 
 func TestFeedSignerOperationConflict(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	req.OperationID = "shared-op" // bound by the world's preflight seeding below
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
-	req.OperationID = "shared-op"
 	if _, err := w.signer.Commit(context.Background(), req); err != nil {
 		t.Fatalf("first commit: %v", err)
 	}
@@ -505,6 +560,7 @@ func TestFeedSignerUncertainResponseRecovery(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -571,11 +627,18 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 
 	repoTopic := spec.RepoStateFeedRef(testFeedOwner, testRepo)
 	stampFeed := spec.StampPolicyFeedRef(testFeedOwner)
+	// Data-plane preflight: op-1 is durably bound to the exact payload.
+	if _, err := store.ReservePublicationBinding(context.Background(), "op-1", newReg.ID,
+		NormalizePublicationBindingHash(newReg.ID, "0x"+testFeedOwner, testRepo, "latest", "sha256:"+refHex('a'))); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
 	feedStore := &MemoryRegistryFeedStore{Feeds: map[string]string{repoTopic: refHex('b'), stampFeed: refHex('c')}}
 	docs := resolve.NewMemoryDocumentStore()
 	docs.Documents = map[string][]byte{
 		refHex('b'): mustRepoDoc(t, testRepo, 0),
-		refHex('a'): mustRepoDoc(t, testRepo, 1),
+		refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
+			map[string]string{"latest": "sha256:" + refHex('a')},
+			map[string]spec.TagPublication{"latest": {OperationID: "op-1", Generation: 1, Digest: "sha256:" + refHex('a')}}),
 		refHex('c'): mustStampDoc(t, "batch-1"),
 	}
 	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs}
@@ -614,6 +677,7 @@ func TestFeedSignerConcurrentIdenticalRequests(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -655,6 +719,7 @@ func TestFeedSignerDifferentOperationIDsSameTarget(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -839,6 +904,18 @@ type sharedFeedWorld struct {
 	topic   string
 }
 
+// seedBinding durably binds an explicit operation key to one logical payload
+// (registry/owner/repo/tag/digest) via the FIRST store — the data-plane
+// preflight reservation the signer's identity authentication reads.
+func (w *sharedFeedWorld) seedBinding(t *testing.T, operationID, tag, digest string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := w.stores[0].ReservePublicationBinding(ctx, operationID, w.reg.ID,
+		NormalizePublicationBindingHash(w.reg.ID, "0x"+testFeedOwner, testRepo, tag, digest)); err != nil {
+		t.Fatalf("seed binding %q: %v", operationID, err)
+	}
+}
+
 func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs map[string][]byte) *sharedFeedWorld {
 	t.Helper()
 	ctx := context.Background()
@@ -895,9 +972,12 @@ func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
 		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
-			refHex('a'): mustRepoDoc(t, testRepo, 1),
+			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
+				map[string]string{"latest": "sha256:" + refHex('a')},
+				map[string]spec.TagPublication{"latest": {OperationID: "op-1", Generation: 1, Digest: "sha256:" + refHex('a')}}),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
+	w.seedBinding(t, "op-1", "latest", "sha256:"+refHex('a'))
 
 	req := validCommitReq(w.reg.ID, "batch-1")
 	req.Owner = "0x" + testFeedOwner
@@ -946,9 +1026,12 @@ func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
-			refHex('a'): mustRepoDoc(t, testRepo, 1),
+			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
+				map[string]string{"latest": "sha256:" + refHex('a')},
+				map[string]spec.TagPublication{"latest": {OperationID: "shared-op-A", Generation: 1, Digest: "sha256:" + refHex('a')}}),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
+	w.seedBinding(t, "shared-op-A", "latest", "sha256:"+refHex('a'))
 
 	reqA := validCommitReq(w.reg.ID, "batch-1")
 	reqA.OperationID = "shared-op-A"
@@ -960,7 +1043,10 @@ func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 	reqB := reqA
 	reqB.OperationID = "shared-op-B"
 	reqB.Reference = refHex('d')
-	w.docs.Documents[refHex('d')] = mustRepoDoc(t, testRepo, 1)
+	w.docs.Documents[refHex('d')] = mustRepoDocWithPubs(t, testRepo, 1,
+		map[string]string{"latest": "sha256:" + refHex('d')},
+		map[string]spec.TagPublication{"latest": {OperationID: "shared-op-B", Generation: 1, Digest: "sha256:" + refHex('d')}})
+	w.seedBinding(t, "shared-op-B", "latest", "sha256:"+refHex('d'))
 
 	var start sync.WaitGroup
 	start.Add(1)
@@ -1003,6 +1089,7 @@ func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -1637,13 +1724,29 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag(t *testing.T) {
 	testDigestB := "sha256:" + strings.Repeat("b", 64)
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
-		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
-		targetTags: map[string]string{"latest": testDigestA, "v2": testDigestB},
+		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
+	req.ExpectedGeneration = 1
 	target := refHex('a')
 	ctx := context.Background()
+	// A multi-tag document is legitimate ONLY as retained history: "v2" was
+	// published earlier (its provenance carries verbatim), while "latest" is
+	// the SINGLE tag-publication transition this request authenticates.
+	w.docs.Documents[refHex('b')] = mustRepoDocWithPubs(t, testRepo, 1,
+		map[string]string{"v2": testDigestB},
+		map[string]spec.TagPublication{"v2": {OperationID: "op-v2-orig", Generation: 1, Digest: testDigestB}})
+	w.docs.Documents[refHex('a')] = mustRepoDocWithPubs(t, testRepo, 2,
+		map[string]string{"latest": testDigestA, "v2": testDigestB},
+		map[string]spec.TagPublication{
+			"latest": {OperationID: "op-1", Generation: 2, Digest: testDigestA},
+			"v2":     {OperationID: "op-v2-orig", Generation: 1, Digest: testDigestB},
+		})
+	if _, err := w.store.ReservePublicationBinding(ctx, "op-1", w.registry.ID,
+		NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, "latest", testDigestA)); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
 
 	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", testDigestA, req.ExpectedGeneration)
 	if histID == req.OperationID {
@@ -1780,20 +1883,42 @@ func TestFeedSignerMultiTagLegacyDerivationFailClosed(t *testing.T) {
 	})
 	t.Run("over-cap-tags-no-adoption", func(t *testing.T) {
 		req := validCommitReq(1, "batch-1")
-		tags := make(map[string]string, feedSignerLegacyMaxCandidates+1)
+		// The CURRENT document already carries the tag population at the cap
+		// (each with its own retained provenance); the TARGET adds exactly ONE
+		// new tag — the single transition this request operates.
+		curTags := make(map[string]string, feedSignerLegacyMaxCandidates)
+		curPubs := make(map[string]spec.TagPublication, feedSignerLegacyMaxCandidates)
+		targetTags := make(map[string]string, feedSignerLegacyMaxCandidates+1)
+		targetPubs := make(map[string]spec.TagPublication, feedSignerLegacyMaxCandidates+1)
 		digests := make([]string, feedSignerLegacyMaxCandidates+1)
 		for i := 0; i <= feedSignerLegacyMaxCandidates; i++ {
 			sum := sha256.Sum256([]byte(fmt.Sprintf("m-digest-%d", i)))
 			d := "sha256:" + hex.EncodeToString(sum[:])
-			tags[fmt.Sprintf("m-tag-%04d", i)] = d
 			digests[i] = d
+			if i == 0 {
+				// m-tag-0000 is the NEW tag operated by this request.
+				continue
+			}
+			tag := fmt.Sprintf("m-tag-%04d", i)
+			curTags[tag] = d
+			curPubs[tag] = spec.TagPublication{OperationID: fmt.Sprintf("op-existing-%04d", i), Generation: 5, Digest: d}
+			targetTags[tag] = d
+			targetPubs[tag] = curPubs[tag]
 		}
+		targetTags["m-tag-0000"] = digests[0]
 		w := newFeedTestWorld(t, req, feedDocSet{
-			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
-			targetTags: tags,
+			currentRef: refHex('b'), currentGen: 5, targetRef: refHex('a'), targetGen: 6, stampRef: refHex('c'),
 		})
 		req.RegistryID = w.registry.ID
 		w.fillTopic(&req)
+		req.ExpectedGeneration = 5
+		// Generated operation identity for the ONE operated tag: no durable
+		// binding is needed for the fresh signing.
+		generatedID := publish.ComputeOperationID(req.RegistryID, req.Owner, testRepo, "m-tag-0000", digests[0], req.ExpectedGeneration)
+		req.OperationID = generatedID
+		targetPubs["m-tag-0000"] = spec.TagPublication{OperationID: generatedID, Generation: 6, Digest: digests[0]}
+		w.docs.Documents[refHex('b')] = mustRepoDocWithPubs(t, testRepo, 5, curTags, curPubs)
+		w.docs.Documents[refHex('a')] = mustRepoDocWithPubs(t, testRepo, 6, targetTags, targetPubs)
 		ctx := context.Background()
 
 		// Seed the row for tag 0 — the ONE row a bounded derivation must NOT
@@ -1889,6 +2014,7 @@ func TestFeedSignerGenerationZeroCreatesAbsentFeed(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -1920,6 +2046,7 @@ func TestFeedSignerGenerationZeroAlreadyCreatedFailsClosed(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -2010,10 +2137,16 @@ func TestFeedSignerConcurrentFirstPushesOneAdvancement(t *testing.T) {
 	w := newSharedFeedWorld(t, 2,
 		map[string]string{spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
-			refHex('a'): mustRepoDoc(t, testRepo, 1),
-			refHex('d'): mustRepoDoc(t, testRepo, 1),
+			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
+				map[string]string{"latest": "sha256:" + refHex('a')},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-A", Generation: 1, Digest: "sha256:" + refHex('a')}}),
+			refHex('d'): mustRepoDocWithPubs(t, testRepo, 1,
+				map[string]string{"latest": "sha256:" + refHex('d')},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-B", Generation: 1, Digest: "sha256:" + refHex('d')}}),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
+	w.seedBinding(t, "first-push-A", "latest", "sha256:"+refHex('a'))
+	w.seedBinding(t, "first-push-B", "latest", "sha256:"+refHex('d'))
 
 	reqA := validCommitReq(w.reg.ID, "batch-1")
 	reqA.OperationID = "first-push-A"

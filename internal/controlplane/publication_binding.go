@@ -129,6 +129,22 @@ func (s *Store) ReservePublicationBinding(ctx context.Context, operationID strin
 	return b, nil
 }
 
+// GetPublicationBinding returns the durable binding row for an explicit
+// operation identity, or sql.ErrNoRows when the identity was never durably
+// bound. It is the signer's read-side of the preflight reservation: a commit
+// whose request carries an explicit (non-generated) operation ID is
+// authenticated ONLY against this permanent row. No error or row content is
+// ever propagated into a request error by the caller.
+func (s *Store) GetPublicationBinding(ctx context.Context, operationID string) (PublicationBinding, error) {
+	var b PublicationBinding
+	err := scanPublicationBinding(s.DB.QueryRowContext(ctx,
+		`select `+publicationBindingColumns+` from publication_bindings where operation_id = ?`, operationID), &b)
+	if err != nil {
+		return PublicationBinding{}, err
+	}
+	return b, nil
+}
+
 // NormalizePublicationBindingHash derives the deterministic domain-separated
 // SHA-256 of the FIVE typed binding fields (registry, owner, repo, tag,
 // manifest digest) with the same explicit binary framing
