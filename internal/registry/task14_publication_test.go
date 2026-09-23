@@ -421,7 +421,10 @@ func TestLostResponseRetryWithCommitterExactlyOneCommit(t *testing.T) {
 // as the already-published operation on a retry — zero additional writes.
 func TestExplicitIdempotencyKeySameRequestSucceedsThenVerifies(t *testing.T) {
 	const key = "client-t14-key-0001"
-	_, docs, feeds, issuer, serverURL := task14World(t)
+	h, docs, feeds, issuer, serverURL := task14World(t)
+	// An explicit key is only ever accepted with a durable binder attached.
+	binder := newDurableBindingStore()
+	h.Preflight = binder
 
 	configBytes := []byte(`{"architecture":"amd64"}`)
 	configDigest := stageBlob(t, serverURL, issuer, configBytes, "application/vnd.oci.image.config.v1+json")

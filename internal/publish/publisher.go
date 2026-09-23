@@ -46,6 +46,16 @@ type BuildInput struct {
 	ManifestJSON   []byte
 	Manifest       spec.ManifestDescriptor
 	StagedBlobs    map[string]spec.BlobDescriptor
+	// OperationID, when non-empty, is the operation identity the
+	// repository-state document records as the DURABLE publication provenance
+	// for input.Tag (see spec.TagPublication): the exact operation that
+	// produced this tag's mapping, the generation it was applied at, and the
+	// digest it points at. PublishCommit always supplies it via the operation
+	// identity it commits to the feed; callers of the legacy Publish path
+	// leave it empty and their documents carry no provenance — those
+	// documents stay valid, and their exact prior operation identity is
+	// simply not recoverable by a later retry (never fabricated).
+	OperationID string
 	// UpdatedAt, when non-empty, is the EXACT repo-state UpdatedAt value the
 	// builder must persist verbatim. Callers that need byte-stable,
 	// restart-safe idempotent rebuilds (a retry of one logical publication
@@ -140,6 +150,11 @@ func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.R
 	}
 
 	input.Manifest.SwarmRef = manifestRef
+	// The committed operation identity IS the durable publication provenance
+	// recorded in the repo-state document (spec.TagPublication). The legacy
+	// Publish path passes an empty identity and its documents carry no
+	// provenance; PublishCommit always records the exact operation it commits.
+	input.OperationID = operationID
 	next, err := p.Builder.BuildNext(current, input)
 	if err != nil {
 		return spec.RepoStateDocument{}, PublicationReceipt{}, err
@@ -231,6 +246,13 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 		Tags:       cloneStringMap(current.Tags),
 		Manifests:  cloneManifestMap(current.Manifests),
 		Blobs:      cloneBlobMap(current.Blobs),
+		// The per-tag publication provenance is cloned like every other map
+		// (never aliased against the caller's document) and REPLACED for the
+		// operated tag when an operation identity is supplied. It is retained
+		// verbatim across unrelated tags' publications — the durable record a
+		// restart-safe retry reads. A nil current map yields a non-nil empty
+		// map, so every PublishCommit-produced document carries the field.
+		TagPublications: cloneTagPublications(current.TagPublications),
 	}
 
 	// Copy staged blobs into the next state REFERENCED-ONLY: a staged blob is
@@ -256,6 +278,18 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 	}
 	next.Manifests[input.ManifestDigest] = input.Manifest
 	next.Tags[input.Tag] = input.ManifestDigest
+	if input.OperationID != "" {
+		// Record the durable per-tag provenance: the EXACT operation identity
+		// this publication commits under, the generation it is applied at, and
+		// the digest its tag now maps to. The resulting document is validated
+		// below (coherence with the tag mapping is checked by
+		// RepoStateDocument.Validate), so a malformed identity fails closed.
+		next.TagPublications[input.Tag] = spec.TagPublication{
+			OperationID: input.OperationID,
+			Generation:  next.Generation,
+			Digest:      input.ManifestDigest,
+		}
+	}
 
 	return next, next.Validate()
 }
@@ -435,6 +469,18 @@ func cloneManifestMap(in map[string]spec.ManifestDescriptor) map[string]spec.Man
 
 func cloneBlobMap(in map[string]spec.BlobDescriptor) map[string]spec.BlobDescriptor {
 	out := make(map[string]spec.BlobDescriptor, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// cloneTagPublications deep-enough clones the per-tag publication provenance
+// map (the entry values are value structs). It always returns a NON-NIL map —
+// including for a nil input — so every document the built-in builder produces
+// carries the provenance field deterministically.
+func cloneTagPublications(in map[string]spec.TagPublication) map[string]spec.TagPublication {
+	out := make(map[string]spec.TagPublication, len(in))
 	for k, v := range in {
 		out[k] = v
 	}

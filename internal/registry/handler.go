@@ -93,7 +93,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	registryIdentity, err := h.Resolver.ResolveRegistry(r.Context(), r.Host)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "REGISTRY_UNAVAILABLE", err.Error())
+		// Fixed centralized classification: a raw identity-resolution failure
+		// (which can carry the host, repository, document references, decoder
+		// or topology detail) must never cross the HTTP boundary.
+		status, code, message := classifyRequestBoundaryError(err)
+		writeError(w, status, code, message)
 		return
 	}
 
@@ -154,7 +158,8 @@ func routeAction(resource string, method string) (auth.Action, bool) {
 func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string, principal auth.Principal) {
 	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
+		status, code, message := classifyRequestBoundaryError(err)
+		writeError(w, status, code, message)
 		return
 	}
 	if !authorized {
@@ -165,7 +170,7 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 
 	state, err := h.Resolver.ResolveRepoState(r.Context(), registryIdentity, repo)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", err.Error())
+		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", messageRepositoryNotFound)
 		return
 	}
 
@@ -193,7 +198,7 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 
 	data, err := h.Objects.Get(r.Context(), desc.SwarmRef)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "MANIFEST_BLOB_UNKNOWN", err.Error())
+		writeError(w, http.StatusBadGateway, "MANIFEST_BLOB_UNKNOWN", messageManifestUnavailable)
 		return
 	}
 
@@ -212,7 +217,8 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, digest string, principal auth.Principal) {
 	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
+		status, code, message := classifyRequestBoundaryError(err)
+		writeError(w, status, code, message)
 		return
 	}
 	if !authorized {
@@ -223,7 +229,7 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 
 	state, err := h.Resolver.ResolveRepoState(r.Context(), registryIdentity, repo)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", err.Error())
+		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", messageRepositoryNotFound)
 		return
 	}
 
@@ -241,7 +247,7 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 
 	data, err := h.Objects.Get(r.Context(), desc.SwarmRef)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "BLOB_UNKNOWN", err.Error())
+		writeError(w, http.StatusBadGateway, "BLOB_UNKNOWN", messageBlobUnavailable)
 		return
 	}
 
@@ -264,7 +270,8 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 
 	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
+		status, code, message := classifyRequestBoundaryError(err)
+		writeError(w, status, code, message)
 		return
 	}
 	if !authorized {
@@ -281,7 +288,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 		}
 		session, err := h.Staging.CreateSession(r.Context(), repo, actor, h.SessionTTL)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", err.Error())
+			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", messageUnknown)
 			return
 		}
 		location := fmt.Sprintf("/v2/%s/blobs/uploads/%s", repo, session.ID)
@@ -294,7 +301,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 
 	session, ok, err := h.Staging.GetSession(r.Context(), uploadID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", err.Error())
+		writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", messageUnknown)
 		return
 	}
 	if !ok || session.Repo != repo || session.Actor != actor {
@@ -308,12 +315,12 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 	case http.MethodPatch:
 		chunk, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageUploadBodyRead)
 			return
 		}
 		updated, err := h.Staging.Append(r.Context(), uploadID, chunk)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
 			return
 		}
 		writeUploadAccepted(w, repo, updated)
@@ -325,19 +332,19 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 		}
 		finalBytes, err := io.ReadAll(r.Body)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageUploadBodyRead)
 			return
 		}
 		if len(finalBytes) > 0 {
 			session, err = h.Staging.Append(r.Context(), uploadID, finalBytes)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", err.Error())
+				writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
 				return
 			}
 		}
 		data, err := h.Staging.Bytes(r.Context(), uploadID)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
 			return
 		}
 		if computeDigest(data) != digest {
@@ -346,7 +353,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 		}
 		ref, err := h.Uploader.Put(r.Context(), data, batchID)
 		if err != nil {
-			writeError(w, http.StatusBadGateway, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusBadGateway, "BLOB_UPLOAD_INVALID", messageBlobUploadFailed)
 			return
 		}
 		if err := h.Staging.StageBlob(r.Context(), spec.StagedBlob{
@@ -360,11 +367,11 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 			CreatedAt: session.CreatedAt,
 			ExpiresAt: session.ExpiresAt,
 		}); err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
 			return
 		}
 		if err := h.Staging.DeleteSession(r.Context(), uploadID); err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", err.Error())
+			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
 			return
 		}
 		w.Header().Set("Docker-Content-Digest", digest)
@@ -372,7 +379,7 @@ func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryI
 		w.WriteHeader(http.StatusCreated)
 	case http.MethodDelete:
 		if err := h.Staging.DeleteSession(r.Context(), uploadID); err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", err.Error())
+			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", messageUnknown)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -392,7 +399,8 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 
 	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "AUTH_POLICY_UNAVAILABLE", err.Error())
+		status, code, message := classifyRequestBoundaryError(err)
+		writeError(w, status, code, message)
 		return
 	}
 	if !authorized {
@@ -415,6 +423,21 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	}
 	if second := r.Header.Values(OperationIDHeader); len(second) > 1 {
 		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "duplicate operation-ID header")
+		return
+	}
+
+	// Task 14 (round 2): an explicit operation key is ONLY ever accepted when
+	// a durable binder is attached. Without one, a keyed request cannot be
+	// durably bound to exactly one logical payload, so accepting the key would
+	// allow changed-payload reuse and would echo caller-supplied ids as prior
+	// success with no durable backing. Reject the keyed request with a fixed
+	// 503 dependency response BEFORE the registry-identity resolver, any
+	// object/feed write, or any staging consumption (the staged blobs remain,
+	// ready for a no-key or properly-wired retry). No-key identity mode keeps
+	// working — its idempotency is governed by the durable feed read-back
+	// gate below, never by a fabricated identity.
+	if clientOperationID != "" && h.Preflight == nil {
+		writeError(w, http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable)
 		return
 	}
 
@@ -490,32 +513,67 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 
 	// Restart-safe retry recognition BEFORE any write: the effective feed is
 	// the durable truth — if it already carries this exact tag→digest mapping
-	// at generation >= 1, the client is retrying a lost response. The prior
-	// publication is re-VERIFIED through the production feed/document path and
-	// the verified 201 is returned without touching the feed, the object
-	// store, or staging again — so an already-published target is answered
-	// from durable state, never from an in-memory cache. If the feed advanced
-	// incompatibly, the effort falls through to a fresh publication whose
-	// generation check at the control plane conflicts rather than overwrites.
-	if found && current.Generation >= 1 && current.Tags[reference] == manifestDigest {
-		retryOperationID := clientOperationID
-		if retryOperationID == "" {
-			// The publication ALREADY happened at the stored generation; its
-			// provisional operation ID therefore used expected = gen-1.
-			retryOperationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation-1)
-		}
-		verr := VerifyPublishedRetryState(r.Context(), h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, input, artifact)
-		if verr == nil {
-			writePublishedSuccess(w, repo, reference, manifestDigest, retryOperationID)
-			return
-		}
-		if errors.Is(verr, ErrTargetNotCurrentState) {
-			// Effective feed advanced incompatibly since resolution: not a
-			// retry. Fall through to the normal publish path.
-		} else {
-			status, code, message := classifyPublicationError(verr)
-			writeError(w, status, code, message)
-			return
+	// at generation >= 1, the client may be retrying a lost response. The
+	// prior publication's IDENTITY is recovered from the DURABLE per-tag
+	// publication provenance recorded in the immutable repo-state document —
+	// the exact operation that produced THIS tag's mapping, retained across
+	// unrelated publications — never re-inferred from the current generation.
+	// The prior publication is re-VERIFIED through the production
+	// feed/document path and the verified 201 is returned without touching
+	// the feed, the object store, or staging again.
+	//
+	// An explicit key can fast-path ONLY when it equals the exact recorded
+	// operation ID (and its durable binding is validated below, before any
+	// answer). A DISTINCT explicit key — including an arbitrary, new, or
+	// previously-conflicting one — never fast-paths: it falls through to the
+	// preflight where it becomes a genuine new operation or a hard conflict,
+	// and is never echoed as a prior success. A document WITHOUT provenance
+	// (legacy valid state) falls through to a fresh publication. If the feed
+	// advanced incompatibly, the effort falls through to a fresh publication
+	// whose generation check at the control plane conflicts rather than
+	// overwrites.
+	if found && current.Generation >= 1 {
+		if mappedDigest, mapped := current.Tags[reference]; mapped && mappedDigest == manifestDigest {
+			if pub, hasProvenance := current.TagPublications[reference]; hasProvenance && pub.OperationID != "" && pub.Digest == manifestDigest {
+				if clientOperationID == "" || clientOperationID == pub.OperationID {
+					if clientOperationID != "" {
+						// An explicit key is never echoed as prior success
+						// without a VALID durable binding to this exact
+						// logical payload: revalidate the binding first.
+						if err := h.Preflight.Bind(r.Context(), publish.OperationBindingRequest{
+							OperationID:    clientOperationID,
+							RegistryID:     registryIdentity.RegistryID,
+							Owner:          registryIdentity.Owner,
+							Repo:           repo,
+							Tag:            reference,
+							ManifestDigest: manifestDigest,
+						}); err != nil {
+							status, code, message := classifyPublicationError(err)
+							writeError(w, status, code, message)
+							return
+						}
+					}
+					verr := VerifyPublishedRetryState(r.Context(), h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
+					if verr == nil {
+						writePublishedSuccess(w, repo, reference, manifestDigest, pub.OperationID)
+						return
+					}
+					if errors.Is(verr, ErrTargetNotCurrentState) {
+						// Effective feed advanced incompatibly since
+						// resolution: not a retry. Fall through to the normal
+						// publish path.
+					} else {
+						status, code, message := classifyPublicationError(verr)
+						writeError(w, status, code, message)
+						return
+					}
+				}
+				// A distinct explicit key: not a retry of the recorded
+				// operation. Fall through to the preflight/publish path.
+			}
+			// No provenance for this tag (legacy document): the exact prior
+			// operation identity is not recoverable and is NEVER fabricated —
+			// fall through to a fresh publication.
 		}
 	}
 
@@ -664,6 +722,18 @@ func computeDigest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("sha256:%x", sum[:])
 }
+
+// Fixed, data-free messages for the non-publication paths (pull and upload).
+// Raw err.Error() text — which can carry repository, digest, swarm-reference,
+// document, decoder, or store detail — never crosses the HTTP boundary; each
+// path answers with exactly one of these fixed strings and a fixed status/code.
+const (
+	messageRepositoryNotFound  = "repository not found"
+	messageManifestUnavailable = "the manifest content is unavailable"
+	messageBlobUnavailable     = "the blob content is unavailable"
+	messageUploadBodyRead      = "failed to read the upload body"
+	messageBlobUploadFailed    = "blob upload failed"
+)
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {
 	w.Header().Set("Content-Type", "application/json")

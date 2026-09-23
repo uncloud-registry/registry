@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -52,6 +54,13 @@ func verificationFixture(t *testing.T) (*resolve.MemoryFeedStore, *resolve.Memor
 				SwarmRef:  "config-ref",
 				Size:      int64(len(configBody)),
 				MediaType: "application/vnd.oci.image.config.v1+json",
+			},
+		},
+		TagPublications: map[string]spec.TagPublication{
+			"latest": {
+				OperationID: "op-verify-test",
+				Generation:  1,
+				Digest:      manifestDigest,
 			},
 		},
 	}
@@ -358,22 +367,25 @@ func TestVerifyPublishedStateDependencyClassification(t *testing.T) {
 }
 
 // TestVerifyRetriedPublicationStateMatrix proves the retry recognition
-// verifier: a current state carrying the exact target verifies; a state whose
-// tag moved away is NOT a retry (sentinel), and corruption stays Integrity.
+// verifier: a current state carrying the exact target AND the exact recorded
+// provenance operation identity verifies; a state whose tag moved away, whose
+// mapping was produced by a DIFFERENT operation, or that never advanced is NOT
+// a retry (sentinel), and corruption stays Integrity.
 func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 	t.Run("current state matches the target", func(t *testing.T) {
-		feeds, docs, _, input, artifact := verificationFixture(t)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, input, artifact)
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		if err != nil {
 			t.Fatalf("expected verified retry, got %v", err)
 		}
 	})
 
 	t.Run("tag moved away is not a retry", func(t *testing.T) {
-		feeds, docs, _, input, artifact := verificationFixture(t)
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
 		s := loadStateDoc(t, docs, "state-ref")
 		movedDigest := publish.ComputeDigest([]byte("moved digest"))
 		// The moved target must itself be a VALID manifest in the document,
+		// and (Task 14 round 2) the tag's provenance entry must move with it —
 		// otherwise the document no longer decodes and the failure would be a
 		// decode integrity error rather than the tag-moved sentinel.
 		s.Tags["latest"] = movedDigest
@@ -382,29 +394,88 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 			MediaType: publish.MediaTypeOCIManifest,
 			Size:      12,
 		}
+		s.TagPublications["latest"] = spec.TagPublication{
+			OperationID: "op-moved",
+			Generation:  1,
+			Digest:      movedDigest,
+		}
 		putStateDoc(t, docs, "state-ref", s)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		if !errors.Is(err, ErrTargetNotCurrentState) {
 			t.Fatalf("expected ErrTargetNotCurrentState, got %T: %v", err, err)
 		}
 	})
 
+	t.Run("mapping recorded by a different operation is not a retry", func(t *testing.T) {
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
+		// The tag still points at the SAME digest, but the durable provenance
+		// records a DIFFERENT operation (the mapping was re-recorded). The
+		// retry of the recorded operation must NOT be answered as success.
+		s := loadStateDoc(t, docs, "state-ref")
+		s.TagPublications["latest"] = spec.TagPublication{
+			OperationID: "op-other",
+			Generation:  1,
+			Digest:      input.ManifestDigest,
+		}
+		putStateDoc(t, docs, "state-ref", s)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		if !errors.Is(err, ErrTargetNotCurrentState) {
+			t.Fatalf("expected ErrTargetNotCurrentState for a differently-recorded mapping, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("legacy document without provenance is not a retry", func(t *testing.T) {
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
+		// A schema-valid document predating provenance carries the target
+		// mapping but NO recoverable operation identity: the exact recorded op
+		// ID is unknowable and must never be fabricated — not a retry.
+		s := loadStateDoc(t, docs, "state-ref")
+		s.TagPublications = nil
+		putStateDoc(t, docs, "state-ref", s)
+		if _, err := spec.DecodeRepoStateDocument(docs.Documents["state-ref"]); err != nil {
+			t.Fatalf("legacy document must stay schema-valid: %v", err)
+		}
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		if !errors.Is(err, ErrTargetNotCurrentState) {
+			t.Fatalf("expected ErrTargetNotCurrentState for a legacy document, got %T: %v", err, err)
+		}
+	})
+
 	t.Run("malformed state stays integrity", func(t *testing.T) {
-		feeds, docs, _, input, artifact := verificationFixture(t)
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
 		docs.Documents["state-ref"] = []byte(`garbage`)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var igt *IntegrityError
 		if !errors.As(err, &igt) {
 			t.Fatalf("expected IntegrityError, got %T: %v", err, err)
 		}
 	})
 
+	t.Run("forged provenance operation ID stays integrity", func(t *testing.T) {
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
+		// A forged provenance entry that violates strict decode (bad glyphs in
+		// the operation ID) must fail closed as a decode integrity error and
+		// NEVER be usable as a retry identity.
+		s := loadStateDoc(t, docs, "state-ref")
+		s.TagPublications["latest"] = spec.TagPublication{
+			OperationID: `bad"quote`,
+			Generation:  1,
+			Digest:      input.ManifestDigest,
+		}
+		putStateDoc(t, docs, "state-ref", s)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		var igt *IntegrityError
+		if !errors.As(err, &igt) {
+			t.Fatalf("expected IntegrityError for forged provenance, got %T: %v", err, err)
+		}
+	})
+
 	t.Run("state that never advanced is integrity", func(t *testing.T) {
-		feeds, docs, _, input, artifact := verificationFixture(t)
+		feeds, docs, receipt, input, artifact := verificationFixture(t)
 		s := loadStateDoc(t, docs, "state-ref")
 		s.Generation = 0
 		putStateDoc(t, docs, "state-ref", s)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var igt *IntegrityError
 		if !errors.As(err, &igt) {
 			t.Fatalf("expected IntegrityError, got %T: %v", err, err)
@@ -412,9 +483,9 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 	})
 
 	t.Run("feed reveal dependency failure", func(t *testing.T) {
-		_, _, _, input, artifact := verificationFixture(t)
+		_, _, receipt, input, artifact := verificationFixture(t)
 		feeds := failingFeedResolver{err: context.DeadlineExceeded}
-		err := VerifyPublishedRetryState(context.Background(), feeds, nil, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, nil, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var dep *DependencyError
 		if !errors.As(err, &dep) {
 			t.Fatalf("expected DependencyError, got %T: %v", err, err)
@@ -435,10 +506,10 @@ func TestClassifyPublicationErrorMatrix(t *testing.T) {
 		wantStatus int
 		wantCode   string
 	}{
-		{name: "integrity", err: &IntegrityError{Err: errors.New(marker)}, wantStatus: http.StatusBadGateway, wantCode: ErrorCodePublicationUnverified},
-		{name: "wrapped integrity", err: fmt.Errorf("outer: %w", &IntegrityError{Err: errors.New(marker)}), wantStatus: http.StatusBadGateway, wantCode: ErrorCodePublicationUnverified},
-		{name: "dependency", err: &DependencyError{Err: errors.New(marker)}, wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
-		{name: "conflict typed", err: &ConflictError{Err: errors.New(marker)}, wantStatus: http.StatusConflict, wantCode: ErrorCodeManifestConflict},
+		{name: "integrity", err: newIntegrityError(errors.New(marker)), wantStatus: http.StatusBadGateway, wantCode: ErrorCodePublicationUnverified},
+		{name: "wrapped integrity", err: fmt.Errorf("outer: %w", newIntegrityError(errors.New(marker))), wantStatus: http.StatusBadGateway, wantCode: ErrorCodePublicationUnverified},
+		{name: "dependency", err: newDependencyError(errors.New(marker)), wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
+		{name: "conflict typed", err: newConflictError(errors.New(marker)), wantStatus: http.StatusConflict, wantCode: ErrorCodeManifestConflict},
 		{name: "commit conflict sentinel", err: fmt.Errorf("commit: %w", publish.ErrCommitConflict), wantStatus: http.StatusConflict, wantCode: ErrorCodeManifestConflict},
 		{name: "commit backend sentinel", err: fmt.Errorf("commit: %w", publish.ErrCommitBackend), wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
 		{name: "commit unauthorized sentinel", err: publish.ErrCommitUnauthorized, wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
@@ -465,31 +536,147 @@ func TestClassifyPublicationErrorMatrix(t *testing.T) {
 	}
 }
 
-// TestTypedPublicationErrorsFixedPublicText pins the data-free contract of the
-// typed errors themselves: Error() is a fixed generic string that never
-// includes the retained cause, while Unwrap() keeps the cause reachable
-// server-side.
-func TestTypedPublicationErrorsFixedPublicText(t *testing.T) {
+// TestTypedPublicationErrorsDataFreeSurface pins the ENTIRE externally
+// traversable surface of the three typed classes to fixed, data-free values:
+// Error() is the fixed generic message; Unwrap() returns ONLY the fixed safe
+// class sentinel (never the private diagnostic cause); the full unwrap chain
+// carries no injected marker; errors.Is matches the safe sentinel; errors.As
+// still classifies the typed value; and the exported reflection surface
+// exposes NO fields and NO accessors beyond Error and Unwrap.
+func TestTypedPublicationErrorsDataFreeSurface(t *testing.T) {
 	marker := "MARKER_T14_53e8"
-	errorsCases := []struct {
-		name string
-		err  error
-		want string
+	cases := []struct {
+		name     string
+		err      error
+		want     string
+		sentinel error
 	}{
-		{name: "integrity", err: &IntegrityError{Err: errors.New(marker)}, want: "published repository state could not be verified"},
-		{name: "dependency", err: &DependencyError{Err: errors.New(marker)}, want: "a required service is temporarily unavailable"},
-		{name: "conflict", err: &ConflictError{Err: errors.New(marker)}, want: "the repository publication conflicts with an existing operation"},
+		{name: "integrity", err: newIntegrityError(errors.New(marker)), want: "published repository state could not be verified", sentinel: ErrPublicationUnverified},
+		{name: "dependency", err: newDependencyError(errors.New(marker)), want: "a required service is temporarily unavailable", sentinel: ErrDependencyUnavailable},
+		{name: "conflict", err: newConflictError(errors.New(marker)), want: "the repository publication conflicts with an existing operation", sentinel: ErrPublicationConflict},
 	}
-	for _, tc := range errorsCases {
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := tc.err.Error(); got != tc.want {
 				t.Fatalf("typed error Error() must be the fixed generic message, got %q", got)
 			}
-			if strings.Contains(tc.err.Error(), marker) {
-				t.Fatalf("typed error leaks the retained cause: %q", tc.err.Error())
+			// Unwrap must yield the fixed safe sentinel, never the cause.
+			if got := errors.Unwrap(tc.err); got != tc.sentinel {
+				t.Fatalf("Unwrap must return the fixed safe class sentinel, got %T: %q", got, got)
 			}
-			if got := errors.Unwrap(tc.err); got == nil || !strings.Contains(got.Error(), marker) {
-				t.Fatalf("cause must stay reachable server-side via Unwrap, got %v", got)
+			// The FULL unwrap chain must be data-free: no marker anywhere.
+			if chain := unwrapChainText(t, tc.err); strings.Contains(chain, marker) {
+				t.Fatalf("unwrap chain leaks the raw cause marker: %q", chain)
+			}
+			if !errors.Is(tc.err, tc.sentinel) {
+				t.Fatal("errors.Is must match the fixed safe class sentinel")
+			}
+			// Typed classification is preserved server-side.
+			switch tc.name {
+			case "integrity":
+				var igt *IntegrityError
+				if !errors.As(tc.err, &igt) {
+					t.Fatal("errors.As must classify *IntegrityError")
+				}
+			case "dependency":
+				var dep *DependencyError
+				if !errors.As(tc.err, &dep) {
+					t.Fatal("errors.As must classify *DependencyError")
+				}
+			case "conflict":
+				var cfl *ConflictError
+				if !errors.As(tc.err, &cfl) {
+					t.Fatal("errors.As must classify *ConflictError")
+				}
+			}
+			// No exported fields: the single retained cause is private.
+			typ := reflect.TypeOf(tc.err).Elem()
+			if typ.NumField() != 1 {
+				t.Fatalf("expected exactly one private cause field, got %d", typ.NumField())
+			}
+			if field := typ.Field(0); field.PkgPath == "" {
+				t.Fatalf("the cause field %s must be unexported", field.Name)
+			}
+			// No exported accessors beyond Error and Unwrap.
+			if got := exportedMethodNames(reflect.TypeOf(tc.err)); !reflect.DeepEqual(got, []string{"Error", "Unwrap"}) {
+				t.Fatalf("exported method surface must be exactly Error+Unwrap, got %v", got)
+			}
+		})
+	}
+}
+
+// unwrapChainText walks the full unwrap chain and concatenates every
+// Error() text, so a marker leak anywhere in the externally traversable chain
+// is detectable.
+func unwrapChainText(t *testing.T, err error) string {
+	t.Helper()
+	var parts []string
+	for err != nil {
+		parts = append(parts, err.Error())
+		next := errors.Unwrap(err)
+		if next == nil || next == err {
+			break
+		}
+		err = next
+	}
+	return strings.Join(parts, " | ")
+}
+
+// exportedMethodNames returns the sorted names of a type's EXPORTED methods
+// (reflection exposes only exported methods on the type itself).
+func exportedMethodNames(t reflect.Type) []string {
+	var names []string
+	for i := 0; i < t.NumMethod(); i++ {
+		names = append(names, t.Method(i).Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestVerifyPublishedStateProvenanceMismatchFailsClosed proves the
+// read-after-write verification ALSO validates the committed document's
+// per-tag publication provenance against the receipt: a committed state
+// whose provenance entry is missing, disagrees on the operation ID, the
+// applied generation, or the digest is an integrity failure — the 201 can
+// never be produced for a document that does not durably record the exact
+// operation the receipt names.
+func TestVerifyPublishedStateProvenanceMismatchFailsClosed(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*spec.RepoStateDocument)
+	}{
+		{name: "provenance entry missing", mutate: func(s *spec.RepoStateDocument) { delete(s.TagPublications, "latest") }},
+		{name: "operation ID mismatch", mutate: func(s *spec.RepoStateDocument) {
+			p := s.TagPublications["latest"]
+			p.OperationID = "op-other"
+			s.TagPublications["latest"] = p
+		}},
+		{name: "applied generation mismatch", mutate: func(s *spec.RepoStateDocument) {
+			p := s.TagPublications["latest"]
+			p.Generation = 99
+			s.TagPublications["latest"] = p
+		}},
+		{name: "digest mismatch", mutate: func(s *spec.RepoStateDocument) {
+			p := s.TagPublications["latest"]
+			p.Digest = "sha256:other"
+			s.TagPublications["latest"] = p
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			feeds, docs, receipt, input, artifact := verificationFixture(t)
+			s := loadStateDoc(t, docs, "state-ref")
+			tc.mutate(&s)
+			putStateDoc(t, docs, "state-ref", s)
+			err := VerifyPublishedState(context.Background(), feeds, docs, receipt, input, artifact)
+			var igt *IntegrityError
+			if !errors.As(err, &igt) {
+				t.Fatalf("expected IntegrityError, got %T: %v", err, err)
+			}
+			// The private cause may name the tag, but the error surface stays
+			// fixed and the marker-less traversal holds.
+			if err.Error() != "published repository state could not be verified" {
+				t.Fatalf("public Error() must stay fixed, got %q", err.Error())
 			}
 		})
 	}

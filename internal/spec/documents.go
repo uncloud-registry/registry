@@ -36,6 +36,24 @@ type RepoStateDocument struct {
 	Tags       map[string]string             `json:"tags"`
 	Manifests  map[string]ManifestDescriptor `json:"manifests"`
 	Blobs      map[string]BlobDescriptor     `json:"blobs"`
+	// TagPublications records, PER TAG, the durable publication provenance of
+	// the tag's CURRENT mapping: the exact operation identity that produced
+	// it, the generation it was applied at, and the digest it points at. One
+	// bounded entry per tag — replaced when the tag moves, retained across
+	// unrelated publications, and never an unbounded history — so a retry can
+	// recover the EXACT prior operation from durable state instead of
+	// re-inferring it from the current generation. A document WITHOUT this
+	// field (legacy valid state) keeps decoding; there the exact prior
+	// operation identity is simply not recoverable and must never be
+	// fabricated.
+	TagPublications map[string]TagPublication `json:"tagPublications,omitempty"`
+}
+
+// TagPublication is the durable per-tag provenance entry (Task 14 round 2).
+type TagPublication struct {
+	OperationID string `json:"operationID"`
+	Generation  int64  `json:"generation"`
+	Digest      string `json:"digest"`
 }
 
 type ManifestDescriptor struct {
@@ -194,6 +212,31 @@ func (d RepoStateDocument) Validate() error {
 		}
 	}
 
+	// Per-tag publication provenance is validated to be COHERENT with the
+	// document so malformed or forged provenance FAILS CLOSED at decode and
+	// can never be echoed to a caller: the operation ID must satisfy the exact
+	// bounded grammar, the applied generation must lie within
+	// [1, doc.Generation], and the recorded digest must equal the tag's
+	// CURRENT mapping (so a forged entry cannot point at a different target).
+	// An absent or null field on an otherwise valid document (legacy state)
+	// is fine: the exact prior operation is simply not recoverable there.
+	if d.TagPublications != nil {
+		for tag, pub := range d.TagPublications {
+			if tag == "" || pub.OperationID == "" || pub.Digest == "" {
+				return errors.New("repo state publication provenance must not contain empty tag, operationID, or digest")
+			}
+			if !IsValidPublicationOperationID(pub.OperationID) {
+				return fmt.Errorf("repo state publication provenance operation ID for tag %q violates the bounded operation-ID grammar", tag)
+			}
+			if pub.Generation < 1 || pub.Generation > d.Generation {
+				return fmt.Errorf("repo state publication provenance generation for tag %q is outside the document generation range", tag)
+			}
+			if d.Tags[tag] != pub.Digest {
+				return fmt.Errorf("repo state publication provenance digest for tag %q disagrees with the current tag mapping", tag)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -241,4 +284,29 @@ func (p StampAccessPolicy) Validate() error {
 		return errors.New("stamp access policy missing batchID")
 	}
 	return nil
+}
+
+// PublicationOperationIDMaxLen mirrors publish.OperationIDMaxLen (128 bytes):
+// the maximum length of a persisted publication provenance operation ID.
+// Kept in lockstep by the parity test in internal/spec.
+const PublicationOperationIDMaxLen = 128
+
+// IsValidPublicationOperationID reports whether s satisfies the EXACT
+// operation-ID grammar publish.ValidateOperationID enforces (bounded
+// JSON-safe printable ASCII: 0x20..0x7e minus the HTML/JSON-significant
+// characters ", \, <, >, &). It exists so persisted provenance operation IDs
+// are validated at decode time without an import cycle (publish imports
+// spec); the parity test keeps the two grammars byte-identical, so a value
+// that passes here is exactly a value publish would accept as a caller key.
+func IsValidPublicationOperationID(s string) bool {
+	if s == "" || len(s) > PublicationOperationIDMaxLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			return false
+		}
+	}
+	return true
 }
