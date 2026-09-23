@@ -208,14 +208,12 @@ func validateInputArtifact(current spec.RepoStateDocument, input BuildInput) (Ar
 		}
 	}
 	if got := ComputeDigest(input.ManifestJSON); got != input.ManifestDigest {
-		return Artifact{}, newValidationCause(ErrKindDigestMismatch, "",
-			"computed manifest body digest disagrees with the handler-provided digest",
-			fmt.Errorf("computed %s while handler declared %s", got, input.ManifestDigest))
+		return Artifact{}, newValidationError(ErrKindDigestMismatch, "",
+			"computed manifest body digest disagrees with the handler-provided digest")
 	}
 	if int64(len(input.ManifestJSON)) != input.Manifest.Size {
-		return Artifact{}, newValidationCause(ErrKindSizeMismatch, "",
-			"manifest body size disagrees with the handler-provided descriptor",
-			fmt.Errorf("body is %d bytes while handler declared %d", len(input.ManifestJSON), input.Manifest.Size))
+		return Artifact{}, newValidationError(ErrKindSizeMismatch, "",
+			"manifest body size disagrees with the handler-provided descriptor")
 	}
 	if err := validateManifestReferences(current, input, artifact); err != nil {
 		return Artifact{}, err
@@ -256,9 +254,8 @@ func validateManifestReferences(current spec.RepoStateDocument, input BuildInput
 		staged, inStaged := input.StagedBlobs[ref.Digest]
 		currentStored, inCurrent := current.Blobs[ref.Digest]
 		if !inCurrent && !inStaged {
-			return newValidationCause(ErrKindMissingReference, "",
-				"manifest references a blob that is neither in repository state nor staged",
-				fmt.Errorf("missing reference %s", ref.Digest))
+			return newValidationError(ErrKindMissingReference, "",
+				"manifest references a blob that is neither in repository state nor staged")
 		}
 		if inCurrent {
 			if err := checkReferenceMetadata(ref, currentStored); err != nil {
@@ -275,14 +272,13 @@ func validateManifestReferences(current spec.RepoStateDocument, input BuildInput
 }
 
 // checkReferenceMetadata verifies one descriptor's size and media type against
-// one present stored blob record. Errors are data-free: the public message
-// never echoes the descriptor digest, stored size, or stored media type; those
-// details live only in the internal cause reachable via errors.Is/As.
+// one present stored blob record. Errors are data-free: the message never
+// echoes the descriptor digest, stored size, or stored media type, and no
+// attacker-controlled detail is retained as a cause.
 func checkReferenceMetadata(ref Descriptor, stored spec.BlobDescriptor) error {
 	if stored.Size != ref.Size {
-		return newValidationCause(ErrKindSizeMismatch, "",
-			"stored blob size disagrees with the manifest descriptor",
-			fmt.Errorf("blob %s stored %d while descriptor declares %d", ref.Digest, stored.Size, ref.Size))
+		return newValidationError(ErrKindSizeMismatch, "",
+			"stored blob size disagrees with the manifest descriptor")
 	}
 	if err := mediaTypesCoherent(ref.MediaType, stored.MediaType); err != nil {
 		return err
@@ -297,7 +293,7 @@ func checkReferenceMetadata(ref Descriptor, stored spec.BlobDescriptor) error {
 // transparent; any concrete stored type must MIME-normalize equal the
 // descriptor's, and a concrete conflicting or malformed type is a mismatch.
 // Error messages are data-free: the stored/descriptor media-type values are
-// only retained in the internal cause.
+// never echoed and never retained.
 func mediaTypesCoherent(descriptorMediaType, storedMediaType string) error {
 	trimmed := strings.TrimSpace(storedMediaType)
 	if trimmed == "" {
@@ -305,23 +301,20 @@ func mediaTypesCoherent(descriptorMediaType, storedMediaType string) error {
 	}
 	norm, err := normalizeMediaType(trimmed)
 	if err != nil {
-		return newValidationCause(ErrKindMediaTypeMismatch, "",
-			"stored blob media type is malformed and cannot be reconciled with the descriptor",
-			fmt.Errorf("stored %q while descriptor kind %q", trimmed, descriptorMediaType))
+		return newValidationError(ErrKindMediaTypeMismatch, "",
+			"stored blob media type is malformed and cannot be reconciled with the descriptor")
 	}
 	if norm == blobGenericMediaType {
 		return nil
 	}
 	want, err := normalizeMediaType(descriptorMediaType)
 	if err != nil {
-		return newValidationCause(ErrKindMediaTypeMismatch, "",
-			"descriptor media type cannot be reconciled with the stored blob type",
-			fmt.Errorf("descriptor %q", descriptorMediaType))
+		return newValidationError(ErrKindMediaTypeMismatch, "",
+			"descriptor media type cannot be reconciled with the stored blob type")
 	}
 	if norm != want {
-		return newValidationCause(ErrKindMediaTypeMismatch, "",
-			"stored blob media type disagrees with the manifest descriptor media type",
-			fmt.Errorf("stored %q while descriptor %q", trimmed, descriptorMediaType))
+		return newValidationError(ErrKindMediaTypeMismatch, "",
+			"stored blob media type disagrees with the manifest descriptor media type")
 	}
 	return nil
 }

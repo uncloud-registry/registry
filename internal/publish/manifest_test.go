@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1427,6 +1428,217 @@ func TestPublishValidationErrorsAreDataFree(t *testing.T) {
 			if !errors.As(err, &ve) {
 				t.Fatalf("expected typed ValidationError, got %T: %v", err, err)
 			}
+			if objs.puts != 0 || feeds.updates != 0 {
+				t.Fatalf("validation failure caused writes: puts=%d feeds=%d", objs.puts, feeds.updates)
+			}
+		})
+	}
+}
+
+// collectErrChain appends err and every error reachable from it through
+// errors.Unwrap — through BOTH the single-error and the []error Unwrap forms —
+// so a caller can assert a marker is absent from every recursively unwrapped
+// error, not just the top one.
+func collectErrChain(err error, out *[]error) {
+	if err == nil {
+		return
+	}
+	*out = append(*out, err)
+	switch u := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			collectErrChain(e, out)
+		}
+	case interface{ Unwrap() error }:
+		collectErrChain(u.Unwrap(), out)
+	}
+}
+
+// assertValidationErrorDataFree asserts a *ValidationError (reachable via
+// errors.As) and EVERY error reachable from it through formatting, %+v, and
+// every recursively unwrapped error contains only data-free content: the
+// attacker marker appears nowhere. It also asserts the kind classification
+// still works and that the ValidationError type exposes no raw cause.
+func assertValidationErrorDataFree(t *testing.T, err error, marker string, wantKind ValidationErrorKind) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected a validation error")
+	}
+
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("errors.As must still classify the typed ValidationError, got %T: %v", err, err)
+	}
+	if ve.Kind != wantKind {
+		t.Fatalf("expected kind %q, got %q (err %v)", wantKind, ve.Kind, err)
+	}
+
+	var chain []error
+	collectErrChain(err, &chain)
+	for i, e := range chain {
+		if strings.Contains(e.Error(), marker) {
+			t.Fatalf("unwrapped error[%d] echoes attacker marker %q: %q", i, marker, e.Error())
+		}
+		if s := fmt.Sprintf("%+v", e); strings.Contains(s, marker) {
+			t.Fatalf("unwrapped error[%d] %%-formatted echoes attacker marker %q: %s", i, marker, s)
+		}
+	}
+	if s := fmt.Sprintf("%+v", err); strings.Contains(s, marker) {
+		t.Fatalf("%%-formatted error echoes attacker marker %q: %s", marker, s)
+	}
+
+	// A returned error's whole reachable surface must be data free, including
+	// any exported accessor/interface on the typed error.
+	for _, iface := range []any{ve} {
+		if s := fmt.Sprintf("%+v", iface); strings.Contains(s, marker) {
+			t.Fatalf("exported error value %%-formatted echoes attacker marker %q: %s", marker, s)
+		}
+	}
+	// Reflected exported string fields must be data free too.
+	rv := reflect.ValueOf(ve).Elem()
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported
+		}
+		if f.Type.Kind() == reflect.String && strings.Contains(rv.Field(i).String(), marker) {
+			t.Fatalf("exported field %s echoes attacker marker %q", f.Name, marker)
+		}
+	}
+}
+
+// TestValidationErrorExposesNoCause pins the compile-time-invisible contract:
+// the ValidationError method set has no Cause accessor and the struct retains
+// only the stable Kind/Field/Err state. A Cause method cannot be called
+// directly (it no longer exists), so reflection asserts its absence, along
+// with the absence of any unexported detail field.
+func TestValidationErrorExposesNoCause(t *testing.T) {
+	rt := reflect.TypeOf((*ValidationError)(nil)).Elem()
+	if m, ok := rt.MethodByName("Cause"); ok {
+		t.Fatalf("ValidationError must not expose a Cause accessor, found method %v", m.Func.Type())
+	}
+	if m, ok := rt.MethodByName("CauseOf"); ok {
+		t.Fatalf("ValidationError must not expose a cause accessor, found method %v", m.Func.Type())
+	}
+	// The struct must retain ONLY the three stable, data-free fields.
+	if got := rt.NumField(); got != 3 {
+		t.Fatalf("ValidationError must have exactly 3 stable fields (Kind/Field/Err), got %d", got)
+	}
+	for _, name := range []string{"cause", "Cause", "detail", "CauseErr"} {
+		if _, ok := rt.FieldByName(name); ok {
+			t.Fatalf("ValidationError must not retain a detail field %q", name)
+		}
+	}
+}
+
+// TestValidationErrorDataFreeAcrossAllSurfaces drives attacker markers through
+// every validation surface — unknown member key, invalid digest, media type,
+// conflicting digest, stored blob media type, and a staged SwarmRef — and
+// asserts the marker is absent from Error(), %+v, every recursively unwrapped
+// error, every exported string field, and every exported accessor, while
+// errors.As/kind classification still works.
+func TestValidationErrorDataFreeAcrossAllSurfaces(t *testing.T) {
+	const marker = "SECRETMARKERDEADBEEF"
+
+	parseCases := []struct {
+		name      string
+		mediaType string
+		body      string
+		wantKind  ValidationErrorKind
+	}{
+		{
+			name:      "unknown member key",
+			mediaType: ociManifestMT,
+			body:      fmt.Sprintf(`{"schemaVersion":2,"%s":1,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, marker, ociConfigMT, dig('c')),
+			wantKind:  ErrKindUnknownMember,
+		},
+		{
+			name:      "invalid digest value",
+			mediaType: ociManifestMT,
+			body:      fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, ociConfigMT, "sha256:"+marker),
+			wantKind:  ErrKindInvalidDigest,
+		},
+		{
+			name:      "embedded media type marker",
+			mediaType: ociManifestMT,
+			body:      fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[]}`, "application/"+marker, ociConfigMT, dig('c')),
+			wantKind:  ErrKindMediaTypeMismatch,
+		},
+		{
+			name:      "conflicting digest never becomes the field path",
+			mediaType: ociManifestMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":99,"digest":%q}]}`,
+				ociConfigMT, dig('c'), ociLayerMT, dig('c')),
+			wantKind: ErrKindConflictingDescriptors,
+		},
+	}
+
+	for _, tc := range parseCases {
+		t.Run("parse/"+tc.name, func(t *testing.T) {
+			_, err := ParseArtifact(tc.mediaType, []byte(tc.body))
+			assertValidationErrorDataFree(t, err, marker, tc.wantKind)
+			if tc.wantKind == ErrKindConflictingDescriptors {
+				// The conflicting digest is canonical-but-attacker-controlled; it
+				// must NOT surface as the structural Field path.
+				var ve *ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("expected typed ValidationError, got %T", err)
+				}
+				if ve.Field != conflictMarker {
+					t.Fatalf("conflicting-digest Field must be the fixed marker %q, got %q", conflictMarker, ve.Field)
+				}
+			}
+		})
+	}
+
+	// Publish-path markers: stored blob media type and staged SwarmRef.
+	ctx := context.Background()
+	publishCases := []struct {
+		name     string
+		mut      func(input BuildInput) BuildInput
+		wantKind ValidationErrorKind
+	}{
+		{
+			name: "stored media marker",
+			mut: func(input BuildInput) BuildInput {
+				s := input.StagedBlobs[dig('a')]
+				s.SwarmRef = marker
+				s.MediaType = marker
+				input.StagedBlobs[dig('a')] = s
+				return input
+			},
+			wantKind: ErrKindMediaTypeMismatch,
+		},
+		{
+			name: "swarm ref marker on size mismatch",
+			mut: func(input BuildInput) BuildInput {
+				s := input.StagedBlobs[dig('c')]
+				s.SwarmRef = marker
+				s.Size = 999
+				input.StagedBlobs[dig('c')] = s
+				return input
+			},
+			wantKind: ErrKindSizeMismatch,
+		},
+		{
+			name: "manifest digest marker",
+			mut: func(input BuildInput) BuildInput {
+				input.ManifestDigest = marker
+				return input
+			},
+			wantKind: ErrKindDigestMismatch,
+		},
+	}
+
+	for _, tc := range publishCases {
+		t.Run("publish/"+tc.name, func(t *testing.T) {
+			objs := &countingObjects{}
+			feeds := &countingFeeds{}
+			p := Publisher{Builder: DefaultBuilder{}, Objects: objs, Feeds: feeds}
+			input := tc.mut(validBuildInput(t))
+			_, err := p.Publish(ctx, "feed://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", spec.RepoStateDocument{}, input, "batch-1")
+			assertValidationErrorDataFree(t, err, marker, tc.wantKind)
 			if objs.puts != 0 || feeds.updates != 0 {
 				t.Fatalf("validation failure caused writes: puts=%d feeds=%d", objs.puts, feeds.updates)
 			}

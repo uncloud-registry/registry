@@ -139,18 +139,18 @@ const (
 	ErrKindUnsupportedPublication ValidationErrorKind = "unsupported_artifact_publication"
 )
 
-// ValidationError is the typed artifact/publication validation failure. Its
-// message carries only a stable Kind and a bounded structural field path with
-// a GENERIC reason — never untrusted body-member values, media types,
-// digests, repo/tag, or huge input. The optional internal cause may keep
-// detailed, attacker-influenced context for errors.Is/As and debugging, but it
-// is NEVER rendered by Error(), so no public string leaks the untrusted data.
-// Kind gives Task 14 a stable class for public error mapping.
+// ValidationError is the typed artifact/publication validation failure. It
+// carries ONLY a stable Kind, a fixed/bounded structural Field path, and a
+// GENERIC safe message — never untrusted body-member values, media types,
+// digests, repo/tag, huge input, or any attacker-controlled detail. Nothing is
+// retained as an internal cause and no raw parser/mime/input error is wrapped,
+// so the public error is data-free through Error(), %+v, errors.Unwrap/Is/As,
+// and every reflection-visible exported member. Kind gives Task 14 a stable
+// class for public error mapping.
 type ValidationError struct {
 	Kind  ValidationErrorKind
 	Field string
 	Err   error
-	cause error
 }
 
 func (e *ValidationError) Error() string {
@@ -160,24 +160,12 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("artifact validation: %s: %v", e.Field, e.Err)
 }
 
-// Cause exposes the internal detail retained for errors.Is/As and debugging.
-// It is deliberately never rendered by Error() so attacker-controlled values
-// cannot leak through the public string.
-func (e *ValidationError) Cause() error { return e.cause }
-
-func (e *ValidationError) Unwrap() []error {
-	if e.cause != nil {
-		return []error{e.Err, e.cause}
-	}
-	return []error{e.Err}
-}
+// Unwrap exposes only the stable generic Err, which is a fixed, data-free
+// message. It deliberately cannot reach any attacker-controlled string.
+func (e *ValidationError) Unwrap() []error { return []error{e.Err} }
 
 func newValidationError(kind ValidationErrorKind, field string, msg string) *ValidationError {
 	return &ValidationError{Kind: kind, Field: field, Err: errors.New(msg)}
-}
-
-func newValidationCause(kind ValidationErrorKind, field string, msg string, cause error) *ValidationError {
-	return &ValidationError{Kind: kind, Field: field, Err: errors.New(msg), cause: cause}
 }
 
 // errDuplicateMember marks a duplicate object member anywhere in the doc.
@@ -189,6 +177,12 @@ var errDuplicateMember = errors.New("JSON object contains duplicate members")
 // an attacker-controlled unknown JSON member key, so the validation error's
 // Field remains a stable, bounded schema path and never echoes the key.
 const unknownMemberMarker = "<unknown-member>"
+
+// conflictMarker is the fixed structural Field placeholder used when the same
+// (attacker-controlled) digest appears more than once with conflicting size or
+// media type. Echoing the digest as a field path would leak untrusted data, so
+// the public error carries only this stable marker plus the Kind.
+const conflictMarker = "<conflicting-digest>"
 
 // Exact, case-sensitive key vocabularies for each object shape. decoding is
 // done through map[string]json.RawMessage, whose keys are the JSON literal
@@ -637,7 +631,9 @@ func rejectConflictingDescriptors(a Artifact) error {
 	check := func(d Descriptor) error {
 		if prev, dup := seen[d.Digest]; dup {
 			if prev.size != d.Size || prev.mediaType != d.MediaType {
-				return newValidationError(ErrKindConflictingDescriptors, d.Digest,
+				// Field must stay data-free: the conflicting digest is attacker
+				// controlled and must NOT become part of the structural path.
+				return newValidationError(ErrKindConflictingDescriptors, conflictMarker,
 					"digest is referenced more than once with conflicting size or media type")
 			}
 			return nil
