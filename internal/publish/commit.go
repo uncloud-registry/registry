@@ -85,9 +85,11 @@ const CommitResponseMaxBody = 4096
 // CommitRequestMaxBody bounds the internal feed-commit request body.
 const CommitRequestMaxBody = 16384
 
-// Bounded string-length contract for every request field.
+// OperationIDMaxLen is the documented upper bound on an operation identifier
+// (bytes), enforced by ValidateOperationID and mirrored byte-for-byte by the
+// control-plane database operation-ID grammar.
 const (
-	operationIDMaxLen = 128
+	OperationIDMaxLen = 128
 	ownerMaxLen       = 128
 	batchIDMaxLen     = 128
 )
@@ -441,7 +443,7 @@ func isJSONSafeOperationID(s string) bool {
 // OperationID (via ValidateCommitRequest) and the result's OperationID (via
 // ValidateCommitResult). A valid operation ID is:
 //
-//   - non-empty and at most operationIDMaxLen (128) bytes;
+//   - non-empty and at most OperationIDMaxLen (128) bytes;
 //   - every byte an ASCII printable 0x20..0x7e except the five Go-JSON-escaped
 //     bytes `"`, `\`, `<`, `>`, `&`; and therefore
 //   - free of controls (0x00..0x1f), DEL (0x7f), and any non-ASCII byte
@@ -453,7 +455,7 @@ func isJSONSafeOperationID(s string) bool {
 // can never be a value Go would reject, and json.Marshal always emits it
 // verbatim (the premise of the canonical-result byte-exact invariant).
 func ValidateOperationID(opID string) error {
-	if opID == "" || len(opID) > operationIDMaxLen {
+	if opID == "" || len(opID) > OperationIDMaxLen {
 		return errors.New("operationID must be non-empty and bounded")
 	}
 	if !isJSONSafeOperationID(opID) {
@@ -555,6 +557,26 @@ func ComputeOperationID(registryID int64, owner string, repo string, tag string,
 	writeStringField(h, manifestDigest)
 	writeInt64Field(h, expectedGeneration)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// DeterministicUpdatedAt derives the repo-state UpdatedAt timestamp for a
+// logical publication as a PURE function of its operation identity. A retry of
+// the same publication (the same client request or an identical lost-response
+// retry, which compute the same operation ID) therefore rebuilds
+// BYTE-IDENTICAL repo-state bytes — the precondition for the control plane's
+// durable request-hash idempotency and for restart-safe read-after-write
+// retries. It intentionally NEVER consults the wall clock: time-varying state
+// would make every rebuilt document differ and defeat byte-stable rebuilds.
+// The value is a deterministic RFC3339 UTC timestamp seeded by the operation
+// ID's digest, inside a fixed anchored window.
+func DeterministicUpdatedAt(operationID string) string {
+	sum := sha256.Sum256([]byte("uncloud-registry-updated-at:v1\x00" + operationID))
+	// Map the digest onto a fixed one-year window anchored in the past so the
+	// timestamp is always parseable, deterministic, and never wall-clock.
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	seconds := int64(binary.BigEndian.Uint64(sum[:8]))
+	offset := seconds % (366 * 24 * 3600)
+	return anchor.Add(time.Duration(offset) * time.Second).UTC().Format(time.RFC3339)
 }
 
 func writeStringField(h io.Writer, s string) {

@@ -46,6 +46,13 @@ type BuildInput struct {
 	ManifestJSON   []byte
 	Manifest       spec.ManifestDescriptor
 	StagedBlobs    map[string]spec.BlobDescriptor
+	// UpdatedAt, when non-empty, is the EXACT repo-state UpdatedAt value the
+	// builder must persist verbatim. Callers that need byte-stable,
+	// restart-safe idempotent rebuilds (a retry of one logical publication
+	// must produce byte-identical repo-state bytes) supply
+	// DeterministicUpdatedAt(operationID); an empty value keeps the builder's
+	// wall-clock fallback for callers with no retry contract.
+	UpdatedAt string
 }
 
 type Publisher struct {
@@ -60,10 +67,46 @@ type Publisher struct {
 	Commits RepoCommitter
 }
 
+// PublicationReceipt is the exact observable outcome of one repository
+// publication, captured BEFORE the uncertain commit boundary so the caller can
+// VERIFY the committed outcome afterwards through the production
+// resolver/document path (exact read-after-write verification) and answer
+// lost-response retries restart-safely. The control plane independently
+// records the same operation identity; the receipt is the data plane's
+// caller-visible statement of what this logical publication intended to
+// commit.
+type PublicationReceipt struct {
+	// OperationID is the stable identity of this logical publication, echoed
+	// to the caller in the successful response.
+	OperationID string
+	// StateFeed is the canonical repository-state feed the commit targeted.
+	StateFeed string
+	// StateRef is the immutable repository-state document reference committed
+	// to the feed. Verification requires the effective feed to resolve to
+	// EXACTLY this reference.
+	StateRef string
+	// ManifestRef is the immutable reference the published manifest body was
+	// stored under.
+	ManifestRef string
+	// Owner and Repo identify the repository namespace the publication
+	// targeted.
+	Owner string
+	Repo  string
+	// Tag is the manifest reference (tag) this publication wrote.
+	Tag string
+	// ManifestDigest is the content digest of the published manifest body.
+	ManifestDigest string
+	// ExpectedGeneration is the generation the publication was built against,
+	// and Generation is the generation it resulted in (Expected + 1).
+	ExpectedGeneration int64
+	Generation         int64
+}
+
 type DefaultBuilder struct{}
 
 func (p Publisher) Publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string) (spec.RepoStateDocument, error) {
-	return p.publish(ctx, stateFeed, current, input, batchID, false, 0, "", "")
+	next, _, err := p.publish(ctx, stateFeed, current, input, batchID, false, 0, "", "")
+	return next, err
 }
 
 // PublishCommit is the publisher path that carries the registry identity,
@@ -71,12 +114,15 @@ func (p Publisher) Publish(ctx context.Context, stateFeed string, current spec.R
 // repository feed commit. When Publisher.Commits is configured (Bee mode) the
 // immutable state reference is committed through the control-plane internal
 // feed signer with a FeedCommitRequest built from those fields; otherwise it
-// falls back to the local Feeds updater (in-memory mode).
-func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, operationID string) (spec.RepoStateDocument, error) {
-	return p.publish(ctx, stateFeed, current, input, batchID, true, registryID, owner, operationID)
+// falls back to the local Feeds updater (in-memory mode). It returns the exact
+// PublicationReceipt — captured BEFORE the commit boundary — so the caller can
+// run the read-after-write verification and answer retries.
+func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, operationID string) (PublicationReceipt, error) {
+	_, receipt, err := p.publish(ctx, stateFeed, current, input, batchID, true, registryID, owner, operationID)
+	return receipt, err
 }
 
-func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, error) {
+func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, PublicationReceipt, error) {
 	// Strict pre-upload validation: parse the artifact, verify the
 	// handler-provided digest/size/media against the actual body, and confirm
 	// every referenced descriptor's size and media type agree with its stored
@@ -85,28 +131,45 @@ func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.R
 	// SAME routine DefaultBuilder.BuildNext runs, so both entry points share
 	// one validation contract with no parse-twice drift.
 	if _, err := validateInputArtifact(current, input); err != nil {
-		return spec.RepoStateDocument{}, err
+		return spec.RepoStateDocument{}, PublicationReceipt{}, err
 	}
 
 	manifestRef, err := p.Objects.Put(ctx, input.ManifestJSON, batchID)
 	if err != nil {
-		return spec.RepoStateDocument{}, fmt.Errorf("upload manifest bytes: %w", err)
+		return spec.RepoStateDocument{}, PublicationReceipt{}, fmt.Errorf("upload manifest bytes: %w", err)
 	}
 
 	input.Manifest.SwarmRef = manifestRef
 	next, err := p.Builder.BuildNext(current, input)
 	if err != nil {
-		return spec.RepoStateDocument{}, err
+		return spec.RepoStateDocument{}, PublicationReceipt{}, err
 	}
 
 	stateBytes, err := json.Marshal(next)
 	if err != nil {
-		return spec.RepoStateDocument{}, fmt.Errorf("marshal repo state: %w", err)
+		return spec.RepoStateDocument{}, PublicationReceipt{}, fmt.Errorf("marshal repo state: %w", err)
 	}
 
 	stateRef, err := p.Objects.Put(ctx, stateBytes, batchID)
 	if err != nil {
-		return spec.RepoStateDocument{}, fmt.Errorf("upload repo state: %w", err)
+		return spec.RepoStateDocument{}, PublicationReceipt{}, fmt.Errorf("upload repo state: %w", err)
+	}
+
+	// The receipt is fully determined at this point — BEFORE the uncertain
+	// commit boundary — so the caller can verify the committed outcome through
+	// the production feed/document path without trusting this process's
+	// memory.
+	receipt := PublicationReceipt{
+		OperationID:        operationID,
+		StateFeed:          stateFeed,
+		StateRef:           stateRef,
+		ManifestRef:        manifestRef,
+		Owner:              owner,
+		Repo:               input.Repo,
+		Tag:                input.Tag,
+		ManifestDigest:     input.ManifestDigest,
+		ExpectedGeneration: current.Generation,
+		Generation:         next.Generation,
 	}
 
 	if useCommits && p.Commits != nil {
@@ -122,13 +185,13 @@ func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.R
 			BatchID:            batchID,
 			ExpectedGeneration: current.Generation,
 		}); err != nil {
-			return spec.RepoStateDocument{}, fmt.Errorf("commit state feed: %w", err)
+			return spec.RepoStateDocument{}, PublicationReceipt{}, fmt.Errorf("commit state feed: %w", err)
 		}
 	} else if err := p.Feeds.UpdateFeed(ctx, stateFeed, stateRef); err != nil {
-		return spec.RepoStateDocument{}, fmt.Errorf("update state feed: %w", err)
+		return spec.RepoStateDocument{}, PublicationReceipt{}, fmt.Errorf("update state feed: %w", err)
 	}
 
-	return next, nil
+	return next, receipt, nil
 }
 
 func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput) (spec.RepoStateDocument, error) {
@@ -145,11 +208,26 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 		return spec.RepoStateDocument{}, err
 	}
 
+	// The state timestamp is part of the persisted document BYTES, so a
+	// non-empty deterministic UpdatedAt (see BuildInput.UpdatedAt) must be
+	// honored verbatim to keep retried rebuilds byte-identical; a malformed
+	// non-empty value is rejected. The wall-clock fallback exists only for
+	// callers with no retry contract.
+	updatedAt := input.UpdatedAt
+	if updatedAt != "" {
+		if _, err := time.Parse(time.RFC3339, updatedAt); err != nil {
+			return spec.RepoStateDocument{}, newValidationError(ErrKindInvalidShape, "UpdatedAt",
+				"a non-empty deterministic UpdatedAt must be RFC3339")
+		}
+	} else {
+		updatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+
 	next := spec.RepoStateDocument{
 		Version:    1,
 		Repo:       input.Repo,
 		Generation: current.Generation + 1,
-		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt:  updatedAt,
 		Tags:       cloneStringMap(current.Tags),
 		Manifests:  cloneManifestMap(current.Manifests),
 		Blobs:      cloneBlobMap(current.Blobs),

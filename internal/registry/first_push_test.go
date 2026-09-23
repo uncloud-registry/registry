@@ -467,3 +467,50 @@ func TestFirstPushErrorIsTypedAndDataFree(t *testing.T) {
 		t.Fatalf("expected stable MANIFEST_INVALID error code, got %+v", payload.Errors)
 	}
 }
+
+// staleFeedUpdater models a signer that reports success while the effective
+// feed settles on a DIFFERENT (stale) reference than the committed one — the
+// exact read-after-write hazard the verification gate must fail closed on.
+type staleFeedUpdater struct {
+	inner publish.FeedUpdater
+}
+
+func (s staleFeedUpdater) UpdateFeed(ctx context.Context, feed string, ref string) error {
+	return s.inner.UpdateFeed(ctx, feed, "stale-ref-"+ref)
+}
+
+// TestManifestPutStaleFeedReadBackFailsClosed502 proves the read-after-write
+// gate end to end: a reported commit success whose EFFECTIVE feed read-back
+// does not resolve to the exact committed state reference is a 502
+// PUBLICATION_UNVERIFIED, and the referenced staging is retained for a safe
+// retry — a 201 is only ever produced after exact verification.
+func TestManifestPutStaleFeedReadBackFailsClosed502(t *testing.T) {
+	t.Parallel()
+
+	h, _, feeds, issuer := newFirstPushWorld(t)
+	h.Publisher.Feeds = staleFeedUpdater{inner: feeds}
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	configBytes := []byte(`{"architecture":"amd64"}`)
+	configDigest := stageBlob(t, server.URL, issuer, configBytes, "application/vnd.oci.image.config.v1+json")
+	manifestBody := []byte(`{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":` +
+		fmt.Sprintf("%d", len(configBytes)) + `,"digest":"` + configDigest + `"},"layers":[]}`)
+	resp := putManifest(t, server.URL, issuer, manifestBody)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("stale feed read-back must fail closed with 502, got %d (body %s)", resp.StatusCode, body)
+	}
+	code, _ := decodeErrorPayload(t, body)
+	if code != ErrorCodePublicationUnverified {
+		t.Fatalf("expected PUBLICATION_UNVERIFIED code, got %q (body %s)", code, body)
+	}
+	remaining, err := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
+	if err != nil {
+		t.Fatalf("list staged: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].Digest != configDigest {
+		t.Fatalf("verification failure must retain the referenced staging for retry, got %+v", remaining)
+	}
+}

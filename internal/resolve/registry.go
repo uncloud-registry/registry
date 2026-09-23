@@ -2,6 +2,8 @@ package resolve
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -173,13 +175,11 @@ func (s StaticFeedResolver) ResolveFeed(_ context.Context, feed string) (string,
 
 type MemoryDocumentStore struct {
 	mu        sync.RWMutex
-	nextID    int64
 	Documents map[string][]byte
 }
 
 func NewMemoryDocumentStore() *MemoryDocumentStore {
 	return &MemoryDocumentStore{
-		nextID:    1,
 		Documents: map[string][]byte{},
 	}
 }
@@ -201,12 +201,17 @@ func (m *MemoryDocumentStore) Get(ctx context.Context, ref string) ([]byte, erro
 	return m.Read(ctx, ref)
 }
 
+// Put stores data under its deterministic content address — the exact
+// in-memory model of Bee's content-addressed immutable store that
+// restart-safe retries depend on: identical bytes ALWAYS produce the identical
+// reference, so a retried publication (same manifest and repo-state bytes)
+// resolves to the same immutable objects and NEVER grows the store.
 func (m *MemoryDocumentStore) Put(_ context.Context, data []byte, _ string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ref := fmt.Sprintf("mem-ref-%d", m.nextID)
-	m.nextID++
+	sum := sha256.Sum256(data)
+	ref := "mem-ref-" + hex.EncodeToString(sum[:])
 	out := make([]byte, len(data))
 	copy(out, data)
 	m.Documents[ref] = out

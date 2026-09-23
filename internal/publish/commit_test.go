@@ -3,6 +3,8 @@ package publish
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +13,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/uncloud-registry/registry/internal/resolve"
+	"github.com/uncloud-registry/registry/internal/spec"
 )
 
 const commitSecret = "shared-internal-secret-bytes"
@@ -304,4 +309,91 @@ func TestOperationIDJSONSafeConstraint(t *testing.T) {
 			t.Fatalf("operationID %q must be accepted: %v", opID, err)
 		}
 	}
+}
+
+// echoCommitter is a faithful in-process model of the control-plane feed
+// signer's success response: it returns the canonical request-bound result
+// and records every request for assertions.
+type echoCommitter struct {
+	calls int
+	last  FeedCommitRequest
+}
+
+func (e *echoCommitter) Commit(_ context.Context, req FeedCommitRequest) (FeedCommitResult, error) {
+	e.calls++
+	e.last = req
+	return FeedCommitResult{
+		OperationID: req.OperationID,
+		Feed:        CanonicalTopic(req.Topic),
+		Reference:   CanonicalReference(req.Reference),
+	}, nil
+}
+
+// TestDeterministicUpdatedAtStablePerOperation pins the restart-safe state
+// timestamp contract: UpdatedAt is a pure deterministic function of the
+// operation identity, so a retry of one logical publication rebuilds
+// BYTE-IDENTICAL repo-state bytes — the precondition for the control plane's
+// durable request-hash idempotency after an uncertain commit boundary.
+func TestDeterministicUpdatedAtStablePerOperation(t *testing.T) {
+	a1 := DeterministicUpdatedAt("op-1")
+	a2 := DeterministicUpdatedAt("op-1")
+	if a1 != a2 {
+		t.Fatalf("same operation must derive the same UpdatedAt: %q vs %q", a1, a2)
+	}
+	if a1 == DeterministicUpdatedAt("op-2") {
+		t.Fatal("distinct operations must derive distinct UpdatedAt values")
+	}
+	if _, err := time.Parse(time.RFC3339, a1); err != nil {
+		t.Fatalf("deterministic UpdatedAt must be RFC3339: %v", err)
+	}
+}
+
+// TestPublishCommitReturnsExactReceipt proves PublishCommit captures the exact
+// publication receipt available BEFORE the uncertain commit boundary: the
+// canonical repo feed, the immutable state reference the object store
+// returned, the manifest reference, the resulting generation, tag, and
+// manifest digest — all verifiable afterwards through the production
+// resolver/document path.
+func TestPublishCommitReturnsExactReceipt(t *testing.T) {
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	// No custom committer: PublishCommit falls back to the local Feeds
+	// updater, so the receipt reference must equal the feed target exactly.
+	p := Publisher{Builder: DefaultBuilder{}, Objects: docs, Feeds: feeds}
+
+	feed := spec.RepoStateFeedRef("0xaliceowner", "backend/api")
+	current := spec.RepoStateDocument{}
+	input := validBuildInput(t)
+	input.UpdatedAt = DeterministicUpdatedAt("op-t14-1")
+
+	receipt, err := p.PublishCommit(context.Background(), feed, current, input, "batch-1", 7, "0xaliceowner", "op-t14-1")
+	if err != nil {
+		t.Fatalf("publish commit: %v", err)
+	}
+	if receipt.OperationID != "op-t14-1" {
+		t.Fatalf("receipt operation id mismatch: %q", receipt.OperationID)
+	}
+	if receipt.StateFeed != feed {
+		t.Fatalf("receipt feed mismatch: %q", receipt.StateFeed)
+	}
+	if receipt.Repo != "backend/api" || receipt.Tag != "latest" || receipt.ManifestDigest != input.ManifestDigest {
+		t.Fatalf("receipt target mismatch: %+v", receipt)
+	}
+	if receipt.ExpectedGeneration != 0 || receipt.Generation != 1 {
+		t.Fatalf("receipt generation mismatch: expected 0->1, got %+v", receipt)
+	}
+	if receipt.ManifestRef != contentAddress(docs, input.ManifestJSON) {
+		t.Fatalf("receipt manifest ref mismatch: %q", receipt.ManifestRef)
+	}
+	if receipt.StateRef != feeds.Feeds[feed] {
+		t.Fatalf("receipt state ref %q must equal the feed target %q", receipt.StateRef, feeds.Feeds[feed])
+	}
+}
+
+// contentAddress returns the deterministic content-addressed reference
+// resolve.MemoryDocumentStore.Put assigns to data — the exact in-memory model
+// of Bee's content addressing that restart-safe retries depend on.
+func contentAddress(docs *resolve.MemoryDocumentStore, data []byte) string {
+	sum := sha256.Sum256(data)
+	return "mem-ref-" + hex.EncodeToString(sum[:])
 }

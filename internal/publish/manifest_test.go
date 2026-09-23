@@ -1645,3 +1645,29 @@ func TestValidationErrorDataFreeAcrossAllSurfaces(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildNextHonorsDeterministicUpdatedAt pins the state-byte stability
+// contract: when the caller supplies a deterministic UpdatedAt, the builder
+// writes it verbatim so a retry of one logical publication rebuilds
+// BYTE-IDENTICAL repo-state documents (the precondition for the control
+// plane's durable request-hash idempotency after an uncertain commit
+// boundary). A malformed non-empty value is rejected rather than persisted.
+func TestBuildNextHonorsDeterministicUpdatedAt(t *testing.T) {
+	input := validBuildInput(t)
+	input.UpdatedAt = "2026-02-02T02:02:02Z"
+	// Direct builder calls must carry the manifest reference, exactly like the
+	// publisher sets it before BuildNext.
+	input.Manifest.SwarmRef = "manifest-ref"
+	next, err := (DefaultBuilder{}).BuildNext(spec.RepoStateDocument{}, input)
+	if err != nil {
+		t.Fatalf("build next: %v", err)
+	}
+	if next.UpdatedAt != "2026-02-02T02:02:02Z" {
+		t.Fatalf("builder must honor the deterministic UpdatedAt, got %q", next.UpdatedAt)
+	}
+
+	input.UpdatedAt = "not-a-timestamp"
+	if _, err := (DefaultBuilder{}).BuildNext(spec.RepoStateDocument{}, input); err == nil {
+		t.Fatal("a malformed deterministic UpdatedAt must be rejected")
+	}
+}

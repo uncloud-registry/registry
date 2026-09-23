@@ -386,8 +386,25 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		return
 	}
 	if !authorized {
-		w.Header().Set("WWW-Authenticate", bearerChallenge(h.AuthRealm, registryIdentity.Host, repo, "push"))
-		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "push access denied")
+		// An AUTHENTICATED principal denied by policy is 403 DENIED (not a
+		// 401 challenge): re-challenging would loop the client.
+		writeError(w, http.StatusForbidden, "DENIED", "push access denied")
+		return
+	}
+
+	// Caller-supplied idempotency key: exactly one, validated against the
+	// Task 10 operation-ID grammar BEFORE any resolve, object, feed, or
+	// staging write. An invalid key is 400 with zero writes and the value is
+	// never echoed.
+	clientOperationID := r.Header.Get(OperationIDHeader)
+	if clientOperationID != "" {
+		if err := publish.ValidateOperationID(clientOperationID); err != nil {
+			writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "invalid operation ID: "+err.Error())
+			return
+		}
+	}
+	if second := r.Header.Values(OperationIDHeader); len(second) > 1 {
+		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "duplicate operation-ID header")
 		return
 	}
 
@@ -407,7 +424,8 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	// other's state.
 	current, found, err := h.Resolver.ResolveRepoStateOptional(r.Context(), registryIdentity, repo)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", err.Error())
+		status, code, message := classifyPublicationError(err)
+		writeError(w, status, code, message)
 		return
 	}
 	if !found {
@@ -421,9 +439,13 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		}
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, publish.MaxArtifactBodyBytes+1))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", err.Error())
+		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "failed to read the manifest body")
+		return
+	}
+	if len(body) > publish.MaxArtifactBodyBytes {
+		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "manifest body exceeds the size bound")
 		return
 	}
 
@@ -443,9 +465,53 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		referencedDigests[ref.Digest] = struct{}{}
 	}
 
+	manifestDigest := computeDigest(body)
+	stateFeed := spec.RepoStateFeedRef(registryIdentity.Owner, repo)
+	input := publish.BuildInput{
+		Repo:           repo,
+		Tag:            reference,
+		ManifestDigest: manifestDigest,
+		ManifestJSON:   body,
+		Manifest: spec.ManifestDescriptor{
+			MediaType: r.Header.Get("Content-Type"),
+			Size:      int64(len(body)),
+		},
+	}
+
+	// Restart-safe retry recognition BEFORE any write: the effective feed is
+	// the durable truth — if it already carries this exact tag→digest mapping
+	// at generation >= 1, the client is retrying a lost response. The prior
+	// publication is re-VERIFIED through the production feed/document path and
+	// the verified 201 is returned without touching the feed, the object
+	// store, or staging again — so an already-published target is answered
+	// from durable state, never from an in-memory cache. If the feed advanced
+	// incompatibly, the effort falls through to a fresh publication whose
+	// generation check at the control plane conflicts rather than overwrites.
+	if found && current.Generation >= 1 && current.Tags[reference] == manifestDigest {
+		retryOperationID := clientOperationID
+		if retryOperationID == "" {
+			// The publication ALREADY happened at the stored generation; its
+			// provisional operation ID therefore used expected = gen-1.
+			retryOperationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation-1)
+		}
+		verr := VerifyPublishedRetryState(r.Context(), h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, input, artifact)
+		if verr == nil {
+			writePublishedSuccess(w, repo, reference, manifestDigest, retryOperationID)
+			return
+		}
+		if errors.Is(verr, ErrTargetNotCurrentState) {
+			// Effective feed advanced incompatibly since resolution: not a
+			// retry. Fall through to the normal publish path.
+		} else {
+			status, code, message := classifyPublicationError(verr)
+			writeError(w, status, code, message)
+			return
+		}
+	}
+
 	stagedBlobs, err := h.Staging.ListStagedBlobs(r.Context(), repo, actor)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "MANIFEST_INVALID", err.Error())
+		writeError(w, http.StatusInternalServerError, "UNKNOWN", "internal server error")
 		return
 	}
 	blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
@@ -462,22 +528,31 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		}
 	}
 
-	next, err := h.Publisher.PublishCommit(r.Context(), spec.RepoStateFeedRef(registryIdentity.Owner, repo), current, publish.BuildInput{
-		Repo:           repo,
-		Tag:            reference,
-		ManifestDigest: computeDigest(body),
-		ManifestJSON:   body,
-		Manifest: spec.ManifestDescriptor{
-			MediaType: r.Header.Get("Content-Type"),
-			Size:      int64(len(body)),
-		},
-		StagedBlobs: blobMap,
-	}, batchID, registryIdentity.RegistryID, registryIdentity.Owner,
-		// Stable deterministic operation ID for this logical publication, so a
-		// retry of the same publication is idempotent at the control plane.
-		publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, computeDigest(body), current.Generation))
+	operationID := clientOperationID
+	if operationID == "" {
+		operationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation)
+	}
+	input.StagedBlobs = blobMap
+	// Byte-stable state rebuilds across retries: the state timestamp is
+	// derived deterministically from the operation identity, never the clock.
+	input.UpdatedAt = publish.DeterministicUpdatedAt(operationID)
+
+	receipt, err := h.Publisher.PublishCommit(r.Context(), stateFeed, current, input, batchID, registryIdentity.RegistryID, registryIdentity.Owner, operationID)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", err.Error())
+		status, code, message := classifyPublicationError(err)
+		writeError(w, status, code, message)
+		return
+	}
+
+	// Read-after-write verification BEFORE the 201: the exact committed state
+	// reference must resolve through the effective feed and decode to exact,
+	// coherent repository state (generation, repo, tag→digest, manifest
+	// descriptor and object bytes, referenced blob records). A 201 is only
+	// ever produced after this verification passes; on failure the referenced
+	// staging is RETAINED for a safe retry.
+	if err := VerifyPublishedState(r.Context(), h.Resolver.Feeds, h.Resolver.Docs, receipt, input, artifact); err != nil {
+		status, code, message := classifyPublicationError(err)
+		writeError(w, status, code, message)
 		return
 	}
 
@@ -488,13 +563,19 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		consumed = append(consumed, digest)
 	}
 	if err := h.Staging.ClearStagedBlobsByDigest(r.Context(), repo, actor, consumed); err != nil {
-		writeError(w, http.StatusInternalServerError, "MANIFEST_INVALID", err.Error())
+		writeError(w, http.StatusInternalServerError, "UNKNOWN", "internal server error")
 		return
 	}
 
-	digest := next.Tags[reference]
+	writePublishedSuccess(w, repo, reference, manifestDigest, operationID)
+}
+
+// writePublishedSuccess emits the verified 201 publication response with the
+// operation identity header the caller needs for restart-safe retries.
+func writePublishedSuccess(w http.ResponseWriter, repo string, tag string, digest string, operationID string) {
 	w.Header().Set("Docker-Content-Digest", digest)
-	w.Header().Set("Location", fmt.Sprintf("/v2/%s/manifests/%s", repo, reference))
+	w.Header().Set("Location", fmt.Sprintf("/v2/%s/manifests/%s", repo, tag))
+	w.Header().Set(OperationIDHeader, operationID)
 	w.WriteHeader(http.StatusCreated)
 }
 
