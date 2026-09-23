@@ -3,9 +3,11 @@ package controlplane
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"strconv"
@@ -1375,5 +1377,494 @@ func TestFeedSignerLegacyRowAdversarialNonMatch(t *testing.T) {
 	}
 	if n := w.feedStore.Feeds[w.repoTopic]; n != refHex('b') {
 		t.Fatalf("feed must not advance on conflict, got %q", n)
+	}
+}
+
+// TestFeedSignerDerivesMultiTagLegacyCandidates proves deriveLegacyCandidates
+// reconstructs the EXACT historical operation-ID/request-hash identity for
+// EVERY valid tag entry of the immutable target repo-state document at
+// req.Reference (registry/owner/repo/that tag/that digest/expected generation),
+// deterministically SORTED with no duplicates, and fails CLOSED (empty result)
+// on an empty, invalid, oversized, or over-cap document so adoption can never
+// bridge a multi-tag or unreadable repository to a wrong row.
+func TestFeedSignerDerivesMultiTagLegacyCandidates(t *testing.T) {
+	const (
+		t1 = "latest"
+		t2 = "v2"
+		t3 = "stable"
+	)
+	dig := func(c byte) string { return "sha256:" + refHex(c) }
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{t1: dig('a'), t2: dig('b'), t3: dig('c')},
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+	signer := &FeedSigner{Docs: w.docs}
+
+	t.Run("derives-every-valid-tag-sorted", func(t *testing.T) {
+		cands := signer.deriveLegacyCandidates(ctx, req)
+		if len(cands) != 3 {
+			t.Fatalf("expected one candidate per valid tag entry, got %d", len(cands))
+		}
+		byTag := map[string]LegacyOperationCandidate{}
+		for _, cand := range cands {
+			histReq := req
+			histReq.OperationID = cand.OperationID
+			// The candidate's hash must be the EXACT historical (m9) hash of the
+			// historical request — every tag's identity must reproduce the m9 row
+			// that this tag's old publication would have written.
+			if cand.RequestHash != m9HistoricalRequestHash(histReq) {
+				t.Fatalf("candidate %s carries the wrong historical hash", cand.OperationID)
+			}
+			byTag[cand.OperationID] = cand
+		}
+		// The derived IDs are the exact historical operation IDs per tag.
+		for tag, d := range map[string]string{t1: dig('a'), t2: dig('b'), t3: dig('c')} {
+			wantID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, tag, d, req.ExpectedGeneration)
+			if _, ok := byTag[wantID]; !ok {
+				t.Fatalf("missing derived candidate for tag %q (id %s)", tag, wantID)
+			}
+		}
+		// Deterministically sorted by operation ID.
+		for i := 1; i < len(cands); i++ {
+			if cands[i-1].OperationID >= cands[i].OperationID {
+				t.Fatalf("candidates must be sorted, got %s before %s", cands[i-1].OperationID, cands[i].OperationID)
+			}
+		}
+	})
+	t.Run("same-digest-multi-tag-distinct-candidates", func(t *testing.T) {
+		// The SAME manifest digest under two tags yields TWO distinct exact
+		// historical identities (the m9 ID was framed per tag).
+		req2 := validCommitReq(1, "batch-1")
+		w2 := newFeedTestWorld(t, req2, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: map[string]string{"alias-a": dig('b'), "alias-b": dig('b')},
+		})
+		req2.RegistryID = w2.registry.ID
+		w2.fillTopic(&req2)
+		cands := (&FeedSigner{Docs: w2.docs}).deriveLegacyCandidates(ctx, req2)
+		if len(cands) != 2 || cands[0].OperationID == cands[1].OperationID {
+			t.Fatalf("same digest under two tags must yield two distinct candidate identities, got %+v", cands)
+		}
+	})
+	t.Run("tag-overwrite-only-current-value", func(t *testing.T) {
+		// After a tag OVERWRITE the target doc carries ONLY the new value; the
+		// derived identity for that tag is the new digest's, never the old one.
+		req3 := validCommitReq(1, "batch-1")
+		w3 := newFeedTestWorld(t, req3, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: map[string]string{"latest": dig('e'), "stable": dig('b')},
+		})
+		req3.RegistryID = w3.registry.ID
+		w3.fillTopic(&req3)
+		cands := (&FeedSigner{Docs: w3.docs}).deriveLegacyCandidates(ctx, req3)
+		if len(cands) != 2 {
+			t.Fatalf("expected exactly the two current tag digests, got %+v", cands)
+		}
+		oldID := legacyComputeOperationID(req3.RegistryID, req3.Owner, testRepo, "latest", dig('a'), req3.ExpectedGeneration)
+		newID := legacyComputeOperationID(req3.RegistryID, req3.Owner, testRepo, "latest", dig('e'), req3.ExpectedGeneration)
+		for _, cand := range cands {
+			if cand.OperationID == oldID {
+				t.Fatal("the overwritten digest's historical identity must NOT be derived")
+			}
+		}
+		foundNew := false
+		for _, cand := range cands {
+			if cand.OperationID == newID {
+				foundNew = true
+			}
+		}
+		if !foundNew {
+			t.Fatal("the current digest's historical identity must be derived")
+		}
+	})
+	t.Run("non-canonical-digest-fails-closed", func(t *testing.T) {
+		// A tag whose digest is NOT a canonical 64-hex reference but that is
+		// structurally present in the doc must fail the whole derivation closed
+		// (no partial candidate set): adoption can never proceed from a doc that
+		// does not confirm to the canonical tag/digest rules.
+		badDigest := "bogus-digest"
+		w4 := newFeedTestWorld(t, validCommitReq(1, "batch-1"), feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: map[string]string{"latest": badDigest},
+		})
+		req4 := validCommitReq(1, "batch-1")
+		req4.RegistryID = w4.registry.ID
+		w4.fillTopic(&req4)
+		if cands := (&FeedSigner{Docs: w4.docs}).deriveLegacyCandidates(ctx, req4); cands != nil {
+			t.Fatalf("non-canonical digest must fail closed, got %+v", cands)
+		}
+	})
+	t.Run("invalid-doc-fails-closed", func(t *testing.T) {
+		req5 := validCommitReq(1, "batch-1")
+		w5 := newFeedTestWorld(t, req5, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: map[string]string{"latest": dig('a')},
+		})
+		req5.RegistryID = w5.registry.ID
+		w5.fillTopic(&req5)
+		// The doc at the target reference is NOT a repo-state document.
+		w5.docs.Documents[refHex('a')] = []byte(`{"not":"a repo state doc"`)
+		if cands := (&FeedSigner{Docs: w5.docs}).deriveLegacyCandidates(ctx, req5); cands != nil {
+			t.Fatalf("invalid target document must fail closed, got %+v", cands)
+		}
+	})
+	t.Run("oversized-doc-fails-closed", func(t *testing.T) {
+		req6 := validCommitReq(1, "batch-1")
+		w6 := newFeedTestWorld(t, req6, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: map[string]string{"latest": dig('a')},
+		})
+		req6.RegistryID = w6.registry.ID
+		w6.fillTopic(&req6)
+		big := make([]byte, feedSignerLegacyDocMaxBytes+1)
+		copy(big, mustRepoDocWithTags(t, testRepo, 1, map[string]string{"latest": dig('a')}))
+		w6.docs.Documents[refHex('a')] = big
+		if cands := (&FeedSigner{Docs: w6.docs}).deriveLegacyCandidates(ctx, req6); cands != nil {
+			t.Fatalf("oversized target document must fail closed, got %d candidates", len(cands))
+		}
+	})
+	t.Run("over-cap-tags-fails-closed", func(t *testing.T) {
+		req7 := validCommitReq(1, "batch-1")
+		tags := make(map[string]string, feedSignerLegacyMaxCandidates+1)
+		for i := 0; i <= feedSignerLegacyMaxCandidates; i++ {
+			sum := sha256.Sum256([]byte(fmt.Sprintf("digest-%d", i)))
+			tags[fmt.Sprintf("tag-%04d", i)] = "sha256:" + hex.EncodeToString(sum[:])
+		}
+		w7 := newFeedTestWorld(t, req7, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: tags,
+		})
+		req7.RegistryID = w7.registry.ID
+		w7.fillTopic(&req7)
+		if cands := (&FeedSigner{Docs: w7.docs}).deriveLegacyCandidates(ctx, req7); cands != nil {
+			t.Fatalf("over-cap tag count must fail closed, got %d candidates", len(cands))
+		}
+	})
+	t.Run("no-tags-no-candidates", func(t *testing.T) {
+		req8 := validCommitReq(1, "batch-1")
+		w8 := newFeedTestWorld(t, req8, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		})
+		req8.RegistryID = w8.registry.ID
+		w8.fillTopic(&req8)
+		if cands := (&FeedSigner{Docs: w8.docs}).deriveLegacyCandidates(ctx, req8); cands != nil {
+			t.Fatalf("a tag-less doc must yield no candidates, got %+v", cands)
+		}
+	})
+}
+
+// TestFeedSignerAdoptsLegacyM9HashRowMultiTag proves a REALISTIC multi-tag
+// target repo-state document: the doc carries TWO tags (different digests) but
+// only ONE historical quarantine row exists (the row for one of the tags). The
+// row's own primary key — one of the derived candidate operation IDs —
+// identifies it as the old publication, so it adopts exactly once: SUCCEEDED
+// adoption short-circuits (zero external updates, feed untouched), the result
+// is rewritten to the CURRENT operation ID, and the quarantine row is deleted.
+func TestFeedSignerAdoptsLegacyM9HashRowMultiTag(t *testing.T) {
+	testDigestA := "sha256:" + strings.Repeat("a", 64)
+	testDigestB := "sha256:" + strings.Repeat("b", 64)
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": testDigestA, "v2": testDigestB},
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	target := refHex('a')
+	ctx := context.Background()
+
+	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", testDigestA, req.ExpectedGeneration)
+	if histID == req.OperationID {
+		t.Fatal("test requires old and new operation IDs to differ")
+	}
+	histReq := req
+	histReq.OperationID = histID
+	m9hash := m9HistoricalRequestHash(histReq)
+	result := `{"operationID":"` + histID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'succeeded', ?, ?, ?)`, histID, m9hash[:], result, nowNs, nowNs); err != nil {
+		t.Fatalf("seed m9 succeeded row: %v", err)
+	}
+
+	updater := &countingFeedUpdater{inner: w.feedStore}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	res, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("multi-tag adopt+idempotent commit: %v", err)
+	}
+	if res.OperationID != req.OperationID || res.Feed != w.repoTopic || res.Reference != target {
+		t.Fatalf("adopted result mismatch: %+v", res)
+	}
+	if gotFeed := w.feedStore.Feeds[w.repoTopic]; gotFeed != refHex('b') {
+		t.Fatalf("feed must not be re-advanced on adoption, got %q", gotFeed)
+	}
+	if n := updater.count(); n != 0 {
+		t.Fatalf("adoption must not call the external updater, got %d calls", n)
+	}
+	if legacyCount(t, w.store, histID) != 0 {
+		t.Fatal("quarantine row must be deleted after successful multi-tag adoption")
+	}
+	op, err := w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if err != nil || op.State != FeedSignerOpSucceeded {
+		t.Fatalf("adopted active row malformed: state=%q err=%v", op.State, err)
+	}
+	want := `{"operationID":"` + req.OperationID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
+	if string(op.ResultJSON) != want {
+		t.Fatalf("adopted active result must be rewritten to the CURRENT operation ID, got %s want %s", op.ResultJSON, want)
+	}
+}
+
+// TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag proves a two-tag target
+// document with only ONE historical PENDING row: the row adopts and the
+// request proceeds through the normal sign path EXACTLY ONCE (feed advanced
+// once, one updater call), under the CURRENT operation ID and CURRENT hash.
+func TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag(t *testing.T) {
+	testDigestA := "sha256:" + strings.Repeat("a", 64)
+	testDigestB := "sha256:" + strings.Repeat("b", 64)
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": testDigestA, "v2": testDigestB},
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	target := refHex('a')
+	ctx := context.Background()
+
+	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", testDigestA, req.ExpectedGeneration)
+	if histID == req.OperationID {
+		t.Fatal("test requires old and new operation IDs to differ")
+	}
+	histReq := req
+	histReq.OperationID = histID
+	m9hash := m9HistoricalRequestHash(histReq)
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'pending', null, ?, ?)`, histID, m9hash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("seed m9 pending row: %v", err)
+	}
+
+	updater := &countingFeedUpdater{inner: w.feedStore}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	res, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("multi-tag adopt pending + sign: %v", err)
+	}
+	if res.OperationID != req.OperationID || res.Feed != w.repoTopic || res.Reference != target {
+		t.Fatalf("unexpected sign result: %+v", res)
+	}
+	if gotFeed := w.feedStore.Feeds[w.repoTopic]; gotFeed != target {
+		t.Fatalf("pending-adopt must sign once and advance the feed, got %q", gotFeed)
+	}
+	if n := updater.count(); n != 1 {
+		t.Fatalf("pending-adopt must sign exactly once, got %d", n)
+	}
+	if legacyCount(t, w.store, histID) != 0 {
+		t.Fatal("quarantine row must be deleted after successful pending multi-tag adoption")
+	}
+	op, err := w.store.GetFeedSignerOperation(ctx, req.OperationID)
+	if err != nil || op.State != FeedSignerOpSucceeded || op.RequestHash != NormalizeFeedCommitHash(req) {
+		t.Fatalf("pending-adopt should complete to succeeded under the current hash, got state=%q err=%v", op.State, err)
+	}
+}
+
+// TestFeedSignerAdoptsLegacyM9HashRowFeedAdvanced proves adoption does NOT
+// depend on the CURRENT feed state and needs NO predecessor comparison: the
+// current feed has already ADVANCED past the immutable target document (a
+// newer reference), yet the quarantined m9 row — whose request target document
+// still identifies it via its own primary key — adopts exactly once with zero
+// updater calls and the newer feed value is never overwritten.
+func TestFeedSignerAdoptsLegacyM9HashRowFeedAdvanced(t *testing.T) {
+	testDigest := "sha256:" + strings.Repeat("a", 64)
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('c'), currentGen: 2, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('d'),
+		targetTags: map[string]string{"latest": testDigest},
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	target := refHex('a')
+	ctx := context.Background()
+
+	histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", testDigest, req.ExpectedGeneration)
+	if histID == req.OperationID {
+		t.Fatal("test requires old and new operation IDs to differ")
+	}
+	histReq := req
+	histReq.OperationID = histID
+	m9hash := m9HistoricalRequestHash(histReq)
+	result := `{"operationID":"` + histID + `","feed":"` + w.repoTopic + `","reference":"` + target + `"}`
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'succeeded', ?, ?, ?)`, histID, m9hash[:], result, nowNs, nowNs); err != nil {
+		t.Fatalf("seed m9 succeeded row: %v", err)
+	}
+
+	updater := &countingFeedUpdater{inner: w.feedStore}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	res, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("feed-advanced adoption: %v", err)
+	}
+	if res.OperationID != req.OperationID || res.Reference != target {
+		t.Fatalf("adopted result mismatch: %+v", res)
+	}
+	if gotFeed := w.feedStore.Feeds[w.repoTopic]; gotFeed != refHex('c') {
+		t.Fatalf("the advanced feed must never be overwritten, got %q", gotFeed)
+	}
+	if n := updater.count(); n != 0 {
+		t.Fatalf("adoption must not call the external updater, got %d calls", n)
+	}
+	if legacyCount(t, w.store, histID) != 0 {
+		t.Fatal("quarantine row must be deleted after feed-advanced adoption")
+	}
+}
+
+// TestFeedSignerMultiTagLegacyDerivationFailClosed proves the bounded
+// derivation gates end-to-end: when the immutable target document is
+// oversized or carries more tags than the candidate cap, NO adoption happens
+// (empty candidate set fails closed) — the quarantined row is never touched
+// and the request proceeds as an ordinary fresh signing.
+func TestFeedSignerMultiTagLegacyDerivationFailClosed(t *testing.T) {
+	t.Run("oversized-doc-no-adoption", func(t *testing.T) {
+		req := validCommitReq(1, "batch-1")
+		w := newFeedTestWorld(t, req, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: map[string]string{"latest": "sha256:" + strings.Repeat("a", 64)},
+		})
+		req.RegistryID = w.registry.ID
+		w.fillTopic(&req)
+		ctx := context.Background()
+
+		histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", "sha256:"+strings.Repeat("a", 64), req.ExpectedGeneration)
+		histReq := req
+		histReq.OperationID = histID
+		m9hash := m9HistoricalRequestHash(histReq)
+		nowNs := timeToNanos(time.Now().UTC())
+		if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+			(operation_id, request_hash, state, result_json, created_at, updated_at)
+			values (?, ?, 'succeeded', ?, ?, ?)`, histID, m9hash[:],
+			`{"operationID":"`+histID+`","feed":"`+w.repoTopic+`","reference":"`+refHex('a')+`"}`, nowNs, nowNs); err != nil {
+			t.Fatalf("seed m9 row: %v", err)
+		}
+		// Oversize the target document BEYOND the derivation bound.
+		big := make([]byte, feedSignerLegacyDocMaxBytes+1)
+		copy(big, mustRepoDocWithTags(t, testRepo, 1, map[string]string{"latest": "sha256:" + strings.Repeat("a", 64)}))
+		w.docs.Documents[refHex('a')] = big
+
+		// Derivation fails closed -> no adoption; the quarantine row survives
+		// untouched. The commit itself fails because the oversized target
+		// document cannot be a valid publication target.
+		if _, err := w.signer.Commit(ctx, req); err == nil {
+			t.Fatal("oversized target document must fail the commit")
+		}
+		if legacyCount(t, w.store, histID) != 1 {
+			t.Fatal("quarantine row must survive oversized-document fail-closed derivation")
+		}
+	})
+	t.Run("over-cap-tags-no-adoption", func(t *testing.T) {
+		req := validCommitReq(1, "batch-1")
+		tags := make(map[string]string, feedSignerLegacyMaxCandidates+1)
+		digests := make([]string, feedSignerLegacyMaxCandidates+1)
+		for i := 0; i <= feedSignerLegacyMaxCandidates; i++ {
+			sum := sha256.Sum256([]byte(fmt.Sprintf("m-digest-%d", i)))
+			d := "sha256:" + hex.EncodeToString(sum[:])
+			tags[fmt.Sprintf("m-tag-%04d", i)] = d
+			digests[i] = d
+		}
+		w := newFeedTestWorld(t, req, feedDocSet{
+			currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+			targetTags: tags,
+		})
+		req.RegistryID = w.registry.ID
+		w.fillTopic(&req)
+		ctx := context.Background()
+
+		// Seed the row for tag 0 — the ONE row a bounded derivation must NOT
+		// reach when the tag count exceeds the cap.
+		histID := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "m-tag-0000", digests[0], req.ExpectedGeneration)
+		histReq := req
+		histReq.OperationID = histID
+		m9hash := m9HistoricalRequestHash(histReq)
+		nowNs := timeToNanos(time.Now().UTC())
+		if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+			(operation_id, request_hash, state, result_json, created_at, updated_at)
+			values (?, ?, 'succeeded', ?, ?, ?)`, histID, m9hash[:],
+			`{"operationID":"`+histID+`","feed":"`+w.repoTopic+`","reference":"`+refHex('a')+`"}`, nowNs, nowNs); err != nil {
+			t.Fatalf("seed m9 row: %v", err)
+		}
+
+		// No adoption: the request commits as an ordinary fresh signing (the
+		// document itself is valid), the feed advances exactly once, and the
+		// quarantine row is retained.
+		updater := &countingFeedUpdater{inner: w.feedStore}
+		signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+		if _, err := signer.Commit(ctx, req); err != nil {
+			t.Fatalf("over-cap tags must commit as a fresh signing: %v", err)
+		}
+		if n := updater.count(); n != 1 {
+			t.Fatalf("fresh signing must update exactly once, got %d", n)
+		}
+		if legacyCount(t, w.store, histID) != 1 {
+			t.Fatal("quarantine row must survive over-cap fail-closed derivation")
+		}
+	})
+}
+
+// TestFeedSignerMultiTagTwoRowsAmbiguity proves end-to-end that when the target
+// document's TWO tag entries both have matching quarantine rows (two legacy
+// tags), adoption is a hard AMBIGUITY/CONFLICT: ALL quarantine rows are
+// retained, the feed is never advanced, and no active row is created.
+func TestFeedSignerMultiTagTwoRowsAmbiguity(t *testing.T) {
+	digA := "sha256:" + strings.Repeat("a", 64)
+	digB := "sha256:" + strings.Repeat("b", 64)
+	req := validCommitReq(1, "batch-1")
+	w := newFeedTestWorld(t, req, feedDocSet{
+		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
+		targetTags: map[string]string{"latest": digA, "v2": digB},
+	})
+	req.RegistryID = w.registry.ID
+	w.fillTopic(&req)
+	ctx := context.Background()
+
+	histID1 := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", digA, req.ExpectedGeneration)
+	histID2 := legacyComputeOperationID(req.RegistryID, req.Owner, testRepo, "v2", digB, req.ExpectedGeneration)
+	nowNs := timeToNanos(time.Now().UTC())
+	for i, h := range []struct {
+		id  string
+		tag string
+		d   string
+	}{{histID1, "latest", digA}, {histID2, "v2", digB}} {
+		hr := req
+		hr.OperationID = h.id
+		m9hash := m9HistoricalRequestHash(hr)
+		if _, err := w.store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+			(operation_id, request_hash, state, result_json, created_at, updated_at)
+			values (?, ?, 'succeeded', ?, ?, ?)`, h.id, m9hash[:],
+			`{"operationID":"`+h.id+`","feed":"`+w.repoTopic+`","reference":"`+refHex('a')+`"}`, nowNs, nowNs); err != nil {
+			t.Fatalf("seed m9 row %d: %v", i, err)
+		}
+	}
+
+	_, err := w.signer.Commit(ctx, req)
+	if !errors.Is(err, errFeedSignerConflict) {
+		t.Fatalf("two matching legacy rows must fail as a conflict/ambiguity, got %v", err)
+	}
+	if legacyCount(t, w.store, histID1) != 1 || legacyCount(t, w.store, histID2) != 1 {
+		t.Fatal("ambiguous rows must ALL stay quarantined")
+	}
+	if n := w.feedStore.Feeds[w.repoTopic]; n != refHex('b') {
+		t.Fatalf("feed must not advance on ambiguity, got %q", n)
+	}
+	if _, err := w.store.GetFeedSignerOperation(ctx, req.OperationID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("no active row may be created on ambiguity, got err=%v", err)
 	}
 }

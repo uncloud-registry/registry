@@ -446,6 +446,134 @@ func feedSignerOperationIDTriggerSQL() []string {
 	}
 }
 
+// feedSignerOperationIDGrammarCondV14 is the migration-14 BYTE-EXACT predicate
+// that replaces migration 13's UNICODE CODEPOINT GLOB guard. It is TRUE exactly
+// when an operation_id VIOLATES the application operation-ID grammar, decided on
+// the RAW STORED BYTES — never on decoded characters — so malformed UTF-8 of
+// every form is rejected without ever being decoded:
+//
+//   - the value is normalized to its raw bytes via hex(CAST(... AS BLOB)) (a
+//     TEXT->BLOB cast copies the stored bytes verbatim, and hex() renders each
+//     byte as an aligned 2-hex-digit pair — a lone continuation byte, an
+//     overlong/surrogate/out-of-range 4-byte sequence, and a truncated sequence
+//     all surface as their exact byte pairs, with no UTF-8 decoder in between);
+//   - byte length must be 1..128 EXACTLY: hex length between 2 and 256 (a
+//     multibyte character no longer undercounts bytes the way SQLite's
+//     character length() does — 100 'é' is 200 bytes and is rejected);
+//   - every aligned pair must be an ALLOWED byte: 0x20..0x7e (the pairs lie in
+//     ['20','7E'] — fixed-width uppercase hex is monotonic with the byte value),
+//     excluding the five Go-JSON-escaped bytes 0x22 quote, 0x26 &, 0x3c <,
+//     0x3e >, 0x5c backslash (pairs '22','26','3C','3E','5C');
+//   - an EXISTS over a recursive byte-index CTE scans ONLY ALIGNED 2-hex-digit
+//     pairs (offset i = 1,3,5,...), so no unaligned GLOB over the hex string can
+//     fabricate or hide a forbidden pair;
+//   - the leading IS NULL term keeps the whole OR never-NULL (SQLite 3VL can
+//     never bypass the guard via NULL), and typeof() rejects BLOB/numeric/NULL
+//     storage classes outright (the table CHECK independently requires text).
+//
+// WITH RECURSIVE inside an EXISTS subquery is legal in modernc.org/sqlite
+// trigger bodies (verified empirically: the `select raise(abort,...) where ...`
+// guard accepts a WITH-clause subquery).
+const feedSignerOperationIDGrammarCondV14 = `(NEW.operation_id IS NULL
+	OR typeof(NEW.operation_id) <> 'text'
+	OR length(hex(cast(NEW.operation_id as blob))) not between 2 and 256
+	OR length(hex(cast(NEW.operation_id as blob))) % 2 != 0
+	OR exists (
+		with recursive feed_signer_op_byte_scan(i, pair) as (
+			select 1, substr(hex(cast(NEW.operation_id as blob)), 1, 2)
+			union all
+			select i + 1, substr(hex(cast(NEW.operation_id as blob)), 2 * (i + 1) - 1, 2)
+			from feed_signer_op_byte_scan
+			where i < length(hex(cast(NEW.operation_id as blob))) / 2
+		)
+		select 1 from feed_signer_op_byte_scan
+		where pair < '20' or pair > '7E' or pair in ('22','26','3C','3E','5C')
+	))`
+
+// feedSignerOperationIDTriggerSQLV14 returns the migration-14 identity triggers:
+// BEFORE INSERT and BEFORE UPDATE on feed_signer_operations, applying the
+// byte-exact operation-ID grammar (feedSignerOperationIDGrammarCondV14) to EVERY
+// active row regardless of state.
+func feedSignerOperationIDTriggerSQLV14() []string {
+	return []string{
+		`create trigger feed_signer_operation_id_ins
+			before insert on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer operation id violates the byte-exact operation-ID grammar') where ` + feedSignerOperationIDGrammarCondV14 + `; end`,
+		`create trigger feed_signer_operation_id_upd
+			before update on feed_signer_operations for each row
+			begin select raise(abort, 'feed signer operation id violates the byte-exact operation-ID grammar') where ` + feedSignerOperationIDGrammarCondV14 + `; end`,
+	}
+}
+
+// installFeedSignerOperationStoreV14 is migration 14's body. It REPLACES
+// migration 13's operation-ID identity triggers — whose Unicode CODEPOINT GLOB
+// guard (`[char(128)-char(0x10ffff)]` ranges over DECODED characters) can admit
+// MALFORMED UTF-8 byte sequences, e.g. `CAST(X'F4908080' AS TEXT)` decodes to
+// one character that the codepoint ranges classify as allowed — with the
+// BYTE-EXACT predicate over `hex(CAST(NEW.operation_id AS BLOB))`, which scans
+// aligned 2-hex-digit pairs and accepts a value iff every STORED BYTE is an
+// allowed ASCII byte 0x20..0x7e minus the five Go-JSON-escaped bytes, with byte
+// length 1..128. It rejects malformed UTF-8 of ALL forms (lone continuation
+// bytes, overlong encodings, surrogate encodings, truncated sequences,
+// out-of-range 4-byte sequences) by their raw bytes, never decoding them, and
+// rejects BLOB/numeric/NULL storage classes via typeof().
+//
+// The migration:
+//
+//  1. DROP-and-re-CREATE the dedicated operation-ID identity triggers (INSERT +
+//     UPDATE) under the byte-exact predicate;
+//  2. REINSTALL the migration-12 byte-exact canonical-result triggers (drop +
+//     recreate) ONLY AFTER the identity triggers, so their byte-exact
+//     concatenation of NEW.operation_id into the canonical JSON runs only once
+//     the operation-id grammar has been proven for every row that reaches it
+//     (the same ordering migration 13 established);
+//  3. ATOMICALLY harden every existing active row via the guarded self-update,
+//     which fires the new UPDATE identity trigger (and result triggers) per
+//     row. Any schema-admitted old-v13 row whose operation_id violates the
+//     BYTE-EXACT grammar — e.g. a row keyed by a malformed-UTF-8 operation_id
+//     that v13's codepoint GLOB admitted — aborts the migration and rolls back
+//     byte-identically: version stays 13, the triggers/schema/data are
+//     untouched, and no invalid active operational state is silently rewritten,
+//     deleted, or quarantined.
+//
+// Fresh installs run 1→13→14 and reach version 14 with the byte-exact identity
+// triggers present; every valid v13 database (whose operation ids are the
+// 64-hex forms ComputeOperationID has always produced) upgrades cleanly.
+func installFeedSignerOperationStoreV14(ctx context.Context, tx *sql.Tx) error {
+	// 1. Drop any stale identity triggers and install the byte-exact ones.
+	for _, name := range []string{"feed_signer_operation_id_ins", "feed_signer_operation_id_upd"} {
+		if _, err := tx.ExecContext(ctx, `drop trigger if exists `+name); err != nil {
+			return fmt.Errorf("migration 14: drop stale operation-id trigger %s: %w", name, err)
+		}
+	}
+	for _, stmt := range feedSignerOperationIDTriggerSQLV14() {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration 14: install byte-exact operation-id identity trigger: %w", err)
+		}
+	}
+	// 2. Reinstall the byte-exact canonical-result triggers under the same names
+	//    migration 12 created, ordering the operation-id grammar first.
+	for _, name := range []string{"feed_signer_result_integrity_ins", "feed_signer_result_integrity_upd"} {
+		if _, err := tx.ExecContext(ctx, `drop trigger if exists `+name); err != nil {
+			return fmt.Errorf("migration 14: drop canonical-result trigger %s: %w", name, err)
+		}
+	}
+	for _, stmt := range feedSignerResultCanonicalTriggerSQL() {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration 14: install canonical-result trigger: %w", err)
+		}
+	}
+	// 3. Harden existing active rows atomically: the guarded self-update fires
+	//    the new UPDATE identity trigger (and result triggers) for EVERY row,
+	//    with no value changed. A row with a byte-grammar-violating operation_id
+	//    aborts here, rolling the whole migration back (version stays 13, no
+	//    schema object, trigger, or data touched).
+	if _, err := tx.ExecContext(ctx, `update feed_signer_operations set operation_id = operation_id`); err != nil {
+		return fmt.Errorf("migration 14: hardening existing feed signer operations failed: %w", err)
+	}
+	return nil
+}
+
 // installFeedSignerOperationStoreV13 is migration 13's body. It closes the
 // database operation-ID grammar gap by:
 //
@@ -637,30 +765,65 @@ var (
 	errFeedSignerLegacyAmbiguous = errors.New("feed signer: multiple distinct legacy candidates match; refusing to adopt")
 )
 
+// feedSignerLegacyMaxCandidates is the explicit safe bound on BOTH the derived
+// legacy-candidate list (the number of tag entries in the target repo-state
+// document that may be recognized as historical operation identities) and the
+// store-side adoption list. It keeps the per-identity quarantine lookups and
+// the derived-ID space bounded: a target document with more tag entries than
+// this fails closed (no adoption) rather than scanning an unbounded candidate
+// set, and the adoption transaction never issues more than
+// 1+feedSignerLegacyMaxCandidates bounded point queries.
+const feedSignerLegacyMaxCandidates = 256
+
+// LegacyOperationCandidate is ONE derived candidate identity for a quarantined
+// migration-9 row: the exact historical operation ID that the row's primary key
+// would carry for one tag entry in the immutable target repo-state document at
+// the request reference (registry/owner/repo/that tag/that manifest digest/
+// expected generation via the migration-only legacyComputeOperationID), plus
+// the exact historical request hash over the reconstructed historical request
+// (OperationID := that historical ID via legacyFeedCommitHashFor — the only
+// byte sequence a real m9 row's stored request_hash can equal). The candidate
+// set is derived deterministically (sorted, deduplicated, bounded); the
+// quarantined row's own primary key identifies which candidate was the old
+// publication.
+type LegacyOperationCandidate struct {
+	OperationID string
+	RequestHash [32]byte
+}
+
 // AdoptLegacyFeedSignerOperation atomically adopts a quarantined migration-9
 // row into the hardened ACTIVE table on the FIRST same-logical-request call,
-// locating the quarantined row by the CURRENT operation ID OR the DERIVED
-// historical migration-9 operation ID (legacyOperationID).
+// locating the quarantined row by the CURRENT operation ID OR ANY of the
+// DERIVED HISTORICAL migration-9 operation IDs (candidates).
 //
 // A quarantined row is validated against the algorithm/identity it claims:
 //
 //   - a row keyed by the CURRENT operation ID is the CURRENT identity and must
 //     carry the CURRENT canonical request hash (reqHash) to be promoted;
-//   - a row keyed by the DERIVED HISTORICAL operation ID is the HISTORICAL
-//     (migration-9) identity and must carry the exact historical request hash
-//     (legacyReqHash — legacyFeedCommitHash over the reconstructed historical
-//     request whose OperationID is the historical value) to be validated.
+//   - a row keyed by a DERIVED HISTORICAL operation ID is the HISTORICAL
+//     (migration-9) identity for that candidate's tag entry and must carry the
+//     exact historical request hash (the candidate's RequestHash —
+//     legacyFeedCommitHash over the reconstructed historical request whose
+//     OperationID is the historical value) to be validated.
 //
-// The candidate set is resolved DETERMINISTICALLY:
-//   - zero candidates -> no-op (nothing quarantined for this operation);
-//   - a candidate whose stored hash does NOT match its claimed identity is a
-//     CONFLICT (the OperationID was reused with different input) and stays
+// The candidate set is resolved DETERMINISTICALLY in ONE write transaction
+// (bounded point queries per identity, never an unbounded IN list):
+//
+//   - zero candidate rows -> no-op (nothing quarantined for this operation);
+//     the caller then reserves the current identity normally;
+//   - a candidate row whose stored hash does NOT match its claimed identity is
+//     a CONFLICT (the OperationID was reused with different input) and stays
+//     quarantined — a conflicting candidate is NEVER ignored merely because
+//     another candidate matches;
+//   - a candidate row whose content is malformed (unknown state, missing or
+//     non-decodable succeeded result, or a result that does not match the row's
+//     own identity / the current logical request) FAILS CLOSED and stays
 //     quarantined;
-//   - TWO distinct valid candidates (one current, one historical) is an
-//     AMBIGUITY that FAILS CLOSED with nothing adopted and nothing deleted, so
-//     a conflicting dual row can never accidentally adopt a different logical
-//     request;
-//   - exactly one valid candidate is adopted.
+//   - MORE THAN ONE valid candidate row (including current+legacy or two legacy
+//     tags both carrying matching rows) is an AMBIGUITY that FAILS CLOSED with
+//     nothing adopted and nothing deleted, so a conflicting dual row can never
+//     accidentally adopt a different logical request;
+//   - exactly one valid candidate row is adopted.
 //
 // pending: becomes an active PENDING row under the CURRENT operation ID and
 // CURRENT request hash, carrying the supplied registry_id and canonical topic,
@@ -676,7 +839,17 @@ var (
 // unchanged). No external feed re-update ever happens on adoption. The active
 // insert and the quarantine delete occur in ONE transaction; a malformed legacy
 // succeeded result fails closed and stays quarantined.
-func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash [32]byte, legacyOperationID string, legacyReqHash [32]byte) (adopted bool, err error) {
+//
+// Concurrency: withWriteTx serializes the whole read/insert/delete under BEGIN
+// IMMEDIATE with bounded busy-retry, so two independent Stores over one
+// database cannot both adopt the same quarantine row: the loser's transaction
+// starts only after the winner commits, sees the new ACTIVE row, and
+// short-circuits (adopted=false, no error) — exactly one adoption succeeds and
+// no quarantine evidence is ever lost or double-deleted.
+func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID string, registryID int64, topic, reference string, reqHash [32]byte, candidates []LegacyOperationCandidate) (adopted bool, err error) {
+	if len(candidates) > feedSignerLegacyMaxCandidates {
+		return false, errFeedSignerLegacyMalformed
+	}
 	type legacyRow struct {
 		opID   string
 		hash   [32]byte
@@ -695,23 +868,31 @@ func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID 
 			return nil
 		}
 
-		// Gather candidate quarantine rows by the current ID OR the derived
-		// historical ID (deduped when they coincide). The two-ID OR is the
-		// migration bridge for a real m9 row (keyed by the historical ID) that
-		// the current request (carrying the current ID) can never reach by key.
-		params := []any{operationID}
-		if legacyOperationID != "" && legacyOperationID != operationID {
-			params = append(params, legacyOperationID)
+		// Build the bounded identity set (current + every distinct legacy
+		// candidate ID) with the expected hash per identity: the CURRENT row
+		// must carry the current canonical request hash; each LEGACY row must
+		// carry the exact historical hash derived for ITS candidate. A candidate
+		// whose ID coincides with the current operation ID is folded into the
+		// current-ID branch (the old behavior); a DUPLICATE derived ID is a
+		// contract violation of the derivation step and fails closed
+		// deterministically (map overwrite order must never decide an adoption).
+		expect := map[string][32]byte{operationID: reqHash}
+		ids := make([]string, 0, 1+len(candidates))
+		ids = append(ids, operationID)
+		for _, cand := range candidates {
+			if cand.OperationID == operationID {
+				continue // identity coincidence: the current-ID branch owns this key
+			}
+			if _, dup := expect[cand.OperationID]; dup {
+				return errFeedSignerLegacyMalformed
+			}
+			expect[cand.OperationID] = cand.RequestHash
+			ids = append(ids, cand.OperationID)
 		}
-		placeholders := "?" + strings.Repeat(", ?", len(params)-1)
-		rows, err := c.QueryContext(ctx,
-			`select `+feedSignerLegacyColumns+` from feed_signer_operations_legacy where operation_id in (`+placeholders+`)`,
-			params...)
-		if err != nil {
-			return err
-		}
+
+		// Bounded per-identity point queries — NEVER an unbounded IN list.
 		var cands []legacyRow
-		for rows.Next() {
+		for _, id := range ids {
 			var (
 				opID                 string
 				hash                 []byte
@@ -719,45 +900,37 @@ func (s *Store) AdoptLegacyFeedSignerOperation(ctx context.Context, operationID 
 				result               sql.NullString
 				createdNs, updatedNs int64
 			)
-			if err := rows.Scan(&opID, &hash, &state, &result, &createdNs, &updatedNs); err != nil {
-				rows.Close()
+			err := c.QueryRowContext(ctx,
+				`select `+feedSignerLegacyColumns+` from feed_signer_operations_legacy where operation_id = ?`, id).
+				Scan(&opID, &hash, &state, &result, &createdNs, &updatedNs)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
 				return err
 			}
 			var h [32]byte
 			copy(h[:], hash)
 			cands = append(cands, legacyRow{opID: opID, hash: h, state: state, result: result})
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
 		if len(cands) == 0 {
 			return nil
 		}
 
-		// Classify every candidate against its claimed identity. A candidate is
-		// accepted only when its stored hash matches the algorithm of the row it
-		// keys (current identities must match reqHash; historical identities must
-		// match legacyReqHash); a mismatch is a hard conflict under BOTH
-		// algorithms and stays quarantined.
+		// Classify EVERY candidate row against the identity it claims. A row
+		// whose stored hash does not match its claimed identity is a hard
+		// conflict under BOTH algorithms and stays quarantined; the loop never
+		// ignores a conflicting candidate merely because another one matches.
 		var valid []legacyRow
 		for _, cd := range cands {
-			switch {
-			case cd.opID == operationID:
-				if cd.hash != reqHash {
-					return errFeedSignerLegacyConflict
-				}
-			case legacyOperationID != "" && cd.opID == legacyOperationID:
-				if cd.hash != legacyReqHash {
-					return errFeedSignerLegacyConflict
-				}
-			default:
-				// A row matched the IN-list but is neither identity: incoherent.
+			want, known := expect[cd.opID]
+			if !known || cd.hash != want {
 				return errFeedSignerLegacyConflict
 			}
 			valid = append(valid, cd)
 		}
-		// Two distinct valid candidates => ambiguity => fail closed.
+		// More than one distinct valid candidate (current+legacy, or two legacy
+		// tags) => ambiguity => fail closed.
 		if len(valid) != 1 {
 			return errFeedSignerLegacyAmbiguous
 		}

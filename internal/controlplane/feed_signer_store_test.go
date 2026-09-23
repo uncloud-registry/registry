@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -115,8 +118,8 @@ func TestMigration10ConstrainHardenedSchemaOnFresh(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	v, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || v != 13 {
-		t.Fatalf("expected schema version 13, got %d (err %v)", v, err)
+	if err != nil || v != 14 {
+		t.Fatalf("expected schema version 14, got %d (err %v)", v, err)
 	}
 	cols := tableColumnsOf(t, db, "feed_signer_operations")
 	for _, want := range []string{"operation_id", "registry_id", "topic", "request_hash", "state", "result_json", "claim_token", "lease_until", "attempts", "created_at", "updated_at"} {
@@ -256,8 +259,8 @@ func TestMigration11HardensOldV10ActiveRows(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("migration 11 hardening old-v10 must succeed for valid rows: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 13 {
-		t.Fatalf("expected version 13, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 14 {
+		t.Fatalf("expected version 14, got %d (err %v)", v, err)
 	}
 	// Quarantine table re-created, triggers installed, valid row preserved.
 	if sqliteObjectCount(t, db, "table", "feed_signer_operations_legacy") != 1 {
@@ -766,7 +769,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	// 1. PENDING CURRENT identity -> active pending under current ID + reqHash.
 	seed("current-pending", "pending", "", reqHash)
 	topicOther := spec.RepoStateFeedRef(testFeedOwner, "otherrepo")
-	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "current-pending", reg.ID, topicOther, ref, reqHash, "", reqHash); err != nil || !adopted {
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "current-pending", reg.ID, topicOther, ref, reqHash, nil); err != nil || !adopted {
 		t.Fatalf("current pending adoption: adopted=%v err=%v", adopted, err)
 	}
 	if op, err := store.GetFeedSignerOperation(ctx, "current-pending"); err != nil || op.State != FeedSignerOpPending || op.RegistryID != reg.ID || op.Topic != topicOther || op.RequestHash != reqHash {
@@ -779,7 +782,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	// 2. PENDING HISTORICAL identity (keyed by histID, m9 hash) -> active
 	//    pending under CURRENT ID; quarantine deleted.
 	seed(histID, "pending", "", histHash)
-	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, reg.ID, topic, ref, reqHash, histID, histHash); err != nil || !adopted {
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{{OperationID: histID, RequestHash: histHash}}); err != nil || !adopted {
 		t.Fatalf("historical pending adoption: adopted=%v err=%v", adopted, err)
 	}
 	op, err := store.GetFeedSignerOperation(ctx, req.OperationID)
@@ -793,7 +796,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	// 3. SUCCEEDED CURRENT identity -> adopted with current result.
 	goodCurrent := `{"operationID":"suc-current","feed":"` + topic + `","reference":"` + ref + `"}`
 	seed("suc-current", "succeeded", goodCurrent, reqHash)
-	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "suc-current", reg.ID, topic, ref, reqHash, "", reqHash); err != nil || !adopted {
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "suc-current", reg.ID, topic, ref, reqHash, nil); err != nil || !adopted {
 		t.Fatalf("current succeeded adoption: adopted=%v err=%v", adopted, err)
 	}
 	if op, err := store.GetFeedSignerOperation(ctx, "suc-current"); err != nil || op.State != FeedSignerOpSucceeded || string(op.ResultJSON) != goodCurrent {
@@ -815,7 +818,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	histHash2 := legacyFeedCommitHashFor(histID2, req2)
 	histResult := `{"operationID":"` + histID2 + `","feed":"` + topic + `","reference":"` + ref + `"}`
 	seed(histID2, "succeeded", histResult, histHash2)
-	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req2.OperationID, reg.ID, topic, ref, req2Hash, histID2, histHash2); err != nil || !adopted {
+	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req2.OperationID, reg.ID, topic, ref, req2Hash, []LegacyOperationCandidate{{OperationID: histID2, RequestHash: histHash2}}); err != nil || !adopted {
 		t.Fatalf("historical succeeded adoption: adopted=%v err=%v", adopted, err)
 	}
 	op, err = store.GetFeedSignerOperation(ctx, req2.OperationID)
@@ -832,7 +835,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 
 	// 5. CONFLICT under the CURRENT identity: stored hash != reqHash.
 	seed("cur-conflict", "pending", "", feedSignerTestHash("different"))
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "cur-conflict", reg.ID, topic, ref, feedSignerTestHash("other"), "", feedSignerTestHash("other")); !errors.Is(err, errFeedSignerLegacyConflict) {
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "cur-conflict", reg.ID, topic, ref, feedSignerTestHash("other"), nil); !errors.Is(err, errFeedSignerLegacyConflict) {
 		t.Fatalf("current differing hash must conflict, got %v", err)
 	}
 	if n := legacyCount(t, store, "cur-conflict"); n != 1 {
@@ -843,7 +846,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	//    The caller's operation ID is FRESH so the active-row short-circuit does
 	//    not hide the conflict.
 	seed(histID, "pending", "", feedSignerTestHash("not-the-m9-hash"))
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "hist-conflict-caller", reg.ID, topic, ref, feedSignerTestHash("caller-hash"), histID, histHash); !errors.Is(err, errFeedSignerLegacyConflict) {
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "hist-conflict-caller", reg.ID, topic, ref, feedSignerTestHash("caller-hash"), []LegacyOperationCandidate{{OperationID: histID, RequestHash: histHash}}); !errors.Is(err, errFeedSignerLegacyConflict) {
 		t.Fatalf("historical differing hash must conflict, got %v", err)
 	}
 	if n := legacyCount(t, store, histID); n != 1 {
@@ -854,7 +857,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	//    identity (current) demands the NEW hash, so it is a CONFLICT, never
 	//    adopted (the round-3 "m9 hash over the current request" behavior).
 	seed("legacy-hash-current-id", "pending", "", m9HistoricalRequestHash(func() publish.FeedCommitRequest { r := req; r.OperationID = "legacy-hash-current-id"; return r }()))
-	_, err = store.AdoptLegacyFeedSignerOperation(ctx, "legacy-hash-current-id", reg.ID, topic, ref, reqHash, "", reqHash)
+	_, err = store.AdoptLegacyFeedSignerOperation(ctx, "legacy-hash-current-id", reg.ID, topic, ref, reqHash, nil)
 	if !errors.Is(err, errFeedSignerLegacyConflict) {
 		t.Fatalf("current-ID row with old hash must conflict (coherent identity check), got %v", err)
 	}
@@ -864,7 +867,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 
 	// 8. Malformed succeeded legacy result -> fail closed, stays quarantined.
 	seed("leg-mal", "succeeded", `{"operationID":"leg-mal","feed":"NOT_A_FEED","reference":"bad"}`, feedSignerTestHash("mal"))
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, feedSignerTestHash("mal"), "", feedSignerTestHash("mal")); !errors.Is(err, errFeedSignerLegacyMalformed) {
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "leg-mal", reg.ID, topic, ref, feedSignerTestHash("mal"), nil); !errors.Is(err, errFeedSignerLegacyMalformed) {
 		t.Fatalf("malformed legacy succeeded result must fail closed, got %v", err)
 	}
 	if n := legacyCount(t, store, "leg-mal"); n != 1 {
@@ -882,7 +885,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	dualHistHash := legacyFeedCommitHashFor(dualHistID, req)
 	dualHistResult := `{"operationID":"` + dualHistID + `","feed":"` + topic + `","reference":"` + ref + `"}`
 	seed(dualHistID, "succeeded", dualHistResult, dualHistHash)
-	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "dual-cur", reg.ID, topic, ref, dualCurHash, dualHistID, dualHistHash); !errors.Is(err, errFeedSignerLegacyAmbiguous) {
+	if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "dual-cur", reg.ID, topic, ref, dualCurHash, []LegacyOperationCandidate{{OperationID: dualHistID, RequestHash: dualHistHash}}); !errors.Is(err, errFeedSignerLegacyAmbiguous) {
 		t.Fatalf("two valid candidates must be an ambiguity that fails closed, got %v", err)
 	}
 	if n := legacyCount(t, store, "dual-cur"); n != 1 {
@@ -901,6 +904,290 @@ func legacyCount(t *testing.T, store *Store, opID string) int {
 		t.Fatalf("count legacy: %v", err)
 	}
 	return n
+}
+
+// TestAdoptLegacyFeedSignerOperationMultiTagCandidates drives the migration-9
+// quarantine adoption gate with a BOUNDED MULTI-CANDIDATE legacy identity set —
+// the form the signer derives from a multi-tag target repo-state document (one
+// {historical operation ID, historical request hash} per valid tag entry). The
+// quarantined row's own primary key identifies which candidate was the old
+// publication:
+//
+//   - two legacy candidates with ONE existing historical row -> that row adopts
+//     (pending promoted under the current ID/hash; succeeded promoted with the
+//     result rewritten to the current ID);
+//   - the same manifest digest under TWO tags, one existing row -> that row
+//     adopts;
+//   - TAG OVERWRITE: a quarantine row keyed by an OLDER publication's
+//     (tag, digest) that is NOT in the derived candidate set is never adopted;
+//   - TWO existing rows that both match derived candidates (two legacy tags) ->
+//     ambiguity, all rows retained;
+//   - one VALID matching row PLUS one hash-mismatched (conflicting) row ->
+//     CONFLICT with ALL rows retained — a conflicting candidate is never
+//     ignored merely because another matches;
+//   - a duplicate derived ID and an over-cap candidate list fail closed;
+//   - zero rows -> no-op (reserve current normally).
+func TestAdoptLegacyFeedSignerOperationMultiTagCandidates(t *testing.T) {
+	store := newProvisioningStore(t)
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ctx := context.Background()
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+	seed := func(opID, state, result string, hash [32]byte) {
+		t.Helper()
+		if _, err := store.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+			(operation_id, request_hash, state, result_json, created_at, updated_at)
+			values (?, ?, ?, ?, ?, ?)`, opID, hash[:], state, sql.NullString{String: result, Valid: state == "succeeded"}, nowNs, nowNs); err != nil {
+			t.Fatalf("seed legacy %s: %v", opID, err)
+		}
+	}
+	// One concrete logical publication: caller sends the CURRENT operation ID;
+	// the target doc carries multiple tags, so multiple historical identities
+	// are derived. req.Owner is supplied raw (as the m9 identity consumed it).
+	req := publish.FeedCommitRequest{
+		OperationID:        "current-multi",
+		RegistryID:         reg.ID,
+		Owner:              "0x" + testFeedOwner,
+		Topic:              topic,
+		Reference:          ref,
+		BatchID:            "batch-1",
+		ExpectedGeneration: 4,
+	}
+	reqHash := NormalizeFeedCommitHash(req)
+	hist := func(tag, digest string) LegacyOperationCandidate {
+		t.Helper()
+		id := legacyComputeOperationID(reg.ID, req.Owner, "repo1", tag, digest, req.ExpectedGeneration)
+		return LegacyOperationCandidate{OperationID: id, RequestHash: legacyFeedCommitHashFor(id, req)}
+	}
+	digA := "sha256:" + strings.Repeat("a", 64)
+	digB := "sha256:" + strings.Repeat("b", 64)
+
+	t.Run("two-candidates-one-pending-row-adopts", func(t *testing.T) {
+		c1, c2 := hist("latest", digA), hist("v2", digB)
+		seed(c1.OperationID, "pending", "", c1.RequestHash)
+		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "multi-pending", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2})
+		if err != nil || !adopted {
+			t.Fatalf("multi-tag pending adoption: adopted=%v err=%v", adopted, err)
+		}
+		op, err := store.GetFeedSignerOperation(ctx, "multi-pending")
+		if err != nil || op.State != FeedSignerOpPending || op.RequestHash != reqHash || op.RegistryID != reg.ID || op.Topic != topic {
+			t.Fatalf("adopted multi-tag pending row malformed: %+v err=%v", op, err)
+		}
+		if n := legacyCount(t, store, c1.OperationID); n != 0 {
+			t.Fatalf("adopted multi-tag pending row must be deleted, got %d", n)
+		}
+		if _, err := store.DB.ExecContext(ctx, `delete from feed_signer_operations where operation_id='multi-pending'`); err != nil {
+			t.Fatalf("reset active: %v", err)
+		}
+	})
+	t.Run("two-candidates-one-succeeded-row-adopts", func(t *testing.T) {
+		c1, c2 := hist("latest", digA), hist("v2", digB)
+		result := `{"operationID":"` + c1.OperationID + `","feed":"` + topic + `","reference":"` + ref + `"}`
+		seed(c1.OperationID, "succeeded", result, c1.RequestHash)
+		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "multi-succeeded", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2})
+		if err != nil || !adopted {
+			t.Fatalf("multi-tag succeeded adoption: adopted=%v err=%v", adopted, err)
+		}
+		op, err := store.GetFeedSignerOperation(ctx, "multi-succeeded")
+		if err != nil || op.State != FeedSignerOpSucceeded {
+			t.Fatalf("adopted multi-tag succeeded row malformed: %+v err=%v", op, err)
+		}
+		want := `{"operationID":"multi-succeeded","feed":"` + topic + `","reference":"` + ref + `"}`
+		if string(op.ResultJSON) != want {
+			t.Fatalf("succeeded result must be rewritten to the CURRENT id, got %s want %s", op.ResultJSON, want)
+		}
+		if n := legacyCount(t, store, c1.OperationID); n != 0 {
+			t.Fatalf("adopted quarantine row must be deleted, got %d", n)
+		}
+	})
+	t.Run("same-digest-two-tags-one-row-adopts", func(t *testing.T) {
+		// The SAME manifest digest under two tags: both historical identities
+		// are derived; only the "aliased" tag's row exists in quarantine.
+		cA, cB := hist("alias-a", digB), hist("alias-b", digB)
+		if cA.OperationID == cB.OperationID {
+			t.Fatal("test requires distinct historical IDs for distinct tags")
+		}
+		seed(cA.OperationID, "pending", "", cA.RequestHash)
+		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "same-digest", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{cA, cB})
+		if err != nil || !adopted {
+			t.Fatalf("same-digest multi-tag adoption: adopted=%v err=%v", adopted, err)
+		}
+		if n := legacyCount(t, store, cA.OperationID); n != 0 {
+			t.Fatalf("adopted quarantine row must be deleted, got %d", n)
+		}
+	})
+	t.Run("tag-overwrite-old-row-not-matched", func(t *testing.T) {
+		// The target doc carries latest -> digA (the value AFTER the overwrite).
+		// A quarantine row from an OLDER publication keyed by latest -> digB is
+		// NOT in the derived candidate set: it must never be adopted or deleted.
+		c := hist("latest", digA)
+		old := hist("latest", digB)
+		seed(old.OperationID, "succeeded",
+			`{"operationID":"`+old.OperationID+`","feed":"`+topic+`","reference":"`+ref+`"}`, old.RequestHash)
+		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "tag-overwrite", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c})
+		if err != nil || adopted {
+			t.Fatalf("old overwritten row must NOT adopt: adopted=%v err=%v", adopted, err)
+		}
+		if n := legacyCount(t, store, old.OperationID); n != 1 {
+			t.Fatalf("overwritten row must stay quarantined untouched, got %d", n)
+		}
+	})
+	t.Run("two-legacy-rows-ambiguity-preserves-all", func(t *testing.T) {
+		c1, c2 := hist("t-ambig-a", digA), hist("t-ambig-b", digB)
+		r1 := `{"operationID":"` + c1.OperationID + `","feed":"` + topic + `","reference":"` + ref + `"}`
+		r2 := `{"operationID":"` + c2.OperationID + `","feed":"` + topic + `","reference":"` + ref + `"}`
+		seed(c1.OperationID, "succeeded", r1, c1.RequestHash)
+		seed(c2.OperationID, "succeeded", r2, c2.RequestHash)
+		if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "two-row-ambig", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2}); !errors.Is(err, errFeedSignerLegacyAmbiguous) {
+			t.Fatalf("two matching legacy rows must be an ambiguity, got %v", err)
+		}
+		if legacyCount(t, store, c1.OperationID) != 1 || legacyCount(t, store, c2.OperationID) != 1 {
+			t.Fatal("ambiguous rows must ALL stay quarantined")
+		}
+	})
+	t.Run("valid-plus-conflict-never-ignored", func(t *testing.T) {
+		// One row matches its candidate EXACTLY; the OTHER row's stored hash
+		// differs from its candidate's historical hash. The adoption must fail
+		// CLOSED as a conflict and retain BOTH rows — a conflicting candidate is
+		// never ignored merely because another one matches.
+		c1, c2 := hist("t-conf-a", digA), hist("t-conf-b", digB)
+		seed(c1.OperationID, "pending", "", c1.RequestHash)
+		seed(c2.OperationID, "pending", "", feedSignerTestHash("corrupted-hash"))
+		if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "valid-plus-conflict", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2}); !errors.Is(err, errFeedSignerLegacyConflict) {
+			t.Fatalf("conflicting candidate must fail the whole adoption, got %v", err)
+		}
+		if legacyCount(t, store, c1.OperationID) != 1 || legacyCount(t, store, c2.OperationID) != 1 {
+			t.Fatal("conflict must retain EVERY candidate row")
+		}
+	})
+	t.Run("duplicate-derived-id-rejected", func(t *testing.T) {
+		c1 := hist("latest", digA)
+		c2 := c1
+		c2.RequestHash = feedSignerTestHash("different")
+		seed(c1.OperationID, "pending", "", c1.RequestHash)
+		if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "dup-id", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2}); !errors.Is(err, errFeedSignerLegacyMalformed) {
+			t.Fatalf("duplicate derived ID must fail closed deterministically, got %v", err)
+		}
+		if n := legacyCount(t, store, c1.OperationID); n != 1 {
+			t.Fatalf("duplicate-ID rejection must retain the row, got %d", n)
+		}
+	})
+	t.Run("candidate-cap-fails-closed", func(t *testing.T) {
+		cands := make([]LegacyOperationCandidate, feedSignerLegacyMaxCandidates+1)
+		for i := range cands {
+			cands[i] = LegacyOperationCandidate{OperationID: fmt.Sprintf("id-%d", i), RequestHash: feedSignerTestHash(fmt.Sprintf("h-%d", i))}
+		}
+		if _, err := store.AdoptLegacyFeedSignerOperation(ctx, "cap-op", reg.ID, topic, ref, reqHash, cands); !errors.Is(err, errFeedSignerLegacyMalformed) {
+			t.Fatalf("over-cap candidate list must fail closed, got %v", err)
+		}
+	})
+	t.Run("no-rows-no-op", func(t *testing.T) {
+		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "no-rows", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{hist("t-none-x", digA), hist("t-none-y", digB)})
+		if err != nil || adopted {
+			t.Fatalf("zero candidate rows must be a no-op: adopted=%v err=%v", adopted, err)
+		}
+	})
+}
+
+// TestAdoptLegacyFeedSignerOperationTwoStoresRace proves cross-Store
+// serialization: TWO independent Store instances (separate connection pools over
+// ONE on-disk database) race to adopt the SAME quarantined migration-9 row.
+// withWriteTx serializes the whole read/insert/delete under BEGIN IMMEDIATE with
+// bounded busy-retry, so exactly ONE adopter can succeed: the loser either
+// starts after the winner commits and short-circuits on the new ACTIVE row
+// (adopted=false, no error), and the quarantine row is deleted exactly once —
+// no evidence is ever lost or double-deleted. A retry by the loser then
+// resolves through the normal idempotent path.
+func TestAdoptLegacyFeedSignerOperationTwoStoresRace(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "adopt-race.db")
+	open := func() *Store {
+		t.Helper()
+		s, err := OpenSQLite(dbPath)
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		if _, err := s.DB.ExecContext(ctx, `pragma busy_timeout = 10000`); err != nil {
+			t.Fatalf("busy_timeout: %v", err)
+		}
+		t.Cleanup(func() { _ = s.DB.Close() })
+		return s
+	}
+	storeA, storeB := open(), open()
+
+	owner, err := storeA.CreateUser(ctx, "racer@example.com", "hash")
+	if err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	reg, err := storeA.CreateProvisionedRegistry(ctx, Registry{
+		Slug: "racer", Host: "racer.test", ENSName: "", OwnerUserID: owner.ID,
+		FeedOwnerAddress: testFeedOwner, DefaultStampBatchID: "batch-1", AnonymousPull: true,
+	}, newTestFeedKeyCipherForStore(t), []byte("01234567890123456789012345678901"),
+		[]byte(testAuthPayload), []byte(testStampPayload))
+	if err != nil {
+		t.Fatalf("create registry: %v", err)
+	}
+	if err := storeA.MarkRegistryReady(ctx, reg.ID); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	topic := spec.RepoStateFeedRef(testFeedOwner, testRepo)
+	ref := strings.Repeat("ab", 32)
+	req := publish.FeedCommitRequest{
+		OperationID: "race-op", RegistryID: reg.ID, Owner: "0x" + testFeedOwner,
+		Topic: topic, Reference: ref, BatchID: "batch-1", ExpectedGeneration: 4,
+	}
+	reqHash := NormalizeFeedCommitHash(req)
+	histID := legacyComputeOperationID(reg.ID, req.Owner, "repo1", "latest", "sha256:"+strings.Repeat("a", 64), req.ExpectedGeneration)
+	histHash := legacyFeedCommitHashFor(histID, req)
+	nowNs := timeToNanos(time.Now().UTC())
+	if _, err := storeA.DB.ExecContext(ctx, `insert into feed_signer_operations_legacy
+		(operation_id, request_hash, state, result_json, created_at, updated_at)
+		values (?, ?, 'pending', null, ?, ?)`, histID, histHash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("seed quarantine row: %v", err)
+	}
+
+	const n = 2
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	adopted := make([]bool, n)
+	errs := make([]error, n)
+	for i, s := range []*Store{storeA, storeB} {
+		wg.Add(1)
+		go func(i int, s *Store) {
+			defer wg.Done()
+			<-start
+			adopted[i], errs[i] = s.AdoptLegacyFeedSignerOperation(ctx, "race-op", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{{OperationID: histID, RequestHash: histHash}})
+		}(i, s)
+	}
+	close(start)
+	wg.Wait()
+
+	wins := 0
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("racer %d: unexpected adoption error: %v", i, errs[i])
+		}
+		if adopted[i] {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("exactly ONE racer must adopt, got %d (adopted=%v)", wins, adopted)
+	}
+	// Evidence: quarantine row gone exactly once; active row carries the
+	// current identity/hash.
+	if n := legacyCount(t, storeA, histID); n != 0 {
+		t.Fatalf("quarantine row must be deleted exactly once, got %d", n)
+	}
+	op, err := storeA.GetFeedSignerOperation(ctx, "race-op")
+	if err != nil || op.State != FeedSignerOpPending || op.RequestHash != reqHash {
+		t.Fatalf("active row malformed after race: %+v err=%v", op, err)
+	}
+	// A retry through the LOSER store resolves idempotently (no adoption, no
+	// error): the active row now short-circuits the adoption.
+	if adoptedRetry, err := storeB.AdoptLegacyFeedSignerOperation(ctx, "race-op", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{{OperationID: histID, RequestHash: histHash}}); err != nil || adoptedRetry {
+		t.Fatalf("loser retry must short-circuit: adopted=%v err=%v", adoptedRetry, err)
+	}
 }
 
 // TestFeedSignerResultCanonicalByteExactTriggers proves migration 12's

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"strings"
@@ -39,8 +40,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 13 {
-		t.Fatalf("expected schema version 13, got %d", version)
+	if version != 14 {
+		t.Fatalf("expected schema version 14, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -77,8 +78,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 13 {
-		t.Fatalf("expected 13 migration rows, got %d", rows)
+	if rows != 14 {
+		t.Fatalf("expected 14 migration rows, got %d", rows)
 	}
 }
 
@@ -141,8 +142,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 13 {
-		t.Fatalf("expected schema version 13 after upgrade, got %d", version)
+	if version != 14 {
+		t.Fatalf("expected schema version 14 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -1136,8 +1137,8 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 13 {
-		t.Fatalf("expected version 13, got %d", version)
+	if version != 14 {
+		t.Fatalf("expected version 14, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
 	assertInviteDigestSchema(t, db)
@@ -1155,8 +1156,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 13 {
-			t.Fatalf("expected version 13, got %d", version)
+		if version != 14 {
+			t.Fatalf("expected version 14, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		assertInviteDigestSchema(t, db)
@@ -1170,8 +1171,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 13 {
-			t.Fatalf("expected version 13, got %d", version)
+		if version != 14 {
+			t.Fatalf("expected version 14, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1213,8 +1214,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 13 {
-			t.Fatalf("expected version 13, got %d", version)
+		if version != 14 {
+			t.Fatalf("expected version 14, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})
@@ -1628,8 +1629,8 @@ func TestMigration13AcceptsValidV12OperationIDRowsUpgrade(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("valid v12 rows must upgrade to 13: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 13 {
-		t.Fatalf("expected version 13, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 14 {
+		t.Fatalf("expected version 14, got %d (err %v)", v, err)
 	}
 	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
 		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {
@@ -1641,6 +1642,443 @@ func TestMigration13AcceptsValidV12OperationIDRowsUpgrade(t *testing.T) {
 	}
 	if string(gotSuc) != sucResult {
 		t.Fatalf("succeeded row must be untouched by the upgrade: %s", gotSuc)
+	}
+}
+
+// TestMigration14OperationIDGrammarTriggers proves the migration-14 identity
+// triggers enforce the operation-ID grammar BYTE-EXACTLY — decided on the RAW
+// STORED BYTES via hex(CAST(NEW.operation_id AS BLOB)) with an ALIGNED
+// recursive byte scan, never on decoded Unicode characters — for every class of
+// malformed input the Unicode-codepoint GLOB guard (migration 13) got wrong:
+//
+//   - the reviewer's exact probe `CAST(X'F4908080' AS TEXT)` (an OUT-OF-RANGE
+//     4-byte sequence that migration 13's codepoint ranges classify as allowed),
+//   - a lone continuation byte `cast(X'80' as text)`,
+//   - overlong encodings (C0 AF), surrogate encodings (ED A0 80), truncated
+//     sequences (E2 82), out-of-range sequences (F5 90 80 80) and a lone FF,
+//   - VALID non-ASCII UTF-8 ('é', '中') — every byte >= 0x80 rejects,
+//   - NUL/control/DEL and the five Go-JSON-escaped bytes 0x22/0x26/0x3C/0x3E/0x5C,
+//   - empty and 129 bytes,
+//   - BLOB/numeric/NULL storage classes.
+//
+// It then proves every ALLOWED ASCII boundary/punctuation sample and the exact
+// 1..128 byte-length bounds pass on BOTH INSERT and UPDATE, and that the
+// canonical-result triggers are re-created AFTER the identity triggers (their
+// rowids are larger), preserving the byte-exact result-concatenation guard.
+func TestMigration14OperationIDGrammarTriggers(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 14 {
+		t.Fatalf("expected schema version 14, got %d (err %v)", v, err)
+	}
+	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
+		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {
+		t.Fatal("migration 14 must install the byte-exact operation-ID identity triggers")
+	}
+	// Identity triggers must fire BEFORE (rowid <) the canonical-result triggers
+	// so the byte-exact operation_id concatenation runs only on grammar-proven
+	// rows.
+	var idInsRowID, resInsRowID int64
+	if err := db.QueryRowContext(ctx, `select rowid from sqlite_master where type='trigger' and name='feed_signer_operation_id_ins'`).Scan(&idInsRowID); err != nil {
+		t.Fatalf("locate identity trigger: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `select rowid from sqlite_master where type='trigger' and name='feed_signer_result_integrity_ins'`).Scan(&resInsRowID); err != nil {
+		t.Fatalf("locate result trigger: %v", err)
+	}
+	if idInsRowID > resInsRowID {
+		t.Fatalf("identity trigger (rowid %d) must precede result trigger (rowid %d)", idInsRowID, resInsRowID)
+	}
+
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+	canon := func(opID string) string {
+		return string(publish.CanonicalFeedCommitResultJSON(publish.FeedCommitResult{OperationID: opID, Feed: topic, Reference: ref}))
+	}
+	ins := func(opID any, result string) error {
+		h := feedSignerTestHash("h-" + fmt.Sprint(opID))
+		_, err := db.ExecContext(ctx, `insert into feed_signer_operations
+			(operation_id, registry_id, topic, request_hash, state, result_json,
+			 claim_token, lease_until, attempts, created_at, updated_at)
+			values (?, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+			opID, reg.ID, topic, h[:], result, nowNs, nowNs)
+		return err
+	}
+	// A pending row (NULL result) to exercise the UPDATE identity trigger.
+	updHash := feedSignerTestHash("upd-base")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values ('upd-base', ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+		reg.ID, topic, updHash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("seed updatable pending row: %v", err)
+	}
+	upd := func(opID any) error {
+		_, err := db.ExecContext(ctx, `update feed_signer_operations
+			set operation_id = ? where operation_id = 'upd-base'`, opID)
+		return err
+	}
+	raw := func(hexBytes string) string {
+		// Raw stored bytes (including malformed UTF-8) as a Go string; the
+		// driver binds them verbatim (verified empirically).
+		b, err := hex.DecodeString(hexBytes)
+		if err != nil {
+			t.Fatalf("bad raw hex %q: %v", hexBytes, err)
+		}
+		return string(b)
+	}
+
+	forbidden := []struct {
+		name string
+		opID any
+	}{
+		// Reviewer-exact malformed UTF-8 probes (all previously decodable by
+		// migration 13's codepoint GLOB or misclassified by character length()).
+		{"reviewer-F4908080", raw("F4908080")},
+		{"lone-continuation-80", raw("80")},
+		{"overlong-C0AF", raw("C0AF")},
+		{"surrogate-EDA080", raw("EDA080")},
+		{"truncated-E282", raw("E282")},
+		{"overlong-C080", raw("C080")},
+		{"out-of-range-F5908080", raw("F5908080")},
+		{"lone-FF", raw("FF")},
+		{"truncated-F09F", raw("F09F")},
+		// Valid non-ASCII UTF-8: every byte >= 0x80 is forbidden by the byte
+		// grammar (é = C3 A9, 中 = E4 B8 AD — rejected by raw bytes, not by
+		// decoding).
+		{"valid-nonascii-eacute", "a\xc3\xa9b"},
+		{"valid-nonascii-han", "a\xe4\xb8\xadb"},
+		// NUL / controls / DEL.
+		{"nul", "a\x00b"},
+		{"control-01", "a\x01b"},
+		{"tab", "a	b"},
+		{"newline", "a\nb"},
+		{"control-1f", "a\x1fb"},
+		{"del", "a\x7fb"},
+		// The five Go-JSON-escaped bytes.
+		{"lt", "a<b"},
+		{"gt", "a>b"},
+		{"amp", "a&b"},
+		{"quote", `a"b`},
+		{"backslash", `a\b`},
+		// Empty and byte-length over the 128 bound.
+		{"empty", ""},
+		{"129-bytes", strings.Repeat("a", 129)},
+		// 65 chars of 'é' = 130 raw bytes but only 65 characters — the BYTE
+		// length gate must reject it (character length() would have admitted it
+		// at <= 128 chars).
+		{"65-eacute-130-bytes", strings.Repeat("\xc3\xa9", 65)},
+		// Storage-class subversion. (Numeric 42 cannot reach the predicate as a
+		// number here: the operation_id column's TEXT affinity converts it to
+		// TEXT '42'; the storage-class rejection of INTEGER is proven in the
+		// parity test through an AFFINITY-FREE subquery.)
+		{"blob", []byte("abc")},
+		{"null", nil},
+	}
+	for _, fc := range forbidden {
+		t.Run("insert/"+fc.name, func(t *testing.T) {
+			if err := ins(fc.opID, canon(fmt.Sprint(fc.opID))); err == nil {
+				t.Fatalf("INSERT with operation_id %s must be rejected by the byte-exact identity trigger", fc.name)
+			}
+		})
+		t.Run("update/"+fc.name, func(t *testing.T) {
+			// Re-anchor the update target whenever a prior subtest mutated it
+			// (an ADMITTED value would otherwise leave 'upd-base' missing and
+			// the UPDATE would silently match zero rows).
+			if _, err := db.ExecContext(ctx, `insert or ignore into feed_signer_operations
+				(operation_id, registry_id, topic, request_hash, state, result_json,
+				 claim_token, lease_until, attempts, created_at, updated_at)
+				values ('upd-base', ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+				reg.ID, topic, updHash[:], nowNs, nowNs); err != nil {
+				t.Fatalf("re-anchor updatable pending row: %v", err)
+			}
+			if err := upd(fc.opID); err == nil {
+				t.Fatalf("UPDATE to operation_id %s must be rejected by the byte-exact identity trigger", fc.name)
+			}
+		})
+	}
+	// The reviewer's exact probe with a raw byte string bound as a parameter
+	// (modernc binds Go strings as verbatim TEXT bytes, verified) must ALSO be
+	// rejected — no storage path around the byte grammar.
+	if err := ins(string([]byte{0xF4, 0x90, 0x80, 0x80}), canon("x")); err == nil {
+		t.Fatal("reviewer probe CAST(X'F4908080' AS TEXT) as a bound TEXT parameter must be rejected")
+	}
+	if err := upd(string([]byte{0x80})); err == nil {
+		t.Fatal("bound lone-continuation byte must be rejected on UPDATE")
+	}
+
+	// Every ALLOWED byte boundary and punctuation sample passes on INSERT
+	// (canonical result, so only the identity trigger decides) and UPDATE.
+	valid := []string{
+		strings.Repeat("a", 64),  // current ComputeOperationID form
+		strings.Repeat("a", 128), // exact upper byte bound (128 ASCII bytes)
+		"op-idA1-2.3_4:5",        // punctuation, no forbidden byte
+		"~!%^()+,-./:=?@[]{|}~",  // printable 0x20..0x7e minus the five
+		" ",                      // 0x20 lower boundary
+		"~",                      // 0x7e upper boundary
+		"a b c",                  // literal 0x20 spaces are allowed bytes
+	}
+	for _, opID := range valid {
+		if err := ins(opID, canon(opID)); err != nil {
+			t.Fatalf("INSERT with valid operation_id %q must succeed: %v", opID, err)
+		}
+	}
+	for _, opID := range []string{"upd-valid-1", "upd-" + strings.Repeat("a", 128)} {
+		if err := upd(opID); err != nil {
+			t.Fatalf("UPDATE to valid operation_id %q must succeed: %v", opID, err)
+		}
+	}
+}
+
+// TestMigration14OperationIDGrammarParityExhaustive proves SQL and Go agree
+// EXHAUSTIVELY on the migration-14 BYTE-EXACT grammar: every ASCII byte value,
+// embedded boundary/forbidden bytes, control runs, VALID non-ASCII UTF-8
+// runes, and RAW MALFORMED UTF-8 byte sequences of every form (lone
+// continuation, overlong, surrogate, truncated, out-of-range, lone lead/FF),
+// plus the byte-length bounds, `publish.ValidateOperationID` accepts exactly
+// when the migration-14 SQL predicate accepts. The expected (Go) and actual
+// (SQL) sides are independent implementations — the SQL predicate is a
+// hand-written constant and the Go side is the production validator. NULL is
+// invalid in SQL (no Go equivalent).
+func TestMigration14OperationIDGrammarParityExhaustive(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	pred := strings.ReplaceAll(feedSignerOperationIDGrammarCondV14, "NEW.operation_id", "operation_id")
+	q := `select ` + pred + ` from (select ? as operation_id)`
+	sqlBad := func(s any) int {
+		var bad int
+		if err := db.QueryRowContext(ctx, q, s).Scan(&bad); err != nil {
+			t.Fatalf("evaluate SQL predicate for %v: %v", s, err)
+		}
+		return bad
+	}
+	// Raw-byte variants run through a TEXT literal so byte-exactness is decided
+	// by SQLite alone (no driver-bound-string dependency for the malformed set).
+	qRaw := func(hexBytes string) int {
+		var bad int
+		query := `select ` + pred + ` from (select cast(X'` + hexBytes + `' as text) as operation_id)`
+		if err := db.QueryRowContext(ctx, query).Scan(&bad); err != nil {
+			t.Fatalf("evaluate raw SQL predicate X'%s': %v", hexBytes, err)
+		}
+		return bad
+	}
+
+	var cases []string
+	// Every single ASCII byte value, 0x00..0x7f.
+	for b := 0; b <= 0x7f; b++ {
+		cases = append(cases, string([]byte{byte(b)}))
+	}
+	// Boundary/forbidden bytes embedded in a longer identifier.
+	for _, b := range []byte{0x00, 0x01, 0x09, 0x0a, 0x1f, 0x20, '"', '\\', '<', '>', '&', '~', 0x7f} {
+		cases = append(cases, "a"+string([]byte{b})+"b")
+	}
+	// Accepted punctuation and alphanumerics in context.
+	for _, s := range []string{"a-b_c.d:e", "A1-2.3_4:5", "0x9f", "hello world", "~!%^()+,-./:=?@[]{|}~"} {
+		cases = append(cases, s)
+	}
+	// VALID non-ASCII UTF-8 runes: Go and SQLite agree the raw BYTES reject.
+	for _, r := range []rune{0x80, 0x9f, 0xe9, 0xff, 0x2028, 0x2029, 0x4e2d, 0xfffd, 0x10ffff} {
+		cases = append(cases, "a"+string(r)+"b")
+	}
+	// Byte-length bounds.
+	cases = append(cases, strings.Repeat("a", 128), strings.Repeat("a", 129))
+	cases = append(cases, strings.Repeat("\xc3\xa9", 65), strings.Repeat("\xc3\xa9", 64))
+
+	for _, s := range cases {
+		goBad := publish.ValidateOperationID(s) != nil
+		sb := sqlBad(s)
+		if goBad != (sb == 1) {
+			t.Fatalf("parity mismatch for %q: Go valid=%v, SQL invalid=%d", s, !goBad, sb)
+		}
+	}
+
+	// Raw MALFORMED UTF-8 byte sequences — the byte-exact delta over migration
+	// 13. The Go side sees the same bytes; both must reject.
+	rawCases := []string{
+		"F4908080", // reviewer probe: out-of-range 4-byte sequence
+		"80",       // lone continuation
+		"C0AF",     // overlong 2-byte
+		"C080",     // overlong 2-byte (NUL)
+		"EDA080",   // surrogate encoding
+		"EDBFBF",   // surrogate encoding (max)
+		"E282",     // truncated 3-byte
+		"F09F",     // truncated 4-byte
+		"F5908080", // out-of-range 4-byte
+		"FF",       // lone FF
+		"C0",       // lone lead
+		"F490",     // truncated 4-byte lead pair
+		"E28241",   // truncated 3-byte then ASCII
+		"F09F92",   // truncated 4-byte
+	}
+	for _, hx := range rawCases {
+		var raw []byte
+		for i := 0; i < len(hx); i += 2 {
+			var v int
+			if _, err := fmt.Sscanf(hx[i:i+2], "%02x", &v); err != nil {
+				t.Fatalf("parse hex %s: %v", hx, err)
+			}
+			raw = append(raw, byte(v))
+		}
+		goBad := publish.ValidateOperationID(string(raw)) != nil
+		sb := qRaw(hx)
+		if goBad != (sb == 1) {
+			t.Fatalf("raw parity mismatch for X'%s': Go valid=%v, SQL invalid=%d", hx, !goBad, sb)
+		}
+		if goBad != true {
+			t.Fatalf("malformed bytes X'%s' must be invalid in Go", hx)
+		}
+	}
+	// Negative control: a VALID raw 3-byte sequence must be rejected by BOTH
+	// (bytes >= 0x80) — and the alignment scan must agree.
+	if sb := qRaw("E282A1"); sb != 1 {
+		t.Fatalf("valid UTF-8 raw bytes must reject at the byte level, SQL=%d", sb)
+	}
+	if goBad := publish.ValidateOperationID("\xe2\x82\xa1") != nil; !goBad {
+		t.Fatal("valid UTF-8 raw bytes must reject in Go")
+	}
+	// A SQL NULL must be invalid (guard not bypassable via NULL).
+	if sb := sqlBad(nil); sb != 1 {
+		t.Fatalf("NULL operation_id must be invalid, SQL predicate=%d", sb)
+	}
+	// Storage classes must reject (byte grammar is text-only).
+	for _, v := range []any{[]byte("abc"), 42, 3.14} {
+		if sb := sqlBad(v); sb != 1 {
+			t.Fatalf("storage class %T must be invalid, SQL predicate=%d", v, sb)
+		}
+	}
+}
+
+// TestMigration14RejectsInvalidV13OperationIDRollsBack proves migration 14's
+// atomic hardening: a v13 database whose active PENDING row carries a
+// MALFORMED-UTF-8 operation_id — admitted by v13's Unicode-codepoint GLOB
+// guard, which classifies CAST(X'F4908080' AS TEXT) as an allowed codepoint —
+// causes migration 14 to FAIL and roll back byte-identically: the version
+// stays 13, and sqlite_master, the migration count, and the offending row are
+// all byte-identical. No silent rewrite, deletion, or quarantine of invalid
+// active state, ever.
+func TestMigration14RejectsInvalidV13OperationIDRollsBack(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 13); err != nil {
+		t.Fatalf("apply through v13: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	nowNs := timeToNanos(time.Now().UTC())
+
+	// The reviewer's exact probe: a TEXT value carrying the raw bytes
+	// F4 90 80 80 (an out-of-range UTF-8 sequence). v13's codepoint GLOB guard
+	// DECODES it into characters its allowed ranges admit, so v13 accepts it —
+	// this is precisely the malformed-UTF-8 hole migration 14 closes.
+	badID := string([]byte{0xF4, 0x90, 0x80, 0x80})
+	badHash := feedSignerTestHash("f4908080")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values (?, ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+		badID, reg.ID, topic, badHash[:], nowNs, nowNs); err != nil {
+		t.Fatalf("v13 must admit the malformed-UTF-8 operation_id (the migration-14 gap): %v", err)
+	}
+
+	preSchema := dumpSQLiteSchema(t, db)
+	preRow := dumpOperationRow(t, db, badID)
+	preMigs := migrationCount(t, db)
+
+	if err := ApplyMigrations(ctx, db); err == nil {
+		t.Fatal("migration 14 must fail when hardening encounters a malformed-UTF-8 v13 operation_id")
+	}
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 13 {
+		t.Fatalf("version must stay 13 on adversarial migration 14, got %d (err %v)", v, err)
+	}
+	if got := migrationCount(t, db); got != preMigs {
+		t.Fatalf("schema_migrations must be untouched after rollback: had %d, now %d", preMigs, got)
+	}
+	if !bytes.Equal(dumpSQLiteSchema(t, db), preSchema) {
+		t.Fatal("sqlite_master must be byte-identical after migration 14 rollback (no trigger installed)")
+	}
+	if got := dumpOperationRow(t, db, badID); !bytes.Equal(got, preRow) {
+		t.Fatalf("offending row must be byte-identical after rollback: %q", got)
+	}
+}
+
+// TestMigration14AcceptsValidV13OperationIDRowsUpgrade proves the supported
+// upgrade: every schema-admitted v13 active row whose operation_id obeys the
+// BYTE-EXACT grammar (the 64-hex ComputeOperationID forms and valid printable
+// punctuation) upgrades to version 14 cleanly, with the byte-exact identity
+// triggers installed (a subsequent malformed-UTF-8 INSERT is rejected, where
+// v13 admitted it) and every row intact.
+func TestMigration14AcceptsValidV13OperationIDRowsUpgrade(t *testing.T) {
+	db := openRawTestDB(t)
+	ctx := context.Background()
+	if err := applyMigrationsThrough(ctx, db, 13); err != nil {
+		t.Fatalf("apply through v13: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+	ref := strings.Repeat("ab", 32)
+	nowNs := timeToNanos(time.Now().UTC())
+
+	pendingIDs := []string{strings.Repeat("a", 64), "op-idA1-2.3_4:5"}
+	for _, opID := range pendingIDs {
+		ph := feedSignerTestHash(opID)
+		if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+			(operation_id, registry_id, topic, request_hash, state, result_json,
+			 claim_token, lease_until, attempts, created_at, updated_at)
+			values (?, ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+			opID, reg.ID, topic, ph[:], nowNs, nowNs); err != nil {
+			t.Fatalf("seed pending %q: %v", opID, err)
+		}
+	}
+	sucOp := strings.Repeat("b", 64)
+	sucResult := string(publish.CanonicalFeedCommitResultJSON(publish.FeedCommitResult{OperationID: sucOp, Feed: topic, Reference: ref}))
+	sh := feedSignerTestHash(sucOp)
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values (?, ?, ?, ?, 'succeeded', ?, null, null, 0, ?, ?)`,
+		sucOp, reg.ID, topic, sh[:], sucResult, nowNs, nowNs); err != nil {
+		t.Fatalf("seed succeeded %q: %v", sucOp, err)
+	}
+
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("valid v13 rows must upgrade to 14: %v", err)
+	}
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 14 {
+		t.Fatalf("expected version 14, got %d (err %v)", v, err)
+	}
+	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
+		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {
+		t.Fatal("byte-exact identity triggers must be installed after upgrade")
+	}
+	// The hardened guard now rejects what v13 admitted.
+	postHash := feedSignerTestHash("post-upgrade")
+	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
+		(operation_id, registry_id, topic, request_hash, state, result_json,
+		 claim_token, lease_until, attempts, created_at, updated_at)
+		values (cast(X'F4908080' as text), ?, ?, ?, 'pending', null, null, null, 0, ?, ?)`,
+		reg.ID, topic, postHash[:], nowNs, nowNs); err == nil {
+		t.Fatal("post-upgrade malformed-UTF-8 operation_id must be rejected")
+	}
+	var gotSuc []byte
+	if err := db.QueryRowContext(ctx, `select result_json from feed_signer_operations where operation_id = ?`, sucOp).Scan(&gotSuc); err != nil {
+		t.Fatal(err)
+	}
+	if string(gotSuc) != sucResult {
+		t.Fatalf("succeeded row must be untouched by the upgrade: %s", gotSuc)
+	}
+	var pendCount int
+	if err := db.QueryRowContext(ctx, `select count(*) from feed_signer_operations where state='pending'`).Scan(&pendCount); err != nil {
+		t.Fatal(err)
+	}
+	if pendCount != len(pendingIDs) {
+		t.Fatalf("pending rows must be untouched by the upgrade, got %d", pendCount)
 	}
 }
 

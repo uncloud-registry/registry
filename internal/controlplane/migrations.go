@@ -342,6 +342,27 @@ var migrations = []migration{
 		Version: 13,
 		Apply:   installFeedSignerOperationStoreV13,
 	},
+	// Version 14 replaces migration 13's operation-ID identity triggers — whose
+	// Unicode CODEPOINT GLOB guard (`[char(128)-char(0x10ffff)]` ranges over
+	// DECODED characters) can admit MALFORMED UTF-8, e.g. a pending row keyed by
+	// `CAST(X'F4908080' AS TEXT)` whose decoded character the codepoint ranges
+	// classify as allowed — with BYTE-EXACT identity triggers over
+	// `hex(CAST(NEW.operation_id AS BLOB))` that accept a value iff EVERY stored
+	// byte is an allowed ASCII byte 0x20..0x7e minus the five Go-JSON-escaped
+	// bytes `"` `\` `<` `>` `&`, with byte length 1..128. Malformed UTF-8 of all
+	// forms (lone continuation bytes, overlong/surrogate/out-of-range sequences,
+	// truncated sequences) is rejected by its raw bytes, never decoded, and
+	// BLOB/numeric/NULL storage classes are rejected via typeof(). It reinstalls
+	// the byte-exact canonical-result triggers AFTER the identity triggers (the
+	// migration-13 ordering) and ATOMICALLY hardens every existing active row via
+	// a guarded self-update: any schema-admitted old-v13 row whose operation_id
+	// (or byte length) violates the byte-exact grammar aborts the migration and
+	// rolls back byte-identically (version stays 13, no schema/trigger/data
+	// touched). Fresh installs run 1→13→14; every valid v13 database upgrades.
+	{
+		Version: 14,
+		Apply:   installFeedSignerOperationStoreV14,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

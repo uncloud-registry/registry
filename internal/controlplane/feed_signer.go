@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -102,14 +103,23 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 
 	// Adopt any quarantined migration-9 row for this operation on this FIRST
 	// request (before reservation). A quarantined row is located atomically by
-	// the CURRENT operation ID OR the DERIVED historical migration-9 operation
-	// ID, and its stored request hash must match the algorithm/identity of the
-	// row it claims (see legacyComputeOperationID / deriveLegacyOperationID);
-	// a differing hash under either identity is a hard conflict (a reused
-	// OperationID with different input), a malformed legacy succeeded result
-	// fails closed and stays quarantined, and TWO distinct valid candidates are
-	// an ambiguity that fails closed (never accidentally adopt a different
-	// logical request). The historical ID is only ever derived here to RECOGNIZE
+	// the CURRENT operation ID OR ANY DERIVED HISTORICAL migration-9 operation
+	// ID (see deriveLegacyCandidates): for EVERY valid tag entry in the
+	// immutable target repo-state document at req.Reference, the exact
+	// historical operation ID (registry/owner/repo/that tag/that manifest
+	// digest/expected generation) and the exact historical request hash
+	// (legacyFeedCommitHashFor over the reconstructed historical request whose
+	// OperationID is that historical ID) are derived, deterministically sorted
+	// and bounded; the quarantined row's own primary key identifies which
+	// candidate was the old publication (this also works when the feed advanced
+	// after the historical success — the immutable target document still
+	// identifies the row; no predecessor comparison is needed). A candidate row
+	// with a differing hash under any claimed identity is a hard conflict (a
+	// reused OperationID with different input), a malformed legacy succeeded
+	// result fails closed and stays quarantined, and MORE THAN ONE valid
+	// candidate row (current+legacy, or two legacy tags) is an ambiguity that
+	// fails closed — a conflicting candidate is never ignored merely because
+	// another matches. The historical ID is only ever derived here to RECOGNIZE
 	// a logically-identical m9 row; it is never used as a new active operation
 	// ID — the promoted active row always carries the CURRENT operation ID and
 	// CURRENT request hash. The round-3 legacy hash — the historical framing
@@ -117,17 +127,17 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	// real m9 row (whose operation ID was the historical value), so it is
 	// replaced here by the historical hash over the reconstructed historical
 	// request (OperationID := the derived historical ID).
-	var legacyOpID string
-	var legacyHash [32]byte
+	var legacyCands []LegacyOperationCandidate
 	if n, err := s.Store.LegacyOperationCount(ctx); err == nil && n > 0 {
-		if id, ok := s.deriveLegacyOperationID(ctx, req); ok {
-			legacyOpID = id
-			legacyHash = legacyFeedCommitHashFor(id, req)
-		}
+		legacyCands = s.deriveLegacyCandidates(ctx, req)
 	}
-	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash, legacyOpID, legacyHash)
+	_, aerr := s.Store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, req.RegistryID, canonicalTopic, publish.CanonicalReference(req.Reference), reqHash, legacyCands)
 	if aerr != nil {
-		if errors.Is(aerr, errFeedSignerLegacyConflict) {
+		if errors.Is(aerr, errFeedSignerLegacyConflict) || errors.Is(aerr, errFeedSignerLegacyAmbiguous) {
+			// A conflicting or ambiguous quarantine identity is a hard user-visible
+			// conflict: ALL quarantine rows are retained and the feed is never
+			// advanced (fail closed, never adopt a row a conflicting candidate was
+			// matched against).
 			return publish.FeedCommitResult{}, errFeedSignerConflict
 		}
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: adopt legacy operation: %v", errFeedSignerBackend, aerr)
@@ -597,59 +607,87 @@ func legacyComputeOperationID(registryID int64, owner, repo, tag, manifestDigest
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// deriveLegacyOperationID deterministically reconstructs the exact historical
-// migration-9 operation ID for the logical publication this request represents,
-// by recovering the repository identity from the referenced target repo-state
-// document:
+// feedSignerLegacyDocMaxBytes bounds the target repo-state document read for
+// legacy candidate derivation. There is no proven bound on the resolve.Reader
+// interface (a reader may return arbitrary bytes), so the legacy derivation
+// imposes a local, explicit cap: a document larger than this fails closed
+// (no candidates, no adoption) rather than decoding an unbounded payload. 1 MiB
+// is far beyond any legitimate repo-state document (which carries a bounded set
+// of tag/digest entries plus manifest/blob descriptors) and is deliberately
+// local to this task — it does not preempt a shared reader-level bound.
+const feedSignerLegacyDocMaxBytes = 1 << 20 // 1 MiB
+
+// deriveLegacyCandidates deterministically reconstructs the EXACT historical
+// migration-9 operation identity candidates for the logical publication this
+// request represents, by recovering the repository identity from the referenced
+// target repo-state document:
 //
-//   - repo  = the target document's canonical Repo,
-//   - tag   = the single unambiguous tag the document carries (the tag the
-//     operation published — the manifest-Digest value, exactly as the data
-//     plane's ComputeOperationID argument),
-//   - manifestDigest = that tag's manifest digest, and
-//   - registry/owner/expectedGeneration from the request.
+//   - the document is read at req.Reference with a local byte bound and parsed
+//     with the EXISTING spec validation (spec.DecodeRepoStateDocument), so an
+//     unreadable, oversized, or malformed document fails closed;
+//   - repo  = the target document's canonical Repo;
+//   - for EVERY VALID tag entry (tag → manifest digest) of the document (a
+//     multi-tag repository — the normal case after tags are overwritten,
+//     retagged, or aliased — never requires a single-tag target), the exact
+//     historical operation ID is derived via the migration-only
+//     legacyComputeOperationID over registry/owner/repo/that tag/that digest/
+//     expected generation, and the exact historical request hash via
+//     legacyFeedCommitHashFor (the historical framing over the reconstructed
+//     historical request whose OperationID is that historical ID) — the only
+//     byte sequence a real m9 row keyed by that ID can store;
+//   - candidates are deterministically sorted (by derived operation ID);
+//   - explicit safe bounds are enforced: the document byte size and the tag
+//     candidate count are capped (feedSignerLegacyDocMaxBytes /
+//     feedSignerLegacyMaxCandidates), a malformed tag/digest entry fails the
+//     WHOLE set closed, and a duplicate derived ID (an ambiguity — two entries
+//     collapsing to one historical identity) fails the whole set closed.
 //
-// It then applies the migration-only legacyComputeOperationID calculator. This
-// is only ever a RECOGNITION key to find a logically-identical quarantined m9
-// row keyed by that historical ID; it is never used as a new active operation
-// ID.
-//
-// It returns ok=false — and the caller then skips the historical-ID branch —
-// whenever the repository identity is not DETERMINISTICALLY recoverable here:
-// the document cannot be read at the request reference, the document has any
-// number of tags other than one (multiple tags would make the tag/digest
-// ambiguous, so deriving a wrong historical ID and potentially adopting a
-// different logical request is refused), or the single tag is malformed. This
-// is the fail-closed ambiguity guarantee the adoption path requires: a
-// multi-tag or unreadable repository simply cannot be bridged to an exact
-// historical ID and the m9 row stays quarantined rather than risk a wrong
-// adoption.
-func (s *FeedSigner) deriveLegacyOperationID(ctx context.Context, req publish.FeedCommitRequest) (string, bool) {
+// Empty/no-valid/oversized/ambiguous candidate sets return nil and the caller
+// fails closed with NO adoption (the m9 rows stay quarantined rather than risk
+// a wrong adoption). This is only ever a RECOGNITION key set to find a
+// logically-identical quarantined m9 row; the historical IDs are never used as
+// new active operation IDs.
+func (s *FeedSigner) deriveLegacyCandidates(ctx context.Context, req publish.FeedCommitRequest) []LegacyOperationCandidate {
 	data, err := s.Docs.Read(ctx, req.Reference)
 	if err != nil {
-		return "", false
+		return nil
 	}
-	var doc struct {
-		Repo string            `json:"repo"`
-		Tags map[string]string `json:"tags"`
+	if len(data) > feedSignerLegacyDocMaxBytes {
+		return nil
 	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return "", false
+	doc, err := spec.DecodeRepoStateDocument(data)
+	if err != nil {
+		return nil
 	}
-	if doc.Repo == "" || len(doc.Tags) != 1 {
-		return "", false
+	if len(doc.Tags) > feedSignerLegacyMaxCandidates {
+		return nil
 	}
-	var tag, digest string
-	var hasTag bool
-	for t, d := range doc.Tags {
-		tag, digest, hasTag = t, d, true
-	}
-	if !hasTag || tag == "" || digest == "" || !publish.IsHexReference(digest[strings.LastIndexByte(digest, ':')+1:]) {
+	cands := make([]LegacyOperationCandidate, 0, len(doc.Tags))
+	seen := make(map[string]struct{}, len(doc.Tags))
+	for tag, digest := range doc.Tags {
 		// The manifest digest must be a 64-hex immutable reference (after any
-		// "sha256:" prefix); a malformed value cannot reproduce an exact ID.
-		return "", false
+		// "sha256:" prefix), exactly as the data plane supplied it to the
+		// historical ComputeOperationID; a malformed value means the entry's
+		// identity cannot be reproduced EXACTLY, so the whole set fails closed.
+		if !publish.IsHexReference(digest[strings.LastIndexByte(digest, ':')+1:]) {
+			return nil
+		}
+		id := legacyComputeOperationID(req.RegistryID, req.Owner, doc.Repo, tag, digest, req.ExpectedGeneration)
+		if _, dup := seen[id]; dup {
+			// Two distinct tag entries collapsed to one historical identity:
+			// the quarantine row's primary key could not disambiguate them.
+			return nil
+		}
+		seen[id] = struct{}{}
+		cands = append(cands, LegacyOperationCandidate{OperationID: id, RequestHash: legacyFeedCommitHashFor(id, req)})
 	}
-	return legacyComputeOperationID(req.RegistryID, req.Owner, doc.Repo, tag, digest, req.ExpectedGeneration), true
+	sort.Slice(cands, func(i, j int) bool { return cands[i].OperationID < cands[j].OperationID })
+	if len(cands) == 0 {
+		// An empty candidate set (no valid tags) is the same fail-closed outcome
+		// as an unreadable document: nil means "do not attempt adoption".
+		return nil
+	}
+	return cands
 }
 
 // decodeStoredResult STRICTLY decodes a stored succeeded result JSON: duplicate
