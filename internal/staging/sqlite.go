@@ -3,6 +3,7 @@ package staging
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -780,13 +781,19 @@ type dbPool struct {
 	ch       chan *sql.Conn // buffered (size N); NEVER closed
 	closing  chan struct{}  // closed once by the shutdown owner
 	done     chan struct{}  // closed exactly once when shutdown fully completes; never replaced
+	poisonCh chan struct{}  // closed once when the pool is quarantined (poisoned)
 	mu       sync.Mutex
 	cond     *sync.Cond
 	closed   bool
+	poisoned bool
 	borrowed int
 	// shutdownStarted is set under mu by the single task that owns the drain
 	// (the caller that transitioned open→closing); every other Close joins it.
 	shutdownStarted bool
+	// closedConns counts handles the pool itself closed (retire, drain, or a
+	// release after closing/poisoning) — test-observable, so a broken handle
+	// can be proven closed exactly once.
+	closedConns int
 
 	// closeHook is a test-only observation barrier fired by the shutdown owner
 	// at named boundaries ("marked", "drained", "dbclose", "done"); nil in
@@ -798,16 +805,22 @@ type dbPool struct {
 // channel.
 func newDBPool(db *sql.DB, size int) *dbPool {
 	p := &dbPool{
-		db:      db,
-		ch:      make(chan *sql.Conn, size),
-		closing: make(chan struct{}),
-		done:    make(chan struct{}),
+		db:       db,
+		ch:       make(chan *sql.Conn, size),
+		closing:  make(chan struct{}),
+		done:     make(chan struct{}),
+		poisonCh: make(chan struct{}),
 	}
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
 
 var errPoolClosed = errors.New("staging database pool is closed")
+
+// errPoolPoisoned is the fixed data-free error every acquire returns once the
+// pool is poisoned; it unwraps to ErrDependency, so callers and tests match
+// it with errors.Is(err, ErrDependency).
+var errPoolPoisoned = typed(ErrDependency, errors.New("staging database pool poisoned"))
 
 // openStagingPool opens and verifies the staging database exactly like
 // openStagingDB (with the connection count bounded and every physical
@@ -862,6 +875,10 @@ func (p *dbPool) acquire(ctx context.Context) (*sql.Conn, error) {
 		return nil, err
 	}
 	p.mu.Lock()
+	if p.poisoned {
+		p.mu.Unlock()
+		return nil, errPoolPoisoned
+	}
 	if p.closed {
 		p.mu.Unlock()
 		return nil, errPoolClosed
@@ -870,9 +887,24 @@ func (p *dbPool) acquire(ctx context.Context) (*sql.Conn, error) {
 	p.mu.Unlock()
 	select {
 	case c := <-p.ch:
-		// Reservation converts into the borrow: the handle is accounted for
-		// before close() could observe an idle pool, so close() now waits
-		// for its release.
+		// A poison that landed after the reservation must not hand out a
+		// handle: quarantine is atomic, so the received handle is closed
+		// here instead of borrowed (accounted exactly once either way).
+		p.mu.Lock()
+		if p.poisoned {
+			if p.borrowed > 0 {
+				p.borrowed--
+			}
+			p.closedConns++
+			p.cond.Broadcast()
+			p.mu.Unlock()
+			_ = c.Close()
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
+			return nil, errPoolPoisoned
+		}
+		p.mu.Unlock()
 		return c, nil
 	case <-ctx.Done():
 		p.releaseReservation()
@@ -884,7 +916,22 @@ func (p *dbPool) acquire(ctx context.Context) (*sql.Conn, error) {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
+		// A poisoned pool is quarantined even when a Close lands on the same
+		// wake: the fixed dependency error stays the poison answer.
+		p.mu.Lock()
+		poisoned := p.poisoned
+		p.mu.Unlock()
+		if poisoned {
+			return nil, errPoolPoisoned
+		}
 		return nil, errPoolClosed
+	case <-p.poisonCh:
+		p.releaseReservation()
+		// The caller's own cancellation, when it fired, is authoritative.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		return nil, errPoolPoisoned
 	}
 }
 
@@ -902,15 +949,17 @@ func (p *dbPool) releaseReservation() {
 // release hands the handle back. Returning the handle to the channel and
 // decrementing the borrow happen in ONE critical section, so close() can
 // only observe an idle pool (borrowed == 0) once every returned handle is
-// back in the channel and can drain the exact retained set. After close the
-// handle is closed here instead (never sent, so there can never be a send
-// on a closed channel — the channel is never closed — and never leaked).
+// back in the channel and can drain the exact retained set. After close or
+// poison the handle is closed here instead (never sent, so there can never
+// be a send on a closed channel — the channel is never closed — and never
+// leaked).
 func (p *dbPool) release(c *sql.Conn) {
 	p.mu.Lock()
 	if p.borrowed > 0 {
 		p.borrowed--
 	}
-	if p.closed {
+	if p.closed || p.poisoned {
+		p.closedConns++
 		p.cond.Broadcast()
 		p.mu.Unlock()
 		_ = c.Close()
@@ -921,6 +970,50 @@ func (p *dbPool) release(c *sql.Conn) {
 	p.ch <- c
 	p.cond.Broadcast()
 	p.mu.Unlock()
+}
+
+// poison atomically quarantines the pool: no acquire — blocked or fresh —
+// succeeds from here on (each fails with the fixed dependency error while
+// the caller's own context error stays authoritative), every handle released
+// into the pool afterwards is closed instead of reused, and a later close()
+// still drains and joins the single shutdown completion. It is idempotent.
+func (p *dbPool) poison() {
+	p.mu.Lock()
+	if !p.poisoned {
+		p.poisoned = true
+		close(p.poisonCh)
+	}
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+// retire permanently removes a broken retained connection from the pool: the
+// handle is closed (never returned to the channel) and — best-effort — the
+// PHYSICAL connection is closed too, so any transaction or SQLite write lock
+// it still carries is released instead of lingering in the sql.DB pool.
+// Retiring without poisoning shrinks the retained capacity, so callers
+// retire only when they poison the pool. The handle is closed by the pool
+// exactly once.
+func (p *dbPool) retire(c *sql.Conn) {
+	if c == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.borrowed > 0 {
+		p.borrowed--
+	}
+	p.closedConns++
+	p.cond.Broadcast()
+	p.mu.Unlock()
+	// The Raw close makes the *sql.Conn permanently broken: the database/sql
+	// pool will discard it instead of reusing it when Conn.Close is called.
+	_ = c.Raw(func(dc any) error {
+		if d, ok := dc.(driver.Conn); ok {
+			return d.Close()
+		}
+		return nil
+	})
+	_ = c.Close()
 }
 
 // close linearizes staging-pool shutdown so every concurrent or later Close
@@ -975,15 +1068,22 @@ func (p *dbPool) close() {
 	// The channel is frozen once `closed` is set: release() closes rather
 	// than re-sends during closing, and no post-close acquire can receive, so
 	// draining here lands exactly the retained idle handles and closes each.
+	var drained []*sql.Conn
 	for {
 		select {
 		case c := <-p.ch:
-			_ = c.Close()
+			drained = append(drained, c)
 		default:
 			goto drainFinished
 		}
 	}
 drainFinished:
+	p.mu.Lock()
+	p.closedConns += len(drained)
+	p.mu.Unlock()
+	for _, c := range drained {
+		_ = c.Close()
+	}
 	if p.closeHook != nil {
 		p.closeHook("dbclose")
 	}

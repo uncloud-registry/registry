@@ -98,6 +98,7 @@ type service struct {
 	commitHook       func() error // fires before COMMIT
 	createBarrier    func()       // fires after both durable files exist, before activation
 	postActivateHook func()       // fires immediately after the activation commit, before token-file removal
+	truncateHook     func() error // fires before the rollback tail-truncate (fault injection)
 }
 
 // NewService constructs the durable staging service: it validates and
@@ -164,29 +165,45 @@ func (s *service) Close() error {
 // BUSY/LOCKED with bounded context-aware backoff), executes fn on that
 // connection, and COMMITs. Any failure rolls back; a busy failure
 // mid-transaction retries the WHOLE read-decision-write body, never a single
-// statement.
+// statement, with a FRESH pooled connection so an attempt whose rollback
+// itself failed is never reused.
 //
-// Panic safety: runTxAttempt installs the rollback BEFORE invoking the
-// callback and guarantees the transaction is rolled back on EVERY
-// non-committed exit — including a panic from the callback or from an
-// io.Reader it drives (Append copies inside fn). A connection with BEGIN
-// active is therefore never released back to the pool, the panic still
-// propagates to the caller, and a recovered caller finds a clean pool.
+// Panic safety: runTxAttempt installs the restoration/rollback protocol
+// BEFORE invoking the callback and guarantees the transaction is rolled back
+// — or, when the restoration or rollback cannot be confirmed safe, the
+// broken connection is permanently retired and the pool atomically poisoned
+// — on EVERY non-committed exit, including a panic from the callback or from
+// an io.Reader it drives (Append copies inside fn). A connection with BEGIN
+// active is therefore never released back to the pool, the ORIGINAL panic
+// value still propagates to the caller, and a recovered caller either finds
+// a clean pool or a fixed, data-free poisoned pool.
 func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) error {
+	return s.withTxCleanup(ctx, fn, nil)
+}
+
+// withTxCleanup is withTx plus an optional restoration hook that runs INSIDE
+// the transaction attempt — while the BEGIN IMMEDIATE write lock is still
+// held — on every non-committed exit, before the rollback. Append registers
+// its file restoration here so an interrupted append truncates and fsyncs
+// its tail before the serialization point can pass to another writer, and so
+// a restoration failure can atomically poison the pool before the
+// connection is released.
+func (s *service) withTxCleanup(ctx context.Context, fn func(conn *sql.Conn) error, onFailure func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	conn, err := s.pool.acquire(ctx)
-	if err != nil {
-		return err
-	}
-	defer s.pool.release(conn)
-
 	for attempt := 0; attempt < maxTxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		conn, err := s.pool.acquire(ctx)
+		if err != nil {
+			return err
+		}
 		if _, err := conn.ExecContext(ctx, "begin immediate"); err != nil {
+			// No transaction was started: the handle is healthy and returns
+			// to the pool.
+			s.pool.release(conn)
 			if isBusyLocked(err) {
 				if waitErr := busyWait(ctx, attempt); waitErr != nil {
 					return waitErr
@@ -198,12 +215,17 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 			}
 			return typed(ErrDependency, err)
 		}
-
-		runErr := s.runTxAttempt(ctx, conn, fn)
+		// BEGIN succeeded: runTxAttempt owns this connection for the rest of
+		// the attempt — it releases, retires, or poisons on every exit.
+		runErr := s.runTxAttempt(ctx, conn, fn, onFailure)
 		if runErr == nil {
 			return nil
 		}
 		if isBusyLocked(runErr) && ctx.Err() == nil {
+			// fn failed mid-transaction with a busy result: the attempt has
+			// already restored the file (Append), rolled back, and released
+			// (or retired+poisoned, if the rollback itself failed) the
+			// connection. Retry the WHOLE body with a fresh acquire.
 			if waitErr := busyWait(ctx, attempt); waitErr != nil {
 				return waitErr
 			}
@@ -215,27 +237,115 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 }
 
 // runTxAttempt executes one begin/fn/commit cycle on a connection that is
-// already inside BEGIN IMMEDIATE. The rollback defer is installed FIRST and
-// the recover defer SECOND, so on a panic the recover re-raises only after
-// the rollback has run — the connection leaving this function never carries
-// an open transaction, committed or not (commit success disables the
-// rollback).
-func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn *sql.Conn) error) error {
+// already inside BEGIN IMMEDIATE, and OWNS that connection for the whole
+// attempt. The restoration defer is installed FIRST and the recover defer
+// SECOND, so on a panic the recover captures the ORIGINAL value without
+// re-raising, the restoration protocol completes (callback cleanup under the
+// write lock, then ROLLBACK), the connection is released — or, when the
+// cleanup or rollback cannot be confirmed safe, permanently retired and the
+// pool atomically poisoned BEFORE the connection's serialization is released
+// — and only then is the original panic re-raised. Commit success disables
+// the rollback entirely, so a durable commit is never reported as a failure.
+func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn *sql.Conn) error, onFailure func() error) (err error) {
 	committed := false
+	var (
+		panicked any
+		didPanic bool
+	)
 	defer func() {
-		if !committed {
-			// Best-effort rollback on every non-committed exit. The
-			// callback, the commit hook, and COMMIT itself all run above
-			// this defer, so a panic from any of them is covered too.
-			_, _ = conn.ExecContext(context.Background(), "rollback")
+		if committed {
+			// The transaction committed durably: the rollback is disabled and
+			// the connection is clean — release it and let the success stand.
+			s.pool.release(conn)
+			return
+		}
+		uncertain := false
+		var (
+			cleanupErr   error
+			cleanupPanic any
+		)
+		if onFailure != nil {
+			// 1. Callback-specific restoration runs while the write lock is
+			// still held: an interrupted append truncates and fsyncs its tail
+			// BEFORE the serialization point can pass to another writer. A
+			// panicking restoration is always uncertainty; a FAILING
+			// restoration is uncertainty on the PANIC path (nothing else can
+			// report it), while on an ordinary error path it folds into the
+			// returned error exactly like the pre-existing contract (the
+			// truncate result is itself durable and a sync failure
+			// propagates), leaving the pool usable.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						cleanupPanic = r
+						uncertain = true
+					}
+				}()
+				if cerr := onFailure(); cerr != nil {
+					if didPanic {
+						uncertain = true
+					} else {
+						cleanupErr = cerr
+					}
+				}
+			}()
+		}
+		// 2. ROLLBACK — its result is never discarded. When the transaction
+		// is already gone (a commit that errored durably executed, or the
+		// driver ended it), the connection is clean and the operation result
+		// stands as-is: a durable commit is never reported as a failure.
+		if !uncertain {
+			if _, rbErr := conn.ExecContext(context.Background(), "rollback"); rbErr != nil && !txAlreadyEnded(rbErr) {
+				uncertain = true
+			}
+		}
+		if uncertain {
+			// The connection (or the state under it) can no longer be
+			// trusted: atomically quarantine the pool BEFORE the
+			// connection's serialization is released, permanently retire the
+			// broken handle (closed exactly once, never returned to the
+			// pool), and surface the fixed data-free dependency — or the
+			// exact context error when the caller's own context fired. A
+			// panic always propagates: the ORIGINAL value when one exists,
+			// otherwise the restoration panic itself.
+			s.pool.poison()
+			s.pool.retire(conn)
+			if didPanic {
+				panic(panicked)
+			}
+			if cleanupPanic != nil {
+				panic(cleanupPanic)
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				err = cerr
+			} else {
+				err = typed(ErrDependency, err)
+			}
+			return
+		}
+		s.pool.release(conn)
+		if cleanupErr != nil {
+			// Ordinary-path restoration failure: the rollback succeeded and
+			// the connection is healthy; surface the fixed dependency with
+			// the restoration cause retained only privately.
+			if cerr := ctx.Err(); cerr != nil {
+				err = cerr
+			} else {
+				err = typed(ErrDependency, errors.Join(err, cleanupErr))
+			}
+		}
+		if didPanic {
+			panic(panicked)
 		}
 	}()
-	// Recover must be registered AFTER the rollback defer so the rollback
-	// runs (it is invoked by the re-panic unwinding) before the panic
-	// propagates; the panic value is preserved.
+	// Recover is registered AFTER the restoration defer (so the restoration
+	// runs, invoked by the re-panic unwinding, before the panic escapes) and
+	// captures WITHOUT re-raising: the defer above re-raises the IDENTICAL
+	// value after the invariants are restored.
 	defer func() {
 		if r := recover(); r != nil {
-			panic(r)
+			didPanic = true
+			panicked = r
 		}
 	}()
 
@@ -246,17 +356,30 @@ func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn
 		}
 	}
 	if runErr == nil {
-		if _, err := conn.ExecContext(ctx, "commit"); err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				runErr = cerr
+		if _, cerr := conn.ExecContext(ctx, "commit"); cerr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				runErr = ctxErr
 			} else {
-				runErr = typed(ErrDependency, err)
+				runErr = typed(ErrDependency, cerr)
 			}
 		} else {
 			committed = true
 		}
 	}
 	return runErr
+}
+
+// txAlreadyEnded reports whether a ROLLBACK failed because no transaction
+// is active at all: the transaction ended without our commit (a COMMIT that
+// returned an error durably executed, or the driver already ended it). There
+// is nothing to roll back and the connection is clean — the operation result
+// stands as-is and is never turned into an uncertainty.
+func txAlreadyEnded(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no transaction is active") || strings.Contains(msg, "cannot rollback")
 }
 
 // queryer abstracts the pinned *sql.Conn used inside withTx.
@@ -799,21 +922,48 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 	var fd *os.File
 	var oldOffset int64
 	var result Session
-	// Panic safety: a panicking source reader (or hook) unwinds through
-	// withTx, which rolls the transaction back; here the same unwind must
-	// close the append descriptor and truncate the uncommitted tail back to
-	// the pre-append offset so neither an fd nor uncommitted bytes survive.
-	defer func() {
-		if r := recover(); r != nil {
-			if fd != nil {
-				_ = fd.Truncate(oldOffset)
-				_ = s.syncFile(fd)
-				_ = fd.Close()
-			}
-			panic(r)
+	// restoreTail runs INSIDE the transaction attempt on every non-committed
+	// exit — a panicking reader, a hook fault, or any ordinary error — while
+	// the BEGIN IMMEDIATE write lock is still held: the uncommitted tail is
+	// truncated exactly back to the pre-append offset, the truncation is
+	// fsynced (a sync failure propagates before any success), and the
+	// descriptor is settled, BEFORE the serialization point can pass to
+	// another writer — so an interrupted append can never erase bytes another
+	// service committed after the lock was released. Cleanup settles each
+	// attempt's descriptor at most once. A failure of the restoration is
+	// cleanup uncertainty: runTxAttempt atomically poisons the pool and
+	// retires the connection before it can be reused, and the ORIGINAL panic
+	// or error still propagates with no raw path/offset/panic detail in the
+	// returned error surface.
+	restoreTail := func() error {
+		f := fd
+		if f == nil {
+			return nil
 		}
-	}()
-	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		fd = nil
+		var errs []error
+		if s.truncateHook != nil {
+			if terr := s.truncateHook(); terr != nil {
+				errs = append(errs, terr)
+			}
+		}
+		if len(errs) == 0 {
+			if terr := f.Truncate(oldOffset); terr != nil {
+				errs = append(errs, terr)
+			}
+		}
+		if len(errs) == 0 {
+			if serr := s.syncFile(f); serr != nil {
+				errs = append(errs, serr)
+			}
+		}
+		if cerr := f.Close(); cerr != nil {
+			errs = append(errs, cerr)
+		}
+		return errors.Join(errs...)
+	}
+
+	err := s.withTxCleanup(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
 			return err // exact context error or raw mapped below
@@ -880,21 +1030,14 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 		sess.Offset = newOffset
 		result = sess
 		return nil
-	})
+	}, restoreTail)
 	if fd != nil {
-		// Any failure after bytes were written (source error, overflow,
-		// fsync, update, or commit) must leave the file exactly at the
-		// committed offset: a partial append is never accepted. The rollback
-		// truncate is itself made durable and a sync failure propagates, so
-		// the tail cannot reappear after an acknowledged failure.
-		if err != nil {
-			if terr := fd.Truncate(oldOffset); terr != nil {
-				err = typed(ErrDependency, terr)
-			} else if serr := s.syncFile(fd); serr != nil {
-				err = typed(ErrDependency, serr)
-			}
-		}
+		// The attempt committed: restoreTail only runs on non-committed
+		// exits, so settle the descriptor here. A close fault after the
+		// durable commit never turns success into failure (the bytes are
+		// already fsynced and the offset committed).
 		_ = fd.Close()
+		fd = nil
 	}
 	if err != nil {
 		return Session{}, err
