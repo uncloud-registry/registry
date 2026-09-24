@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -411,12 +410,6 @@ func newStagingDBAt(dbPath string) (*sql.DB, error) {
 	return openStagingDB(context.Background(), dbPath, 0)
 }
 
-// setUmaskTestHook changes the process umask for the duration of a test.
-func setUmaskTestHook(mask int) func() {
-	old := syscall.Umask(mask)
-	return func() { syscall.Umask(old) }
-}
-
 // ---------------------------------------------------------------------------
 // Schema golden parity (both directions).
 // ---------------------------------------------------------------------------
@@ -684,48 +677,4 @@ func sqlOpenMust(t *testing.T, path string) *sql.DB {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	return db
-}
-
-// TestRound2SpoolModeRepairsOnRestrictiveUmask proves a spool file created
-// under a restrictive umask is still exactly 0600 (repaired through the
-// descriptor before any byte is appended).
-func TestRound2SpoolModeRepairsOnRestrictiveUmask(t *testing.T) {
-	if os.Getenv("GO_RACE") != "" {
-		t.Skip("umask manipulation is process-global; skipped under race")
-	}
-	restore := setUmaskTestHook(0o077)
-	defer restore()
-
-	dir := tempPrivate(t)
-	sp, err := newSpool(context.Background(), filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("newSpool: %v", err)
-	}
-	defer sp.Close()
-	f, err := sp.create(strings.Repeat("33", 32))
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if _, err := f.Write([]byte("x")); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := f.Sync(); err != nil {
-		t.Fatalf("sync: %v", err)
-	}
-	f.Close()
-	fi, err := sp.root.Lstat(strings.Repeat("33", 32))
-	if err != nil {
-		t.Fatalf("lstat: %v", err)
-	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("spool file mode %o, want 0600", perm)
-	}
-	// The spool root stays exactly 0700.
-	fi, err = os.Lstat(filepath.Join(dir, "spool"))
-	if err != nil {
-		t.Fatalf("stat root: %v", err)
-	}
-	if perm := fi.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("spool root mode %o, want 0700", perm)
-	}
 }

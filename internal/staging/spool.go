@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 // spoolErrorKind identifies fail-closed filesystem divergences so the
@@ -84,18 +83,20 @@ type spool struct {
 // trusted descriptor anchor — absolute "/" for absolute paths, the
 // descriptor-opened CWD (".") for relative ones. Each component is Lstat'd
 // in the CURRENT root: a symlink or non-directory is rejected, a missing
-// component is created (exactly 0700, umask-proof) only when enforce is
-// true, an existing component's mode is verified and repaired through the
-// anchored parent descriptor (a no-exec child is opened read-only by name
-// from the parent and fchmod'd — never chmod'd through a path), then
-// OpenRoot'd and compared against a post-open snapshot so a swap of any
-// component is detected. The deepest whole path is never Lstat'd or
-// OpenRoot'd directly. Only the components BELOW the anchor may be created
-// or mode-repaired, always through the anchored descriptor; OS-standard
-// symlink prefixes (/var, /tmp) therefore reject the path rather than being
-// followed. The final directory is verified and repaired to exactly 0700.
-// When enforce is false (the implied "." parent of a bare database name)
-// only the anchor is opened and nothing is created or modified.
+// component is created exactly 0700 without touching the process umask (an
+// anchored, no-follow descriptor repair re-bases a restrictive umask) only
+// when enforce is true, an existing component's mode is verified and
+// repaired through the anchored parent descriptor (a no-exec child is
+// opened read-only by name from the parent and fchmod'd — never through a
+// raw path), then OpenRoot'd and compared against a post-open snapshot so a
+// swap of any component is detected. The deepest whole path is never Lstat'd
+// or OpenRoot'd directly. Only the components BELOW the anchor may be
+// created or mode-repaired, always through the anchored descriptor;
+// OS-standard symlink prefixes (/var, /tmp) therefore reject the path rather
+// than being followed. The final directory is verified and repaired to
+// exactly 0700. When enforce is false (the implied "." parent of a bare
+// database name) only the anchor is opened and nothing is created or
+// modified.
 func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 	if path == "" {
 		return nil, spoolErr(spoolErrGeneric, errors.New("empty directory path"))
@@ -151,7 +152,7 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 				anchor.Close()
 				return nil, spoolErr(spoolErrGeneric, errors.New("path component does not exist"))
 			}
-			if err := mkdirPrivate(anchor, comp); err != nil {
+			if err := createPrivateDir(anchor, comp); err != nil {
 				anchor.Close()
 				return nil, err
 			}
@@ -216,21 +217,59 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 	return anchor, nil
 }
 
-// mkdirPrivate creates a subdirectory of root with EXACTLY 0700 regardless
-// of the process umask. The umask is cleared for the single mkdir syscall
-// and restored immediately; the bitwise effect can only ever ADD the bits
-// explicitly requested (0700) — it can never make the directory looser than
-// requested — and the resulting mode is verified afterwards. The service
-// constructor is the only caller and never runs concurrently with other
-// goroutines at that point.
-func mkdirPrivate(root *os.Root, comp string) error {
-	old := syscall.Umask(0)
+// createPrivateDir creates comp as a subdirectory of the anchored parent
+// root with EXACTLY 0700 WITHOUT ever touching the process umask (a
+// process-global knob a library/service must not mutate — the constructor
+// genuinely can run concurrently with unrelated file creation). The
+// requested owner-only 0700 carries no group/other bits, so ordinary umasks
+// (022, 002, 077) cannot loosen it and no repair is needed. Only an
+// unusually restrictive umask that strips OWNER bits (e.g. 0777 -> 0000)
+// loosens it; that is repaired through the anchored parent with a
+// descriptor-relative, no-follow fchmodat (Root.Chmod, AT_SYMLINK_NOFOLLOW)
+// bound to the freshly created child, then verified. If the repair cannot
+// succeed the creation FAILS CLOSED and the attributable residue (the child
+// WE just created) is removed through the same anchored parent — never a
+// raw path chmod, never an umask change.
+func createPrivateDir(root *os.Root, comp string) error {
+	created := false
 	err := root.Mkdir(comp, 0o700)
-	syscall.Umask(old)
-	if err != nil && !errors.Is(err, os.ErrExist) {
+	switch {
+	case err == nil:
+		created = true
+	case errors.Is(err, os.ErrExist):
+		// A pre-existing entry is not ours; descent (Lstat + verifyPrivateDir
+		// on the final component) handles its identity and mode through the
+		// anchored parent. Never touch it here.
+		return nil
+	default:
 		return spoolErr(spoolErrGeneric, err)
 	}
-	return nil
+	fi, err := root.Lstat(comp)
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		if created {
+			_ = root.Remove(comp)
+		}
+		if err != nil {
+			return spoolErr(spoolErrGeneric, err)
+		}
+		return spoolErr(spoolErrGeneric, errors.New("path component is not a real directory"))
+	}
+	if fi.Mode().Perm() == 0o700 {
+		return nil
+	}
+	// Restrictive umask stripped owner bits. Repair through the anchored
+	// parent descriptor on the freshly created name; verify the exact mode
+	// AND that the entry is still the same inode before accepting.
+	if cerr := root.Chmod(comp, 0o700); cerr == nil {
+		afi, lerr := root.Lstat(comp)
+		if lerr == nil && os.SameFile(fi, afi) && afi.Mode().Perm() == 0o700 {
+			return nil
+		}
+	}
+	if created {
+		_ = root.Remove(comp)
+	}
+	return spoolErr(spoolErrGeneric, errors.New("cannot create private directory under restrictive umask"))
 }
 
 // verifyPrivateDir confirms the descriptor-relative name is a real

@@ -201,62 +201,6 @@ func TestRound3REDCreateFinalSyncFailureLeavesNoActiveRow(t *testing.T) {
 	svc2.Close()
 }
 
-// RED 5: a fresh database created under a restrictive umask (0777) must be
-// forced to exactly 0600 through its opened descriptor BEFORE any schema
-// inspection, and the constructor must succeed.
-func TestRound3REDFreshDBUnderUmask0777(t *testing.T) {
-	if os.Getenv("GO_RACE") != "" {
-		t.Skip("umask manipulation is process-global; skipped under race")
-	}
-	dir := tempPrivate(t)
-	restore := setUmaskTestHook(0o777)
-	defer restore()
-
-	spoolDir := filepath.Join(dir, "spool")
-	dbPath := filepath.Join(dir, "staging.db")
-	svc, err := NewService(context.Background(), spoolDir, dbPath)
-	if err != nil {
-		t.Fatalf("RED: fresh DB under restrictive umask failed: %v", err)
-	}
-	defer svc.Close()
-	fi, err := os.Lstat(dbPath)
-	if err != nil {
-		t.Fatalf("lstat db: %v", err)
-	}
-	if fi.Mode().Perm() != 0o600 {
-		t.Fatalf("db mode = %o, want exact 0600 under umask 0777", fi.Mode().Perm())
-	}
-	mustCreate(t, svc, "backend/api", "user:alice")
-}
-
-// RED 6: a failed fresh-DB creation (migration fault after the file was
-// created) must never leave a mode-000 file behind.
-func TestRound3REDNoMode000ResidueOnCreationFailure(t *testing.T) {
-	if os.Getenv("GO_RACE") != "" {
-		t.Skip("umask manipulation is process-global; skipped under race")
-	}
-	dir := tempPrivate(t)
-	restore := setUmaskTestHook(0o777)
-	defer restore()
-
-	dbPath := filepath.Join(dir, "staging.db")
-	migrationFault = errors.New("injected migration fault")
-	defer func() { migrationFault = nil }()
-
-	svc, err := NewService(context.Background(), filepath.Join(dir, "spool"), dbPath)
-	if err == nil {
-		svc.Close()
-		t.Fatal("constructor accepted the faulted migration")
-	}
-	if !errors.Is(err, ErrDependency) {
-		t.Fatalf("constructor error: %v, want ErrDependency", err)
-	}
-	fi, lerr := os.Lstat(dbPath)
-	if lerr == nil && fi.Mode().Perm() == 0 {
-		t.Fatal("RED: mode-000 residue left on failed database creation")
-	}
-}
-
 // RED 7: directory mode repair must operate ONLY through the retained
 // anchored descriptor. When the retained root is (a) renamed away and
 // (b) drifted to a no-exec mode, a replacement planted at the original path

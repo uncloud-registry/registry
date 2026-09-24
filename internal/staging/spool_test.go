@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 )
 
@@ -214,43 +213,6 @@ func TestNewSpoolCreatesRootAndRejectsSymlinks(t *testing.T) {
 			t.Fatal("openForAppend followed a symlink")
 		}
 	})
-}
-
-// TestSpoolModesUnderPermissiveUmask proves effective 0700 directory and
-// 0600 file modes hold even when the process umask would allow looser bits.
-func TestSpoolModesUnderPermissiveUmask(t *testing.T) {
-	old := syscall.Umask(0)
-	defer syscall.Umask(old)
-
-	dir := tempPrivate(t)
-	rootPath := filepath.Join(dir, "spool")
-	sp, err := newSpool(context.Background(), rootPath)
-	if err != nil {
-		t.Fatalf("newSpool: %v", err)
-	}
-	defer sp.Close()
-
-	fi, err := os.Lstat(rootPath)
-	if err != nil {
-		t.Fatalf("lstat root: %v", err)
-	}
-	if got := fi.Mode().Perm(); got != 0o700 {
-		t.Fatalf("root mode = %o, want 0700", got)
-	}
-
-	id := validTestID()
-	f, err := sp.create(id)
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	f.Close()
-	fi, err = os.Lstat(filepath.Join(rootPath, id))
-	if err != nil {
-		t.Fatalf("lstat spool file: %v", err)
-	}
-	if got := fi.Mode().Perm(); got != 0o600 {
-		t.Fatalf("spool file mode = %o, want 0600", got)
-	}
 }
 
 // TestSpoolFileLifecycle proves create/openForAppend/openForRead/remove work

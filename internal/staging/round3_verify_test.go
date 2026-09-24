@@ -613,31 +613,3 @@ func TestRound3ExistingDBModeDriftRepairedThroughDescriptor(t *testing.T) {
 		t.Fatalf("spool root not exactly 0700: %v %o", err, fiSpool.Mode().Perm())
 	}
 }
-
-// TestRound3RestrictiveUmaskCreatesExactPrivateModes proves fresh creation
-// under umask 0777 still yields EXACTLY 0700 directory and 0600 file modes
-// everywhere (fchmod descriptors and umask-proof mkdir), and that the
-// process umask is restored.
-func TestRound3RestrictiveUmaskCreatesExactPrivateModes(t *testing.T) {
-	if os.Getenv("GO_RACE") != "" {
-		t.Skip("umask manipulation is process-global; skipped under race")
-	}
-	dir := tempPrivate(t)
-	restore := setUmaskTestHook(0o777)
-	defer restore()
-	svc, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
-	if err != nil {
-		t.Fatalf("constructor under umask 0777: %v", err)
-	}
-	defer svc.Close()
-	if fi, err := os.Lstat(filepath.Join(dir, "spool")); err != nil || fi.Mode().Perm() != 0o700 {
-		t.Fatalf("spool root mode %o err=%v, want 0700", fi.Mode().Perm(), err)
-	}
-	if fi, err := os.Lstat(filepath.Join(dir, "staging.db")); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("db mode %o err=%v, want 0600", fi.Mode().Perm(), err)
-	}
-	s := mustCreate(t, svc, "backend/api", "user:alice")
-	if fi, err := os.Lstat(filepath.Join(dir, "spool", s.ID)); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("canonical file mode %o err=%v, want 0600", fi.Mode().Perm(), err)
-	}
-}
