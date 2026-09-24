@@ -147,6 +147,13 @@ func (s *service) Close() error {
 // connection, and COMMITs. Any failure rolls back; a busy failure
 // mid-transaction retries the WHOLE read-decision-write body, never a single
 // statement.
+//
+// Panic safety: runTxAttempt installs the rollback BEFORE invoking the
+// callback and guarantees the transaction is rolled back on EVERY
+// non-committed exit — including a panic from the callback or from an
+// io.Reader it drives (Append copies inside fn). A connection with BEGIN
+// active is therefore never released back to the pool, the panic still
+// propagates to the caller, and a recovered caller finds a clean pool.
 func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -174,27 +181,7 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 			return typed(ErrDependency, err)
 		}
 
-		runErr := fn(conn)
-		if runErr == nil && s.commitHook != nil {
-			if hookErr := s.commitHook(); hookErr != nil {
-				runErr = typed(ErrDependency, hookErr)
-			}
-		}
-		committed := false
-		if runErr == nil {
-			if _, err := conn.ExecContext(ctx, "commit"); err != nil {
-				if cerr := ctx.Err(); cerr != nil {
-					runErr = cerr
-				} else {
-					runErr = typed(ErrDependency, err)
-				}
-			} else {
-				committed = true
-			}
-		}
-		if !committed {
-			_, _ = conn.ExecContext(context.Background(), "rollback")
-		}
+		runErr := s.runTxAttempt(ctx, conn, fn)
 		if runErr == nil {
 			return nil
 		}
@@ -207,6 +194,51 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 		return runErr
 	}
 	return typed(ErrDependency, errors.New("staging transaction serialization exceeded retry bound"))
+}
+
+// runTxAttempt executes one begin/fn/commit cycle on a connection that is
+// already inside BEGIN IMMEDIATE. The rollback defer is installed FIRST and
+// the recover defer SECOND, so on a panic the recover re-raises only after
+// the rollback has run — the connection leaving this function never carries
+// an open transaction, committed or not (commit success disables the
+// rollback).
+func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn *sql.Conn) error) error {
+	committed := false
+	defer func() {
+		if !committed {
+			// Best-effort rollback on every non-committed exit. The
+			// callback, the commit hook, and COMMIT itself all run above
+			// this defer, so a panic from any of them is covered too.
+			_, _ = conn.ExecContext(context.Background(), "rollback")
+		}
+	}()
+	// Recover must be registered AFTER the rollback defer so the rollback
+	// runs (it is invoked by the re-panic unwinding) before the panic
+	// propagates; the panic value is preserved.
+	defer func() {
+		if r := recover(); r != nil {
+			panic(r)
+		}
+	}()
+
+	runErr := fn(conn)
+	if runErr == nil && s.commitHook != nil {
+		if hookErr := s.commitHook(); hookErr != nil {
+			runErr = typed(ErrDependency, hookErr)
+		}
+	}
+	if runErr == nil {
+		if _, err := conn.ExecContext(ctx, "commit"); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				runErr = cerr
+			} else {
+				runErr = typed(ErrDependency, err)
+			}
+		} else {
+			committed = true
+		}
+	}
+	return runErr
 }
 
 // queryer abstracts the pinned *sql.Conn used inside withTx.
@@ -229,9 +261,10 @@ type sessionRow struct {
 	mediaType              sql.NullString
 	size                   sql.NullInt64
 	createToken            sql.NullString
+	cleanupToken           sql.NullString
 }
 
-const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size, create_token`
+const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size, create_token, cleanup_token`
 
 func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool, error) {
 	var row sessionRow
@@ -239,7 +272,7 @@ func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool,
 		`select `+sessionColumns+` from upload_sessions where id = ?`, id).
 		Scan(&row.id, &row.repo, &row.actor, &row.state, &row.offset,
 			&row.createdNanos, &row.expiresNanos, &row.digest, &row.beeRef,
-			&row.mediaType, &row.size, &row.createToken)
+			&row.mediaType, &row.size, &row.createToken, &row.cleanupToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -312,23 +345,34 @@ func buildSession(row *sessionRow) Session {
 //	       token-free by construction.
 //	verify re-read the token file and compare constant-time with the row
 //	       token; anything else fails closed before activation is attempted.
-//	Tx 2   activate: creating→active with create_token cleared, guarded by
-//	       `state='creating' AND create_token=? AND created_at=?`.
-//	PhaseR remove the token file and fsync the directory — the LAST failure
-//	       point. If this (or any earlier phase) fails, Create returns a
-//	       data-free dependency error and NEVER leaves a durable active row:
-//	       a pre-activation failure rolls the creating row back (tombstone →
-//	       remove attributable files → delete row); a post-activation failure
-//	       rolls the ACTIVE row back through the same tombstone protocol.
+//	Tx 2   activate: creating→active with create_token cleared and the token
+//	       atomically moved INTO cleanup_token (the durable post-activation
+//	       sidecar provenance), guarded by `state='creating' AND
+//	       create_token=? AND created_at=?` — THE POINT OF NO RETURN. From
+//	       this commit on the session is durably valid and Create returns it
+//	       truthfully whatever happens next; the token sidecar is ONLY ever
+//	       removed as a sidecar, never as a rollback of the active row.
+//	PhaseR remove the token file, fsync the directory, then clear
+//	       cleanup_token in a guarded transaction. Any failure here leaves
+//	       durable provenance (cleanup_token + the authenticated .tok file)
+//	       that startup reconciliation finishes; Create STILL returns the
+//	       committed active session. The canonical payload is NEVER touched
+//	       by this cleanup, so bytes accepted by a concurrent Append are
+//	       safe by construction.
+//	Pre-activation failures (Phases T/C/verify/Tx2) roll the creating row
+//	back (tombstone → remove attributable files → delete row) and return a
+//	data-free dependency error, and NEVER leave a durable active row.
 //
 // Crash points are therefore all attributable and recoverable: no durable
 // `active` row can exist whose canonical file is not already empty,
-// token-free, and fsynced; every interrupted create converges to a
-// tombstoned (deleting) row that a later run finishes, or to live creating
-// residue that only its creator (holding the lease) may activate. Startup
-// re-reads the current row state/token/lease inside the serialized decision
-// and never acts on a stale snapshot, so a row concurrently activated and
-// truncated by its creator is never rejected.
+// token-free, and fsynced; every interrupted create converges either to a
+// tombstoned (deleting) row that a later run finishes, to live creating
+// residue that only its creator (holding the lease) may activate, or — after
+// the point of no return — to a committed active session with a pending
+// sidecar cleanup that startup finishes. Startup re-reads the current row
+// state/token/lease inside the serialized decision and never acts on a stale
+// snapshot, so a row concurrently activated and truncated by its creator is
+// never rejected.
 func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Duration) (Session, error) {
 	if err := validateRepo(repo); err != nil {
 		return Session{}, err
@@ -436,13 +480,16 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 	// Activate: creating -> active, guarded by token and lease anchor so
 	// only this creator can activate this exact row. The canonical file is
 	// already empty, token-free, and durable, so the moment this commits
-	// the session is a fully valid active session.
+	// the session is a fully valid active session. The create token is
+	// atomically cleared and moved into cleanup_token — THE POINT OF NO
+	// RETURN: every later failure leaves the committed session intact and
+	// only ever defers sidecar cleanup.
 	activated := false
 	err = s.withTx(ctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'active', create_token = null
+			`update upload_sessions set state = 'active', create_token = null, cleanup_token = ?
 			 where id = ? and state = 'creating' and create_token = ? and created_at = ?`,
-			id, token, createdNanos)
+			token, id, token, createdNanos)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
@@ -468,13 +515,17 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		s.postActivateHook()
 	}
 
-	// Phase R: token-file removal — the final token-clearing step, itself
-	// durable (directory fsync). On failure the create must NOT leave a
-	// durable active row: the active row is rolled back through the
-	// tombstone protocol and a data-free dependency error is returned.
-	if err := s.removeTokDurable(id); err != nil {
-		_ = s.rollbackActivatedCreate(ctx, id)
-		return Session{}, typed(ErrDependency, err)
+	// Phase R: token-sidecar removal — the FINAL token-clearing step, itself
+	// durable (directory fsync), followed by clearing the cleanup provenance
+	// in a guarded transaction. This is pure sidecar maintenance: the
+	// canonical payload is never touched. Any failure leaves the durable
+	// provenance (cleanup_token + the authenticated .tok file) for startup
+	// reconciliation, and Create STILL returns the committed active session
+	// — a committed activation is never reported as failed solely because
+	// post-commit cleanup could not finish.
+	rctx := context.WithoutCancel(ctx)
+	if err := s.removeTokDurable(id); err == nil {
+		_ = s.clearCleanupToken(rctx, id, token)
 	}
 	return Session{
 		ID:        id,
@@ -544,7 +595,7 @@ func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 	proceed := false
 	if err := s.withTx(rctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(rctx,
-			`update upload_sessions set state = 'deleting', create_token = null
+			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null
 			 where id = ? and state = 'creating' and create_token = ?`, id, token)
 		if err != nil {
 			return typed(ErrDependency, err)
@@ -573,41 +624,57 @@ func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 	return err
 }
 
-// rollbackActivatedCreate reverts a create whose activation COMMITTED but
-// whose final token-clearing step failed: the active row is tombstoned
-// (guarded on state='active' — its id is fresh and unguessable, so only the
-// creating caller can race it), its files are removed, and the row is
-// deleted. The result is a converged, recoverable state instead of a
-// durable active row paired with a failed create.
-func (s *service) rollbackActivatedCreate(ctx context.Context, id string) error {
-	rctx := context.WithoutCancel(ctx)
-	proceed := false
-	if err := s.withTx(rctx, func(conn *sql.Conn) error {
-		res, err := conn.ExecContext(rctx,
-			`update upload_sessions set state = 'deleting' where id = ? and state = 'active'`, id)
-		if err != nil {
+// clearCleanupToken clears the durable post-activation sidecar provenance
+// once the token sidecar is durably gone (or verified absent). The guarded
+// update — `cleanup_token = ? AND state IN (active,finalized)` — makes it
+// idempotent across instances and a no-op once another instance (or a
+// tombstone) already resolved the row. It runs under a cancellation-proof
+// context so a committed create always converges.
+func (s *service) clearCleanupToken(ctx context.Context, id, token string) error {
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx,
+			`update upload_sessions set cleanup_token = null
+			 where id = ? and cleanup_token = ? and state in ('active', 'finalized')`, id, token); err != nil {
 			return typed(ErrDependency, err)
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return typed(ErrDependency, err)
-		}
-		proceed = n == 1
 		return nil
-	}); err != nil {
+	})
+}
+
+// finishTokCleanup is the startup (and retry) path for a committed
+// activation whose token-sidecar removal is still pending: it removes the
+// sidecar ONLY when it provably carries exactly the row's cleanup token,
+// fsyncs the directory, and clears the cleanup provenance. A sidecar that
+// is absent is treated as already removed (the metadata is cleared); a
+// sidecar carrying foreign or empty bytes is NEVER removed, the provenance
+// is retained, and the startup fails closed with the foreign leaf untouched.
+func (s *service) finishTokCleanup(ctx context.Context, id, token string) error {
+	if token == "" {
+		// No provenance at all: nothing is authenticated to remove, and a
+		// leftover <id>.tok is benign residue (Phase C tolerates it). The
+		// row itself is already clean.
+		return nil
+	}
+	_, exists, err := s.spool.tokInfo(id)
+	if err != nil {
+		return typed(ErrDependency, err)
+	}
+	if !exists {
+		// The sidecar is already gone (its unlink succeeded before the
+		// directory sync faulted, or another instance removed it): clear the
+		// durable provenance.
+		return s.clearCleanupToken(ctx, id, token)
+	}
+	if err := s.verifyCreatingTok(ctx, id, token); err != nil {
+		// The sidecar does not carry OUR token: foreign/empty residue is
+		// NEVER removed and the provenance is retained (fail closed,
+		// untouched).
 		return err
 	}
-	if !proceed {
-		return nil
+	if err := s.removeTokDurable(id); err != nil {
+		return err
 	}
-	if err := s.removeFiles(id); err != nil {
-		return typed(ErrDependency, err)
-	}
-	if err := s.syncDir(); err != nil {
-		return typed(ErrDependency, err)
-	}
-	_, err := s.deleteTombstonedRow(rctx, id)
-	return err
+	return s.clearCleanupToken(ctx, id, token)
 }
 
 // deleteTombstonedRow removes the metadata row of a deleting tombstone and
@@ -714,6 +781,20 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 	var fd *os.File
 	var oldOffset int64
 	var result Session
+	// Panic safety: a panicking source reader (or hook) unwinds through
+	// withTx, which rolls the transaction back; here the same unwind must
+	// close the append descriptor and truncate the uncommitted tail back to
+	// the pre-append offset so neither an fd nor uncommitted bytes survive.
+	defer func() {
+		if r := recover(); r != nil {
+			if fd != nil {
+				_ = fd.Truncate(oldOffset)
+				_ = s.syncFile(fd)
+				_ = fd.Close()
+			}
+			panic(r)
+		}
+	}()
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
@@ -1072,7 +1153,7 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 			return nil // tombstone already durable
 		}
 		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting', create_token = null where id = ? and state <> 'deleting'`, id)
+			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
@@ -1203,7 +1284,7 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 			return nil
 		}
 		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting', create_token = null where id = ? and state <> 'deleting'`, id)
+			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
@@ -1273,7 +1354,7 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 	var rows []rowInfo
 	// Phase A: durable-consistent snapshot.
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
-		r, err := conn.QueryContext(ctx, `select id, state, offset, created_at, create_token from upload_sessions`)
+		r, err := conn.QueryContext(ctx, `select id, state, offset, created_at, create_token, cleanup_token from upload_sessions`)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
@@ -1283,14 +1364,15 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 				return ctx.Err()
 			}
 			var ri rowInfo
-			var tok sql.NullString
-			if err := r.Scan(&ri.id, &ri.state, &ri.offset, &ri.createdNanos, &tok); err != nil {
+			var tok, cleanup sql.NullString
+			if err := r.Scan(&ri.id, &ri.state, &ri.offset, &ri.createdNanos, &tok, &cleanup); err != nil {
 				if cerr := ctx.Err(); cerr != nil {
 					return cerr
 				}
 				return typed(ErrDependency, err)
 			}
 			ri.token = tok.String
+			ri.cleanupToken = cleanup.String
 			rows = append(rows, ri)
 		}
 		if err := r.Err(); err != nil {
@@ -1331,6 +1413,14 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 		case StateActive, StateFinalized:
 			if err := s.spool.align(ri.id, ri.offset); err != nil {
 				return typed(ErrDependency, err)
+			}
+			// A committed activation with a pending sidecar cleanup carries
+			// the authenticated cleanup token: finish the cleanup now
+			// (verify the sidecar, remove it durably, clear the metadata).
+			if ri.cleanupToken != "" {
+				if err := s.finishTokCleanup(ctx, ri.id, ri.cleanupToken); err != nil {
+					return err
+				}
 			}
 		default:
 			return typed(ErrDependency, errors.New("unknown session state"))
@@ -1394,13 +1484,15 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 }
 
 // rowInfo is a durable-consistent snapshot row: the create-time row
-// fields needed to decide a creating row's fate at startup.
+// fields needed to decide a creating row's fate at startup, plus the
+// post-activation sidecar cleanup provenance.
 type rowInfo struct {
 	id           string
 	state        string
 	offset       int64
 	createdNanos int64
 	token        string
+	cleanupToken string
 }
 
 // reconcileCreatingRow decides the fate of a creating row WITHOUT trusting
@@ -1417,7 +1509,7 @@ func (s *service) reconcileCreatingRow(ctx context.Context, ri rowInfo) error {
 		return typed(ErrDependency, errors.New("creating session has a nonzero offset"))
 	}
 	// Re-read the CURRENT row inside the serialized decision.
-	var curState, curTok string
+	var curState, curTok, curCleanup string
 	var curCreated int64
 	found := false
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
@@ -1429,6 +1521,7 @@ func (s *service) reconcileCreatingRow(ctx context.Context, ri rowInfo) error {
 			found = true
 			curState = row.state
 			curTok = row.createToken.String
+			curCleanup = row.cleanupToken.String
 			curCreated = row.createdNanos
 		}
 		return nil
@@ -1444,9 +1537,13 @@ func (s *service) reconcileCreatingRow(ctx context.Context, ri rowInfo) error {
 	case StateActive, StateFinalized:
 		// The creator won: the row is already active/finalized with its
 		// canonical file empty/token-free. Align (crash-tail truncation is
-		// idempotent) and move on — never reject through the stale snapshot.
+		// idempotent) and finish any pending sidecar cleanup — never reject
+		// through the stale snapshot.
 		if err := s.spool.align(ri.id, ri.offset); err != nil {
 			return typed(ErrDependency, err)
+		}
+		if curCleanup != "" {
+			return s.finishTokCleanup(ctx, ri.id, curCleanup)
 		}
 		return nil
 	case StateDeleting:

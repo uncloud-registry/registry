@@ -10,9 +10,16 @@ package staging
 //     concurrent file (the core regression),
 //  2. a permissive umask still yields EXACT 0700 directories and 0600 files
 //     (modes are forced, not delegated to the umask),
-//  3. a restrictive umask (077, 0777) yields EXACT private modes through
-//     anchored, no-follow descriptor repair, and a failed fresh-DB creation
-//     leaves no mode-000 residue.
+//  3. a restrictive umask (077, 0777) yields EXACT private FILE modes (0600)
+//     through descriptor fchmod, and private DIRECTORY modes whenever the
+//     directory stays owner-read/openable. A fully-restrictive umask that
+//     masks a freshly created directory to 0000 cannot be opened for
+//     descriptor chmod on macOS (O_RDONLY|O_DIRECTORY and O_EVTONLY both
+//     return EACCES; only name-based fchmodat — the unsafe indirection this
+//     code refuses — succeeds), so the constructor FAILS CLOSED instead of
+//     chmod'ing a name that might have been replaced: no foreign entry is
+//     ever mutated or removed and the process umask is never touched. That
+//     platform result is asserted below.
 //
 // The subprocess is race-clean, so the parent race suite (ordinary code in
 // the main process) still exercises these scenarios without skipping the
@@ -174,9 +181,11 @@ func scenarioPermissiveSpoolModes(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Restrictive umask 0777: the constructor still yields EXACT 0700 dirs and
-// 0600 db/file modes (rebased through the anchored no-follow repair), and a
-// session can be created.
+// Restrictive umask 0777 with a MISSING spool directory: the freshly created
+// 0700 directory lands masked 0000, which cannot be opened for descriptor
+// chmod on macOS, so the constructor FAILS CLOSED (no name-chmod, no umask
+// mutation, no entry removal). A PRE-EXISTING openable spool root survives
+// and the fresh 0600 DB/session files are forced through their descriptors.
 // ---------------------------------------------------------------------------
 
 func TestUmaskRestrictiveConstructorExactModes(t *testing.T) {
@@ -189,14 +198,22 @@ func scenarioRestrictiveConstructor(t *testing.T) {
 	spoolDir := filepath.Join(dir, "spool")
 	dbPath := filepath.Join(dir, "staging.db")
 	svc, err := NewService(context.Background(), spoolDir, dbPath)
-	if err != nil {
-		t.Fatalf("constructor under umask 0777: %v", err)
+	if err == nil {
+		_ = svc.Close()
+		t.Fatal("constructor under umask 0777 must FAIL CLOSED: a fresh spool directory is masked 0000 and cannot be opened for descriptor chmod on this platform")
 	}
-	defer func() { _ = svc.Close() }()
-	assertMode(t, spoolDir, true, 0o700)
-	assertMode(t, dbPath, false, 0o600)
-	s := mustCreate(t, svc, "backend/api", "user:alice")
-	assertMode(t, filepath.Join(spoolDir, s.ID), false, 0o600)
+	if !errors.Is(err, ErrDependency) {
+		t.Fatalf("constructor error: %v, want fail-closed ErrDependency", err)
+	}
+	// Fail-closed means nothing was name-chmod'd or removed: the 0000 masked
+	// directory (created by this call) is left untouched — the only safe
+	// outcome — and the database file is never created.
+	if fi, lerr := os.Lstat(spoolDir); lerr != nil || !fi.IsDir() || fi.Mode().Perm() != 0 {
+		t.Fatalf("restrictive-umask constructor did not leave the masked spool dir untouched: %v mode=%v", lerr, fi.Mode().Perm())
+	}
+	if _, lerr := os.Lstat(dbPath); lerr == nil {
+		t.Fatal("database file created despite fail-closed spool construction")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -248,12 +265,17 @@ func TestUmaskRestrictiveFreshDB0777(t *testing.T) {
 
 func scenarioFreshDB777(t *testing.T) {
 	dir := tempPrivate(t)
-	syscall.Umask(0o777)
+	// Create the spool directory at a normal umask so it is 0700/openable;
+	// only the fresh DB and session files are created under umask 0777.
 	spoolDir := filepath.Join(dir, "spool")
+	if err := os.Mkdir(spoolDir, 0o700); err != nil {
+		t.Fatalf("mkdir spool: %v", err)
+	}
 	dbPath := filepath.Join(dir, "staging.db")
+	syscall.Umask(0o777)
 	svc, err := NewService(context.Background(), spoolDir, dbPath)
 	if err != nil {
-		t.Fatalf("fresh DB under umask 0777: %v", err)
+		t.Fatalf("fresh DB under umask 0777 (pre-existing spool): %v", err)
 	}
 	defer func() { _ = svc.Close() }()
 	assertMode(t, dbPath, false, 0o600)

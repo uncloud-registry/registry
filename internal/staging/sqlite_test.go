@@ -127,7 +127,7 @@ func TestSchemaColumnsAndTypes(t *testing.T) {
 		// type): REAL or numeric TEXT can never be coerced into them, so
 		// the typeof() CHECKs are the sole storage-class authority.
 		"offset": "", "created_at": "", "expires_at": "",
-		"create_token": "text", "digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
+		"create_token": "text", "cleanup_token": "text", "digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
 	}
 	assertColumns(t, db, "upload_sessions", wantSessions, map[string]bool{"id": true})
 
@@ -992,20 +992,38 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 				"when old.create_token is not null and new.create_token is null then raise(abort, 'x')", 1)
 			return d
 		}, false, false, nil, "token clearing allowed outside creating"},
+		{"trigger_cleanup_softened", func(d []string) []string {
+			d[10] = strings.Replace(d[10], "'cleanup token immutable'", "'x'", 1)
+			return d
+		}, false, false, nil, "cleanup trigger body changed"},
+		{"trigger_cleanup_set_outside_activation", func(d []string) []string {
+			d[10] = strings.Replace(d[10], "and not (old.state = 'creating' and new.state = 'active' and old.create_token is not null and old.create_token = new.cleanup_token and new.create_token is null)",
+				"and not (new.cleanup_token = old.cleanup_token)", 1)
+			return d
+		}, false, false, nil, "cleanup token settable outside activation"},
+		{"trigger_cleanup_cleared_from_creating", func(d []string) []string {
+			d[10] = strings.Replace(d[10], "when old.cleanup_token is not null and new.cleanup_token is null and old.state not in ('active','finalized')",
+				"when old.cleanup_token is not null and new.cleanup_token is null", 1)
+			return d
+		}, false, false, nil, "cleanup token clearable from any state"},
+		{"trigger_cleanup_column_grammar", func(d []string) []string {
+			d[0] = strings.Replace(d[0], "and cleanup_token not glob '*[^0-9a-f]*'", "and cleanup_token glob '*[0-9a-f]*'", 1)
+			return d
+		}, false, false, nil, "cleanup token chars loosened"},
 		{"trigger_delete_softened", func(d []string) []string {
-			d[10] = strings.Replace(d[10], "'delete only via deleting state'", "'x'", 1)
+			d[11] = strings.Replace(d[11], "'delete only via deleting state'", "'x'", 1)
 			return d
 		}, false, false, nil, "delete trigger body changed"},
 		{"trigger_blob_insert_softened", func(d []string) []string {
-			d[11] = strings.Replace(d[11], "'staged blob must match active session'", "'x'", 1)
+			d[12] = strings.Replace(d[12], "'staged blob must match active session'", "'x'", 1)
 			return d
 		}, false, false, nil, "blob insert trigger body changed"},
 		{"trigger_blob_update_wrong_table", func(d []string) []string {
-			d[12] = strings.Replace(d[12], "on staged_blobs", "on upload_sessions", 1)
+			d[13] = strings.Replace(d[13], "on staged_blobs", "on upload_sessions", 1)
 			return d
 		}, false, false, nil, "blob update trigger on the wrong table"},
 		{"trigger_blob_delete_softened", func(d []string) []string {
-			d[13] = strings.Replace(d[13], "'cannot delete staged blob of live session'", "'x'", 1)
+			d[14] = strings.Replace(d[14], "'cannot delete staged blob of live session'", "'x'", 1)
 			return d
 		}, false, false, nil, "blob delete trigger body changed"},
 		{"version_table_shape", nil, true, false, nil, "version table without not null"},
@@ -1056,6 +1074,7 @@ func TestSchemaExactPhysicalShape(t *testing.T) {
 		{"created_at", "", true, false},
 		{"expires_at", "", true, false},
 		{"create_token", "text", false, false},
+		{"cleanup_token", "text", false, false},
 		{"digest", "text", false, false},
 		{"bee_ref", "text", false, false},
 		{"media_type", "text", false, false},

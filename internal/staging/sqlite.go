@@ -70,6 +70,7 @@ var schemaDDL = []string{
 		created_at not null,
 		expires_at not null,
 		create_token text,
+		cleanup_token text,
 		digest     text,
 		bee_ref    text,
 		media_type text,
@@ -80,11 +81,12 @@ var schemaDDL = []string{
 		check (state in ('active','creating','finalized','deleting')),
 		check (typeof(offset) = 'integer' and offset >= 0),
 		check (typeof(created_at) = 'integer' and typeof(expires_at) = 'integer' and expires_at > created_at),
+		check (cleanup_token is null or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128 and cleanup_token = lower(cleanup_token) and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)),
 		check (
 			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null)
 			or (state = 'creating' and digest is null and bee_ref is null and media_type is null and size is null and offset = 0
 				and typeof(create_token) = 'text' and length(hex(create_token)) = 128 and create_token = lower(create_token)
-				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0)
+				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0 and cleanup_token is null)
 			or (state = 'finalized' and digest is not null and bee_ref is not null and media_type is not null
 				and size is not null and typeof(size) = 'integer' and size = offset
 				and typeof(digest) = 'text' and length(hex(digest)) = 142 and instr(hex(digest), '00') = 0
@@ -94,7 +96,7 @@ var schemaDDL = []string{
 				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
 				and create_token is null)
-			or (state = 'deleting' and create_token is null)
+			or (state = 'deleting' and create_token is null and cleanup_token is null)
 		)
 	)`,
 	`create table staged_blobs (
@@ -121,12 +123,15 @@ var schemaDDL = []string{
 	`create index idx_sessions_expiry on upload_sessions(expires_at)`,
 	// A session may only be born active (offset 0, no finalize metadata) or
 	// creating (offset 0, no metadata): the durable-creation pre-state.
+	// Neither birth state may carry the post-activation cleanup token.
 	`create trigger trg_session_insert before insert on upload_sessions begin
 		select case when not (
 			(new.state = 'active' and new.offset = 0
-				and new.digest is null and new.bee_ref is null and new.media_type is null and new.size is null)
+				and new.digest is null and new.bee_ref is null and new.media_type is null and new.size is null
+				and new.cleanup_token is null)
 			or (new.state = 'creating' and new.offset = 0
-				and new.digest is null and new.bee_ref is null and new.media_type is null and new.size is null))
+				and new.digest is null and new.bee_ref is null and new.media_type is null and new.size is null
+				and new.cleanup_token is null))
 			then raise(abort, 'session insert must be active or creating') end;
 	end`,
 	// State transitions: active may only be ENTERED from creating; nothing
@@ -179,6 +184,24 @@ var schemaDDL = []string{
 			when old.create_token is not null and new.create_token is not null then raise(abort, 'create token immutable')
 			when old.create_token is null and new.create_token is not null then raise(abort, 'cannot set create token after insert')
 			when old.create_token is not null and new.create_token is null and old.state <> 'creating' then raise(abort, 'create token cannot be cleared outside creating')
+			else null end;
+	end`,
+	// The cleanup token is the durable post-activation provenance of the
+	// token sidecar: it may only be SET by the activation itself (as the
+	// creating row's create token is atomically cleared), is immutable while
+	// set, and may only be CLEARED from a live row — the Go side clears it
+	// only after the sidecar removal and directory fsync, or at startup
+	// reconciliation after verifying the sidecar is gone or carries exactly
+	// that token.
+	`create trigger trg_session_cleanup before update of cleanup_token on upload_sessions begin
+		select case
+			when old.cleanup_token is not null and new.cleanup_token is not null and old.cleanup_token <> new.cleanup_token then raise(abort, 'cleanup token immutable')
+			when new.cleanup_token is not null and old.cleanup_token is null
+				and not (old.state = 'creating' and new.state = 'active' and old.create_token is not null
+					and old.create_token = new.cleanup_token and new.create_token is null)
+				then raise(abort, 'cleanup token may only be set at activation')
+			when old.cleanup_token is not null and new.cleanup_token is null and old.state not in ('active','finalized')
+				then raise(abort, 'cleanup token may only be cleared from a live row')
 			else null end;
 	end`,
 	// Rows may only be removed through the deleting tombstone.
@@ -746,37 +769,49 @@ func openStagingPool(ctx context.Context, dbPath string, size int) (*dbPool, err
 	return p, nil
 }
 
+// acquire returns a retained handle, serializing acceptance against close
+// WITHOUT holding the mutex while waiting. It reserves the borrow BEFORE
+// receiving: if close has already marked the pool closed the reservation is
+// refused outright, and once a reservation exists close() waits for it, so
+// a successfully received handle is always already accounted (a received
+// handle whose pool is closing is returned, never dropped on the floor).
+// A canceled waiter under full exhaustion releases its reservation and
+// returns the exact context error while another goroutine can still
+// release.
 func (p *dbPool) acquire(ctx context.Context) (*sql.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	select {
-	case <-p.closing:
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
 		return nil, errPoolClosed
-	default:
 	}
+	p.borrowed++ // reservation: Close can no longer complete past this point
+	p.mu.Unlock()
 	select {
 	case c := <-p.ch:
-		p.mu.Lock()
-		p.borrowed++
-		p.mu.Unlock()
+		// Reservation converts into the borrow: the handle is accounted for
+		// before close() could observe an idle pool, so close() now waits
+		// for its release.
 		return c, nil
 	case <-ctx.Done():
+		p.releaseReservation()
 		return nil, ctx.Err()
 	case <-p.closing:
+		p.releaseReservation()
+		// When the caller's own cancellation fired alongside Close, the
+		// exact context sentinel is the more precise answer and MUST win.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, errPoolClosed
 	}
 }
 
-func (p *dbPool) release(c *sql.Conn) {
-	select {
-	case <-p.closing:
-		// The pool is closing: close the handle ourselves so it is never
-		// leaked and close() can complete.
-		_ = c.Close()
-	default:
-		p.ch <- c
-	}
+// releaseReservation undoes an unconsumed acquire reservation: close() may
+// only finish once no reservation or borrow remains.
+func (p *dbPool) releaseReservation() {
 	p.mu.Lock()
 	if p.borrowed > 0 {
 		p.borrowed--
@@ -785,11 +820,36 @@ func (p *dbPool) release(c *sql.Conn) {
 	p.mu.Unlock()
 }
 
-// close marks the pool closed and waits for every borrowed handle to return.
-// Handles released after close are closed by their releasers; once the
-// borrow count reaches zero every remaining handle sits in the channel and
-// is drained and closed here. The channel is never closed, so a concurrent
-// release can never send on a closed channel.
+// release hands the handle back. Returning the handle to the channel and
+// decrementing the borrow happen in ONE critical section, so close() can
+// only observe an idle pool (borrowed == 0) once every returned handle is
+// back in the channel and can drain the exact retained set. After close the
+// handle is closed here instead (never sent, so there can never be a send
+// on a closed channel — the channel is never closed — and never leaked).
+func (p *dbPool) release(c *sql.Conn) {
+	p.mu.Lock()
+	if p.borrowed > 0 {
+		p.borrowed--
+	}
+	if p.closed {
+		p.cond.Broadcast()
+		p.mu.Unlock()
+		_ = c.Close()
+		return
+	}
+	// Capacity == retained count and this handle was borrowed, so the send
+	// cannot block: len(ch) < cap(ch) holds under the lock.
+	p.ch <- c
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+// close marks the pool closed once, wakes every blocked waiter, and waits
+// until every reservation and borrowed handle is returned or canceled
+// before draining the (by then exact) set of idle handles and closing the
+// database. Acquires after close return a fixed closed-pool error; a handle
+// received just before close lanes is already counted and is returned to
+// its holder, whose release closes it.
 func (p *dbPool) close() {
 	p.mu.Lock()
 	if p.closed {
@@ -916,8 +976,19 @@ func createDBFile(parentRoot *os.Root, dbName string) (os.FileInfo, error) {
 		return nil, typed(ErrDependency, errors.New("cannot create database file"))
 	}
 	fail := func(e error) (os.FileInfo, error) {
+		// Clean up ONLY the inode this call created: a foreign replacement
+		// swapped in after creation is detected via the descriptor identity
+		// and left untouched.
+		if ascLeafSwapHook != nil {
+			ascLeafSwapHook("db", dbName)
+		}
+		st, serr := f.Stat()
 		_ = f.Close()
-		_ = parentRoot.Remove(dbName)
+		if serr == nil {
+			if cur, lerr := parentRoot.Lstat(dbName); lerr == nil && os.SameFile(st, cur) {
+				_ = parentRoot.Remove(dbName)
+			}
+		}
 		return nil, e
 	}
 	// fchmod the opened descriptor to exactly 0600 immediately, before any

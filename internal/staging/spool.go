@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +69,15 @@ func spoolErrorCause(err error) error {
 // the root and no symlink is ever followed. The descriptor is retained for
 // the lifetime of the service, so a rename/swap of the root path never
 // redirects production access.
+
+// ascLeafSwapHook, when non-nil, runs at a leaf-boundary decision point (in
+// verifyPrivateDir before its descriptor open, in removeNameGuarded before
+// its guarded unlink, and in createDBFile's guarded cleanup) so a
+// deterministic barrier test can swap the leaf underneath and prove the
+// guarded code never chmods or unlinks a foreign replacement. Tests only;
+// nil in production.
+var ascLeafSwapHook func(phase, name string)
+
 type spool struct {
 	root     *os.Root
 	rootPath string
@@ -222,20 +230,25 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 // process-global knob a library/service must not mutate — the constructor
 // genuinely can run concurrently with unrelated file creation). The
 // requested owner-only 0700 carries no group/other bits, so ordinary umasks
-// (022, 002, 077) cannot loosen it and no repair is needed. Only an
-// unusually restrictive umask that strips OWNER bits (e.g. 0777 -> 0000)
-// loosens it; that is repaired through the anchored parent with a
-// descriptor-relative, no-follow fchmodat (Root.Chmod, AT_SYMLINK_NOFOLLOW)
-// bound to the freshly created child, then verified. If the repair cannot
-// succeed the creation FAILS CLOSED and the attributable residue (the child
-// WE just created) is removed through the same anchored parent — never a
-// raw path chmod, never an umask change.
+// (022, 002, 077) cannot loosen it and no repair is needed. Only a
+// restrictive umask that strips OWNER bits (e.g. 0777 -> 0000) loosens it;
+// that is repaired through an OPENED DESCRIPTOR of the freshly created
+// child — never through a raw-path chmod, never following a symlink — and
+// the descriptor is verified SameFile against the pre-repair anchored
+// FileInfo so a swapped replacement is never chmod'd. When the platform
+// cannot open the restricted-umask directory for descriptor chmod at all
+// (a directory masked 0000/unreadable needs read permission to open on
+// macOS), the creation FAILS CLOSED and NO entry is removed: cleanup can
+// never unlink a leaf it cannot prove it created, so a foreign replacement
+// is always left untouched. Verified platform result: a 0000 directory
+// cannot be opened (O_RDONLY|O_DIRECTORY and O_EVTONLY both return EACCES)
+// while only name-based fchmodat succeeds — which is precisely the unsafe
+// indirection this path refuses, so the repair is impossible and fails
+// closed rather than chmod a name that might be replaced.
 func createPrivateDir(root *os.Root, comp string) error {
-	created := false
 	err := root.Mkdir(comp, 0o700)
 	switch {
 	case err == nil:
-		created = true
 	case errors.Is(err, os.ErrExist):
 		// A pre-existing entry is not ours; descent (Lstat + verifyPrivateDir
 		// on the final component) handles its identity and mode through the
@@ -245,68 +258,60 @@ func createPrivateDir(root *os.Root, comp string) error {
 		return spoolErr(spoolErrGeneric, err)
 	}
 	fi, err := root.Lstat(comp)
-	if err != nil || fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		if created {
-			_ = root.Remove(comp)
-		}
-		if err != nil {
-			return spoolErr(spoolErrGeneric, err)
-		}
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return spoolErr(spoolErrGeneric, errors.New("path component is not a real directory"))
 	}
 	if fi.Mode().Perm() == 0o700 {
 		return nil
 	}
-	// Restrictive umask stripped owner bits. Repair through the anchored
-	// parent descriptor on the freshly created name; verify the exact mode
-	// AND that the entry is still the same inode before accepting.
-	if cerr := root.Chmod(comp, 0o700); cerr == nil {
-		afi, lerr := root.Lstat(comp)
-		if lerr == nil && os.SameFile(fi, afi) && afi.Mode().Perm() == 0o700 {
+	// Restrictive umask stripped owner bits. Repair through the OPENED
+	// descriptor bound to the inspected inode: open the leaf without
+	// following a symlink, require SameFile against the pre-repair anchored
+	// Lstat (so a swap between the Lstat and the open is detected and the
+	// opened leaf is NEVER a foreign replacement), fchmod the descriptor,
+	// and re-verify the exact mode on the SAME descriptor.
+	f, oerr := root.Open(comp)
+	if oerr != nil {
+		// The masked directory cannot be opened for descriptor chmod on
+		// this platform. Fail closed: never chmod comp by name (it may have
+		// been replaced) and never remove it (ownership is unprovable).
+		return spoolErr(spoolErrGeneric, errors.New("cannot open restricted-umask directory for private-mode repair"))
+	}
+	st, serr := f.Stat()
+	if serr != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 || !os.SameFile(fi, st) {
+		_ = f.Close()
+		// Identity mismatch: the opened leaf is not the entry we inspected
+		// (a swap landed between Lstat and open). Do not chmod it; do not
+		// remove either entry — fail closed.
+		return spoolErr(spoolErrGeneric, errors.New("path component replaced during private-mode repair"))
+	}
+	cerr := f.Chmod(0o700)
+	if cerr == nil {
+		ast, aerr := f.Stat()
+		if aerr == nil && ast.IsDir() && ast.Mode().Perm() == 0o700 {
+			_ = f.Close()
 			return nil
 		}
 	}
-	if created {
-		_ = root.Remove(comp)
-	}
-	return spoolErr(spoolErrGeneric, errors.New("cannot create private directory under restrictive umask"))
+	_ = f.Close()
+	return spoolErr(spoolErrGeneric, errors.New("cannot make directory private after creation"))
 }
 
 // verifyPrivateDir confirms the descriptor-relative name is a real
 // non-symlink directory and, when repair is allowed and the mode differs
-// from want, repairs it through an opened descriptor reached FROM THE
-// ANCHORED PARENT (never through a path). A no-exec directory is still
-// openable read-only by name when its parent descriptor is retained, and
-// the repair fchmods that opened descriptor; when the directory cannot even
-// be opened (no read bit, or the final root itself when no parent is
-// available), the repair FAILS CLOSED — an ancestor swap can never redirect
-// a path-based chmod because no path is ever consulted.
+// from want, repairs it through an OPENED DESCRIPTOR OF THE LEAF reached
+// FROM THE ANCHORED PARENT (never through a path) and verified SameFile
+// against the anchored Lstat so a swap between stat/open cannot redirect
+// the fchmod onto a foreign replacement. A directory that cannot even be
+// opened (no owner read bit after a restrictive umask, or the final root
+// itself when no parent is retained) is treated as unrrepairable on this
+// platform and the descent FAILS CLOSED.
 func verifyPrivateDir(root *os.Root, name string, want os.FileMode, repair bool) error {
 	fi, err := root.Lstat(name)
 	if err != nil {
-		// The entry cannot be stat'd from the anchored root: only a missing
-		// execute bit on a child directory (which is still openable by name
-		// from the parent) or an impossible final root (no retained parent)
-		// produce this. Try the descriptor-relative open; anything else
-		// fails closed.
-		if errors.Is(err, fs.ErrPermission) && repair {
-			f, oerr := root.Open(name)
-			if oerr == nil {
-				st, serr := f.Stat()
-				if serr == nil && st.IsDir() && st.Mode()&os.ModeSymlink == 0 {
-					if cerr := f.Chmod(want); cerr == nil {
-						_ = f.Close()
-						fi, err = root.Lstat(name)
-						if err == nil && fi.Mode().Perm() == want {
-							return nil
-						}
-						err = errors.New("directory mode repair verification failed")
-						return spoolErr(spoolErrGeneric, err)
-					}
-				}
-				_ = f.Close()
-			}
-		}
 		return spoolErr(spoolErrGeneric, err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
@@ -315,26 +320,48 @@ func verifyPrivateDir(root *os.Root, name string, want os.FileMode, repair bool)
 	if !fi.IsDir() {
 		return spoolErr(spoolErrGeneric, errors.New("directory path is not a directory"))
 	}
-	if p := fi.Mode().Perm(); p != want {
-		if !repair {
-			return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode %o is not private", p))
-		}
-		f, err := root.Open(name)
-		if err != nil {
-			return spoolErr(spoolErrGeneric, err)
-		}
-		cerr := f.Chmod(want)
-		f.Close()
-		if cerr != nil {
-			return spoolErr(spoolErrGeneric, errors.New("cannot make directory private"))
-		}
-		fi, err = root.Lstat(name)
-		if err != nil {
-			return spoolErr(spoolErrGeneric, err)
-		}
-		if p := fi.Mode().Perm(); p != want {
-			return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode repair to %o failed", want))
-		}
+	if p := fi.Mode().Perm(); p == want {
+		return nil
+	}
+	if !repair {
+		return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode %o is not private", fi.Mode().Perm()))
+	}
+	if ascLeafSwapHook != nil {
+		// Deterministic swap barrier: the leaf is swapped between the
+		// anchored Lstat and the descriptor open, proving the fchmod (when
+		// reached) is NEVER redirected onto a foreign replacement.
+		ascLeafSwapHook("verify", name)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		// Unopenable (restrictive-umask 0000): descriptor repair is
+		// impossible on this platform; fail closed without touching any
+		// leaf or name.
+		return spoolErr(spoolErrGeneric, err)
+	}
+	st, serr := f.Stat()
+	if serr != nil || !st.IsDir() || st.Mode()&os.ModeSymlink != 0 || !os.SameFile(fi, st) {
+		// The opened leaf is not the entry we inspected: do not chmod a
+		// foreign replacement. Fail closed.
+		_ = f.Close()
+		return spoolErr(spoolErrGeneric, errors.New("directory replaced before private-mode repair"))
+	}
+	cerr := f.Chmod(want)
+	f.Close()
+	if cerr != nil {
+		return spoolErr(spoolErrGeneric, errors.New("cannot make directory private"))
+	}
+	// Re-verify through the anchored parent: the entry must still be the
+	// same inode and now carry the exact mode.
+	afi, err := root.Lstat(name)
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	if !os.SameFile(fi, afi) {
+		return spoolErr(spoolErrGeneric, errors.New("directory replaced during private-mode repair"))
+	}
+	if p := afi.Mode().Perm(); p != want {
+		return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode repair to %o failed", want))
 	}
 	return nil
 }
@@ -413,10 +440,39 @@ func (sp *spool) createTok(id string) (*os.File, error) {
 	return sp.createName(tokName(id))
 }
 
+// removeNameGuarded unlinks name, relative to root, only if the CURRENT
+// directory entry is the very inode described by want (the object this call
+// created/verified). A leaf that was swapped or replaced after identity
+// verification is NEVER removed — cleanup fails closed and leaves the
+// foreign entry untouched.
+func removeNameGuarded(root *os.Root, name string, want os.FileInfo) error {
+	if ascLeafSwapHook != nil {
+		ascLeafSwapHook("remove", name)
+	}
+	cur, err := root.Lstat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // already gone; nothing to remove
+		}
+		return spoolErr(spoolErrGeneric, err)
+	}
+	if !os.SameFile(want, cur) {
+		// A foreign replacement occupies the name: leave it, fail closed.
+		return nil
+	}
+	if err := root.Remove(name); err != nil && !os.IsNotExist(err) {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	return nil
+}
+
 // createName is the shared O_EXCL create path: validate the caller-supplied
-// name derives from a validated id, create it exactly 0600 (fchmod, umask-
-// proof), verify by descriptor and by the anchored directory entry, and
-// reject any pre-existing entry (file, symlink, or directory) outright.
+// name derives from a validated id, create it exactly 0600 (fchmod on the
+// descriptor, umask-provable), verify by the opened descriptor AND by the
+// anchored directory entry, and reject any pre-existing entry (file,
+// symlink, or directory) outright. On failure the residue cleaned up is
+// ONLY the inode the O_EXCL created for us — a swapped-in foreign
+// replacement is never removed (removeNameGuarded).
 func (sp *spool) createName(name string) (*os.File, error) {
 	if err := sp.ensureRootMode(); err != nil {
 		return nil, err
@@ -425,29 +481,30 @@ func (sp *spool) createName(name string) (*os.File, error) {
 	if err != nil {
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
-	// Immediate chmod, then exact verification — regardless of umask.
+	// Immediate chmod on the descriptor, then exact verification —
+	// regardless of umask. The cleaned-up residue is always OUR inode.
+	cleanup := func(e error) (*os.File, error) {
+		st, serr := f.Stat()
+		_ = f.Close()
+		if serr == nil {
+			_ = removeNameGuarded(sp.root, name, st)
+		}
+		return nil, e
+	}
 	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		_ = sp.root.Remove(name)
-		return nil, spoolErr(spoolErrGeneric, err)
+		return cleanup(spoolErr(spoolErrGeneric, err))
 	}
 	st, err := f.Stat()
 	if err != nil {
-		f.Close()
-		_ = sp.root.Remove(name)
-		return nil, spoolErr(spoolErrGeneric, err)
+		return cleanup(spoolErr(spoolErrGeneric, err))
 	}
 	if !st.Mode().IsRegular() || st.Mode().Perm() != 0o600 {
-		f.Close()
-		_ = sp.root.Remove(name)
-		return nil, spoolErr(spoolErrGeneric, errors.New("spool file is not an exact 0600 regular file"))
+		return cleanup(spoolErr(spoolErrGeneric, errors.New("spool file is not an exact 0600 regular file")))
 	}
 	// Descriptor identity: no swap between creation and hand-off.
 	lst, err := sp.root.Lstat(name)
 	if err != nil || !os.SameFile(st, lst) || lst.Mode()&os.ModeSymlink != 0 {
-		f.Close()
-		_ = sp.root.Remove(name)
-		return nil, spoolErr(spoolErrGeneric, errors.New("spool file changed during creation"))
+		return cleanup(spoolErr(spoolErrGeneric, errors.New("spool file changed during creation")))
 	}
 	return f, nil
 }

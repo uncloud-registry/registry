@@ -405,14 +405,17 @@ func TestRound3StartupReReadsConcurrentlyActivatedRow(t *testing.T) {
 }
 
 // TestRound3CrashMatrixConverges walks every NEW protocol phase with an
-// injected mid-phase failure and asserts convergence: no durable active row
-// from a failed Create, exact dependency errors, no residue, and a clean
-// restart.
+// injected mid-phase failure and asserts convergence: PRE-activation failures
+// never leave a durable active row and return exact dependency errors; the
+// POST-activation (token-clearing) failure is a point-of-no-return — the
+// committed create is returned truthfully and the deferred sidecar cleanup
+// converges at restart.
 func TestRound3CrashMatrixConverges(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
-		name  string
-		fault func(svc *service, counter *atomic.Int32)
+		name     string
+		expectOK bool // post-activation: create returns the committed session
+		fault    func(svc *service, counter *atomic.Int32)
 	}{
 		{
 			name: "token-file-write-sync",
@@ -448,7 +451,8 @@ func TestRound3CrashMatrixConverges(t *testing.T) {
 			},
 		},
 		{
-			name: "final-token-clearing-sync",
+			name:     "final-token-clearing-sync",
+			expectOK: true, // the POST-activation cleanup must never roll back the committed create
 			fault: func(svc *service, c *atomic.Int32) {
 				svc.dirSyncHook = func() error {
 					n := c.Add(1)
@@ -466,13 +470,27 @@ func TestRound3CrashMatrixConverges(t *testing.T) {
 			var c atomic.Int32
 			tc.fault(svc, &c)
 			s, err := svc.Create(ctx, "backend/api", "user:alice", time.Hour)
-			if err == nil {
+			if tc.expectOK {
+				// Point of no return: the activation is durable; a failing
+				// token-clearing sync must NOT roll it back or report the
+				// committed create as failed.
+				if err != nil {
+					t.Fatalf("committed create must be returned truthfully despite the post-activation fault: %v", err)
+				}
+				if s.ID == "" || s.State != StateActive {
+					t.Fatalf("create returned non-committed session: %+v", s)
+				}
+				rst, rerr := svc.Status(ctx, s.ID, "backend/api", "user:alice")
+				if rerr != nil || rst.State != StateActive {
+					t.Fatalf("committed active session not visible despite the cleanup fault: %v state=%s", rerr, rst.State)
+				}
+			} else if err == nil {
 				t.Fatalf("create succeeded despite the injected %s fault", tc.name)
-			}
-			if !errors.Is(err, ErrDependency) {
+			} else if !errors.Is(err, ErrDependency) {
 				t.Fatalf("error %v, want data-free ErrDependency", err)
 			}
-			// No durable active row.
+			// A pre-activation failure must leave no durable active row; a
+			// post-activation failure must leave the committed row active.
 			if s.ID != "" {
 				db, derr := sqlOpenForTest(filepath.Join(dir, "staging.db"))
 				if derr != nil {
@@ -483,20 +501,27 @@ func TestRound3CrashMatrixConverges(t *testing.T) {
 					t.Fatalf("count: %v", err)
 				}
 				db.Close()
-				if active != 0 {
+				if tc.expectOK && active != 1 {
+					t.Fatal("committed activation lost its durable active row")
+				}
+				if !tc.expectOK && active != 0 {
 					t.Fatal("failed create left a durable active row")
 				}
 			}
-			// No residue: the spool contains no files.
-			entries, eerr := os.ReadDir(filepath.Join(dir, "spool"))
-			if eerr != nil {
-				t.Fatalf("readdir: %v", eerr)
+			// A pre-activation failure must leave no residue; a post-activation
+			// one leaves the canonical file (a committed session) plus possibly
+			// the pending token sidecar, both converged at restart.
+			if !tc.expectOK {
+				entries, eerr := os.ReadDir(filepath.Join(dir, "spool"))
+				if eerr != nil {
+					t.Fatalf("readdir: %v", eerr)
+				}
+				for _, en := range entries {
+					t.Fatalf("residue entry %s after failed create", en.Name())
+				}
 			}
-			for _, en := range entries {
-				t.Fatalf("residue entry %s after failed create", en.Name())
-			}
-			// A restart converges cleanly (fresh constructor; the failed
-			// create leaves nothing for reconcile to trip on).
+			// A restart converges (for the post-activation case the pending
+			// sidecar cleanup is finished; the session stays active).
 			svc.fsyncHook = nil
 			svc.dirSyncHook = nil
 			svc.Close()
@@ -505,6 +530,20 @@ func TestRound3CrashMatrixConverges(t *testing.T) {
 				t.Fatalf("restart: %v", err)
 			}
 			defer svc2.Close()
+			if tc.expectOK {
+				rst, rerr := svc2.Status(ctx, s.ID, "backend/api", "user:alice")
+				if rerr != nil || rst.State != StateActive {
+					t.Fatalf("session lost after restart convergence: %v state=%s", rerr, rst.State)
+				}
+				// The deferred cleanup converged: the canonical file remains and
+				// the token sidecar is gone.
+				if fi, lerr := os.Lstat(filepath.Join(dir, "spool", s.ID)); lerr != nil || fi.Size() != 0 {
+					t.Fatalf("canonical spool file missing/incorrect after restart: %v size=%d", lerr, fi.Size())
+				}
+				if _, lerr := os.Lstat(filepath.Join(dir, "spool", s.ID+".tok")); lerr == nil {
+					t.Fatal("token sidecar not cleaned by restart convergence")
+				}
+			}
 		})
 	}
 }
