@@ -146,8 +146,13 @@ func TestRound2RestartRollsBackStaleTokenFile(t *testing.T) {
 	}
 	fixture.Close()
 	tokenBytes, _ := hex.DecodeString(token)
-	if err := os.WriteFile(filepath.Join(spoolDir, id), tokenBytes, 0o600); err != nil {
-		t.Fatalf("plant: %v", err)
+	// New-protocol residue: empty canonical payload file + attribution
+	// token file carrying exactly the row token.
+	if err := os.WriteFile(filepath.Join(spoolDir, id), nil, 0o600); err != nil {
+		t.Fatalf("plant canonical: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(spoolDir, id+".tok"), tokenBytes, 0o600); err != nil {
+		t.Fatalf("plant token file: %v", err)
 	}
 	svc, err := NewService(context.Background(), spoolDir, dbPath)
 	if err != nil {
@@ -155,8 +160,10 @@ func TestRound2RestartRollsBackStaleTokenFile(t *testing.T) {
 	}
 	svc.Close()
 	assertRowState(t, dbPath, id, "")
-	if _, err := os.Lstat(filepath.Join(spoolDir, id)); !os.IsNotExist(err) {
-		t.Fatalf("stale token file not removed: %v", err)
+	for _, name := range []string{id, id + ".tok"} {
+		if _, err := os.Lstat(filepath.Join(spoolDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("stale file %s not removed: %v", name, err)
+		}
 	}
 }
 

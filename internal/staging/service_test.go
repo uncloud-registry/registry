@@ -1531,8 +1531,13 @@ func TestServiceRestartRollsBackCreatingRowWithTokenFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode token: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "spool", id), tokenBytes, 0o600); err != nil {
-		t.Fatalf("plant durable token file: %v", err)
+	// New-protocol residue: the canonical payload file (EMPTY) plus the
+	// attribution token file carrying the row token.
+	if err := os.WriteFile(filepath.Join(dir, "spool", id), nil, 0o600); err != nil {
+		t.Fatalf("plant canonical file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "spool", id+".tok"), tokenBytes, 0o600); err != nil {
+		t.Fatalf("plant token file: %v", err)
 	}
 	svc.Close()
 
@@ -1544,8 +1549,10 @@ func TestServiceRestartRollsBackCreatingRowWithTokenFile(t *testing.T) {
 	if _, err := svc2.Status(context.Background(), id, "backend/api", "user:alice"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("stale creating row survived as a session: %v", err)
 	}
-	if _, err := os.Lstat(filepath.Join(dir, "spool", id)); !os.IsNotExist(err) {
-		t.Fatalf("attributable file survived rollback: %v", err)
+	for _, name := range []string{id, id + ".tok"} {
+		if _, err := os.Lstat(filepath.Join(dir, "spool", name)); !os.IsNotExist(err) {
+			t.Fatalf("attributable file %s survived rollback: %v", name, err)
+		}
 	}
 }
 

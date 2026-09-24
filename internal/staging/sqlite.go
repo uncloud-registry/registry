@@ -31,6 +31,12 @@ const busytimeoutMS = 5000
 // the whole migration rolls back atomically.
 var migrationFault error
 
+// reconcileSnapshotHook is a test-only injection point (nil in production):
+// it fires after the Phase A row snapshot in startup reconciliation, so a
+// test can interleave a concurrently-activating creator exactly at the
+// stale-snapshot race window.
+var reconcileSnapshotHook func()
+
 // versionTableDDL is the exact DDL of the version bookkeeping table. It is
 // part of the verified schema surface like every other object.
 const versionTableDDL = `create table staging_schema (version integer primary key, applied_at integer not null)`
@@ -396,6 +402,20 @@ func lowerASCII(c byte) byte {
 	return c
 }
 
+// Test-only fault-injection / observation hooks for the pool constructor
+// (nil in production).
+var (
+	// poolPinHook fires once, after the database is fully verified and just
+	// before the retained connection set is acquired. A path swap made here
+	// must be caught by the per-connection identity verification.
+	poolPinHook func()
+	// poolVerifyHook fires after each retained connection is checked out and
+	// verified, with the zero-based index. Tests assert that ALL N physical
+	// connections are held simultaneously (database/sql InUse == i+1), so a
+	// verification that reuses one idle connection is caught.
+	poolVerifyHook func(i int)
+)
+
 // openStagingDB opens (creating if needed) the dedicated staging database
 // and applies/verifies the schema. maxOpen sets the pool cap (0 keeps the
 // driver default; NewService always passes a finite pool size).
@@ -410,68 +430,84 @@ func lowerASCII(c byte) byte {
 // inspection connection FIRST, so a database we reject is never opened in a
 // way that could write to it — its bytes stay untouched.
 func openStagingDB(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, error) {
+	db, _, _, _, _, err := openStagingDBAnchored(ctx, dbPath, maxOpen)
+	return db, err
+}
+
+// openStagingDBAnchored is openStagingDB plus the retained anchoring
+// resources: the descriptor-relative parent root, the database basename, and
+// the pre-open file identity, so a caller that pins connections (the pool)
+// can identity-verify each one against the exact file that was verified. The
+// returned parent root is NOT closed here; the caller owns it. On any error
+// the database and the parent root are closed.
+func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, *os.Root, string, os.FileInfo, schemaState, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, "", nil, schemaReject, err
 	}
 	base, err := basePathOf(dbPath)
 	if err != nil {
-		return nil, typed(ErrDependency, err)
+		return nil, nil, "", nil, schemaReject, typed(ErrDependency, err)
 	}
 	if base == "" || strings.Contains(base, ":memory:") {
 		// Pure in-memory target: always fresh, no filesystem involvement.
 		db, err := sql.Open("sqlite", normalizeDSN(dbPath))
 		if err != nil {
-			return nil, typed(ErrDependency, err)
+			return nil, nil, "", nil, schemaReject, typed(ErrDependency, err)
 		}
 		if maxOpen > 0 {
 			db.SetMaxOpenConns(maxOpen)
 			db.SetMaxIdleConns(maxOpen)
 		}
+		state := schemaEmpty
 		if err := createFreshSchema(ctx, db); err != nil {
 			db.Close()
-			return nil, err
+			return nil, nil, "", nil, schemaReject, err
 		}
-		return db, nil
+		state = schemaCurrent
+		return db, nil, "", nil, state, nil
 	}
 
 	parentRoot, dbName, preFi, absent, err := prepareDBTarget(ctx, dbPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", nil, schemaReject, err
 	}
-	defer parentRoot.Close()
+	fail := func(e error) (*sql.DB, *os.Root, string, os.FileInfo, schemaState, error) {
+		parentRoot.Close()
+		return nil, nil, "", nil, schemaReject, e
+	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	if absent {
 		// We create the file ourselves through the anchored descriptor
-		// (O_EXCL, no symlink following) so SQLite never opens a foreign
-		// target that merely appeared at the path.
-		created, err := createDBFile(parentRoot, dbName)
-		if err != nil {
-			return nil, err
+		// (O_EXCL, no symlink following, exact 0600 immediately) so SQLite
+		// never opens a foreign target that merely appeared at the path.
+		created, cerr := createDBFile(parentRoot, dbName)
+		if cerr != nil {
+			return fail(cerr)
 		}
 		preFi = created
 	}
 
 	state, err := inspectSchemaState(ctx, dbPath)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if state == schemaReject {
-		return nil, typed(ErrDependency, errors.New("staging database is not a supported upload-staging schema"))
+		return fail(typed(ErrDependency, errors.New("staging database is not a supported upload-staging schema")))
 	}
 
 	// Only after the schema is fully verified may the database file be
 	// touched by a mutation-capable connection; the private mode is exact
 	// 0600 first (through a descriptor, never via a path).
 	if err := repairDBFileMode(parentRoot, dbName, preFi); err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	db, err := sql.Open("sqlite", normalizeDSN(dbPath))
 	if err != nil {
-		return nil, typed(ErrDependency, err)
+		return fail(typed(ErrDependency, err))
 	}
 	closeOnErr := true
 	defer func() {
@@ -491,53 +527,63 @@ func openStagingDB(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, er
 	}
 	if state == schemaEmpty {
 		if err := createFreshSchema(ctx, db); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 	// Post-open identity: the opened database is still exactly the file we
 	// verified — regular, non-symlink, 0600, same inode.
 	if err := verifyDBIdentity(parentRoot, dbName, preFi); err != nil {
-		return nil, err
-	}
-	if maxOpen > 0 {
-		// Force-open every permitted connection now and verify each one's
-		// actual opened file identity and pragma settings, so no later
-		// path-based connection can exist.
-		if err := forceOpenAndVerifyAllConns(ctx, db, maxOpen, parentRoot, dbName, preFi); err != nil {
-			return nil, err
-		}
+		return fail(err)
 	}
 	if err := syncRootDir(parentRoot); err != nil {
-		return nil, typed(ErrDependency, err)
+		return fail(typed(ErrDependency, err))
 	}
 	closeOnErr = false
-	return db, nil
+	return db, parentRoot, dbName, preFi, state, nil
 }
 
-// forceOpenAndVerifyAllConns opens every one of the permitted pool
-// connections now, proves each physical connection is on the verified
-// database file (pragma database_list plus descriptor-relative SameFile) and
-// carries the required pragma settings, then leaves the connections retained
-// as idle pool connections for the service lifetime.
-func forceOpenAndVerifyAllConns(ctx context.Context, db *sql.DB, n int, parentRoot *os.Root, dbName string, preFi os.FileInfo) error {
+// verifyAndPinAllConns acquires ALL n permitted connections simultaneously
+// (so database/sql can never hand back one idle connection repeatedly),
+// verifies each physical connection against the anchored database inode and
+// the required pragma settings while every handle is held, and returns the
+// verified handles for installation into the retained pool. A path swap
+// between the final identity check and any single connection's open is
+// caught per-connection; the constructor fails closed and every already
+// acquired handle is closed.
+func verifyAndPinAllConns(ctx context.Context, db *sql.DB, n int, parentRoot *os.Root, dbName string, preFi os.FileInfo) ([]*sql.Conn, error) {
+	// No idle reuse: every pinned handle is checked out fresh and held.
+	db.SetMaxIdleConns(0)
+	conns := make([]*sql.Conn, 0, n)
 	for i := 0; i < n; i++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			closeRetainedConns(conns)
+			return nil, err
 		}
 		conn, err := db.Conn(ctx)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
-				return cerr
+				err = cerr
 			}
-			return typed(ErrDependency, err)
+			closeRetainedConns(conns)
+			return nil, typed(ErrDependency, err)
 		}
-		verr := verifyConnIdentity(ctx, conn, parentRoot, dbName, preFi)
-		conn.Close()
-		if verr != nil {
-			return verr
+		if poolVerifyHook != nil {
+			poolVerifyHook(i)
 		}
+		if err := verifyConnIdentity(ctx, conn, parentRoot, dbName, preFi); err != nil {
+			_ = conn.Close()
+			closeRetainedConns(conns)
+			return nil, err
+		}
+		conns = append(conns, conn)
 	}
-	return nil
+	return conns, nil
+}
+
+func closeRetainedConns(conns []*sql.Conn) {
+	for _, c := range conns {
+		_ = c.Close()
+	}
 }
 
 // verifyConnIdentity proves a live connection is on exactly the verified
@@ -569,13 +615,22 @@ func verifyConnIdentity(ctx context.Context, conn *sql.Conn, parentRoot *os.Root
 		}
 	}
 	rows.Close()
-	cur, err := parentRoot.Lstat(dbName)
-	if err != nil || preFi == nil || !os.SameFile(cur, preFi) {
-		return typed(ErrDependency, errors.New("database file changed before pool pinning"))
-	}
-	if main != "" {
-		if sfi, serr := os.Stat(main); serr == nil && !os.SameFile(sfi, cur) {
-			return typed(ErrDependency, errors.New("pool connection opened a different database file"))
+	if parentRoot != nil {
+		cur, err := parentRoot.Lstat(dbName)
+		if err != nil || preFi == nil || !os.SameFile(cur, preFi) {
+			return typed(ErrDependency, errors.New("database file changed before pool pinning"))
+		}
+		if main != "" {
+			// The path this connection actually opened must resolve to the
+			// exact verified inode. If it cannot be stat'd at all (path
+			// swapped away), fail closed — never assume.
+			sfi, serr := os.Stat(main)
+			if serr != nil {
+				return typed(ErrDependency, errors.New("pool connection cannot be matched to the database file"))
+			}
+			if !os.SameFile(sfi, cur) {
+				return typed(ErrDependency, errors.New("pool connection opened a different database file"))
+			}
 		}
 	}
 	var fk int
@@ -598,6 +653,16 @@ func verifyConnIdentity(ctx context.Context, conn *sql.Conn, parentRoot *os.Root
 	if jm != "wal" {
 		return typed(ErrDependency, errors.New("pool connection is not in wal journal mode"))
 	}
+	var syncMode int
+	if err := conn.QueryRowContext(ctx, `pragma synchronous`).Scan(&syncMode); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return typed(ErrDependency, err)
+	}
+	if syncMode != 2 {
+		return typed(ErrDependency, errors.New("pool connection is not in synchronous=FULL mode"))
+	}
 	return nil
 }
 
@@ -606,17 +671,48 @@ func verifyConnIdentity(ctx context.Context, conn *sql.Conn, parentRoot *os.Root
 // anchored database file at construction and stays checked out of
 // database/sql for the pool lifetime, so no later path-based connection can
 // be opened behind the service's back.
+//
+// Concurrency contract:
+//   - acquire never holds the pool mutex while waiting for a handle; it
+//     selects on the available-handle channel, the caller's context, and the
+//     pool-closed signal. A canceled waiter under full exhaustion returns
+//     the exact context error promptly while another goroutine can still
+//     release.
+//   - release hands the handle back, or — if the pool is already closing —
+//     closes it itself, so Close never races a send on a closed channel (the
+//     channel is never closed) and a handle released after Close is never
+//     leaked.
+//   - close marks the pool closed, waits for every borrowed handle to be
+//     released (each such release closes its handle), then drains and closes
+//     every retained handle and the underlying *sql.DB. Close is therefore
+//     bounded by the behavior of holders: it completes once all borrowed
+//     handles return. Acquires after Close return a fixed closed-pool error.
 type dbPool struct {
-	db     *sql.DB
-	ch     chan *sql.Conn
-	mu     sync.Mutex
-	closed bool
+	db       *sql.DB
+	ch       chan *sql.Conn // buffered (size N); NEVER closed
+	closing  chan struct{}  // closed once by close()
+	mu       sync.Mutex
+	cond     *sync.Cond
+	closed   bool
+	borrowed int
 }
 
+// newDBPool builds a pool over db with size retained handles already in the
+// channel.
+func newDBPool(db *sql.DB, size int) *dbPool {
+	p := &dbPool{db: db, ch: make(chan *sql.Conn, size), closing: make(chan struct{})}
+	p.cond = sync.NewCond(&p.mu)
+	return p
+}
+
+var errPoolClosed = errors.New("staging database pool is closed")
+
 // openStagingPool opens and verifies the staging database exactly like
-// openStagingDB (with the connection count bounded and each connection
-// forced open and verified), then pins every permitted connection as a
-// retained handle. Callers hold one connection at a time via acquire.
+// openStagingDB (with the connection count bounded and every physical
+// connection held simultaneously, identity-verified against the anchored
+// database file and pragma set, then installed into the retained pool), so
+// the exact full retained set is verified. Callers hold one connection at a
+// time via acquire.
 func openStagingPool(ctx context.Context, dbPath string, size int) (*dbPool, error) {
 	if size <= 0 {
 		size = 4
@@ -630,29 +726,23 @@ func openStagingPool(ctx context.Context, dbPath string, size int) (*dbPool, err
 		// pin exactly one.
 		size = 1
 	}
-	db, err := openStagingDB(ctx, dbPath, size)
+	db, parentRoot, dbName, preFi, _, err := openStagingDBAnchored(ctx, dbPath, size)
 	if err != nil {
 		return nil, err
 	}
-	p := &dbPool{db: db, ch: make(chan *sql.Conn, size)}
-	for i := 0; i < size; i++ {
-		if err := ctx.Err(); err != nil {
-			p.close()
-			return nil, err
-		}
-		conn, err := db.Conn(ctx)
-		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				err = cerr
-			}
-			p.close()
-			return nil, typed(ErrDependency, err)
-		}
-		p.ch <- conn
+	defer parentRoot.Close()
+	if poolPinHook != nil {
+		poolPinHook()
 	}
-	// No idle connections remain: database/sql cannot open or reuse anything
-	// beyond the pinned handles.
-	db.SetMaxIdleConns(0)
+	conns, err := verifyAndPinAllConns(ctx, db, size, parentRoot, dbName, preFi)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	p := newDBPool(db, size)
+	for _, c := range conns {
+		p.ch <- c
+	}
 	return p, nil
 }
 
@@ -660,26 +750,46 @@ func (p *dbPool) acquire(ctx context.Context) (*sql.Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, errors.New("staging database pool is closed")
+	select {
+	case <-p.closing:
+		return nil, errPoolClosed
+	default:
 	}
-	c := <-p.ch
-	p.mu.Unlock()
-	return c, nil
+	select {
+	case c := <-p.ch:
+		p.mu.Lock()
+		p.borrowed++
+		p.mu.Unlock()
+		return c, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-p.closing:
+		return nil, errPoolClosed
+	}
 }
 
 func (p *dbPool) release(c *sql.Conn) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
+	select {
+	case <-p.closing:
+		// The pool is closing: close the handle ourselves so it is never
+		// leaked and close() can complete.
+		_ = c.Close()
+	default:
+		p.ch <- c
 	}
-	p.ch <- c
+	p.mu.Lock()
+	if p.borrowed > 0 {
+		p.borrowed--
+	}
+	p.cond.Broadcast()
 	p.mu.Unlock()
 }
 
+// close marks the pool closed and waits for every borrowed handle to return.
+// Handles released after close are closed by their releasers; once the
+// borrow count reaches zero every remaining handle sits in the channel and
+// is drained and closed here. The channel is never closed, so a concurrent
+// release can never send on a closed channel.
 func (p *dbPool) close() {
 	p.mu.Lock()
 	if p.closed {
@@ -687,6 +797,11 @@ func (p *dbPool) close() {
 		return
 	}
 	p.closed = true
+	close(p.closing)
+	for p.borrowed > 0 {
+		p.cond.Wait()
+	}
+	p.mu.Unlock()
 	for {
 		select {
 		case c := <-p.ch:
@@ -696,7 +811,6 @@ func (p *dbPool) close() {
 		}
 	}
 done:
-	p.mu.Unlock()
 	_ = p.db.Close()
 }
 
@@ -790,26 +904,42 @@ func prepareDBTarget(ctx context.Context, dbPath string) (root *os.Root, dbName 
 }
 
 // createDBFile creates the database file through the anchored descriptor
-// with O_EXCL 0600 and fsyncs the containing directory so the entry is
-// durable before SQLite opens it.
+// with O_EXCL and forces its mode to EXACTLY 0600 by fchmod'ing the OPENED
+// descriptor immediately (a restrictive process umask can never leave it
+// looser, and the descriptor is the only handle used — never a path), then
+// verifies the exact mode AND the directory-entry identity by descriptor
+// before any schema inspection happens. Any failure removes the freshly
+// created file so no mode-000 residue survives.
 func createDBFile(parentRoot *os.Root, dbName string) (os.FileInfo, error) {
 	f, err := parentRoot.OpenFile(dbName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, typed(ErrDependency, errors.New("cannot create database file"))
 	}
+	fail := func(e error) (os.FileInfo, error) {
+		_ = f.Close()
+		_ = parentRoot.Remove(dbName)
+		return nil, e
+	}
+	// fchmod the opened descriptor to exactly 0600 immediately, before any
+	// further check: the file is private from its first byte.
+	if err := f.Chmod(0o600); err != nil {
+		return fail(typed(ErrDependency, err))
+	}
 	st, err := f.Stat()
 	if err != nil {
-		f.Close()
-		_ = parentRoot.Remove(dbName)
-		return nil, typed(ErrDependency, err)
+		return fail(typed(ErrDependency, err))
 	}
-	if !st.Mode().IsRegular() || st.Mode().Perm()&0o077 != 0 {
-		f.Close()
-		_ = parentRoot.Remove(dbName)
-		return nil, typed(ErrDependency, errors.New("database file is not a private regular file"))
+	if !st.Mode().IsRegular() || st.Mode().Perm() != 0o600 {
+		return fail(typed(ErrDependency, errors.New("database file is not a private regular file")))
+	}
+	// The directory entry must be the very inode we just created (no swap,
+	// no symlink) — verified through the anchored descriptor.
+	lst, lerr := parentRoot.Lstat(dbName)
+	if lerr != nil || lst.Mode()&os.ModeSymlink != 0 || !lst.Mode().IsRegular() || !os.SameFile(st, lst) {
+		return fail(typed(ErrDependency, errors.New("database file changed during creation")))
 	}
 	if err := f.Close(); err != nil {
-		return nil, typed(ErrDependency, err)
+		return fail(typed(ErrDependency, err))
 	}
 	return st, nil
 }

@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/spec"
@@ -82,11 +83,12 @@ type service struct {
 
 	// Test-only fault injection points (nil in production). They are set
 	// before operations and never mutated concurrently.
-	fsyncHook     func() error // replaces the spool-file fsync
-	dirSyncHook   func() error // replaces the spool-directory fsync
-	dbWriteHook   func() error // fires before the offset UPDATE
-	commitHook    func() error // fires before COMMIT
-	createBarrier func()       // fires after the durable creating file, before activation
+	fsyncHook        func() error // replaces the spool-file fsync
+	dirSyncHook      func() error // replaces the spool-directory fsync
+	dbWriteHook      func() error // fires before the offset UPDATE
+	commitHook       func() error // fires before COMMIT
+	createBarrier    func()       // fires after both durable files exist, before activation
+	postActivateHook func()       // fires immediately after the activation commit, before token-file removal
 }
 
 // NewService constructs the durable staging service: it validates and
@@ -295,17 +297,38 @@ func buildSession(row *sessionRow) Session {
 // Create
 // ---------------------------------------------------------------------------
 
-// Create commits a durable `creating` row FIRST (transaction 1) with an
-// unforgeable per-create token and a bounded lease anchor (created_at),
-// then creates the spool file, writes the token bytes into it and makes the
-// file and its directory entry durable, verifies the file still carries the
-// token, and only then activates the session (transaction 2) guarded by
-// `state='creating' AND create_token=? AND created_at=?`. A crash at ANY
-// point is attributable: startup rolls a stale lease back (removing the
-// attributable file) and leaves a live lease alone — the creator alone can
-// activate, and unknown residue fails startup closed. Any durability failure
-// rolls the creating row back and removes the file, so a failed create
-// leaves no residue.
+// Create protocol (crash-safe state machine with explicit durable phases):
+//
+//	Tx 1   commit the durable `creating` row carrying an unforgeable random
+//	       token and a bounded lease anchor (created_at). No file exists yet.
+//	PhaseT make the TOKEN FILE (`<id>.tok`, O_EXCL, exact 0600) carry the
+//	       token bytes, fsync the file, fsync the directory. This file is the
+//	       attribution anchor: at every later crash point it proves who owns
+//	       this create attempt.
+//	PhaseC make the CANONICAL payload file (`<id>`, O_EXCL, exact 0600)
+//	       exist EMPTY and durable (fsync file, fsync directory). The
+//	       canonical file contains ONLY upload bytes from offset 0 — it never
+//	       carries the token — so an active canonical file is always
+//	       token-free by construction.
+//	verify re-read the token file and compare constant-time with the row
+//	       token; anything else fails closed before activation is attempted.
+//	Tx 2   activate: creating→active with create_token cleared, guarded by
+//	       `state='creating' AND create_token=? AND created_at=?`.
+//	PhaseR remove the token file and fsync the directory — the LAST failure
+//	       point. If this (or any earlier phase) fails, Create returns a
+//	       data-free dependency error and NEVER leaves a durable active row:
+//	       a pre-activation failure rolls the creating row back (tombstone →
+//	       remove attributable files → delete row); a post-activation failure
+//	       rolls the ACTIVE row back through the same tombstone protocol.
+//
+// Crash points are therefore all attributable and recoverable: no durable
+// `active` row can exist whose canonical file is not already empty,
+// token-free, and fsynced; every interrupted create converges to a
+// tombstoned (deleting) row that a later run finishes, or to live creating
+// residue that only its creator (holding the lease) may activate. Startup
+// re-reads the current row state/token/lease inside the serialized decision
+// and never acts on a stale snapshot, so a row concurrently activated and
+// truncated by its creator is never rejected.
 func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Duration) (Session, error) {
 	if err := validateRepo(repo); err != nil {
 		return Session{}, err
@@ -352,36 +375,57 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		return Session{}, err
 	}
 
-	// Create the file and make the token bytes and the directory entry
-	// durable before the session becomes visible.
-	f, err := s.spool.create(id)
+	// Phase T: the attribution token file — durable before the canonical
+	// file or any activation can exist.
+	tf, err := s.spool.createTok(id)
 	if err != nil {
-		_ = s.rollbackCreate(ctx, id)
+		_ = s.rollbackCreate(ctx, id, token)
 		return Session{}, typed(ErrDependency, err)
 	}
-	if _, werr := f.Write(tokenRaw[:]); werr != nil {
-		_ = f.Close()
-		_ = s.rollbackCreate(ctx, id)
+	if _, werr := tf.Write(tokenRaw[:]); werr != nil {
+		_ = tf.Close()
+		_ = s.rollbackCreate(ctx, id, token)
 		return Session{}, typed(ErrDependency, werr)
 	}
-	serr := s.syncFile(f)
-	cerr := f.Close()
+	serr := s.syncFile(tf)
+	cerr := tf.Close()
 	if serr == nil {
 		serr = cerr
 	}
 	if serr != nil {
-		_ = s.rollbackCreate(ctx, id)
+		_ = s.rollbackCreate(ctx, id, token)
 		return Session{}, typed(ErrDependency, serr)
 	}
 	if err := s.syncDir(); err != nil {
-		_ = s.rollbackCreate(ctx, id)
+		_ = s.rollbackCreate(ctx, id, token)
 		return Session{}, typed(ErrDependency, err)
 	}
 
-	// The file must still carry exactly our token before activation is even
-	// attempted; anything else is a fail-closed dependency error.
-	if err := s.verifyCreatingFile(ctx, id, token); err != nil {
-		_ = s.rollbackCreate(ctx, id)
+	// Phase C: the canonical payload file — EMPTY upload bytes from offset 0,
+	// durable before activation. The token never enters this file.
+	cf, err := s.spool.create(id)
+	if err != nil {
+		_ = s.rollbackCreate(ctx, id, token)
+		return Session{}, typed(ErrDependency, err)
+	}
+	serr = s.syncFile(cf)
+	cerr = cf.Close()
+	if serr == nil {
+		serr = cerr
+	}
+	if serr != nil {
+		_ = s.rollbackCreate(ctx, id, token)
+		return Session{}, typed(ErrDependency, serr)
+	}
+	if err := s.syncDir(); err != nil {
+		_ = s.rollbackCreate(ctx, id, token)
+		return Session{}, typed(ErrDependency, err)
+	}
+
+	// The token file must still carry exactly our token before activation
+	// is even attempted; anything else is a fail-closed dependency error.
+	if err := s.verifyCreatingTok(ctx, id, token); err != nil {
+		_ = s.rollbackCreate(ctx, id, token)
 		return Session{}, err
 	}
 
@@ -390,7 +434,9 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 	}
 
 	// Activate: creating -> active, guarded by token and lease anchor so
-	// only this creator can activate this exact row.
+	// only this creator can activate this exact row. The canonical file is
+	// already empty, token-free, and durable, so the moment this commits
+	// the session is a fully valid active session.
 	activated := false
 	err = s.withTx(ctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(ctx,
@@ -411,18 +457,24 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		return nil
 	})
 	if err != nil || !activated {
-		_ = s.rollbackCreate(ctx, id)
+		_ = s.rollbackCreate(ctx, id, token)
 		if err == nil {
 			err = typed(ErrDependency, errors.New("staging create activation lost its row"))
 		}
 		return Session{}, err
 	}
 
-	// The token lobe is now mere tail; shrink it to the committed offset and
-	// make that durable. A failure here fails the create closed (the
-	// session is already active; the lobe is aligned away at next access).
-	if err := s.truncateToCommitted(id, 0); err != nil {
-		return Session{}, err
+	if s.postActivateHook != nil {
+		s.postActivateHook()
+	}
+
+	// Phase R: token-file removal — the final token-clearing step, itself
+	// durable (directory fsync). On failure the create must NOT leave a
+	// durable active row: the active row is rolled back through the
+	// tombstone protocol and a data-free dependency error is returned.
+	if err := s.removeTokDurable(id); err != nil {
+		_ = s.rollbackActivatedCreate(ctx, id)
+		return Session{}, typed(ErrDependency, err)
 	}
 	return Session{
 		ID:        id,
@@ -434,10 +486,10 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 	}, nil
 }
 
-// verifyCreatingFile reads exactly the token lobe of a creating file and
-// compares it constant-time with the row token. Any mismatch is a
-// fail-closed dependency error; the file is never touched.
-func (s *service) verifyCreatingFile(ctx context.Context, id, tokenHex string) error {
+// verifyCreatingTok reads exactly the token lobe of the creating session's
+// TOKEN FILE and compares it constant-time with the row token. Any mismatch
+// or absence is a fail-closed dependency error; the file is never touched.
+func (s *service) verifyCreatingTok(ctx context.Context, id, tokenHex string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -445,50 +497,55 @@ func (s *service) verifyCreatingFile(ctx context.Context, id, tokenHex string) e
 	if err != nil {
 		return typed(ErrDependency, err)
 	}
-	got, err := s.spool.readExact(id, creatingTokenLen)
+	got, err := s.spool.readTokExact(id, creatingTokenLen)
 	if err != nil {
 		return typed(ErrDependency, err)
 	}
 	if subtle.ConstantTimeCompare(got, want) != 1 {
-		return typed(ErrDependency, errors.New("creating session file does not carry its token"))
+		return typed(ErrDependency, errors.New("creating session token file does not carry its token"))
 	}
 	return nil
 }
 
-// truncateToCommitted verifies the file at the current committed lobe (so a
-// swapped/removed file fails closed) and shrinks it to offset with a durable
-// sync, exactly like the rollback path.
-func (s *service) truncateToCommitted(id string, offset int64) error {
-	f, err := s.spool.openForAppend(id, offset)
-	if err != nil {
+// removeTokDurable unlinks the creating session's token file and fsyncs the
+// spool directory, so a completed create leaves no token bytes anywhere.
+func (s *service) removeTokDurable(id string) error {
+	if err := s.spool.removeTok(id); err != nil {
 		return typed(ErrDependency, err)
 	}
-	terr := f.Truncate(offset)
-	if terr == nil {
-		terr = s.syncFile(f)
-	}
-	cerr := f.Close()
-	if terr == nil {
-		terr = cerr
-	}
-	if terr != nil {
-		return typed(ErrDependency, terr)
+	if err := s.syncDir(); err != nil {
+		return typed(ErrDependency, err)
 	}
 	return nil
 }
 
-// rollbackCreate tears down a creating row and its attributable file
-// (idempotent, safe when the row or file is already absent). It runs its own
-// transactions — never inside a caller's transaction — under a
-// cancellation-proof context so a failed create always converges. It is also
-// the startup rollback path for interrupted creates. It never unlinks a file
-// whose row it did not tombstone.
-func (s *service) rollbackCreate(ctx context.Context, id string) error {
+// removeFiles unlinks BOTH files of a session (the canonical payload file
+// and its token file) through the anchored descriptor, idempotent when
+// either is absent. The caller must hold a durable tombstone for the row
+// before calling (the row-id ownership proof); the containing directory is
+// fsynced by the caller afterwards.
+func (s *service) removeFiles(id string) error {
+	if err := s.spool.remove(id); err != nil {
+		return err
+	}
+	return s.spool.removeTok(id)
+}
+
+// rollbackCreate tears down a creating row and its attributable files
+// (idempotent, safe when the row or files are already absent). The guarded
+// tombstone update — `state='creating' AND create_token=?` — is the
+// serialization point: a row concurrently activated by its creator (or
+// tombstoned by another instance) is NOT touched, and no file is ever
+// unlinked whose row this call did not tombstone. It runs its own
+// transactions under a cancellation-proof context so a failed create always
+// converges. It is also the startup rollback path for interrupted creates.
+func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 	rctx := context.WithoutCancel(ctx)
 	proceed := false
 	if err := s.withTx(rctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(rctx,
-			`update upload_sessions set state = 'deleting', create_token = null where id = ? and state = 'creating'`, id)
+			`update upload_sessions set state = 'deleting', create_token = null
+			 where id = ? and state = 'creating' and create_token = ?`, id, token)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
@@ -503,10 +560,47 @@ func (s *service) rollbackCreate(ctx context.Context, id string) error {
 	}
 	if !proceed {
 		// The row is not in creating state (already activated or already
-		// tombstoned by another instance); never unlink a file we do not own.
+		// tombstoned by another instance); never unlink files we do not own.
 		return nil
 	}
-	if err := s.spool.remove(id); err != nil {
+	if err := s.removeFiles(id); err != nil {
+		return typed(ErrDependency, err)
+	}
+	if err := s.syncDir(); err != nil {
+		return typed(ErrDependency, err)
+	}
+	_, err := s.deleteTombstonedRow(rctx, id)
+	return err
+}
+
+// rollbackActivatedCreate reverts a create whose activation COMMITTED but
+// whose final token-clearing step failed: the active row is tombstoned
+// (guarded on state='active' — its id is fresh and unguessable, so only the
+// creating caller can race it), its files are removed, and the row is
+// deleted. The result is a converged, recoverable state instead of a
+// durable active row paired with a failed create.
+func (s *service) rollbackActivatedCreate(ctx context.Context, id string) error {
+	rctx := context.WithoutCancel(ctx)
+	proceed := false
+	if err := s.withTx(rctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(rctx,
+			`update upload_sessions set state = 'deleting' where id = ? and state = 'active'`, id)
+		if err != nil {
+			return typed(ErrDependency, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return typed(ErrDependency, err)
+		}
+		proceed = n == 1
+		return nil
+	}); err != nil {
+		return err
+	}
+	if !proceed {
+		return nil
+	}
+	if err := s.removeFiles(id); err != nil {
 		return typed(ErrDependency, err)
 	}
 	if err := s.syncDir(); err != nil {
@@ -998,8 +1092,10 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 	}
 
 	// Unlink + directory fsync OUTSIDE any transaction (a rollback must
-	// never revive rows whose files are gone).
-	if err := s.spool.remove(id); err != nil {
+	// never revive rows whose files are gone). Both the canonical payload
+	// file and the session's token file (residue of an interrupted create)
+	// are removed through the anchored descriptor.
+	if err := s.removeFiles(id); err != nil {
 		return typed(ErrDependency, err)
 	}
 	if err := s.syncDir(); err != nil {
@@ -1127,8 +1223,9 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 	}
 
 	// Unlink + directory fsync OUTSIDE any transaction. On failure the
-	// tombstone stays durable for the retry.
-	if err := s.spool.remove(id); err != nil {
+	// tombstone stays durable for the retry. Both the canonical payload file
+	// and the session's token file are removed.
+	if err := s.removeFiles(id); err != nil {
 		return false, typed(ErrDependency, err)
 	}
 	if err := s.syncDir(); err != nil {
@@ -1148,27 +1245,31 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 // reconcileStartup converges the spool and the database after a crash:
 //
 //   - Phase A takes a durable-consistent snapshot of every row (one
-//     read-only transaction).
-//   - Phase B repairs each row WITHOUT any unlink inside a transaction:
-//     deleting rows are finished (durable unlink, then metadata removal);
-//     stale creating rows are rolled back ONLY when attributable through
-//     their unforgeable token file (no file -> row removed; matching file ->
-//     row AND attributable file removed; anything else fails closed) while
-//     live creating leases are left strictly alone; active/finalized rows
-//     are aligned to the committed offset (crash tails truncated, short
-//     files fail closed); unknown states fail closed.
+//     read-only transaction). A test hook fires here so barrier tests can
+//     interleave a concurrently-activating creator.
+//   - Phase B repairs each row WITHOUT any unlink inside a transaction,
+//     re-reading the CURRENT row state/token/lease inside the serialized
+//     decision — a stale snapshot is NEVER used to reject a row that a
+//     live creator concurrently activated and truncated. deleting rows are
+//     finished (durable unlink of both files, then metadata removal); stale
+//     creating rows are rolled back ONLY when attributable through their
+//     unforgeable TOKEN FILE (<id>.tok): no files -> row removed; matching
+//     token file -> row AND its attributable token/canonical files removed;
+//     a canonical file with no token file, or a token file carrying foreign
+//     bytes, is unknown residue and fails closed with every file UNTOUCHED —
+//     attacker-planted empty/wrong-token canonical files are never adopted
+//     or deleted; live creating leases are left strictly alone; active/
+//     finalized rows (including rows just activated by their creator) are
+//     aligned to the committed offset (crash tails truncated, short files
+//     fail closed); unknown states fail closed.
 //   - Phase C re-queries the database FRESH (not the Phase A snapshot) and
 //     demands exact attribution of every spool entry against it: any entry
 //     with no database row makes startup fail closed with its file UNTOUCHED
-//     — a foreign or unowned file is never swept.
+//     — a foreign or unowned file is never swept. A leftover <id>.tok whose
+//     base id HAS a live row is benign interrupted-create residue: it is
+//     never adopted (it is not a canonical file) and never deleted (its
+//     token was already cleared from the row).
 func (s *service) reconcileStartup(ctx context.Context) error {
-	type rowInfo struct {
-		id           string
-		state        string
-		offset       int64
-		createdNanos int64
-		token        string
-	}
 	var rows []rowInfo
 	// Phase A: durable-consistent snapshot.
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
@@ -1203,6 +1304,9 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if reconcileSnapshotHook != nil {
+		reconcileSnapshotHook()
+	}
 
 	// Phase B: per-row repair.
 	for _, ri := range rows {
@@ -1211,7 +1315,7 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 		}
 		switch State(ri.state) {
 		case StateDeleting:
-			if err := s.spool.remove(ri.id); err != nil {
+			if err := s.removeFiles(ri.id); err != nil {
 				return typed(ErrDependency, err)
 			}
 			if err := s.syncDir(); err != nil {
@@ -1221,46 +1325,8 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 				return err
 			}
 		case StateCreating:
-			if ri.offset != 0 {
-				return typed(ErrDependency, errors.New("creating session has a nonzero offset"))
-			}
-			if ri.token == "" {
-				return typed(ErrDependency, errors.New("creating session lacks its create token"))
-			}
-			stale := s.creatingLeaseStale(ri.createdNanos)
-			fi, err := s.spool.root.Lstat(ri.id)
-			switch {
-			case os.IsNotExist(err):
-				if stale {
-					// The token was never durably written: roll the row back.
-					if err := s.rollbackCreate(ctx, ri.id); err != nil {
-						return err
-					}
-				}
-				// Live lease: the creator is still between row commit and
-				// file durability; leave it strictly alone.
-			case err != nil:
-				return typed(ErrDependency, err)
-			case fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular():
-				return typed(ErrDependency, errors.New("creating session file is not a regular file"))
-			default:
-				// The file exists. It is attributable ONLY if it carries
-				// exactly this row's unforgeable token; an empty, short,
-				// long, or wrong-token file is unknown residue and startup
-				// fails closed without touching it (a file never proves a
-				// creator).
-				if stale {
-					if err := s.verifyCreatingFile(ctx, ri.id, ri.token); err != nil {
-						return err
-					}
-					// Stale AND attributable: roll the row back and remove
-					// its attributable file. Never adopt.
-					if err := s.rollbackCreate(ctx, ri.id); err != nil {
-						return err
-					}
-				}
-				// Live lease: the creator may still be between durably
-				// writing its token lobe and activating; leave it alone.
+			if err := s.reconcileCreatingRow(ctx, ri); err != nil {
+				return err
 			}
 		case StateActive, StateFinalized:
 			if err := s.spool.align(ri.id, ri.offset); err != nil {
@@ -1312,9 +1378,125 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 		return err
 	}
 	for _, name := range names {
-		if !dbIDs[name] {
-			return typed(ErrDependency, errors.New("unexpected file in spool"))
+		if dbIDs[name] {
+			continue
 		}
+		if base, ok := strings.CutSuffix(name, ".tok"); ok && dbIDs[base] {
+			// Benign interrupted-create residue: the token file of a live
+			// row. It is never adopted (only canonical names are payload),
+			// never deleted (its token was cleared from the row and cannot
+			// be re-verified), and never blocks startup.
+			continue
+		}
+		return typed(ErrDependency, errors.New("unexpected file in spool"))
 	}
 	return nil
+}
+
+// rowInfo is a durable-consistent snapshot row: the create-time row
+// fields needed to decide a creating row's fate at startup.
+type rowInfo struct {
+	id           string
+	state        string
+	offset       int64
+	createdNanos int64
+	token        string
+}
+
+// reconcileCreatingRow decides the fate of a creating row WITHOUT trusting
+// the Phase A snapshot: it re-reads the current row state, token, and lease
+// inside a serialized transaction, then acts conditionally on THAT state.
+// A row concurrently activated and truncated by its creator is therefore
+// aligned like any active row instead of being rejected through a stale
+// snapshot. Attribution of the create attempt comes from the row's token
+// FILE — a stale creating row is rolled back only when that file carries
+// exactly the row token; a canonical file without a token file, or a token
+// file with foreign bytes, fails closed untouched.
+func (s *service) reconcileCreatingRow(ctx context.Context, ri rowInfo) error {
+	if ri.offset != 0 {
+		return typed(ErrDependency, errors.New("creating session has a nonzero offset"))
+	}
+	// Re-read the CURRENT row inside the serialized decision.
+	var curState, curTok string
+	var curCreated int64
+	found := false
+	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		row, f, err := fetchSession(ctx, conn, ri.id)
+		if err != nil {
+			return err
+		}
+		if f {
+			found = true
+			curState = row.state
+			curTok = row.createToken.String
+			curCreated = row.createdNanos
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		// The row vanished (another instance finished or rolled it back).
+		return nil
+	}
+	switch State(curState) {
+	case StateActive, StateFinalized:
+		// The creator won: the row is already active/finalized with its
+		// canonical file empty/token-free. Align (crash-tail truncation is
+		// idempotent) and move on — never reject through the stale snapshot.
+		if err := s.spool.align(ri.id, ri.offset); err != nil {
+			return typed(ErrDependency, err)
+		}
+		return nil
+	case StateDeleting:
+		// Another instance already tombstoned the interrupted create;
+		// finish the deletion (remove both files, then the row).
+		if err := s.removeFiles(ri.id); err != nil {
+			return typed(ErrDependency, err)
+		}
+		if err := s.syncDir(); err != nil {
+			return typed(ErrDependency, err)
+		}
+		_, err := s.deleteTombstonedRow(ctx, ri.id)
+		return err
+	case StateCreating:
+		// Still creating: decide with the CURRENT token and lease.
+		if !s.creatingLeaseStale(curCreated) {
+			// Live lease: the creator is still between row commit and
+			// activation; leave it (and its files) strictly alone.
+			return nil
+		}
+		tokFi, tokExists, err := s.spool.tokInfo(ri.id)
+		if err != nil {
+			return typed(ErrDependency, err)
+		}
+		_ = tokFi
+		if !tokExists {
+			// No token file: our create never durably wrote its attribution
+			// anchor. A canonical file without a token file is never OURS
+			// (the protocol always writes the token file first and keeps it
+			// until after activation) — it is attacker-planted or foreign
+			// residue and fails closed UNTOUCHED.
+			if _, cexists, cerr := s.spool.nameInfo(ri.id); cerr != nil {
+				return typed(ErrDependency, cerr)
+			} else if cexists {
+				return typed(ErrDependency, errors.New("creating session has an unattributable canonical file"))
+			}
+			// No files at all: roll the row back.
+			return s.rollbackCreate(ctx, ri.id, curTok)
+		}
+		if err := s.verifyCreatingTok(ctx, ri.id, curTok); err != nil {
+			// The token file carries foreign bytes: unknown residue. Never
+			// adopt it, never delete it.
+			return err
+		}
+		// Stale AND attributable: roll the row back and remove its
+		// attributable token + canonical files (the canonical file was
+		// created with O_EXCL by this same create — the unforgeable id plus
+		// a verified token file prove ownership). Never adopt.
+		return s.rollbackCreate(ctx, ri.id, curTok)
+	default:
+		return typed(ErrDependency, errors.New("unknown session state"))
+	}
 }

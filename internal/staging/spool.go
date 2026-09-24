@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // spoolErrorKind identifies fail-closed filesystem divergences so the
@@ -83,15 +84,18 @@ type spool struct {
 // trusted descriptor anchor — absolute "/" for absolute paths, the
 // descriptor-opened CWD (".") for relative ones. Each component is Lstat'd
 // in the CURRENT root: a symlink or non-directory is rejected, a missing
-// component is created (0700) only when enforce is true, then OpenRoot'd
-// and compared against a post-open snapshot so a swap of any component is
-// detected. The deepest whole path is never Lstat'd or OpenRoot'd directly.
-// Only the components BELOW the anchor may be created or mode-repaired,
-// always through the anchored descriptor; OS-standard symlink prefixes
-// (/var, /tmp) therefore reject the path rather than being followed. The
-// final directory is verified and repaired to exactly 0700. When enforce is
-// false (the implied "." parent of a bare database name) only the anchor is
-// opened and nothing is created or modified.
+// component is created (exactly 0700, umask-proof) only when enforce is
+// true, an existing component's mode is verified and repaired through the
+// anchored parent descriptor (a no-exec child is opened read-only by name
+// from the parent and fchmod'd — never chmod'd through a path), then
+// OpenRoot'd and compared against a post-open snapshot so a swap of any
+// component is detected. The deepest whole path is never Lstat'd or
+// OpenRoot'd directly. Only the components BELOW the anchor may be created
+// or mode-repaired, always through the anchored descriptor; OS-standard
+// symlink prefixes (/var, /tmp) therefore reject the path rather than being
+// followed. The final directory is verified and repaired to exactly 0700.
+// When enforce is false (the implied "." parent of a bare database name)
+// only the anchor is opened and nothing is created or modified.
 func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 	if path == "" {
 		return nil, spoolErr(spoolErrGeneric, errors.New("empty directory path"))
@@ -125,7 +129,8 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 		}
 	}
 
-	for _, comp := range comps {
+	for i, comp := range comps {
+		last := i == len(comps)-1
 		if comp == "." || comp == ".." {
 			anchor.Close()
 			return nil, spoolErr(spoolErrGeneric, errors.New("path component is not a plain name"))
@@ -146,9 +151,9 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 				anchor.Close()
 				return nil, spoolErr(spoolErrGeneric, errors.New("path component does not exist"))
 			}
-			if err := anchor.Mkdir(comp, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			if err := mkdirPrivate(anchor, comp); err != nil {
 				anchor.Close()
-				return nil, spoolErr(spoolErrGeneric, err)
+				return nil, err
 			}
 			fi, err = anchor.Lstat(comp)
 			if err != nil {
@@ -162,6 +167,21 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 		default:
 			anchor.Close()
 			return nil, spoolErr(spoolErrGeneric, err)
+		}
+		// The FINAL component alone is ours to verify and repair to exactly
+		// 0700, through the ANCHORED parent descriptor: a no-exec final
+		// directory is still openable by name from the parent (openat needs
+		// only the PARENT's execute bit plus the child's read bit), so the
+		// child's own missing execute bit can be repaired safely. Ancestors
+		// are the operator's — they are only checked for symlink/type, never
+		// mode-repaired. When even the final directory cannot be opened
+		// (no read bit), the descent fails closed — no path-based chmod is
+		// ever used.
+		if last {
+			if err := verifyPrivateDir(anchor, comp, 0o700, enforce); err != nil {
+				anchor.Close()
+				return nil, err
+			}
 		}
 		// Open the component in the CURRENT root and prove its identity with
 		// a post-open snapshot of the same component: a swap between the
@@ -183,12 +203,12 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 	}
 	// Final directory: verify and repair exact 0700 through the descriptor.
 	if clean != "." {
-		if err := verifyPrivateDir(anchor, ".", 0o700, enforce, clean); err != nil {
+		if err := verifyPrivateDir(anchor, ".", 0o700, enforce); err != nil {
 			anchor.Close()
 			return nil, err
 		}
 	} else if enforce {
-		if err := verifyPrivateDir(anchor, ".", 0o700, true, clean); err != nil {
+		if err := verifyPrivateDir(anchor, ".", 0o700, true); err != nil {
 			anchor.Close()
 			return nil, err
 		}
@@ -196,29 +216,59 @@ func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 	return anchor, nil
 }
 
+// mkdirPrivate creates a subdirectory of root with EXACTLY 0700 regardless
+// of the process umask. The umask is cleared for the single mkdir syscall
+// and restored immediately; the bitwise effect can only ever ADD the bits
+// explicitly requested (0700) — it can never make the directory looser than
+// requested — and the resulting mode is verified afterwards. The service
+// constructor is the only caller and never runs concurrently with other
+// goroutines at that point.
+func mkdirPrivate(root *os.Root, comp string) error {
+	old := syscall.Umask(0)
+	err := root.Mkdir(comp, 0o700)
+	syscall.Umask(old)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	return nil
+}
+
 // verifyPrivateDir confirms the descriptor-relative name is a real
 // non-symlink directory and, when repair is allowed and the mode differs
-// from want, repairs it through an opened descriptor. Impossible modes are
-// rejected. When the descriptor-relative open is impossible because the
-// directory lacks the execute bit (an open of "." through the root requires
-// it), an identity-verified path-based fallback chmod is used: the opened
-// descriptor is compared with the anchored identity BEFORE any chmod, so a
-// swapped path is never touched.
-func verifyPrivateDir(root *os.Root, name string, want os.FileMode, repair bool, fullPath string) error {
+// from want, repairs it through an opened descriptor reached FROM THE
+// ANCHORED PARENT (never through a path). A no-exec directory is still
+// openable read-only by name when its parent descriptor is retained, and
+// the repair fchmods that opened descriptor; when the directory cannot even
+// be opened (no read bit, or the final root itself when no parent is
+// available), the repair FAILS CLOSED — an ancestor swap can never redirect
+// a path-based chmod because no path is ever consulted.
+func verifyPrivateDir(root *os.Root, name string, want os.FileMode, repair bool) error {
 	fi, err := root.Lstat(name)
 	if err != nil {
-		// A directory without the execute bit cannot be stat'd or opened
-		// descriptor-relatively; repair it through the parent (identity
-		// verified) and retry.
-		if repair && fullPath != "" && errors.Is(err, fs.ErrPermission) {
-			if rerr := repairDirModeByPath(fullPath, want, root, name); rerr != nil {
-				return rerr
+		// The entry cannot be stat'd from the anchored root: only a missing
+		// execute bit on a child directory (which is still openable by name
+		// from the parent) or an impossible final root (no retained parent)
+		// produce this. Try the descriptor-relative open; anything else
+		// fails closed.
+		if errors.Is(err, fs.ErrPermission) && repair {
+			f, oerr := root.Open(name)
+			if oerr == nil {
+				st, serr := f.Stat()
+				if serr == nil && st.IsDir() && st.Mode()&os.ModeSymlink == 0 {
+					if cerr := f.Chmod(want); cerr == nil {
+						_ = f.Close()
+						fi, err = root.Lstat(name)
+						if err == nil && fi.Mode().Perm() == want {
+							return nil
+						}
+						err = errors.New("directory mode repair verification failed")
+						return spoolErr(spoolErrGeneric, err)
+					}
+				}
+				_ = f.Close()
 			}
-			fi, err = root.Lstat(name)
 		}
-		if err != nil {
-			return spoolErr(spoolErrGeneric, err)
-		}
+		return spoolErr(spoolErrGeneric, err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
 		return spoolErr(spoolErrGeneric, errors.New("directory path is a symbolic link"))
@@ -231,9 +281,6 @@ func verifyPrivateDir(root *os.Root, name string, want os.FileMode, repair bool,
 			return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode %o is not private", p))
 		}
 		f, err := root.Open(name)
-		if err != nil && fullPath != "" {
-			return repairDirModeByPath(fullPath, want, root, name)
-		}
 		if err != nil {
 			return spoolErr(spoolErrGeneric, err)
 		}
@@ -249,48 +296,6 @@ func verifyPrivateDir(root *os.Root, name string, want os.FileMode, repair bool,
 		if p := fi.Mode().Perm(); p != want {
 			return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode repair to %o failed", want))
 		}
-	}
-	return nil
-}
-
-// repairDirModeByPath changes a directory's mode through a descriptor opened
-// by its full path, but ONLY after verifying the opened descriptor is the
-// same file as the pre-open path identity — a rename/swap between
-// verification and open is detected and nothing is modified. It is used when
-// the directory lacks the execute bit and cannot be opened or stat'd
-// descriptor-relatively.
-func repairDirModeByPath(fullPath string, want os.FileMode, root *os.Root, name string) error {
-	pathFi, err := os.Lstat(fullPath)
-	if err != nil {
-		return spoolErr(spoolErrGeneric, err)
-	}
-	if pathFi.Mode()&os.ModeSymlink != 0 || !pathFi.IsDir() {
-		return spoolErr(spoolErrGeneric, errors.New("directory path is a symbolic link or not a directory"))
-	}
-	f, err := os.Open(fullPath)
-	if err != nil {
-		return spoolErr(spoolErrGeneric, err)
-	}
-	st, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return spoolErr(spoolErrGeneric, err)
-	}
-	if !st.IsDir() || st.Mode()&os.ModeSymlink != 0 || !os.SameFile(st, pathFi) {
-		f.Close()
-		return spoolErr(spoolErrGeneric, errors.New("directory changed during mode repair"))
-	}
-	cerr := f.Chmod(want)
-	f.Close()
-	if cerr != nil {
-		return spoolErr(spoolErrGeneric, errors.New("cannot make directory private"))
-	}
-	fi, err := root.Lstat(name)
-	if err != nil {
-		return spoolErr(spoolErrGeneric, err)
-	}
-	if fi.Mode().Perm() != want {
-		return spoolErr(spoolErrGeneric, fmt.Errorf("directory mode repair to %o failed", want))
 	}
 	return nil
 }
@@ -328,7 +333,7 @@ func newSpool(ctx context.Context, rootPath string) (*spool, error) {
 // operation that touches the spool verifies (and repairs through the
 // descriptor, identity-checked) the root mode first.
 func (sp *spool) ensureRootMode() error {
-	return verifyPrivateDir(sp.root, ".", 0o700, true, sp.rootPath)
+	return verifyPrivateDir(sp.root, ".", 0o700, true)
 }
 
 func (sp *spool) Close() error {
@@ -352,44 +357,151 @@ func (sp *spool) create(id string) (*os.File, error) {
 	if err := validateID(id); err != nil {
 		return nil, err
 	}
+	return sp.createName(id)
+}
+
+// tokName is the spool file name carrying the unforgeable create token of a
+// creating session. It is derived from the canonical 64-hex id by a fixed
+// suffix, so it can never collide with a canonical file name and can never
+// be confused with one during enumeration.
+func tokName(id string) string { return id + ".tok" }
+
+// createTok creates the O_EXCL 0600 token file for a validated id and
+// returns the writable descriptor open at offset 0, exactly like create but
+// under the derived .tok name. The caller owns durability: fsync the
+// returned descriptor (or roll the row back) and fsync the directory.
+func (sp *spool) createTok(id string) (*os.File, error) {
+	return sp.createName(tokName(id))
+}
+
+// createName is the shared O_EXCL create path: validate the caller-supplied
+// name derives from a validated id, create it exactly 0600 (fchmod, umask-
+// proof), verify by descriptor and by the anchored directory entry, and
+// reject any pre-existing entry (file, symlink, or directory) outright.
+func (sp *spool) createName(name string) (*os.File, error) {
 	if err := sp.ensureRootMode(); err != nil {
 		return nil, err
 	}
-	f, err := sp.root.OpenFile(id, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := sp.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
 	// Immediate chmod, then exact verification — regardless of umask.
 	if err := f.Chmod(0o600); err != nil {
 		f.Close()
-		_ = sp.remove(id)
+		_ = sp.root.Remove(name)
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
-		_ = sp.remove(id)
+		_ = sp.root.Remove(name)
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
 	if !st.Mode().IsRegular() || st.Mode().Perm() != 0o600 {
 		f.Close()
-		_ = sp.remove(id)
+		_ = sp.root.Remove(name)
 		return nil, spoolErr(spoolErrGeneric, errors.New("spool file is not an exact 0600 regular file"))
 	}
 	// Descriptor identity: no swap between creation and hand-off.
-	lst, err := sp.root.Lstat(id)
+	lst, err := sp.root.Lstat(name)
 	if err != nil || !os.SameFile(st, lst) || lst.Mode()&os.ModeSymlink != 0 {
 		f.Close()
-		_ = sp.remove(id)
+		_ = sp.root.Remove(name)
 		return nil, spoolErr(spoolErrGeneric, errors.New("spool file changed during creation"))
 	}
 	return f, nil
 }
 
-// repairFileMode forces a verified spool file's mode to EXACTLY 0600 through
-// the already-open descriptor (fchmod never follows symlinks); a mode that
-// cannot be repaired fails closed. The descriptor must already be identity-
-// verified by the caller.
+// removeTok unlinks the token file for a validated id (idempotent when
+// absent), through the anchored descriptor — never through a path.
+func (sp *spool) removeTok(id string) error {
+	return sp.removeName(tokName(id))
+}
+
+// removeName unlinks an internal spool name (idempotent when absent).
+func (sp *spool) removeName(name string) error {
+	err := sp.root.Remove(name)
+	if err != nil && os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	return nil
+}
+
+// readTokExact reads exactly n bytes from the token file of a validated id,
+// proving first through the anchored descriptor that the entry is a
+// symlink-free regular file of exactly that size and refusing any extra
+// byte. It is used to attribute a creating session through its unforgeable
+// token; an empty, short, long, symlinked, or wrong-identity token file is
+// an error and is NEVER touched.
+func (sp *spool) readTokExact(id string, n int64) ([]byte, error) {
+	return sp.readNameExact(tokName(id), n)
+}
+
+// readNameExact is the shared size-exact read used for attribution checks.
+func (sp *spool) readNameExact(name string, n int64) ([]byte, error) {
+	fi, err := sp.root.Lstat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, spoolErr(spoolErrMissing, err)
+		}
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, spoolErr(spoolErrSymlink, errors.New("spool path is a symbolic link"))
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, spoolErr(spoolErrNotRegular, errors.New("spool path is not a regular file"))
+	}
+	if fi.Size() != n {
+		return nil, spoolErr(spoolErrShort, errors.New("spool file size does not match the expected lobe"))
+	}
+	f, err := sp.root.OpenFile(name, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() || st.Size() != n || !os.SameFile(st, fi) {
+		f.Close()
+		return nil, spoolErr(spoolErrNotRegular, errors.New("opened spool path is not the verified file"))
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		f.Close()
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	// The lobe must be exact: an extra byte (concurrent extension or swap)
+	// fails closed.
+	var probe [1]byte
+	if m, err := f.Read(probe[:]); err != io.EOF || m != 0 {
+		f.Close()
+		return nil, spoolErr(spoolErrShort, errors.New("spool file carries more bytes than expected"))
+	}
+	f.Close()
+	return buf, nil
+}
+
+// tokInfo reports whether the token file for a validated id exists and its
+// file info, through the anchored descriptor.
+func (sp *spool) tokInfo(id string) (os.FileInfo, bool, error) {
+	return sp.nameInfo(tokName(id))
+}
+
+// nameInfo reports whether an internal spool name exists, through the
+// anchored descriptor and never following symlinks.
+func (sp *spool) nameInfo(name string) (os.FileInfo, bool, error) {
+	fi, err := sp.root.Lstat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, spoolErr(spoolErrGeneric, err)
+	}
+	return fi, true, nil
+}
 func repairFileMode(f *os.File) error {
 	st, err := f.Stat()
 	if err != nil {
