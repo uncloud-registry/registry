@@ -3,6 +3,7 @@ package staging
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1385,15 +1387,115 @@ func TestServiceRestartFullLifecycle(t *testing.T) {
 	}
 }
 
-func TestServiceRestartRemovesOrphanFiles(t *testing.T) {
+// TestServiceRestartFailsClosedOnUnknownSpoolFiles proves startup refuses to
+// sweep files it cannot attribute: an unknown canonical file is preserved
+// byte-for-byte and NewService fails closed with a data-free dependency
+// error, so a foreign or interrupted create can never be silently deleted.
+func TestServiceRestartFailsClosedOnUnknownSpoolFiles(t *testing.T) {
 	svc, dir := newTestService(t)
 	mustCreate(t, svc, "backend/api", "user:alice")
+	svc.Close()
 
-	// Plant an orphan: a canonical-name file with no DB row (crash between
-	// file creation and row commit).
 	orphan := strings.Repeat("d", 64)
-	if err := os.WriteFile(filepath.Join(dir, "spool", orphan), []byte("orphan"), 0o600); err != nil {
-		t.Fatalf("plant orphan: %v", err)
+	planted := filepath.Join(dir, "spool", orphan)
+	if err := os.WriteFile(planted, []byte("unknown-file-content"), 0o600); err != nil {
+		t.Fatalf("plant file: %v", err)
+	}
+	_, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if !errors.Is(err, ErrDependency) {
+		t.Fatalf("startup with unknown canonical file: %v, want ErrDependency", err)
+	}
+	if err.Error() != ErrDependency.Error() {
+		t.Fatalf("startup error leaks data: %q", err.Error())
+	}
+	// The unknown file is preserved, not swept.
+	data, err := os.ReadFile(planted)
+	if err != nil {
+		t.Fatalf("unknown canonical file was removed: %v", err)
+	}
+	if string(data) != "unknown-file-content" {
+		t.Fatalf("unknown canonical file was modified: %q", data)
+	}
+	// A directory planted at a canonical name is preserved too.
+	if err := os.Remove(planted); err != nil {
+		t.Fatalf("remove planted: %v", err)
+	}
+	if err := os.Mkdir(planted, 0o700); err != nil {
+		t.Fatalf("mkdir planted: %v", err)
+	}
+	if _, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db")); !errors.Is(err, ErrDependency) {
+		t.Fatalf("startup with planted directory: %v, want ErrDependency", err)
+	}
+	fi, err := os.Lstat(planted)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("planted directory was modified: %v", err)
+	}
+	// After clearing the obstruction the same database reopens.
+	if err := os.RemoveAll(planted); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	svc2, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("reopen after clear: %v", err)
+	}
+	svc2.Close()
+}
+
+// TestServiceRestartRollsBackCreatingRowWithoutFile proves an interrupted
+// create whose row committed but whose file never became durable is rolled
+// back on startup: the row disappears, no file appears, and the next restart
+// is clean.
+func TestServiceRestartRollsBackCreatingRowWithoutFile(t *testing.T) {
+	svc, dir := newTestService(t)
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	id := strings.Repeat("e", 64)
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano()); err != nil {
+		t.Fatalf("seed creating row: %v", err)
+	}
+	db.Close()
+	svc.Close()
+
+	svc2, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer svc2.Close()
+	if _, err := svc2.Status(context.Background(), id, "backend/api", "user:alice"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("creating row survived rollback: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "spool", id)); !os.IsNotExist(err) {
+		t.Fatalf("rollback left a file: %v", err)
+	}
+	// A second restart is clean: no residue from the interrupted create.
+	svc2.Close()
+	svc3, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("second restart: %v", err)
+	}
+	svc3.Close()
+}
+
+// TestServiceRestartFinishesCreatingRowWithFile proves an interrupted create
+// whose file IS durable (crash after file fsync, before the activating
+// commit) is finished on startup: the session becomes active and usable.
+func TestServiceRestartFinishesCreatingRowWithFile(t *testing.T) {
+	svc, dir := newTestService(t)
+	now := time.Now().UTC()
+	id := strings.Repeat("f", 64)
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano()); err != nil {
+		t.Fatalf("seed creating row: %v", err)
+	}
+	db.Close()
+	if err := os.WriteFile(filepath.Join(dir, "spool", id), nil, 0o600); err != nil {
+		t.Fatalf("plant durable empty file: %v", err)
 	}
 	svc.Close()
 
@@ -1402,8 +1504,413 @@ func TestServiceRestartRemovesOrphanFiles(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer svc2.Close()
-	if _, err := os.Lstat(filepath.Join(dir, "spool", orphan)); !os.IsNotExist(err) {
-		t.Fatalf("orphan file survived startup reconciliation: %v", err)
+	st, err := svc2.Status(context.Background(), id, "backend/api", "user:alice")
+	if err != nil {
+		t.Fatalf("finished creating row not active: %v", err)
+	}
+	if st.State != StateActive || st.Offset != 0 {
+		t.Fatalf("finished session: %+v", st)
+	}
+	st = mustAppend(t, svc2, st, "data")
+	if st.Offset != 4 {
+		t.Fatalf("offset after append = %d, want 4", st.Offset)
+	}
+}
+
+// TestServiceCreateFaultsLeaveNoResidue proves every durability fault during
+// Create (file fsync, directory fsync, activating commit) returns a
+// data-free dependency error and leaves no user-visible residue: no rows, or
+// at most a durable deleting tombstone that a restart completes.
+func TestServiceCreateFaultsLeaveNoResidue(t *testing.T) {
+	ctx := context.Background()
+	scenarios := []struct {
+		name string
+		arm  func(svc *service)
+	}{
+		{"file_sync", func(svc *service) { svc.fsyncHook = func() error { return errors.New("file-sync fault") } }},
+		{"dir_sync", func(svc *service) { svc.dirSyncHook = func() error { return errors.New("dir-sync fault") } }},
+		// The commit fault fires exactly once: the creating-row transaction
+		// commits, the ACTIVATING transaction faults, and the rollback
+		// transactions succeed afterwards.
+		{"activate_commit", func(svc *service) {
+			var once atomic.Int32
+			svc.commitHook = func() error {
+				if once.Add(1) == 1 {
+					return errors.New("commit fault")
+				}
+				return nil
+			}
+		}},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, dir := newTestService(t)
+			tc.arm(svc)
+			if _, err := svc.Create(ctx, "backend/api", "user:alice", time.Hour); !errors.Is(err, ErrDependency) {
+				t.Fatalf("Create with %s: %v, want ErrDependency", tc.name, err)
+			}
+			// No durably-visible residue. A dir-sync fault may leave the
+			// durable deleting tombstone by design (unlink durability could
+			// not be confirmed); every other phase is fully clean.
+			var id, state sql.NullString
+			db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+			if err != nil {
+				t.Fatalf("raw open: %v", err)
+			}
+			if err := db.QueryRow(`select id, state from upload_sessions`).Scan(&id, &state); err != nil {
+				if err != sql.ErrNoRows {
+					t.Fatalf("scan rows: %v", err)
+				}
+			}
+			db.Close()
+			entries, err := os.ReadDir(filepath.Join(dir, "spool"))
+			if err != nil {
+				t.Fatalf("readdir spool: %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("faulted create left spool entries: %v", entries)
+			}
+			if state.Valid && State(state.String) != StateDeleting {
+				t.Fatalf("faulted create left non-tombstone row in state %q", state.String)
+			}
+			if state.Valid && id.Valid {
+				if _, err := os.Lstat(filepath.Join(dir, "spool", id.String)); !os.IsNotExist(err) {
+					t.Fatalf("tombstoned row still owns a spool file: %v", err)
+				}
+			}
+			// The service remains healthy, and a restart is clean even when a
+			// tombstone was retained.
+			svc.fsyncHook = nil
+			svc.dirSyncHook = nil
+			svc.commitHook = nil
+			svc.Close()
+			svc2, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+			if err != nil {
+				t.Fatalf("restart: %v", err)
+			}
+			svc2.Close()
+			db2, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+			if err != nil {
+				t.Fatalf("raw reopen: %v", err)
+			}
+			var rows int
+			if err := db2.QueryRow(`select count(*) from upload_sessions`).Scan(&rows); err != nil {
+				t.Fatalf("count after restart: %v", err)
+			}
+			db2.Close()
+			if rows != 0 {
+				t.Fatalf("restart left %d rows", rows)
+			}
+			svc3, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+			if err != nil {
+				t.Fatalf("service after restart: %v", err)
+			}
+			mustCreate(t, svc3, "backend/api", "user:alice")
+			svc3.Close()
+		})
+	}
+}
+
+// TestServiceDeleteUnlinkFailureRetainsTombstone proves a failed unlink keeps
+// the durable deleting tombstone and the foreign file intact; once the
+// obstruction clears, the same Delete retries and completes.
+func TestServiceDeleteUnlinkFailureRetainsTombstone(t *testing.T) {
+	svc, dir := newTestService(t)
+	ctx := context.Background()
+	s := mustCreate(t, svc, "backend/api", "user:alice")
+	s = mustAppend(t, svc, s, "doomed")
+
+	// Plant a non-empty directory at the session name so unlink fails.
+	planted := filepath.Join(dir, "spool", s.ID)
+	if err := os.Remove(planted); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+	if err := os.Mkdir(planted, 0o700); err != nil {
+		t.Fatalf("mkdir planted: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("plant content: %v", err)
+	}
+
+	if err := svc.Delete(ctx, s.ID, s.Repo, s.Actor); !errors.Is(err, ErrDependency) {
+		t.Fatalf("Delete with unlink failure: %v, want ErrDependency", err)
+	}
+	// Tombstone retained: the row still exists in deleting state and the
+	// foreign directory is intact.
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	var state string
+	if err := db.QueryRow(`select state from upload_sessions where id = ?`, s.ID).Scan(&state); err != nil {
+		t.Fatalf("row gone after failed unlink: %v", err)
+	}
+	db.Close()
+	if state != "deleting" {
+		t.Fatalf("state = %q, want deleting tombstone", state)
+	}
+	if _, err := os.Lstat(filepath.Join(planted, "keep")); err != nil {
+		t.Fatalf("planted directory was damaged: %v", err)
+	}
+	// Clear the obstruction; the retry completes the deletion.
+	if err := os.RemoveAll(planted); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if err := svc.Delete(ctx, s.ID, s.Repo, s.Actor); err != nil {
+		t.Fatalf("Delete after clear: %v", err)
+	}
+	if _, err := svc.Status(ctx, s.ID, s.Repo, s.Actor); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted session survived: %v", err)
+	}
+}
+
+// TestServiceExpireFaultAtEveryPhase proves Expire fail-closes at each phase:
+// tombstone commit, unlink, directory fsync, and metadata-delete commit.
+// The row or tombstone is retained for a later retry and the count only
+// reports fully completed deletions.
+func TestServiceExpireFaultAtEveryPhase(t *testing.T) {
+	svc, dir := newTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	fixedClock(svc, now)
+	s := mustCreate(t, svc, "backend/api", "user:alice")
+	_ = mustAppend(t, svc, s, "expired")
+	future := now.Add(2 * time.Hour)
+	stateOf := func() string {
+		db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+		if err != nil {
+			t.Fatalf("raw open: %v", err)
+		}
+		defer db.Close()
+		var st string
+		if err := db.QueryRow(`select state from upload_sessions where id = ?`, s.ID).Scan(&st); err != nil {
+			t.Fatalf("row missing: %v", err)
+		}
+		return st
+	}
+	fileGone := func() bool {
+		_, err := os.Lstat(filepath.Join(dir, "spool", s.ID))
+		return os.IsNotExist(err)
+	}
+
+	// Phase 1: tombstone commit fails -> row untouched, file intact.
+	svc.commitHook = func() error { return errors.New("tombstone commit fault") }
+	if n, err := svc.Expire(ctx, future, 10); !errors.Is(err, ErrDependency) || n != 0 {
+		t.Fatalf("phase 1: n=%d err=%v", n, err)
+	}
+	svc.commitHook = nil
+	if got := stateOf(); got != "active" {
+		t.Fatalf("phase 1 state = %q, want active", got)
+	}
+	if fileGone() {
+		t.Fatal("phase 1 removed the file")
+	}
+
+	// Phase 2: unlink fails (planted non-empty directory).
+	planted := filepath.Join(dir, "spool", s.ID)
+	if err := os.Remove(planted); err != nil {
+		t.Fatalf("remove file: %v", err)
+	}
+	if err := os.Mkdir(planted, 0o700); err != nil {
+		t.Fatalf("mkdir planted: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+	if n, err := svc.Expire(ctx, future, 10); !errors.Is(err, ErrDependency) || n != 0 {
+		t.Fatalf("phase 2: n=%d err=%v", n, err)
+	}
+	if got := stateOf(); got != "deleting" {
+		t.Fatalf("phase 2 state = %q, want deleting tombstone", got)
+	}
+	if _, err := os.Lstat(filepath.Join(planted, "keep")); err != nil {
+		t.Fatalf("phase 2 damaged the obstruction: %v", err)
+	}
+	if err := os.RemoveAll(planted); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+
+	// Phase 3: directory fsync fails after the unlink -> count 0, tombstone
+	// retained, file durably gone.
+	svc.dirSyncHook = func() error { return errors.New("dir-sync fault") }
+	if n, err := svc.Expire(ctx, future, 10); !errors.Is(err, ErrDependency) || n != 0 {
+		t.Fatalf("phase 3: n=%d err=%v", n, err)
+	}
+	svc.dirSyncHook = nil
+	if got := stateOf(); got != "deleting" {
+		t.Fatalf("phase 3 state = %q, want deleting", got)
+	}
+	if !fileGone() {
+		t.Fatal("phase 3 left the file")
+	}
+	if got := stateOf(); got != "deleting" {
+		t.Fatalf("phase 3 state = %q, want deleting", got)
+	}
+
+	// Phase 4: metadata-delete commit fails -> count 0, row retained.
+	svc.commitHook = func() error { return errors.New("metadata delete fault") }
+	if n, err := svc.Expire(ctx, future, 10); !errors.Is(err, ErrDependency) || n != 0 {
+		t.Fatalf("phase 4: n=%d err=%v", n, err)
+	}
+	svc.commitHook = nil
+	if got := stateOf(); got != "deleting" {
+		t.Fatalf("phase 4 state = %q, want deleting", got)
+	}
+
+	// Complete: the retry finishes the deletion and counts it.
+	n, err := svc.Expire(ctx, future, 10)
+	if err != nil || n != 1 {
+		t.Fatalf("final Expire: n=%d err=%v", n, err)
+	}
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	var rows int
+	if err := db.QueryRow(`select count(*) from upload_sessions`).Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	db.Close()
+	if rows != 0 {
+		t.Fatalf("final state left %d rows", rows)
+	}
+}
+
+// TestServiceExpireCountsOnlyCompletedDeletions proves the returned count is
+// the number of fully completed deletions: a mid-list failure stops the run,
+// leaves the remaining rows coherent, and later runs finish them.
+func TestServiceExpireCountsOnlyCompletedDeletions(t *testing.T) {
+	svc, dir := newTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	fixedClock(svc, now)
+	mk := func(repo string, ttl time.Duration) Session {
+		s, err := svc.Create(ctx, repo, "user:alice", ttl)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return s
+	}
+	a := mk("a/app", time.Minute)
+	b := mk("b/app", 2*time.Minute)
+	c := mk("c/app", 3*time.Minute)
+	future := now.Add(10 * time.Minute)
+
+	// Sabotage the SECOND row in deterministic expiry order so only the first
+	// completes; the run must fail at b and leave c untouched.
+	planted := filepath.Join(dir, "spool", b.ID)
+	if err := os.Remove(planted); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := os.Mkdir(planted, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+
+	n, err := svc.Expire(ctx, future, 3)
+	if err == nil || !errors.Is(err, ErrDependency) {
+		t.Fatalf("Expire with obstruction: n=%d err=%v", n, err)
+	}
+	if n != 1 {
+		t.Fatalf("completed count = %d, want exactly 1 (only the first)", n)
+	}
+	if _, err := svc.Status(ctx, a.ID, a.Repo, a.Actor); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a survived: %v", err)
+	}
+	for _, s := range []Session{b, c} {
+		if _, err := svc.Status(ctx, s.ID, s.Repo, s.Actor); err != nil {
+			t.Fatalf("%s lost coherence: %v", s.ID[:8], err)
+		}
+	}
+
+	// Clear the obstruction; a later run finishes b (already tombstoned) and
+	// c, and only counts the two completed this run.
+	if err := os.RemoveAll(planted); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	n, err = svc.Expire(ctx, future, 3)
+	if err != nil || n != 2 {
+		t.Fatalf("resume Expire: n=%d err=%v", n, err)
+	}
+	for _, s := range []Session{a, b, c} {
+		if _, err := svc.Status(ctx, s.ID, s.Repo, s.Actor); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s survived final expire: %v", s.ID[:8], err)
+		}
+	}
+}
+
+// TestServiceExpireCrossInstance proves concurrent Expire runs over the same
+// spool/database from two service handles both succeed and converge: every
+// expired row is removed exactly once and no row or file is left behind.
+func TestServiceExpireCrossInstance(t *testing.T) {
+	dir := tempPrivate(t)
+	spoolDir := filepath.Join(dir, "spool")
+	dbPath := filepath.Join(dir, "staging.db")
+	svcA, err := NewService(context.Background(), spoolDir, dbPath)
+	if err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	defer svcA.Close()
+	svcB, err := NewService(context.Background(), spoolDir, dbPath)
+	if err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	defer svcB.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	fixedClock(svcA, now)
+	var sessions []Session
+	for i := 0; i < 8; i++ {
+		s, err := svcA.Create(ctx, "backend/api", "user:alice", time.Minute)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		sessions = append(sessions, s)
+	}
+	future := now.Add(time.Hour)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, svc := range []*service{svcA, svcB} {
+		wg.Add(1)
+		go func(i int, svc *service) {
+			defer wg.Done()
+			_, errs[i] = svc.Expire(ctx, future, 100)
+		}(i, svc)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("concurrent Expire %d: %v", i, e)
+		}
+	}
+	// Everything is gone: no rows, no files, and both handles agree.
+	db, err := sqlOpenForTest(dbPath)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	var rows int
+	if err := db.QueryRow(`select count(*) from upload_sessions`).Scan(&rows); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	db.Close()
+	if rows != 0 {
+		t.Fatalf("cross-instance expire left %d rows", rows)
+	}
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("cross-instance expire left files: %v", entries)
+	}
+	for _, svc := range []*service{svcA, svcB} {
+		if n, err := svc.Expire(ctx, future, 100); err != nil || n != 0 {
+			t.Fatalf("post-converge Expire: n=%d err=%v", n, err)
+		}
 	}
 }
 
@@ -1513,5 +2020,401 @@ func TestServiceCreateIsPredictableIDFree(t *testing.T) {
 		if err := validateID(id); err != nil {
 			t.Fatalf("non-canonical id %q", id)
 		}
+	}
+}
+
+// assertDataFreeDependency verifies an error is the data-free ErrDependency
+// family: identical fixed text, Is/Unwrap identity, no leaked formatting
+// fields, and an empty JSON surface.
+func assertDataFreeDependency(t *testing.T, err error, secrets ...string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, ErrDependency) {
+		t.Fatalf("want ErrDependency, got %T %v", err, err)
+	}
+	if err.Error() != ErrDependency.Error() {
+		t.Fatalf("error text differs: %q vs %q", err.Error(), ErrDependency.Error())
+	}
+	formatted := fmt.Sprintf("%v|%+v|%#v|%q", err, err, err, err)
+	for _, s := range secrets {
+		if s != "" && strings.Contains(formatted, s) {
+			t.Fatalf("error leaks %q: %s", s, formatted)
+		}
+	}
+	if u := errors.Unwrap(err); u != nil && !errors.Is(u, ErrDependency) && u != context.Canceled && u != context.DeadlineExceeded {
+		t.Fatalf("unwrap leaked a foreign error: %v", u)
+	}
+	b, jerr := json.Marshal(err)
+	if jerr != nil {
+		t.Fatalf("json marshal: %v", jerr)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(b, &fields); err != nil {
+		t.Fatalf("json unmarshal: %v", err)
+	}
+	if len(fields) != 0 {
+		t.Fatalf("error serializes data: %s", b)
+	}
+}
+
+// TestServiceOwnerMismatchIdentityEqualsNotFound proves missing and
+// wrong-owner outcomes are indistinguishable by error identity across every
+// operation: same value, same text, same unwrap, same Is/As surfaces, same
+// formatted and JSON output. The exported ErrOwnerMismatch is gone; only
+// ErrNotFound is observable.
+func TestServiceOwnerMismatchIdentityEqualsNotFound(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	s := mustCreate(t, svc, "backend/api", "user:alice")
+	missingID := strings.Repeat("c", 64)
+	digest, ref, media, size := finalizeArgs(s)
+
+	type pair struct {
+		name    string
+		missing func() error
+		foreign func() error
+	}
+	pairs := []pair{
+		{
+			name: "Status",
+			missing: func() error {
+				_, err := svc.Status(ctx, missingID, "backend/api", "user:alice")
+				return err
+			},
+			foreign: func() error {
+				_, err := svc.Status(ctx, s.ID, "other/app", "user:alice")
+				return err
+			},
+		},
+		{
+			name: "Append",
+			missing: func() error {
+				_, err := svc.Append(ctx, missingID, "backend/api", "user:alice", 0, strings.NewReader("x"), 3)
+				return err
+			},
+			foreign: func() error {
+				_, err := svc.Append(ctx, s.ID, "other/app", "user:alice", 0, strings.NewReader("x"), 3)
+				return err
+			},
+		},
+		{
+			name: "Open",
+			missing: func() error {
+				_, _, err := svc.Open(ctx, missingID, "backend/api", "user:alice")
+				return err
+			},
+			foreign: func() error {
+				_, _, err := svc.Open(ctx, s.ID, "other/app", "user:alice")
+				return err
+			},
+		},
+		{
+			name: "MarkFinalized",
+			missing: func() error {
+				return svc.MarkFinalized(ctx, missingID, "backend/api", "user:alice", digest, ref, media, size)
+			},
+			foreign: func() error {
+				return svc.MarkFinalized(ctx, s.ID, "other/app", "user:alice", digest, ref, media, size)
+			},
+		},
+		{
+			name: "Delete",
+			missing: func() error {
+				// Deleting a never-existing row is the documented idempotent
+				// no-op (not part of the not-found family); what must be the
+				// exact ErrNotFound sentinel is the wrong-owner delete.
+				if err := svc.Delete(ctx, missingID, "backend/api", "user:alice"); err != nil {
+					t.Fatalf("idempotent delete of a missing row must succeed, got: %v", err)
+				}
+				return svc.Delete(ctx, s.ID, "other/app", "user:alice")
+			},
+			foreign: func() error {
+				return svc.Delete(ctx, s.ID, "other/app", "user:alice")
+			},
+		},
+	}
+	for _, p := range pairs {
+		t.Run(p.name, func(t *testing.T) {
+			missing := p.missing()
+			foreign := p.foreign()
+			if missing == nil || foreign == nil {
+				t.Fatalf("missing=%v foreign=%v, both must fail", missing, foreign)
+			}
+			if missing != foreign {
+				t.Fatal("owner mismatch error differs from not-found by identity")
+			}
+			if missing != ErrNotFound {
+				t.Fatal("missing error is not the exported ErrNotFound sentinel")
+			}
+			if foreign != ErrNotFound {
+				t.Fatal("wrong-owner error is not the exported ErrNotFound sentinel")
+			}
+			if errors.Unwrap(missing) != nil || errors.Unwrap(foreign) != nil {
+				t.Fatal("ErrNotFound must not unwrap")
+			}
+			if !errors.Is(missing, ErrNotFound) || !errors.Is(foreign, ErrNotFound) {
+				t.Fatal("Is(ErrNotFound) failed")
+			}
+			var target interface{ Error() string }
+			if !errors.As(missing, &target) {
+				t.Fatal("As to error interface failed")
+			}
+			if fmt.Sprintf("%v|%+v|%#v|%q", missing, missing, missing, missing) !=
+				fmt.Sprintf("%v|%+v|%#v|%q", foreign, foreign, foreign, foreign) {
+				t.Fatal("formatted surfaces differ")
+			}
+			bm, _ := json.Marshal(missing)
+			bf, _ := json.Marshal(foreign)
+			if string(bm) != string(bf) {
+				t.Fatalf("json surfaces differ: %s vs %s", bm, bf)
+			}
+		})
+	}
+	// Wrong-owner Delete over the REAL owner's session was already exercised
+	// above (foreign Delete); the session must still be owned by alice.
+	st, err := svc.Status(ctx, s.ID, s.Repo, s.Actor)
+	if err != nil || st.State != StateActive {
+		t.Fatalf("wrong-owner Delete damaged the session: %+v %v", st, err)
+	}
+}
+
+// TestServiceCreatingInvisible proves a committed creating row is invisible
+// to every read path (Status/Append/Open/MarkFinalized) even for its owner,
+// while Delete may tombstone it (so interrupted creates can be cleaned).
+func TestServiceCreatingInvisible(t *testing.T) {
+	svc, dir := newTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	id := strings.Repeat("e", 64)
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano()); err != nil {
+		t.Fatalf("seed creating row: %v", err)
+	}
+	db.Close()
+
+	digest, ref, media, size := finalizeArgs(Session{ID: id, Repo: "backend/api", Actor: "user:alice", Offset: 0})
+	pairs := []struct {
+		name string
+		call func() error
+	}{
+		{"Status", func() error { _, err := svc.Status(ctx, id, "backend/api", "user:alice"); return err }},
+		{"Append", func() error {
+			_, err := svc.Append(ctx, id, "backend/api", "user:alice", 0, strings.NewReader("x"), 3)
+			return err
+		}},
+		{"Open", func() error { _, _, err := svc.Open(ctx, id, "backend/api", "user:alice"); return err }},
+		{"MarkFinalized", func() error { return svc.MarkFinalized(ctx, id, "backend/api", "user:alice", digest, ref, media, size) }},
+	}
+	for _, p := range pairs {
+		if err := p.call(); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s on creating row = %v, want ErrNotFound", p.name, err)
+		}
+	}
+	// The owner can tombstone it (crash-recovery surface), and it then goes
+	// away entirely.
+	if err := svc.Delete(ctx, id, "backend/api", "user:alice"); err != nil {
+		t.Fatalf("Delete creating row: %v", err)
+	}
+	if _, err := svc.Status(ctx, id, "backend/api", "user:alice"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("creating row survived delete: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "spool", id)); !os.IsNotExist(err) {
+		t.Fatal("creating file survived delete")
+	}
+}
+
+// TestServiceOperationsAnchoredAcrossRootSwap proves every spool operation
+// stays anchored to the ORIGINAL directory when the root path is renamed
+// away and replaced with a symlink: reads and writes land in the original
+// directory, never through the planted link.
+func TestServiceOperationsAnchoredAcrossRootSwap(t *testing.T) {
+	svc, dir := newTestService(t)
+	ctx := context.Background()
+	s := mustCreate(t, svc, "backend/api", "user:alice")
+	s = mustAppend(t, svc, s, "stable")
+
+	// Rename the spool directory away and plant a symlink to a decoy dir at
+	// the original path.
+	spoolPath := filepath.Join(dir, "spool")
+	moved := filepath.Join(dir, "spool-moved")
+	if err := os.Rename(spoolPath, moved); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	decoy := filepath.Join(dir, "decoy")
+	if err := os.Mkdir(decoy, 0o700); err != nil {
+		t.Fatalf("mkdir decoy: %v", err)
+	}
+	if err := os.Symlink(decoy, spoolPath); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+
+	// Existing session still readable and appendable.
+	if opened := mustOpenAll(t, svc, s); opened != "stable" {
+		t.Fatalf("bytes after swap: %q", opened)
+	}
+	s = mustAppend(t, svc, s, "more")
+	if s.Offset != int64(len("stablemore")) {
+		t.Fatalf("offset after swap: %d", s.Offset)
+	}
+	// New sessions land in the ORIGINAL directory.
+	s3 := mustCreate(t, svc, "backend/api", "user:alice")
+	if _, err := os.Lstat(filepath.Join(moved, s3.ID)); err != nil {
+		t.Fatalf("new file not in the anchored directory: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(decoy, s3.ID)); !os.IsNotExist(err) {
+		t.Fatal("new file reached through the planted symlink")
+	}
+	// Deletes remove from the original directory.
+	if err := svc.Delete(ctx, s3.ID, s3.Repo, s3.Actor); err != nil {
+		t.Fatalf("delete after swap: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(moved, s3.ID)); !os.IsNotExist(err) {
+		t.Fatal("deleted file still in anchored directory")
+	}
+}
+
+// TestNewServiceConstructorErrorConfidentiality proves NewService failures
+// (spool path problems, database problems, startup reconciliation problems)
+// return fixed data-free ErrDependency errors: no paths, DSNs, SQL, or raw
+// causes through Error/Unwrap/formatted/JSON/reflection surfaces.
+func TestNewServiceConstructorErrorConfidentiality(t *testing.T) {
+	dir := tempPrivate(t)
+	secret := "CONSTRUCTOR-SECRET-" + strings.Repeat("x", 8)
+
+	cases := []struct {
+		name    string
+		setup   func() (spool, db string)
+		secrets []string
+	}{
+		{
+			"spool_root_is_a_file",
+			func() (string, string) {
+				spool := filepath.Join(dir, secret)
+				if err := os.WriteFile(spool, []byte("x"), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				return spool, filepath.Join(dir, "staging.db")
+			},
+			nil,
+		},
+		{
+			"spool_root_symlink_component",
+			func() (string, string) {
+				real := filepath.Join(dir, "real")
+				if err := os.Mkdir(real, 0o700); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				link := filepath.Join(dir, "link")
+				if err := os.Symlink(real, link); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+				return filepath.Join(link, secret), filepath.Join(dir, "staging.db")
+			},
+			[]string{secret},
+		},
+		{
+			"database_is_symlink",
+			func() (string, string) {
+				real := filepath.Join(dir, "real.db")
+				if err := os.WriteFile(real, []byte("FOREIGN"), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				dbPath := filepath.Join(dir, secret+".db")
+				if err := os.Symlink(real, dbPath); err != nil {
+					t.Fatalf("symlink: %v", err)
+				}
+				return filepath.Join(dir, "spool"), dbPath
+			},
+			[]string{secret},
+		},
+		{
+			"database_parent_is_a_file",
+			func() (string, string) {
+				parent := filepath.Join(dir, "parent-file")
+				if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				return filepath.Join(dir, "spool"), filepath.Join(parent, secret+".db")
+			},
+			[]string{secret},
+		},
+		{
+			"database_foreign_schema",
+			func() (string, string) {
+				dbPath := filepath.Join(dir, "foreign.db")
+				db, err := sql.Open("sqlite", dbPath)
+				if err != nil {
+					t.Fatalf("open: %v", err)
+				}
+				if _, err := db.Exec(`create table other_thing (id integer)`); err != nil {
+					t.Fatalf("create: %v", err)
+				}
+				db.Close()
+				return filepath.Join(dir, "spool"), dbPath
+			},
+			[]string{},
+		},
+		{
+			"unknown_spool_file_at_startup",
+			func() (string, string) {
+				// A clean database first so failure comes from reconciliation.
+				// The seed service creates the spool root itself.
+				spool := filepath.Join(dir, "spool")
+				dbPath := filepath.Join(dir, "staging.db")
+				svc, err := NewService(context.Background(), spool, dbPath)
+				if err != nil {
+					t.Fatalf("seed service: %v", err)
+				}
+				svc.Close()
+				if err := os.WriteFile(filepath.Join(spool, strings.Repeat("f", 64)), []byte(secret), 0o600); err != nil {
+					t.Fatalf("plant: %v", err)
+				}
+				return spool, dbPath
+			},
+			[]string{secret},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spool, dbPath := tc.setup()
+			_, err := NewService(context.Background(), spool, dbPath)
+			secrets := append([]string{dir}, tc.secrets...)
+			assertDataFreeDependency(t, err, secrets...)
+		})
+	}
+	// The symlink database target must remain byte-identical after rejection.
+	real := filepath.Join(dir, "real.db")
+	if _, err := os.Lstat(real); err == nil {
+		before := hashFile(t, real)
+		dbPath := filepath.Join(dir, secret+".db")
+		if db, err := openStagingDB(context.Background(), dbPath, 0); err == nil {
+			db.Close()
+			t.Fatal("symlinked db accepted by constructor path")
+		}
+		if after := hashFile(t, real); after != before {
+			t.Fatal("symlink target modified after constructor rejection")
+		}
+	}
+}
+
+// TestNewServiceContextCancellation proves a canceled context surfaces as the
+// exact context error (the one sanctioned sentinel payload), not as a
+// dependency error.
+func TestNewServiceContextCancellation(t *testing.T) {
+	dir := tempPrivate(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := NewService(ctx, filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled constructor: %v, want context.Canceled", err)
+	}
+	if errors.Is(err, ErrDependency) {
+		t.Fatal("canceled constructor surfaced as ErrDependency")
 	}
 }

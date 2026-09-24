@@ -203,7 +203,8 @@ func TestNewSpoolCreatesRootAndRejectsSymlinks(t *testing.T) {
 		if err := os.Symlink(other, filepath.Join(rootPath, validTestID())); err != nil {
 			t.Fatalf("symlink inside root: %v", err)
 		}
-		if err := sp.create(validTestID()); err == nil {
+		if f, err := sp.create(validTestID()); err == nil {
+			f.Close()
 			t.Fatal("create accepted a pre-existing symlink")
 		}
 		if _, err := sp.openForRead(validTestID(), 4); err == nil {
@@ -238,9 +239,11 @@ func TestSpoolModesUnderPermissiveUmask(t *testing.T) {
 	}
 
 	id := validTestID()
-	if err := sp.create(id); err != nil {
+	f, err := sp.create(id)
+	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	f.Close()
 	fi, err = os.Lstat(filepath.Join(rootPath, id))
 	if err != nil {
 		t.Fatalf("lstat spool file: %v", err)
@@ -263,13 +266,12 @@ func TestSpoolFileLifecycle(t *testing.T) {
 	defer sp.Close()
 
 	id := validTestID()
-	if err := sp.create(id); err != nil {
+	f, err := sp.create(id)
+	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	f, err := sp.openForAppend(id, 0)
-	if err != nil {
-		t.Fatalf("openForAppend: %v", err)
-	}
+	// The returned descriptor is open at offset 0 and must be fsynced by the
+	// caller before close (Create's durability ordering).
 	if _, err := f.Write([]byte("hello")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -316,9 +318,11 @@ func TestSpoolAlign(t *testing.T) {
 	defer sp.Close()
 
 	id := validTestID()
-	if err := sp.create(id); err != nil {
+	f0, err := sp.create(id)
+	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	f0.Close()
 	f, _ := sp.openForAppend(id, 0)
 	f.Write([]byte("committed-tail"))
 	f.Close()
@@ -385,11 +389,176 @@ func TestSpoolPathRewritesCannotEscape(t *testing.T) {
 		"../x", "..", ".", "/etc/passwd", "a/b", "a\\b", "..\\x",
 		"a\x00b", "\x00", "////", strings.Repeat("a", 64) + "/x",
 	} {
-		if err := sp.create(name); err == nil {
+		if f, err := sp.create(name); err == nil {
+			f.Close()
 			t.Errorf("create(%q) escaped validation", printable(name))
 		}
 		if _, err := sp.openForAppend(name, 0); err == nil {
 			t.Errorf("openForAppend(%q) escaped validation", printable(name))
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mode repair, symlink components, anchoring, and durable removal
+// ---------------------------------------------------------------------------
+
+// TestSpoolRootModeRepair proves an existing root whose mode is not exactly
+// 0700 (looser or missing owner bits) is repaired through the opened
+// descriptor and remains usable; impossible modes/types are rejected by
+// other tests.
+func TestSpoolRootModeRepair(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"loose_0755", 0o755},
+		{"unwritable_0500", 0o500},
+		{"no_exec_0600", 0o600},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootPath := filepath.Join(dir, "root-"+tc.name)
+			if err := os.Mkdir(rootPath, tc.mode); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			sp, err := newSpool(context.Background(), rootPath)
+			if err != nil {
+				t.Fatalf("newSpool(%s): %v", tc.name, err)
+			}
+			defer sp.Close()
+			fi, err := os.Lstat(rootPath)
+			if err != nil {
+				t.Fatalf("lstat root: %v", err)
+			}
+			if got := fi.Mode().Perm(); got != 0o700 {
+				t.Fatalf("repaired root mode = %o, want 0700", got)
+			}
+			// Usable after repair.
+			f, err := sp.create(validTestID())
+			if err != nil {
+				t.Fatalf("create after repair: %v", err)
+			}
+			f.Close()
+		})
+	}
+}
+
+// TestSpoolRejectsSymlinkPathComponent proves a symlink in any below-anchor
+// component of the root path is rejected, never followed.
+func TestSpoolRejectsSymlinkPathComponent(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatalf("mkdir real: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	rootPath := filepath.Join(link, "nested", "spool")
+	if sp, err := newSpool(context.Background(), rootPath); err == nil {
+		sp.Close()
+		t.Fatal("newSpool followed a symlink path component")
+	}
+	if _, err := os.Lstat(filepath.Join(real, "nested")); !os.IsNotExist(err) {
+		t.Fatalf("symlink target was modified through the path: %v", err)
+	}
+}
+
+// TestSpoolAnchoredAcrossRootSwap proves the retained descriptor keeps
+// functioning when the root directory is renamed away and the original path
+// is replaced with a symlink: every operation targets the ORIGINAL directory
+// and never follows the planted link.
+func TestSpoolAnchoredAcrossRootSwap(t *testing.T) {
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "spool")
+	sp, err := newSpool(context.Background(), rootPath)
+	if err != nil {
+		t.Fatalf("newSpool: %v", err)
+	}
+	defer sp.Close()
+
+	id := validTestID()
+	f, err := sp.create(id)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	f.Close()
+
+	moved := filepath.Join(dir, "spool-moved")
+	if err := os.Rename(rootPath, moved); err != nil {
+		t.Fatalf("rename root away: %v", err)
+	}
+	if err := os.Symlink(dir, rootPath); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+
+	// Enumeration through the descriptor still sees the ORIGINAL files.
+	names, err := sp.entries()
+	if err != nil {
+		t.Fatalf("entries: %v", err)
+	}
+	if len(names) != 1 || names[0] != id {
+		t.Fatalf("entries = %v, want exactly the original file", names)
+	}
+	// New files land in the original (renamed) directory, not through the link.
+	id2 := strings.Repeat("b", 64)
+	f2, err := sp.create(id2)
+	if err != nil {
+		t.Fatalf("create after swap: %v", err)
+	}
+	f2.Close()
+	if _, err := os.Lstat(filepath.Join(moved, id2)); err != nil {
+		t.Fatalf("new file not in the anchored directory: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, id2)); !os.IsNotExist(err) {
+		t.Fatalf("new file reached through the planted symlink: %v", err)
+	}
+}
+
+// TestSpoolRemoveDurable proves unlink + directory fsync semantics: removing
+// an absent file is a no-op, and a non-empty directory entry is left intact
+// (the durable-removal contract for tombstoned deletions).
+func TestSpoolRemoveDurable(t *testing.T) {
+	dir := t.TempDir()
+	rootPath := filepath.Join(dir, "spool")
+	sp, err := newSpool(context.Background(), rootPath)
+	if err != nil {
+		t.Fatalf("newSpool: %v", err)
+	}
+	defer sp.Close()
+
+	id := validTestID()
+	f, err := sp.create(id)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	f.Close()
+	if err := sp.removeDurable(id); err != nil {
+		t.Fatalf("removeDurable: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(rootPath, id)); !os.IsNotExist(err) {
+		t.Fatalf("file survives removeDurable: %v", err)
+	}
+	// Idempotent when already absent.
+	if err := sp.removeDurable(id); err != nil {
+		t.Fatalf("second removeDurable: %v", err)
+	}
+
+	// A non-empty directory planted at a session name cannot be unlinked; it
+	// stays intact so a tombstoned deletion retries later.
+	dd := strings.Repeat("d", 64)
+	if err := os.Mkdir(filepath.Join(rootPath, dd), 0o700); err != nil {
+		t.Fatalf("mkdir planted: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootPath, dd, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("plant content: %v", err)
+	}
+	if err := sp.removeDurable(dd); err == nil {
+		t.Fatal("removeDurable removed a non-empty directory")
+	}
+	if _, err := os.Lstat(filepath.Join(rootPath, dd, "keep")); err != nil {
+		t.Fatalf("planted directory entry lost: %v", err)
 	}
 }

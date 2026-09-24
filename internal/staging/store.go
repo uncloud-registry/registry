@@ -196,6 +196,12 @@ type State string
 const (
 	// StateActive accepts streaming appends.
 	StateActive State = "active"
+	// StateCreating is the durable pre-activation state committed BEFORE a
+	// session's file is created: an interrupted create is attributable at
+	// startup (finished if the empty file is durable, rolled back
+	// otherwise) and is never visible to callers. Only startup
+	// reconciliation and Create itself transition out of it.
+	StateCreating State = "creating"
 	// StateFinalized carries complete validated blob metadata; appends are
 	// rejected and the file bytes are frozen.
 	StateFinalized State = "finalized"
@@ -228,14 +234,10 @@ type Session struct {
 // or in any exported accessor.
 var (
 	// ErrNotFound reports that no session exists for the caller. It is also
-	// the observable surface for owner/repo mismatch, so a caller can never
-	// distinguish "no such upload" from "exists but not yours".
+	// the ONE observable identity for owner/repo mismatch: a caller can never
+	// distinguish "no such upload" from "exists but not yours" by any error
+	// surface (value, text, Is/As/Unwrap, formatting, or JSON).
 	ErrNotFound = errors.New("staging upload not found")
-	// ErrOwnerMismatch is the typed identity of the not-found family for
-	// sessions that exist but belong to another repo/actor. errors.Is(err,
-	// ErrNotFound) is true for it, and its text is identical, preserving
-	// existence confidentiality.
-	ErrOwnerMismatch error = ownerMismatchError{}
 	// ErrExpired reports a session whose canonical expiry has passed.
 	ErrExpired = errors.New("staging upload expired")
 	// ErrOffsetMismatch reports an append whose expected offset does not
@@ -262,23 +264,14 @@ var (
 	ErrFinalizeConflict = errors.New("staging upload already finalized with different metadata")
 )
 
-// ownerMismatchError is the not-found family identity for existing-but-foreign
-// sessions. It reports the same fixed text as ErrNotFound so existence is
-// never revealed, while errors.Is can still distinguish the class internally.
-type ownerMismatchError struct{}
-
-func (ownerMismatchError) Error() string { return ErrNotFound.Error() }
-
-func (ownerMismatchError) Is(target error) bool {
-	return target == ErrNotFound || target == ErrOwnerMismatch
-}
-
-// typedError carries a fixed-text sentinel and a private cause. Error() and
-// Unwrap() expose only the sentinel; the cause is available to package
-// internals via causeOf for server-side diagnosis.
+// typedError reports a fixed-text sentinel. Error() and Unwrap() expose only
+// the sentinel; the private cause survives only behind a closure so that no
+// formatting or reflection surface (%v, %+v, %#v, JSON) can ever print
+// paths, DSNs, SQL, or raw causes. causeOf recovers it for package-internal
+// diagnosis.
 type typedError struct {
 	sentinel error
-	cause    error
+	cause    func() error
 }
 
 func (e *typedError) Error() string { return e.sentinel.Error() }
@@ -289,13 +282,15 @@ func typed(sentinel, cause error) error {
 	if cause == nil {
 		return sentinel
 	}
-	return &typedError{sentinel: sentinel, cause: cause}
+	return &typedError{sentinel: sentinel, cause: func() error { return cause }}
 }
 
+// causeOf returns the private diagnostic cause of a typed error, or nil.
+// The returned value must never be rendered into a caller-visible error.
 func causeOf(err error) error {
 	var te *typedError
-	if errors.As(err, &te) {
-		return te.cause
+	if errors.As(err, &te) && te.cause != nil {
+		return te.cause()
 	}
 	return nil
 }
