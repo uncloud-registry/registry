@@ -34,6 +34,19 @@ type BeeObjectStore struct {
 	DeferredUpload bool
 }
 
+// BoundedBytesReader reads an immutable content-addressed object (GET
+// /bytes/<ref>) with an EXPLICIT upper bound on the returned payload. It is
+// the control-plane counterpart of resolve.Reader for ARTIFACT CONTENT — the
+// /bytes object store, NOT the /bzz document path — so the feed signer can
+// re-read and re-verify the operated manifest BODY without ever buffering an
+// unbounded response. An object larger than the bound, a non-200 status, or a
+// transport failure is a data-free error; the response body is always closed.
+// Production: *BeeObjectStore (ReadBounded); in-memory fakes implement it for
+// tests.
+type BoundedBytesReader interface {
+	ReadBounded(ctx context.Context, ref string, maxBytes int64) ([]byte, error)
+}
+
 // isBeeReference reports whether s is a legitimate Swarm object reference:
 // exactly 64 hex characters (a 32-byte content address), either letter case.
 // This is the exact syntax the object store PUT endpoint returns and the feed
@@ -245,6 +258,45 @@ func (s *BeeObjectStore) Get(ctx context.Context, ref string) ([]byte, error) {
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read bee bytes response body: %w", err)
+	}
+	return data, nil
+}
+
+// ReadBounded implements BoundedBytesReader: it reads the immutable object at
+// ref with overflow detection at maxBytes (reading at most maxBytes+1 bytes)
+// so the caller's bound can never be exceeded by a hostile or broken Bee
+// node. A body larger than maxBytes, any non-200 status, and any transport
+// failure are DATA-FREE errors (the fixed status number may appear, but never
+// the response body, the ref, or untrusted transport text); the response body
+// is always closed; the caller's deadline is respected with the same bounded
+// per-request timeout as every other Bee call. maxBytes must be non-negative.
+func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, errors.New("bounded bee read requires a non-negative bound")
+	}
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, s.BaseURL+"/bytes/"+url.PathEscape(ref), nil)
+	if err != nil {
+		return nil, sanitizeBeeTransportError(reqCtx, "create bee bytes bounded read request", err)
+	}
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		return nil, sanitizeBeeTransportError(reqCtx, "bee bytes bounded read request", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// Drain a BOUNDED amount of the error body and discard it: the body
+		// is untrusted and must never be echoed or retained.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		return nil, fmt.Errorf("bee bytes read failed with status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, sanitizeBeeTransportError(reqCtx, "read bee bytes response body", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("bee bytes read exceeded the bound")
 	}
 	return data, nil
 }

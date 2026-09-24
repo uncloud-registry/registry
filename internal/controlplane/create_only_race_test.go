@@ -49,9 +49,11 @@ func (r racingCreateUpdater) UpdateRegistryFeed(ctx context.Context, reg Registr
 // created the feed.
 func TestFeedSignerCreateOnlyRaceDetectedAsGenerationConflict(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -203,6 +205,19 @@ func newCreateOnlyRaceBee(t *testing.T, repoPath string, seedFeeds map[string][]
 			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(payload)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/bytes/"):
+			// The signer's BOUNDED immutable /bytes artifact reader (never
+			// /bzz docs): same content-addressable object map.
+			ref := strings.TrimPrefix(r.URL.Path, "/bytes/")
+			b.mu.Lock()
+			payload, ok := b.payloads[ref]
+			b.mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
 		case r.Method == http.MethodPost && r.URL.Path == "/chunks":
 			body, _ := io.ReadAll(r.Body)
 			ref := chunkRefSHA(body)
@@ -328,12 +343,14 @@ func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 	// The data-plane preflight: each operation key is durably bound to its
 	// exact payload IN ITS OWN store's database, mirroring independent
 	// processes — the signer's identity authentication reads the binding.
+	fxA := simpleArtifact(t, '1', '2', '3', 100, 100)
+	fxB := simpleArtifact(t, '4', '5', '6', 200, 200)
 	if _, err := storeA.ReservePublicationBinding(ctx, "first-push-A", regA,
-		NormalizePublicationBindingHash(regA, "0x"+feedOwner, testRepo, "latest", "sha256:"+refHex('a'))); err != nil {
+		NormalizePublicationBindingHash(regA, "0x"+feedOwner, testRepo, "latest", fxA.digest)); err != nil {
 		t.Fatalf("bind first-push-A: %v", err)
 	}
 	if _, err := storeB.ReservePublicationBinding(ctx, "first-push-B", regB,
-		NormalizePublicationBindingHash(regB, "0x"+feedOwner, testRepo, "latest", "sha256:"+refHex('d'))); err != nil {
+		NormalizePublicationBindingHash(regB, "0x"+feedOwner, testRepo, "latest", fxB.digest)); err != nil {
 		t.Fatalf("bind first-push-B: %v", err)
 	}
 
@@ -346,13 +363,19 @@ func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 		map[string][]byte{pathForFeedRef(stampFeed): refBytesForTest(t, stampRef)},
 		map[string]string{pathForFeedRef(stampFeed): "0000000000000000"},
 		map[string][]byte{
-			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
-				map[string]string{"latest": "sha256:" + refHex('a')},
-				map[string]spec.TagPublication{"latest": {OperationID: "first-push-A", Generation: 1, Digest: "sha256:" + refHex('a')}}), // target doc for op A (gen 1 = 0+1)
-			refHex('d'): mustRepoDocWithPubs(t, testRepo, 1,
-				map[string]string{"latest": "sha256:" + refHex('d')},
-				map[string]spec.TagPublication{"latest": {OperationID: "first-push-B", Generation: 1, Digest: "sha256:" + refHex('d')}}), // target doc for op B
-			stampRef: mustStampDoc(t, testRaceBatch),
+			refHex('a'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxA.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-A", Generation: 1, Digest: fxA.digest}},
+				operatedManifests(manifestsForTags(map[string]string{"latest": fxA.digest}, nil), fxA),
+				fxA.blobDescs), // target doc for op A (gen 1 = 0+1)
+			refHex('d'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxB.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-B", Generation: 1, Digest: fxB.digest}},
+				operatedManifests(manifestsForTags(map[string]string{"latest": fxB.digest}, nil), fxB),
+				fxB.blobDescs), // target doc for op B
+			fxA.manifest.SwarmRef: fxA.body, // served to the signers' bounded /bytes reader
+			fxB.manifest.SwarmRef: fxB.body,
+			stampRef:              mustStampDoc(t, testRaceBatch),
 		})
 
 	feedResolver := swarm.NewBeeFeedResolver(srv.URL, srv.Client())
@@ -360,17 +383,20 @@ func TestFeedSignerTwoIndependentStoresCreateOnlyRaceOneWinner(t *testing.T) {
 	serviceA := &Service{Store: storeA, FeedKeys: newTestFeedKeyCipher(t)}
 	serviceB := &Service{Store: storeB, FeedKeys: newTestFeedKeyCipher(t)}
 
+	bytesStore := swarm.NewBeeObjectStore(srv.URL, srv.Client())
 	signerA := &FeedSigner{
 		Store:        storeA,
 		Feeds:        BeeRegistryFeedUpdater{BaseURL: srv.URL, HTTPClient: srv.Client(), Keys: serviceA},
 		ResolveFeeds: feedResolver,
 		Docs:         docs,
+		Bytes:        bytesStore,
 	}
 	signerB := &FeedSigner{
 		Store:        storeB,
 		Feeds:        BeeRegistryFeedUpdater{BaseURL: srv.URL, HTTPClient: srv.Client(), Keys: serviceB},
 		ResolveFeeds: feedResolver,
 		Docs:         docs,
+		Bytes:        bytesStore,
 	}
 
 	reqA := publish.FeedCommitRequest{
@@ -478,9 +504,11 @@ func (uncertainCreateUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, 
 // second advancement.
 func TestFeedSignerCreateOnlyUncertainUpdateKeepsLease(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)

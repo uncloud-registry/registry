@@ -45,11 +45,15 @@ type feedTestWorld struct {
 	store     *Store
 	feedStore *MemoryRegistryFeedStore
 	docs      *resolve.MemoryDocumentStore
+	bytes     *memoryBytesReader
 	registry  Registry
 	repoTopic string
 	stampFeed string
 	// batchAllowed is the default stamp-policy batch.
 	batchAllowed string
+	// operatedArtifact is the REAL artifact the world served for the
+	// feedDocSet.artifact fixture (set only when one was provided).
+	operatedArtifact *artifactFixture
 }
 
 type feedDocSet struct {
@@ -62,6 +66,13 @@ type feedDocSet struct {
 	// Tags map so migration-only legacy-operation-ID derivation can recover the
 	// tag/manifest digest, mirroring a real single-tag publication.
 	targetTags map[string]string
+	// artifact, when set together with a single targetTags entry, makes the
+	// world build the target doc around a REAL DefaultBuilder artifact: the
+	// tag maps to the artifact's computed content digest, the manifest
+	// descriptor and blob records are the artifact's exact ones, the manifest
+	// BODY is served through the world's bounded /bytes reader, and the
+	// preflight binding (when seeded) covers the same digest.
+	artifact *artifactFixture
 }
 
 // newFeedTestWorld builds the fixture and a FeedSigner. req sets the request;
@@ -110,24 +121,48 @@ func newFeedTestWorld(t *testing.T, req publish.FeedCommitRequest, dst feedDocSe
 		for tg, dg := range dst.targetTags {
 			tag, digest = tg, dg
 		}
-		targetDoc = mustRepoDocWithPubs(t, testRepo, dst.targetGen, dst.targetTags,
-			map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: dst.targetGen, Digest: digest}})
+		if dst.artifact != nil {
+			// The target document is built around the REAL artifact: the tag
+			// maps to the body's computed digest, the manifest descriptor and
+			// blob records are the artifact's exact ones, and the manifest
+			// BODY is served through the bounded /bytes reader so the signer's
+			// independent artifact proof can pass.
+			fx := dst.artifact
+			digest = fx.digest
+			targetDoc = transitionDoc(t, testRepo, dst.targetGen,
+				map[string]string{tag: fx.digest},
+				map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: dst.targetGen, Digest: fx.digest}},
+				map[string]spec.ManifestDescriptor{fx.digest: fx.manifest},
+				fx.blobDescs)
+		} else {
+			targetDoc = mustRepoDocWithPubs(t, testRepo, dst.targetGen, dst.targetTags,
+				map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: dst.targetGen, Digest: digest}})
+		}
 		if _, err := store.ReservePublicationBinding(ctx, req.OperationID, newReg.ID,
 			NormalizePublicationBindingHash(newReg.ID, req.Owner, testRepo, tag, digest)); err != nil {
 			t.Fatalf("seed publication binding: %v", err)
 		}
 	}
 	docs := resolve.NewMemoryDocumentStore()
+	bytes := newMemoryBytesReader()
+	if dst.artifact != nil {
+		bytes.serve(dst.artifact.manifest.SwarmRef, dst.artifact.body)
+	}
 	docs.Documents = map[string][]byte{
 		dst.currentRef: mustRepoDoc(t, testRepo, dst.currentGen),
 		dst.targetRef:  targetDoc,
 		dst.stampRef:   mustStampDoc(t, req.BatchID),
 	}
+	operated := (*artifactFixture)(nil)
+	if dst.artifact != nil {
+		operated = dst.artifact
+	}
 
-	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs}
+	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs, Bytes: bytes}
 	return &feedTestWorld{
-		signer: signer, store: store, feedStore: feedStore, docs: docs,
+		signer: signer, store: store, feedStore: feedStore, docs: docs, bytes: bytes,
 		registry: newReg, repoTopic: repoTopic, stampFeed: stampFeed, batchAllowed: req.BatchID,
+		operatedArtifact: operated,
 	}
 }
 
@@ -237,11 +272,13 @@ func (w *feedTestWorld) fillTopic(req *publish.FeedCommitRequest) {
 
 func TestFeedSignerValidCommit(t *testing.T) {
 	req := validCommitReq(0, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0,
 		targetRef: refHex('a'), targetGen: 1,
 		stampRef:   refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -308,7 +345,7 @@ func TestFeedSignerRegistryNotReady(t *testing.T) {
 		refHex('a'): mustRepoDoc(t, testRepo, 1),
 		refHex('c'): mustStampDoc(t, "batch-1"),
 	}
-	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs}
+	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs, Bytes: newMemoryBytesReader()}
 
 	req := validCommitReq(provisioning.ID, "batch-1")
 	req.Topic = repoTopic
@@ -439,9 +476,11 @@ func TestFeedSignerDisallowedBatch(t *testing.T) {
 
 func TestFeedSignerStampRepoOverrideBatch(t *testing.T) {
 	req := validCommitReq(1, "overridden-batch")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	// The default policy batch is "batch-1"; add a repo override that permits
 	// "overridden-batch" for the target repo.
@@ -465,9 +504,11 @@ func TestFeedSignerStampRepoOverrideBatch(t *testing.T) {
 
 func TestFeedSignerIdempotentIdenticalRequest(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -493,9 +534,11 @@ func TestFeedSignerIdempotentIdenticalRequest(t *testing.T) {
 func TestFeedSignerOperationConflict(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	req.OperationID = "shared-op" // bound by the world's preflight seeding below
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -544,7 +587,7 @@ func TestFeedSignerTypedNilDependenciesFailClosed(t *testing.T) {
 	w.fillTopic(&req)
 
 	var nilUpdater *MemoryRegistryFeedStore // typed nil
-	signer := &FeedSigner{Store: w.store, Feeds: nilUpdater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: nilUpdater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	_, err := signer.Commit(context.Background(), req)
 	if !errors.Is(err, errFeedSignerBackend) {
 		t.Fatalf("expected backend failure for typed-nil updater, got %v", err)
@@ -558,9 +601,11 @@ func TestFeedSignerTypedNilDependenciesFailClosed(t *testing.T) {
 // the feed a second time.
 func TestFeedSignerUncertainResponseRecovery(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -627,21 +672,26 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 
 	repoTopic := spec.RepoStateFeedRef(testFeedOwner, testRepo)
 	stampFeed := spec.StampPolicyFeedRef(testFeedOwner)
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	// Data-plane preflight: op-1 is durably bound to the exact payload.
 	if _, err := store.ReservePublicationBinding(context.Background(), "op-1", newReg.ID,
-		NormalizePublicationBindingHash(newReg.ID, "0x"+testFeedOwner, testRepo, "latest", "sha256:"+refHex('a'))); err != nil {
+		NormalizePublicationBindingHash(newReg.ID, "0x"+testFeedOwner, testRepo, "latest", fx.digest)); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
 	feedStore := &MemoryRegistryFeedStore{Feeds: map[string]string{repoTopic: refHex('b'), stampFeed: refHex('c')}}
+	bytesStore := newMemoryBytesReader()
+	bytesStore.serve(fx.manifest.SwarmRef, fx.body)
 	docs := resolve.NewMemoryDocumentStore()
 	docs.Documents = map[string][]byte{
 		refHex('b'): mustRepoDoc(t, testRepo, 0),
-		refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
-			map[string]string{"latest": "sha256:" + refHex('a')},
-			map[string]spec.TagPublication{"latest": {OperationID: "op-1", Generation: 1, Digest: "sha256:" + refHex('a')}}),
+		refHex('a'): transitionDoc(t, testRepo, 1,
+			map[string]string{"latest": fx.digest},
+			map[string]spec.TagPublication{"latest": {OperationID: "op-1", Generation: 1, Digest: fx.digest}},
+			map[string]spec.ManifestDescriptor{fx.digest: fx.manifest},
+			fx.blobDescs),
 		refHex('c'): mustStampDoc(t, "batch-1"),
 	}
-	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs}
+	signer := &FeedSigner{Store: store, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs, Bytes: bytesStore}
 
 	req := validCommitReq(newReg.ID, "batch-1")
 	req.Owner = "0x" + testFeedOwner
@@ -656,7 +706,7 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 	store2 := open()
 	docs2 := resolve.NewMemoryDocumentStore()
 	docs2.Documents = docs.Documents
-	signer2 := &FeedSigner{Store: store2, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs2}
+	signer2 := &FeedSigner{Store: store2, Feeds: feedStore, ResolveFeeds: feedStore, Docs: docs2, Bytes: bytesStore}
 	result, err := signer2.Commit(context.Background(), req)
 	if err != nil {
 		t.Fatalf("reopen commit: %v", err)
@@ -675,9 +725,11 @@ func TestFeedSignerPersistsAcrossDBRestart(t *testing.T) {
 // interleaving the feed is advanced exactly once to the target.
 func TestFeedSignerConcurrentIdenticalRequests(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -717,9 +769,11 @@ func TestFeedSignerConcurrentIdenticalRequests(t *testing.T) {
 // durable generation guard prevents a stale commit.
 func TestFeedSignerDifferentOperationIDsSameTarget(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -892,16 +946,23 @@ func (c *countingFeedUpdater) count() int {
 }
 
 // sharedFeedWorld opens N independent Stores over one shared on-disk database
-// and assembles N signers sharing one counting updater, one feed store, and one
-// document store, with a single ready registry.
+// and assembles N signers sharing one counting updater, one feed store, one
+// document store, and one bounded /bytes reader, with a single ready registry.
 type sharedFeedWorld struct {
 	stores  []*Store
 	signers []*FeedSigner
 	updater *countingFeedUpdater
 	feeds   *MemoryRegistryFeedStore
 	docs    *resolve.MemoryDocumentStore
+	bytes   *memoryBytesReader
 	reg     Registry
 	topic   string
+}
+
+// serve registers a REAL artifact body with the shared world's bounded /bytes
+// reader at the exact SwarmRef the documents record.
+func (w *sharedFeedWorld) serve(fx artifactFixture) {
+	w.bytes.serve(fx.manifest.SwarmRef, fx.body)
 }
 
 // seedBinding durably binds an explicit operation key to one logical payload
@@ -952,13 +1013,14 @@ func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs ma
 	feeds := &MemoryRegistryFeedStore{Feeds: feedRefs}
 	docsStore := resolve.NewMemoryDocumentStore()
 	docsStore.Documents = docs
+	bytesStore := newMemoryBytesReader()
 	updater := &countingFeedUpdater{inner: feeds}
 	signers := make([]*FeedSigner, n)
 	for i := range signers {
-		signers[i] = &FeedSigner{Store: stores[i], Feeds: updater, ResolveFeeds: feeds, Docs: docsStore}
+		signers[i] = &FeedSigner{Store: stores[i], Feeds: updater, ResolveFeeds: feeds, Docs: docsStore, Bytes: bytesStore}
 	}
 	return &sharedFeedWorld{
-		stores: stores, signers: signers, updater: updater, feeds: feeds, docs: docsStore,
+		stores: stores, signers: signers, updater: updater, feeds: feeds, docs: docsStore, bytes: bytesStore,
 		reg: reg, topic: spec.RepoStateFeedRef(testFeedOwner, testRepo),
 	}
 }
@@ -968,16 +1030,20 @@ func newSharedFeedWorld(t *testing.T, n int, feedRefs map[string]string, docs ma
 // concurrent interleaving: all callers succeed, but exactly ONE external update
 // happens. This is the cross-process/Store safety proof.
 func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newSharedFeedWorld(t, 2,
 		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
-			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
-				map[string]string{"latest": "sha256:" + refHex('a')},
-				map[string]spec.TagPublication{"latest": {OperationID: "op-1", Generation: 1, Digest: "sha256:" + refHex('a')}}),
+			refHex('a'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fx.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "op-1", Generation: 1, Digest: fx.digest}},
+				map[string]spec.ManifestDescriptor{fx.digest: fx.manifest},
+				fx.blobDescs),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
-	w.seedBinding(t, "op-1", "latest", "sha256:"+refHex('a'))
+	w.serve(fx)
+	w.seedBinding(t, "op-1", "latest", fx.digest)
 
 	req := validCommitReq(w.reg.ID, "batch-1")
 	req.Owner = "0x" + testFeedOwner
@@ -1022,16 +1088,21 @@ func TestFeedSignerTwoStoresIdenticalOpOneUpdate(t *testing.T) {
 // guard together guarantee exactly ONE external update, and the loser never
 // updates the feed.
 func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
+	fxA := simpleArtifact(t, '1', '2', '3', 100, 100)
+	fxB := simpleArtifact(t, '4', '5', '6', 200, 200)
 	w := newSharedFeedWorld(t, 2,
 		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
-			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
-				map[string]string{"latest": "sha256:" + refHex('a')},
-				map[string]spec.TagPublication{"latest": {OperationID: "shared-op-A", Generation: 1, Digest: "sha256:" + refHex('a')}}),
+			refHex('a'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxA.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "shared-op-A", Generation: 1, Digest: fxA.digest}},
+				map[string]spec.ManifestDescriptor{fxA.digest: fxA.manifest},
+				fxA.blobDescs),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
-	w.seedBinding(t, "shared-op-A", "latest", "sha256:"+refHex('a'))
+	w.serve(fxA)
+	w.seedBinding(t, "shared-op-A", "latest", fxA.digest)
 
 	reqA := validCommitReq(w.reg.ID, "batch-1")
 	reqA.OperationID = "shared-op-A"
@@ -1043,10 +1114,13 @@ func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 	reqB := reqA
 	reqB.OperationID = "shared-op-B"
 	reqB.Reference = refHex('d')
-	w.docs.Documents[refHex('d')] = mustRepoDocWithPubs(t, testRepo, 1,
-		map[string]string{"latest": "sha256:" + refHex('d')},
-		map[string]spec.TagPublication{"latest": {OperationID: "shared-op-B", Generation: 1, Digest: "sha256:" + refHex('d')}})
-	w.seedBinding(t, "shared-op-B", "latest", "sha256:"+refHex('d'))
+	w.docs.Documents[refHex('d')] = transitionDoc(t, testRepo, 1,
+		map[string]string{"latest": fxB.digest},
+		map[string]spec.TagPublication{"latest": {OperationID: "shared-op-B", Generation: 1, Digest: fxB.digest}},
+		map[string]spec.ManifestDescriptor{fxB.digest: fxB.manifest},
+		fxB.blobDescs)
+	w.serve(fxB)
+	w.seedBinding(t, "shared-op-B", "latest", fxB.digest)
 
 	var start sync.WaitGroup
 	start.Add(1)
@@ -1058,15 +1132,17 @@ func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 	run := func(signer *FeedSigner, req publish.FeedCommitRequest) {
 		defer done.Done()
 		start.Wait()
-		if _, err := signer.Commit(context.Background(), req); err == nil {
-			mu.Lock()
+		// The commit result and the first-error capture share ONE critical
+		// section: firstErr must never be read or written outside the mutex
+		// (the race detector flags mixed access under -race).
+		_, commitErr := signer.Commit(context.Background(), req)
+		mu.Lock()
+		if commitErr == nil {
 			successes++
-			mu.Unlock()
 		} else if firstErr == nil {
-			mu.Lock()
-			firstErr = err
-			mu.Unlock()
+			firstErr = commitErr
 		}
+		mu.Unlock()
 	}
 	go run(w.signers[0], reqA)
 	go run(w.signers[1], reqB)
@@ -1087,9 +1163,11 @@ func TestFeedSignerTwoStoresDistinctOpsOneUpdate(t *testing.T) {
 // the target and completes WITHOUT a second external update.
 func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -1106,7 +1184,7 @@ func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
 	}
 
 	updater := &countingFeedUpdater{inner: w.feedStore}
-	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	result, err := signer.Commit(ctx, req)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -1266,11 +1344,13 @@ func TestLegacyComputeOperationIDPinnedVectors(t *testing.T) {
 // hash.
 func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
 	const testTag = "latest"
-	testDigest := "sha256:" + strings.Repeat("a", 64)
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	testDigest := fx.digest
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{testTag: testDigest},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -1300,7 +1380,7 @@ func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
 	}
 
 	updater := &countingFeedUpdater{inner: w.feedStore}
-	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	res, err := signer.Commit(ctx, req)
 	if err != nil {
 		t.Fatalf("adopt+idempotent commit: %v", err)
@@ -1338,11 +1418,13 @@ func TestFeedSignerAdoptsLegacyM9HashRow(t *testing.T) {
 // exactly once.
 func TestFeedSignerAdoptsLegacyM9HashPendingRow(t *testing.T) {
 	const testTag = "latest"
-	testDigest := "sha256:" + strings.Repeat("b", 64)
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	testDigest := fx.digest
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{testTag: testDigest},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -1364,7 +1446,7 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRow(t *testing.T) {
 	}
 
 	updater := &countingFeedUpdater{inner: w.feedStore}
-	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	res, err := signer.Commit(ctx, req)
 	if err != nil {
 		t.Fatalf("adopt pending + sign: %v", err)
@@ -1688,7 +1770,7 @@ func TestFeedSignerAdoptsLegacyM9HashRowMultiTag(t *testing.T) {
 	}
 
 	updater := &countingFeedUpdater{inner: w.feedStore}
-	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	res, err := signer.Commit(ctx, req)
 	if err != nil {
 		t.Fatalf("multi-tag adopt+idempotent commit: %v", err)
@@ -1720,7 +1802,8 @@ func TestFeedSignerAdoptsLegacyM9HashRowMultiTag(t *testing.T) {
 // request proceeds through the normal sign path EXACTLY ONCE (feed advanced
 // once, one updater call), under the CURRENT operation ID and CURRENT hash.
 func TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag(t *testing.T) {
-	testDigestA := "sha256:" + strings.Repeat("a", 64)
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	testDigestA := fx.digest
 	testDigestB := "sha256:" + strings.Repeat("b", 64)
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
@@ -1737,12 +1820,15 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag(t *testing.T) {
 	w.docs.Documents[refHex('b')] = mustRepoDocWithPubs(t, testRepo, 1,
 		map[string]string{"v2": testDigestB},
 		map[string]spec.TagPublication{"v2": {OperationID: "op-v2-orig", Generation: 1, Digest: testDigestB}})
-	w.docs.Documents[refHex('a')] = mustRepoDocWithPubs(t, testRepo, 2,
+	w.docs.Documents[refHex('a')] = transitionDoc(t, testRepo, 2,
 		map[string]string{"latest": testDigestA, "v2": testDigestB},
 		map[string]spec.TagPublication{
 			"latest": {OperationID: "op-1", Generation: 2, Digest: testDigestA},
 			"v2":     {OperationID: "op-v2-orig", Generation: 1, Digest: testDigestB},
-		})
+		},
+		operatedManifests(manifestsForTags(map[string]string{"latest": testDigestA, "v2": testDigestB}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 	if _, err := w.store.ReservePublicationBinding(ctx, "op-1", w.registry.ID,
 		NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, "latest", testDigestA)); err != nil {
 		t.Fatalf("seed binding: %v", err)
@@ -1763,7 +1849,7 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag(t *testing.T) {
 	}
 
 	updater := &countingFeedUpdater{inner: w.feedStore}
-	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	res, err := signer.Commit(ctx, req)
 	if err != nil {
 		t.Fatalf("multi-tag adopt pending + sign: %v", err)
@@ -1793,11 +1879,13 @@ func TestFeedSignerAdoptsLegacyM9HashPendingRowMultiTag(t *testing.T) {
 // still identifies it via its own primary key — adopts exactly once with zero
 // updater calls and the newer feed value is never overwritten.
 func TestFeedSignerAdoptsLegacyM9HashRowFeedAdvanced(t *testing.T) {
-	testDigest := "sha256:" + strings.Repeat("a", 64)
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	testDigest := fx.digest
 	req := validCommitReq(1, "batch-1")
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('c'), currentGen: 2, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('d'),
 		targetTags: map[string]string{"latest": testDigest},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -1820,7 +1908,7 @@ func TestFeedSignerAdoptsLegacyM9HashRowFeedAdvanced(t *testing.T) {
 	}
 
 	updater := &countingFeedUpdater{inner: w.feedStore}
-	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+	signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 	res, err := signer.Commit(ctx, req)
 	if err != nil {
 		t.Fatalf("feed-advanced adoption: %v", err)
@@ -1883,6 +1971,7 @@ func TestFeedSignerMultiTagLegacyDerivationFailClosed(t *testing.T) {
 	})
 	t.Run("over-cap-tags-no-adoption", func(t *testing.T) {
 		req := validCommitReq(1, "batch-1")
+		fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 		// The CURRENT document already carries the tag population at the cap
 		// (each with its own retained provenance); the TARGET adds exactly ONE
 		// new tag — the single transition this request operates.
@@ -1891,19 +1980,18 @@ func TestFeedSignerMultiTagLegacyDerivationFailClosed(t *testing.T) {
 		targetTags := make(map[string]string, feedSignerLegacyMaxCandidates+1)
 		targetPubs := make(map[string]spec.TagPublication, feedSignerLegacyMaxCandidates+1)
 		digests := make([]string, feedSignerLegacyMaxCandidates+1)
-		for i := 0; i <= feedSignerLegacyMaxCandidates; i++ {
+		digests[0] = fx.digest // the operated digest is a REAL artifact now
+		targetManifests := map[string]spec.ManifestDescriptor{}
+		for i := 1; i <= feedSignerLegacyMaxCandidates; i++ {
 			sum := sha256.Sum256([]byte(fmt.Sprintf("m-digest-%d", i)))
 			d := "sha256:" + hex.EncodeToString(sum[:])
 			digests[i] = d
-			if i == 0 {
-				// m-tag-0000 is the NEW tag operated by this request.
-				continue
-			}
 			tag := fmt.Sprintf("m-tag-%04d", i)
 			curTags[tag] = d
 			curPubs[tag] = spec.TagPublication{OperationID: fmt.Sprintf("op-existing-%04d", i), Generation: 5, Digest: d}
 			targetTags[tag] = d
 			targetPubs[tag] = curPubs[tag]
+			targetManifests[d] = fixtureManifestDescriptor(42)
 		}
 		targetTags["m-tag-0000"] = digests[0]
 		w := newFeedTestWorld(t, req, feedDocSet{
@@ -1918,7 +2006,9 @@ func TestFeedSignerMultiTagLegacyDerivationFailClosed(t *testing.T) {
 		req.OperationID = generatedID
 		targetPubs["m-tag-0000"] = spec.TagPublication{OperationID: generatedID, Generation: 6, Digest: digests[0]}
 		w.docs.Documents[refHex('b')] = mustRepoDocWithPubs(t, testRepo, 5, curTags, curPubs)
-		w.docs.Documents[refHex('a')] = mustRepoDocWithPubs(t, testRepo, 6, targetTags, targetPubs)
+		w.docs.Documents[refHex('a')] = transitionDoc(t, testRepo, 6,
+			targetTags, targetPubs, operatedManifests(targetManifests, fx), fx.blobDescs)
+		w.serveArtifact(fx)
 		ctx := context.Background()
 
 		// Seed the row for tag 0 — the ONE row a bounded derivation must NOT
@@ -1939,7 +2029,7 @@ func TestFeedSignerMultiTagLegacyDerivationFailClosed(t *testing.T) {
 		// document itself is valid), the feed advances exactly once, and the
 		// quarantine row is retained.
 		updater := &countingFeedUpdater{inner: w.feedStore}
-		signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs}
+		signer := &FeedSigner{Store: w.store, Feeds: updater, ResolveFeeds: w.feedStore, Docs: w.docs, Bytes: w.bytes}
 		if _, err := signer.Commit(ctx, req); err != nil {
 			t.Fatalf("over-cap tags must commit as a fresh signing: %v", err)
 		}
@@ -2012,9 +2102,11 @@ func TestFeedSignerMultiTagTwoRowsAmbiguity(t *testing.T) {
 // match, deterministic topic, batch permission — all still required.
 func TestFeedSignerGenerationZeroCreatesAbsentFeed(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -2044,9 +2136,11 @@ func TestFeedSignerGenerationZeroCreatesAbsentFeed(t *testing.T) {
 // touched.
 func TestFeedSignerGenerationZeroAlreadyCreatedFailsClosed(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
@@ -2134,19 +2228,27 @@ func TestFeedSignerGenerationZeroWrongBatchFailsClosed(t *testing.T) {
 // external feed update happens, and the feed advances exactly once.
 func TestFeedSignerConcurrentFirstPushesOneAdvancement(t *testing.T) {
 	// Shared world with NO repo feed: only the stamp feed exists.
+	fxA := simpleArtifact(t, '1', '2', '3', 100, 100)
+	fxB := simpleArtifact(t, '4', '5', '6', 200, 200)
 	w := newSharedFeedWorld(t, 2,
 		map[string]string{spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
-			refHex('a'): mustRepoDocWithPubs(t, testRepo, 1,
-				map[string]string{"latest": "sha256:" + refHex('a')},
-				map[string]spec.TagPublication{"latest": {OperationID: "first-push-A", Generation: 1, Digest: "sha256:" + refHex('a')}}),
-			refHex('d'): mustRepoDocWithPubs(t, testRepo, 1,
-				map[string]string{"latest": "sha256:" + refHex('d')},
-				map[string]spec.TagPublication{"latest": {OperationID: "first-push-B", Generation: 1, Digest: "sha256:" + refHex('d')}}),
+			refHex('a'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxA.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-A", Generation: 1, Digest: fxA.digest}},
+				map[string]spec.ManifestDescriptor{fxA.digest: fxA.manifest},
+				fxA.blobDescs),
+			refHex('d'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxB.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "first-push-B", Generation: 1, Digest: fxB.digest}},
+				map[string]spec.ManifestDescriptor{fxB.digest: fxB.manifest},
+				fxB.blobDescs),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
-	w.seedBinding(t, "first-push-A", "latest", "sha256:"+refHex('a'))
-	w.seedBinding(t, "first-push-B", "latest", "sha256:"+refHex('d'))
+	w.serve(fxA)
+	w.serve(fxB)
+	w.seedBinding(t, "first-push-A", "latest", fxA.digest)
+	w.seedBinding(t, "first-push-B", "latest", fxB.digest)
 
 	reqA := validCommitReq(w.reg.ID, "batch-1")
 	reqA.OperationID = "first-push-A"

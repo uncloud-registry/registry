@@ -400,6 +400,17 @@ func validateManifestReferences(current spec.RepoStateDocument, input BuildInput
 	return nil
 }
 
+// CheckBlobReferenceCoherence verifies ONE stored blob record against the
+// manifest descriptor that references it — exact size plus the documented
+// media-type normalization contract — using EXACTLY the same rules the data
+// plane applies at upload time (checkReferenceMetadata). The control plane
+// reuses it for the operated artifact after the manifest BODY has been
+// independently parsed, so the signer's blob-state proof is the same strict
+// contract a legitimate publication had to pass. Errors are data-free.
+func CheckBlobReferenceCoherence(ref Descriptor, stored spec.BlobDescriptor) error {
+	return checkReferenceMetadata(ref, stored)
+}
+
 // checkReferenceMetadata verifies one descriptor's size and media type against
 // one present stored blob record. Errors are data-free: the message never
 // echoes the descriptor digest, stored size, or stored media type, and no

@@ -77,7 +77,8 @@ func (w *feedTestWorld) countingSigner() (*FeedSigner, *countingFeedUpdater) {
 func TestFeedSignerAuthenticatesGeneratedOperationIdentity(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -85,9 +86,12 @@ func TestFeedSignerAuthenticatesGeneratedOperationIdentity(t *testing.T) {
 	w.fillTopic(&req)
 	generated := publish.ComputeOperationID(req.RegistryID, req.Owner, testRepo, tag, targetDigest, req.ExpectedGeneration)
 	req.OperationID = generated
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	result, err := signer.Commit(context.Background(), req)
@@ -103,14 +107,22 @@ func TestFeedSignerAuthenticatesGeneratedOperationIdentity(t *testing.T) {
 	if got := w.feedStore.Feeds[w.repoTopic]; got != req.Reference {
 		t.Fatalf("feed must advance to the authenticated target, got %q", got)
 	}
-	// A generated identity needs NO durable binding row.
-	var bound int
+	// The generated identity's OWN permanent binding row IS the atomically
+	// reserved serialization point: it exists, matches the exact payload
+	// hash and operated registry, and remains after the commit (permanence).
+	var regID int64
+	var raw []byte
 	if err := w.store.DB.QueryRowContext(context.Background(),
-		`select count(*) from publication_bindings where operation_id = ?`, generated).Scan(&bound); err != nil {
-		t.Fatalf("binding count: %v", err)
+		`select registry_id, binding_hash from publication_bindings where operation_id = ?`, generated).Scan(&regID, &raw); err != nil {
+		t.Fatalf("generated identity must have reserved its binding row: %v", err)
 	}
-	if bound != 0 {
-		t.Fatalf("generated identity must not require a binding row, got %d", bound)
+	if regID != w.registry.ID {
+		t.Fatalf("generated binding must be bound to the operated registry, got %d want %d", regID, w.registry.ID)
+	}
+	var want [32]byte
+	copy(want[:], raw)
+	if got := NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, tag, targetDigest); got != want {
+		t.Fatalf("generated binding hash mismatch: stored %x want %x", want, got)
 	}
 }
 
@@ -123,7 +135,8 @@ func TestFeedSignerAuthenticatesGeneratedOperationIdentity(t *testing.T) {
 func TestFeedSignerRejectsForgedProvenanceOperationID(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -132,11 +145,15 @@ func TestFeedSignerRejectsForgedProvenanceOperationID(t *testing.T) {
 	generated := publish.ComputeOperationID(req.RegistryID, req.Owner, testRepo, tag, targetDigest, req.ExpectedGeneration)
 	req.OperationID = generated
 	forged := "attacker-chosen-valid-grammar-id"
-	// The document itself is FULLY valid (provenance coherent with the tag
-	// mapping); only its provenance identity is forged.
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 1,
+	// The document itself is FULLY valid (a REAL artifact, proven blob
+	// state, provenance coherent with the tag mapping); only its
+	// provenance identity is forged.
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: forged, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: forged, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -161,16 +178,20 @@ func TestFeedSignerRejectsForgedProvenanceOperationID(t *testing.T) {
 func TestFeedSignerRejectsUnboundExplicitOperationID(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)
 	req.OperationID = "explicit-key-never-bound"
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -183,6 +204,17 @@ func TestFeedSignerRejectsUnboundExplicitOperationID(t *testing.T) {
 	if got := w.feedStore.Feeds[w.repoTopic]; got != refHex('b') {
 		t.Fatalf("feed must not advance, got %q", got)
 	}
+	// The signer must NEVER auto-reserve an absent EXPLICIT key: explicit
+	// identities come only from a data-plane preflight that ran BEFORE the
+	// object write (preflight-before-object-write contract).
+	var bound int
+	if err := w.store.DB.QueryRowContext(context.Background(),
+		`select count(*) from publication_bindings where operation_id = ?`, req.OperationID).Scan(&bound); err != nil {
+		t.Fatalf("binding count: %v", err)
+	}
+	if bound != 0 {
+		t.Fatalf("signer must not auto-reserve arbitrary explicit identities, got %d binding rows", bound)
+	}
 }
 
 // TestFeedSignerAcceptsBoundExplicitOperationID proves an explicit operation
@@ -191,7 +223,8 @@ func TestFeedSignerRejectsUnboundExplicitOperationID(t *testing.T) {
 func TestFeedSignerAcceptsBoundExplicitOperationID(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('b')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -202,9 +235,12 @@ func TestFeedSignerAcceptsBoundExplicitOperationID(t *testing.T) {
 		NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, tag, targetDigest)); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	result, err := signer.Commit(context.Background(), req)
@@ -225,7 +261,8 @@ func TestFeedSignerAcceptsBoundExplicitOperationID(t *testing.T) {
 func TestFeedSignerRejectsConflictingExplicitBinding(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('c')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -237,9 +274,12 @@ func TestFeedSignerRejectsConflictingExplicitBinding(t *testing.T) {
 		NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, tag, digestRef('9'))); err != nil {
 		t.Fatalf("seed conflicting binding: %v", err)
 	}
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -315,7 +355,9 @@ func TestFeedSignerRejectsMultipleProvenanceMutations(t *testing.T) {
 // provenance entries verbatim and is accepted (exactly one transition).
 func TestFeedSignerAcceptsUnrelatedTagAdvanceRetainingEntries(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA, digestB, digestC := digestRef('a'), digestRef('b'), digestRef('c')
+	digestA, digestB := digestRef('a'), digestRef('b')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -331,19 +373,20 @@ func TestFeedSignerAcceptsUnrelatedTagAdvanceRetainingEntries(t *testing.T) {
 			"a": {OperationID: "op-a-prev", Generation: 1, Digest: digestA},
 			"b": {OperationID: "op-b-kept", Generation: 1, Digest: digestB},
 		})
-	// The target is DefaultBuilder-faithful: the operated manifest digest C is
-	// ADDED while EVERY existing manifest descriptor (A, B) is retained
-	// verbatim — the reserved manifest shape the signer's complete-transition
-	// validation demands.
+	// The target is DefaultBuilder-faithful: the operated manifest digest C
+	// (a REAL artifact) is ADDED while EVERY existing manifest descriptor
+	// (A, B) is retained verbatim; the blob records are exactly the
+	// artifact's own references.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"a": digestC, "b": digestB},
 		map[string]spec.TagPublication{
 			"a": {OperationID: generated, Generation: 2, Digest: digestC},
 			"b": {OperationID: "op-b-kept", Generation: 1, Digest: digestB},
 		},
-		manifestsForTags(map[string]string{"a": digestC, "b": digestB},
-			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"a": digestC, "b": digestB},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	result, err := signer.Commit(context.Background(), req)
@@ -400,7 +443,9 @@ func TestFeedSignerRejectsUnrelatedTagMappingMutation(t *testing.T) {
 func TestFeedSignerLegacyCurrentFirstProvenanceAccepted(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	digestA, digestC := digestRef('a'), digestRef('c')
+	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -413,13 +458,15 @@ func TestFeedSignerLegacyCurrentFirstProvenanceAccepted(t *testing.T) {
 	w.docs.Documents[refHex('b')] = provenanceRepoDoc(t, testRepo, 1,
 		map[string]string{tag: digestA}, nil)
 	// DefaultBuilder-faithful target: the old manifest descriptor for digestA
-	// is RETAINED verbatim and the operated digest C is added.
+	// is RETAINED verbatim and the operated digest C (a REAL artifact) is
+	// added with its exact reference blob records.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{tag: digestC},
 		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 2, Digest: digestC}},
-		manifestsForTags(map[string]string{tag: digestC},
-			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{tag: digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -436,7 +483,8 @@ func TestFeedSignerLegacyCurrentFirstProvenanceAccepted(t *testing.T) {
 func TestFeedSignerCreatePathAuthenticatesProvenance(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -445,9 +493,12 @@ func TestFeedSignerCreatePathAuthenticatesProvenance(t *testing.T) {
 	generated := publish.ComputeOperationID(req.RegistryID, req.Owner, testRepo, tag, targetDigest, req.ExpectedGeneration)
 	req.OperationID = generated
 	delete(w.feedStore.Feeds, w.repoTopic)
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	result, err := signer.Commit(context.Background(), req)
@@ -503,7 +554,8 @@ func TestFeedSignerCreatePathZeroProvenanceRejected(t *testing.T) {
 func TestFeedSignerDoneRecoveryAuthenticatesProvenance(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -512,9 +564,12 @@ func TestFeedSignerDoneRecoveryAuthenticatesProvenance(t *testing.T) {
 	generated := publish.ComputeOperationID(req.RegistryID, req.Owner, testRepo, tag, targetDigest, req.ExpectedGeneration)
 	req.OperationID = generated
 	w.feedStore.Feeds[w.repoTopic] = refHex('a')
-	w.docs.Documents[refHex('a')] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[refHex('a')] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 	hash := NormalizeFeedCommitHash(req)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
@@ -544,7 +599,8 @@ func TestFeedSignerDoneRecoveryAuthenticatesProvenance(t *testing.T) {
 func TestFeedSignerDoneRecoveryForgedProvenanceRejected(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('a'), currentGen: 1, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -554,9 +610,12 @@ func TestFeedSignerDoneRecoveryForgedProvenanceRejected(t *testing.T) {
 	req.OperationID = generated
 	forged := "attacker-done-forged-id"
 	w.feedStore.Feeds[w.repoTopic] = refHex('a')
-	w.docs.Documents[refHex('a')] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[refHex('a')] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: forged, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: forged, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 	hash := NormalizeFeedCommitHash(req)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
@@ -613,7 +672,8 @@ func TestFeedSignerDoneRecoveryLegacyDocFailsClosed(t *testing.T) {
 func TestFeedSignerSameDigestNewExplicitOperation(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -625,12 +685,17 @@ func TestFeedSignerSameDigestNewExplicitOperation(t *testing.T) {
 		NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, tag, digestA)); err != nil {
 		t.Fatalf("seed binding: %v", err)
 	}
-	w.docs.Documents[refHex('b')] = provenanceRepoDoc(t, testRepo, 1,
+	w.docs.Documents[refHex('b')] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: digestA},
-		map[string]spec.TagPublication{tag: {OperationID: "op-original", Generation: 1, Digest: digestA}})
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 2,
+		map[string]spec.TagPublication{tag: {OperationID: "op-original", Generation: 1, Digest: digestA}},
+		operatedManifests(manifestsForTags(map[string]string{tag: digestA}, nil), fx),
+		fx.blobDescs)
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{tag: digestA},
-		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 2, Digest: digestA}})
+		map[string]spec.TagPublication{tag: {OperationID: req.OperationID, Generation: 2, Digest: digestA}},
+		operatedManifests(manifestsForTags(map[string]string{tag: digestA}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	result, err := signer.Commit(context.Background(), req)
@@ -653,7 +718,9 @@ func TestFeedSignerSameDigestNewExplicitOperation(t *testing.T) {
 func TestFeedSignerRejectsStaleCopiedProvenanceEntry(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	digestA, digestC := digestRef('a'), digestRef('c')
+	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -666,14 +733,15 @@ func TestFeedSignerRejectsStaleCopiedProvenanceEntry(t *testing.T) {
 		map[string]string{tag: digestA},
 		map[string]spec.TagPublication{tag: {OperationID: "op-stale-origin", Generation: 1, Digest: digestA}})
 	// Stale/copied: same operation ID and OLD generation, digest updated to the
-	// new mapping so the document itself remains fully valid (manifests retain
-	// the old descriptor exactly as DefaultBuilder would).
+	// new mapping so the document itself remains fully valid (a REAL artifact,
+	// manifests retain the old descriptor exactly as DefaultBuilder would).
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{tag: digestC},
 		map[string]spec.TagPublication{tag: {OperationID: "op-stale-origin", Generation: 1, Digest: digestC}},
-		manifestsForTags(map[string]string{tag: digestC},
-			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{tag: digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -690,18 +758,26 @@ func TestFeedSignerRejectsStaleCopiedProvenanceEntry(t *testing.T) {
 // model): neither request can advance the feed — exactly zero external updates,
 // feed untouched.
 func TestFeedSignerTwoStoresForgedProvenanceZeroUpdates(t *testing.T) {
+	fxA := simpleArtifact(t, '1', '2', '3', 100, 100)
+	fxB := simpleArtifact(t, '4', '5', '6', 200, 200)
 	w := newSharedFeedWorld(t, 2,
 		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
 			refHex('b'): mustRepoDoc(t, testRepo, 0),
-			refHex('a'): provenanceRepoDoc(t, testRepo, 1,
-				map[string]string{"latest": digestRef('a')},
-				map[string]spec.TagPublication{"latest": {OperationID: "forged-op-a", Generation: 1, Digest: digestRef('a')}}),
-			refHex('d'): provenanceRepoDoc(t, testRepo, 1,
-				map[string]string{"latest": digestRef('b')},
-				map[string]spec.TagPublication{"latest": {OperationID: "forged-op-b", Generation: 1, Digest: digestRef('b')}}),
+			refHex('a'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxA.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "forged-op-a", Generation: 1, Digest: fxA.digest}},
+				operatedManifests(manifestsForTags(map[string]string{"latest": fxA.digest}, nil), fxA),
+				fxA.blobDescs),
+			refHex('d'): transitionDoc(t, testRepo, 1,
+				map[string]string{"latest": fxB.digest},
+				map[string]spec.TagPublication{"latest": {OperationID: "forged-op-b", Generation: 1, Digest: fxB.digest}},
+				operatedManifests(manifestsForTags(map[string]string{"latest": fxB.digest}, nil), fxB),
+				fxB.blobDescs),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
+	w.serve(fxA)
+	w.serve(fxB)
 
 	reqA := validCommitReq(w.reg.ID, "batch-1")
 	reqA.OperationID = "proc-A"
@@ -723,15 +799,17 @@ func TestFeedSignerTwoStoresForgedProvenanceZeroUpdates(t *testing.T) {
 	run := func(signer *FeedSigner, req publish.FeedCommitRequest) {
 		defer done.Done()
 		start.Wait()
-		if _, err := signer.Commit(context.Background(), req); err == nil {
-			mu.Lock()
+		// The commit result and the first-error capture share ONE critical
+		// section: firstErr must never be read or written outside the mutex
+		// (the race detector flags mixed access under -race).
+		_, commitErr := signer.Commit(context.Background(), req)
+		mu.Lock()
+		if commitErr == nil {
 			successes++
-			mu.Unlock()
 		} else if firstErr == nil {
-			mu.Lock()
-			firstErr = err
-			mu.Unlock()
+			firstErr = commitErr
 		}
+		mu.Unlock()
 	}
 	go run(w.signers[0], reqA)
 	go run(w.signers[1], reqB)
@@ -759,7 +837,8 @@ func TestFeedSignerTwoStoresForgedProvenanceZeroUpdates(t *testing.T) {
 func TestFeedSignerMissingBindingStoreRowIsDistinct(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
-	targetDigest := digestRef('e')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	targetDigest := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -779,10 +858,13 @@ func TestFeedSignerMissingBindingStoreRowIsDistinct(t *testing.T) {
 
 	// A MISSING binding is a data-free malformed failure — never a raw sql
 	// error string.
-	doc := provenanceRepoDoc(t, testRepo, 1,
+	doc := transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: "explicit-unbound-x", Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: "explicit-unbound-x", Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
 	w.docs.Documents[refHex('a')] = doc
+	w.serveArtifact(fx)
 	explicitReq := req
 	explicitReq.OperationID = "explicit-unbound-x"
 	explicitReq.Reference = refHex('a')
@@ -798,15 +880,30 @@ func TestFeedSignerMissingBindingStoreRowIsDistinct(t *testing.T) {
 		t.Fatalf("missing binding must cause ZERO external updates, got %d", n)
 	}
 
-	// The GENERATED identity for the same document passes without any row.
-	w.docs.Documents[refHex('a')] = provenanceRepoDoc(t, testRepo, 1,
+	// The GENERATED identity for the same document passes via its OWN
+	// atomically reserved binding row (insert-or-read serializes against any
+	// concurrent explicit preflight; there was none, so the signer won).
+	w.docs.Documents[refHex('a')] = transitionDoc(t, testRepo, 1,
 		map[string]string{tag: targetDigest},
-		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}})
+		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 1, Digest: targetDigest}},
+		operatedManifests(manifestsForTags(map[string]string{tag: targetDigest}, nil), fx),
+		fx.blobDescs)
 	genReq := req
 	genReq.OperationID = generated
 	genReq.Reference = refHex('a')
 	if _, err := signer.Commit(context.Background(), genReq); err != nil {
 		t.Fatalf("generated identity for the same document must pass: %v", err)
+	}
+	var regID int64
+	var raw []byte
+	if err := w.store.DB.QueryRowContext(context.Background(),
+		`select registry_id, binding_hash from publication_bindings where operation_id = ?`, generated).Scan(&regID, &raw); err != nil {
+		t.Fatalf("generated identity must have reserved its binding row: %v", err)
+	}
+	var want [32]byte
+	copy(want[:], raw)
+	if got := NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, tag, targetDigest); got != want {
+		t.Fatalf("generated binding hash mismatch: stored %x want %x", want, got)
 	}
 }
 

@@ -296,9 +296,14 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 		}
 	}
 
+	// The Bee object store is shared by the reconciler/publisher (immutable
+	// document writes) and the internal feed signer (the bounded /bytes
+	// artifact reader); it exists only in Bee mode and is nil otherwise.
+	var objectStore *swarm.BeeObjectStore
 	if cfg.BeeAPIURL != nil {
+		objectStore = swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), nil)
 		service.Publisher = &controlplane.Publisher{
-			Documents: swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), nil),
+			Documents: objectStore,
 			Feeds: controlplane.BeeRegistryFeedUpdater{
 				BaseURL: cfg.BeeAPIURL.String(),
 				Keys:    service,
@@ -346,6 +351,12 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 			Feeds:        controlplane.BeeRegistryFeedUpdater{BaseURL: cfg.BeeAPIURL.String(), Keys: service},
 			ResolveFeeds: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), nil),
 			Docs:         swarm.NewBeeDocumentStore(cfg.BeeAPIURL.String(), nil),
+			// The bounded /bytes reader for the artifact-proven blob
+			// transition: the signer INDEPENDENTLY re-reads the operated
+			// manifest body (bounded, data-free) through the SAME object
+			// store the reconciler/publisher write with. It is always wired
+			// in Bee mode; Commit fails closed when absent.
+			Bytes: objectStore,
 		}
 		internal, err := controlplane.NewInternalFeedServer(signer, &controlplane.PublicationBinder{Store: store}, internalSecret, nil)
 		if err != nil {

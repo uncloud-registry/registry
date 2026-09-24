@@ -117,9 +117,11 @@ func TestInternalFeedServerRejectsMalformedBody(t *testing.T) {
 // full internal HTTP endpoint with the correct credential.
 func TestInternalFeedServerHappyPath(t *testing.T) {
 	req := validCommitReq(0, "batch-1")
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},
+		artifact:   &fx,
 	})
 	req.RegistryID = w.registry.ID
 	w.fillTopic(&req)

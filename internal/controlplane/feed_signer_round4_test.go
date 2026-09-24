@@ -334,7 +334,8 @@ func TestFeedSignerRejectsUnrelatedManifestAddition(t *testing.T) {
 // the manifest validation must not over-reject the operated update.
 func TestFeedSignerAcceptsOperatedManifestUpdateAtOperatedDigest(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -346,15 +347,18 @@ func TestFeedSignerAcceptsOperatedManifestUpdateAtOperatedDigest(t *testing.T) {
 	w.docs.Documents[refHex('b')] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: "op-cur-latest", Generation: 1, Digest: digestA}},
-		map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)},
-		map[string]spec.BlobDescriptor{})
-	// Same digest republished: the operated digest's descriptor is UPDATED and
-	// the provenance entry replaced — both permitted (operated transition only).
+		map[string]spec.ManifestDescriptor{digestA: fx.manifest},
+		fx.blobDescs)
+	// Same digest republished coherently: the operated digest's descriptor is
+	// the REAL artifact's (digest/size/media proven against the body) and the
+	// provenance entry replaced — the semantic "operated update" at the
+	// operated digest, with blob records preserved byte-identically.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: generated, Generation: 2, Digest: digestA}},
-		map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(43)},
-		map[string]spec.BlobDescriptor{})
+		map[string]spec.ManifestDescriptor{digestA: fx.manifest},
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -369,7 +373,9 @@ func TestFeedSignerAcceptsOperatedManifestUpdateAtOperatedDigest(t *testing.T) {
 // from the target is rejected: existing blob entries must be preserved.
 func TestFeedSignerRejectsBlobDeletion(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA, digestC := digestRef('a'), digestRef('c')
+	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -382,14 +388,16 @@ func TestFeedSignerRejectsBlobDeletion(t *testing.T) {
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: "op-cur-latest", Generation: 1, Digest: digestA}},
 		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{"sha256:" + refHex('1'): fixtureBlobDescriptor(100)})
-	// The operated transition is valid; the existing blob record is dropped.
+		withBlobs(map[string]spec.BlobDescriptor{"sha256:" + refHex('1'): fixtureBlobDescriptor(100)}, fx))
+	// The operated transition is valid (a REAL served artifact); the existing
+	// unrelated blob record is dropped from the target.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"latest": digestC},
 		map[string]spec.TagPublication{"latest": {OperationID: generated, Generation: 2, Digest: digestC}},
-		manifestsForTags(map[string]string{"latest": digestC},
-			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -406,7 +414,9 @@ func TestFeedSignerRejectsBlobDeletion(t *testing.T) {
 // NEW blob records, never change existing state.
 func TestFeedSignerRejectsBlobMutation(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA, digestC := digestRef('a'), digestRef('c')
+	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
 	blobDigest := "sha256:" + refHex('1')
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
@@ -420,14 +430,16 @@ func TestFeedSignerRejectsBlobMutation(t *testing.T) {
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: "op-cur-latest", Generation: 1, Digest: digestA}},
 		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{blobDigest: fixtureBlobDescriptor(100)})
-	// The retained blob record's SIZE is rewritten while the tag moves.
+		withBlobs(map[string]spec.BlobDescriptor{blobDigest: fixtureBlobDescriptor(100)}, fx))
+	// The RETAINED unrelated blob record's SIZE is rewritten while the tag
+	// moves — existing records must stay byte-identical.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"latest": digestC},
 		map[string]spec.TagPublication{"latest": {OperationID: generated, Generation: 2, Digest: digestC}},
-		manifestsForTags(map[string]string{"latest": digestC},
-			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
-		map[string]spec.BlobDescriptor{blobDigest: fixtureBlobDescriptor(999)})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}), fx),
+		withBlobs(map[string]spec.BlobDescriptor{blobDigest: fixtureBlobDescriptor(999)}, fx))
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -445,8 +457,9 @@ func TestFeedSignerRejectsBlobMutation(t *testing.T) {
 // reference set — a new record never deletes or rewrites existing state.
 func TestFeedSignerAcceptsBlobAddition(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA, digestC := digestRef('a'), digestRef('c')
-	blobDigest := "sha256:" + refHex('2')
+	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -460,12 +473,15 @@ func TestFeedSignerAcceptsBlobAddition(t *testing.T) {
 		map[string]spec.TagPublication{"latest": {OperationID: "op-cur-latest", Generation: 1, Digest: digestA}},
 		manifestsForTags(map[string]string{"latest": digestA}, nil),
 		map[string]spec.BlobDescriptor{})
+	// The NEW blob records are EXACTLY the artifact's own references — every
+	// addition must be independently proven from the operated manifest body.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"latest": digestC},
 		map[string]spec.TagPublication{"latest": {OperationID: generated, Generation: 2, Digest: digestC}},
-		manifestsForTags(map[string]string{"latest": digestC},
-			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
-		map[string]spec.BlobDescriptor{blobDigest: fixtureBlobDescriptor(100)})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -482,8 +498,12 @@ func TestFeedSignerAcceptsBlobAddition(t *testing.T) {
 // transition, one update).
 func TestFeedSignerAcceptsLegitimateRetainedEntriesAcrossMaps(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA, digestB, digestC, digestD := digestRef('a'), digestRef('b'), digestRef('c'), digestRef('d')
-	blobDigest := "sha256:" + refHex('3')
+	digestA, digestB, digestD := digestRef('a'), digestRef('b'), digestRef('d')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestC := fx.digest
+	// An UNRELATED retained blob whose digest cannot collide with the
+	// artifact's own reference digests.
+	blobDigest := "sha256:" + refHex('9')
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
@@ -503,22 +523,23 @@ func TestFeedSignerAcceptsLegitimateRetainedEntriesAcrossMaps(t *testing.T) {
 		},
 		curManifests,
 		curBlobs)
-	// Target: latest moves to C with new provenance; stable's entry and the
-	// legacy tag are retained verbatim; every manifest and blob is retained
-	// exactly; only the operated manifest digest C is added.
+	// Target: latest moves to C (a REAL artifact) with new provenance;
+	// stable's entry and the legacy tag are retained verbatim; every manifest
+	// is retained exactly; the only NEW blob records are the artifact's own
+	// references (unrelated records preserved byte-identically).
 	targetManifests := map[string]spec.ManifestDescriptor{}
 	for d, desc := range curManifests {
 		targetManifests[d] = desc
 	}
-	targetManifests[digestC] = fixtureManifestDescriptor(42)
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"latest": digestC, "stable": digestB, "legacy": digestD},
 		map[string]spec.TagPublication{
 			"latest": {OperationID: generated, Generation: 2, Digest: digestC},
 			"stable": {OperationID: "op-stable-orig", Generation: 1, Digest: digestB},
 		},
-		targetManifests,
-		curBlobs)
+		operatedManifests(targetManifests, fx),
+		withBlobs(curBlobs, fx))
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -573,8 +594,8 @@ func TestFeedSignerCreatePathRejectsUnrelatedManifestAddition(t *testing.T) {
 // plane commits the artifact's referenced staged blobs).
 func TestFeedSignerCreatePathAcceptsBlobAdditions(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
-	blobDigest := "sha256:" + refHex('4')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -583,11 +604,13 @@ func TestFeedSignerCreatePathAcceptsBlobAdditions(t *testing.T) {
 	generated := publish.ComputeOperationID(req.RegistryID, req.Owner, testRepo, "latest", digestA, req.ExpectedGeneration)
 	req.OperationID = generated
 	delete(w.feedStore.Feeds, w.repoTopic)
+	// The first document's blob records are EXACTLY the artifact's references.
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: generated, Generation: 1, Digest: digestA}},
-		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{blobDigest: fixtureBlobDescriptor(100)})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -608,7 +631,8 @@ func TestFeedSignerCreatePathAcceptsBlobAdditions(t *testing.T) {
 // matching the exact payload still authenticates (row first, hash matched).
 func TestFeedSignerGeneratedLookingIDWithMatchingBindingAccepted(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -624,8 +648,9 @@ func TestFeedSignerGeneratedLookingIDWithMatchingBindingAccepted(t *testing.T) {
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: key, Generation: 1, Digest: digestA}},
-		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -643,7 +668,8 @@ func TestFeedSignerGeneratedLookingIDWithMatchingBindingAccepted(t *testing.T) {
 // the generated-form check.
 func TestFeedSignerGeneratedLookingIDWithConflictingBindingRejected(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -653,7 +679,7 @@ func TestFeedSignerGeneratedLookingIDWithConflictingBindingRejected(t *testing.T
 	req.OperationID = key
 	// The permanent binding for this generated-looking identity is bound to a
 	// DIFFERENT digest — a conflicting payload the generated-form check must
-	// never bypass.
+	// never bypass (and which the signer's own reserve must never overwrite).
 	if _, err := w.store.ReservePublicationBinding(context.Background(), key, w.registry.ID,
 		NormalizePublicationBindingHash(w.registry.ID, req.Owner, testRepo, "latest", digestRef('9'))); err != nil {
 		t.Fatalf("seed conflicting binding: %v", err)
@@ -661,8 +687,9 @@ func TestFeedSignerGeneratedLookingIDWithConflictingBindingRejected(t *testing.T
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: key, Generation: 1, Digest: digestA}},
-		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
@@ -685,7 +712,8 @@ func TestFeedSignerGeneratedLookingIDWithConflictingBindingRejected(t *testing.T
 // (never accepted via the generated form).
 func TestFeedSignerGeneratedLookingIDWithForeignRegistryBindingRejected(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -718,8 +746,9 @@ func TestFeedSignerGeneratedLookingIDWithForeignRegistryBindingRejected(t *testi
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: key, Generation: 1, Digest: digestA}},
-		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 
 	signer, updater := w.countingSigner()
 	_, err = signer.Commit(ctx, req)
@@ -738,7 +767,8 @@ func TestFeedSignerGeneratedLookingIDWithForeignRegistryBindingRejected(t *testi
 // updates.
 func TestFeedSignerBindingQueryFailureNeverFallsBack(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
-	digestA := digestRef('a')
+	fx := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fx.digest
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
@@ -749,10 +779,12 @@ func TestFeedSignerBindingQueryFailureNeverFallsBack(t *testing.T) {
 	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: generated, Generation: 1, Digest: digestA}},
-		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fx),
+		fx.blobDescs)
+	w.serveArtifact(fx)
 	// Break the binding table AFTER the world is fully set up: the signer's
-	// binding read now fails exactly where the precedence decision is made.
+	// ATOMIC RESERVE now fails exactly where the precedence decision is made,
+	// and must surface as backend — never the pre-atomic acceptance.
 	if _, err := w.store.DB.ExecContext(context.Background(), `drop table publication_bindings`); err != nil {
 		t.Fatalf("drop binding table: %v", err)
 	}
@@ -779,7 +811,8 @@ func TestFeedSignerBindingQueryFailureNeverFallsBack(t *testing.T) {
 // row seeded through store 0 is consulted through store 1, and neither
 // request can advance the feed — exactly zero external updates.
 func TestFeedSignerTwoStoresBindingPrecedenceConflictZeroUpdates(t *testing.T) {
-	digestA := digestRef('a')
+	fxA := simpleArtifact(t, '1', '2', '3', 100, 100)
+	digestA := fxA.digest
 	w := newSharedFeedWorld(t, 2,
 		map[string]string{spec.RepoStateFeedRef(testFeedOwner, testRepo): refHex('b'), spec.StampPolicyFeedRef(testFeedOwner): refHex('c')},
 		map[string][]byte{
@@ -787,8 +820,8 @@ func TestFeedSignerTwoStoresBindingPrecedenceConflictZeroUpdates(t *testing.T) {
 			refHex('a'): transitionDoc(t, testRepo, 1,
 				map[string]string{"latest": digestA},
 				map[string]spec.TagPublication{},
-				manifestsForTags(map[string]string{"latest": digestA}, nil),
-				map[string]spec.BlobDescriptor{}),
+				operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fxA),
+				fxA.blobDescs),
 			refHex('c'): mustStampDoc(t, "batch-1"),
 		})
 	key := publish.ComputeOperationID(w.reg.ID, "0x"+testFeedOwner, testRepo, "latest", digestA, 0)
@@ -797,13 +830,14 @@ func TestFeedSignerTwoStoresBindingPrecedenceConflictZeroUpdates(t *testing.T) {
 		NormalizePublicationBindingHash(w.reg.ID, "0x"+testFeedOwner, testRepo, "latest", digestRef('9'))); err != nil {
 		t.Fatalf("seed conflicting binding: %v", err)
 	}
+	w.serve(fxA)
 	// The docs' provenance entry is filled AFTER deriving the key (the helper
 	// requires decode-valid documents).
 	w.docs.Documents[refHex('a')] = transitionDoc(t, testRepo, 1,
 		map[string]string{"latest": digestA},
 		map[string]spec.TagPublication{"latest": {OperationID: key, Generation: 1, Digest: digestA}},
-		manifestsForTags(map[string]string{"latest": digestA}, nil),
-		map[string]spec.BlobDescriptor{})
+		operatedManifests(manifestsForTags(map[string]string{"latest": digestA}, nil), fxA),
+		fxA.blobDescs)
 
 	req := validCommitReq(w.reg.ID, "batch-1")
 	req.OperationID = key
@@ -822,15 +856,17 @@ func TestFeedSignerTwoStoresBindingPrecedenceConflictZeroUpdates(t *testing.T) {
 	run := func(signer *FeedSigner) {
 		defer done.Done()
 		start.Wait()
-		if _, err := signer.Commit(context.Background(), req); err == nil {
-			mu.Lock()
+		// The commit result and the first-error capture share ONE critical
+		// section: firstErr must never be read or written outside the mutex
+		// (the race detector flags mixed access under -race).
+		_, commitErr := signer.Commit(context.Background(), req)
+		mu.Lock()
+		if commitErr == nil {
 			successes++
-			mu.Unlock()
 		} else if firstErr == nil {
-			mu.Lock()
-			firstErr = err
-			mu.Unlock()
+			firstErr = commitErr
 		}
+		mu.Unlock()
 	}
 	go run(w.signers[0])
 	go run(w.signers[1])

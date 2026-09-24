@@ -68,6 +68,15 @@ type FeedSigner struct {
 	// Docs reads the immutable objects referenced by feeds and by the request
 	// (the target repo-state document and the current stamp-policy document).
 	Docs resolve.Reader
+	// Bytes reads the immutable ARTIFACT-CONTENT objects the operated manifest
+	// descriptor points at — GET /bytes/<ref> on the same Bee node, kept
+	// SEPARATE from Docs (the /bzz document path) so the signer can
+	// INDEPENDENTLY prove the operated manifest BODY before any feed update.
+	// Reads are strictly BOUNDED by publish.MaxArtifactBodyBytes with overflow
+	// detection, the response body is always closed, and errors are data-free.
+	// In Bee mode a swarm.BeeObjectStore; Commit fails closed when absent
+	// (startup wiring must always provide it).
+	Bytes swarm.BoundedBytesReader
 }
 
 // Commit is the constrained feed-commit boundary. It validates the bounded
@@ -81,7 +90,7 @@ type FeedSigner struct {
 // when the lease/context bound is reached. All validation runs BEFORE the
 // feed-owner key is touched or any network update.
 func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) (publish.FeedCommitResult, error) {
-	if isNilDependency(s.Store) || isNilDependency(s.Feeds) || isNilDependency(s.ResolveFeeds) || isNilDependency(s.Docs) {
+	if isNilDependency(s.Store) || isNilDependency(s.Feeds) || isNilDependency(s.ResolveFeeds) || isNilDependency(s.Docs) || isNilDependency(s.Bytes) {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: signer not fully configured", errFeedSignerBackend)
 	}
 	if err := publish.ValidateCommitRequest(req); err != nil {
@@ -578,6 +587,12 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 		if operated == "" {
 			return fmt.Errorf("%w: no provenance entry records this operation at the target generation", errFeedSignerMalformed)
 		}
+		// The already-advanced document is ALSO subject to the independent
+		// artifact proof (current == target here: no blob additions are possible,
+		// so the reference/coherence side applies).
+		if err := s.validateArtifactBlobTransition(ctx, targetDoc.Blobs, targetDoc.Blobs, targetDoc, operated); err != nil {
+			return err
+		}
 		return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, targetDoc.TagPublications[operated].Digest)
 	}
 
@@ -628,7 +643,7 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 	if err := validateManifestTransition(cur.Manifests, targetDoc.Manifests, targetDoc.Tags[operated]); err != nil {
 		return err
 	}
-	if err := validateBlobTransition(cur.Blobs, targetDoc.Blobs); err != nil {
+	if err := s.validateArtifactBlobTransition(ctx, cur.Blobs, targetDoc.Blobs, targetDoc, operated); err != nil {
 		return err
 	}
 	return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, entry.Digest)
@@ -698,16 +713,62 @@ func validateManifestTransition(cur, target map[string]spec.ManifestDescriptor, 
 	return nil
 }
 
-// validateBlobTransition enforces the DefaultBuilder blob rule across the
-// transition: EVERY existing blob record is cloned into the next state
-// verbatim; NEW blob records are permitted (the data plane validates the
-// artifact's references and copies only the referenced staged blobs into the
-// next state before the immutable target exists, and the signer cannot
-// re-derive the artifact's reference set from the document alone — an
-// addition never deletes or rewrites existing state). A current-only deletion
-// or the mutation of an existing record is an unrelated semantic change and
-// fails closed as malformed. Errors are value-free.
-func validateBlobTransition(cur, target map[string]spec.BlobDescriptor) error {
+// validateArtifactBlobTransition is the signer's INDEPENDENT proof that the
+// transition's blob state is EXACTLY the operated manifest artifact's. It
+// reads the operated manifest's immutable BODY through the separately-wired
+// bounded /bytes reader (never the docs path, never unbounded) at the operated
+// descriptor's SwarmRef, and the body MUST parse with the strict Task-12
+// artifact parser under the descriptor media type, MUST hash to the operated
+// digest, MUST match the descriptor's size, and MUST NOT be an image index
+// (index publication is rejected — the Task 19 gate). The parser's exact
+// reference set is then enforced against the blob state: EVERY reference must
+// exist in the target Blobs with coherent size/media, EVERY existing record
+// must be preserved byte-identically, and EVERY NEW target blob record must
+// belong to the reference set — an unreferenced addition, a missing or
+// mismatched descriptor, wrong manifest bytes/ref/media/size, or an oversize/
+// failed bounded read ALL fail closed with zero external updates (malformed
+// for provably-wrong content, backend for unreadable content). Errors are
+// data-free: no digest, ref, size, media value, or error body ever appears.
+func (s *FeedSigner) validateArtifactBlobTransition(ctx context.Context, cur, target map[string]spec.BlobDescriptor, targetDoc spec.RepoStateDocument, operated string) error {
+	operatedDigest := targetDoc.Tags[operated]
+	desc, ok := targetDoc.Manifests[operatedDigest]
+	if !ok {
+		return fmt.Errorf("%w: operated manifest descriptor is missing from the target document", errFeedSignerMalformed)
+	}
+	// Bounded independent read of the operated manifest BODY. Any read
+	// failure (transport, status, oversize beyond the bound) is a backend/
+	// dependency condition — the signer never signs a transition whose
+	// manifest content it could not verify.
+	body, err := s.Bytes.ReadBounded(ctx, desc.SwarmRef, publish.MaxArtifactBodyBytes)
+	if err != nil {
+		return fmt.Errorf("%w: operated manifest object: %v", errFeedSignerBackend, err)
+	}
+	if publish.ComputeDigest(body) != operatedDigest {
+		return fmt.Errorf("%w: operated manifest object bytes do not match the operated digest", errFeedSignerMalformed)
+	}
+	if int64(len(body)) != desc.Size {
+		return fmt.Errorf("%w: operated manifest object size disagrees with its descriptor", errFeedSignerMalformed)
+	}
+	artifact, err := publish.ParseArtifact(desc.MediaType, body)
+	if err != nil {
+		return fmt.Errorf("%w: operated manifest body is not a valid artifact: %v", errFeedSignerMalformed, err)
+	}
+	if artifact.Kind == publish.ArtifactKindIndex {
+		return fmt.Errorf("%w: operated manifest is an image index, which cannot be published yet", errFeedSignerMalformed)
+	}
+	refs := artifact.References()
+	referenced := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		referenced[ref.Digest] = struct{}{}
+		blob, ok := target[ref.Digest]
+		if !ok {
+			return fmt.Errorf("%w: operated manifest references a blob absent from the target document", errFeedSignerMalformed)
+		}
+		if err := publish.CheckBlobReferenceCoherence(ref, blob); err != nil {
+			return fmt.Errorf("%w: operated manifest reference disagrees with its stored blob record", errFeedSignerMalformed)
+		}
+	}
+	// Every existing record is cloned into the next state verbatim.
 	for digest, desc := range cur {
 		targetDesc, ok := target[digest]
 		if !ok {
@@ -717,54 +778,76 @@ func validateBlobTransition(cur, target map[string]spec.BlobDescriptor) error {
 			return fmt.Errorf("%w: target document mutates an existing blob record", errFeedSignerMalformed)
 		}
 	}
+	// Every NEW target blob record must be one of the operated artifact's
+	// references — arbitrary additions are never inert.
+	for digest := range target {
+		if _, inCur := cur[digest]; inCur {
+			continue
+		}
+		if _, isRef := referenced[digest]; !isRef {
+			return fmt.Errorf("%w: target document adds a blob record the operated artifact does not reference", errFeedSignerMalformed)
+		}
+	}
 	return nil
 }
 
 // authenticateOperationIdentity proves the request's operation identity is NOT
-// attacker-selected. The PERMANENT publication binding row (the data plane's
-// migration-15 preflight reservation) holds PRECEDENCE and is consulted
-// FIRST: explicit and generated identities share one grammar, so a permanent
-// row that CONFLICTS with the current payload must never be bypassed merely
-// because the identity coincides with the deterministic recomputation of
-// ComputeOperationID over (registry ID, owner, repo, operated tag, digest,
-// expected generation). When the row EXISTS, the binding is authoritative:
-// its registry must equal the request registry and its stored hash must equal
-// the derived binding hash over (registry, owner, repo, tag, digest) — a
-// mismatch (or a foreign registry) is a hard conflict REGARDLESS of the
-// generated form. Only an AUTHORITATIVE not-found (sql.ErrNoRows — never a
-// query/db error) may fall back to the generated-ID recomputation, which
-// authenticates the identity WITHOUT any durable binding; a not-found for
-// any other identity is an EXPLICIT caller key that was never bound and is
-// malformed. A DB/query failure is a backend/uncertain condition and NEVER
-// falls back to the generated form. All errors are data-free (fixed sentinel
-// + fixed message; the query failure keeps its cause server-side only).
+// attacker-selected and decides it ATOMICALLY — never on a stale absence.
+//
+// When the request's operation ID is EXACTLY the deterministic recomputation
+// of ComputeOperationID over (registry ID, owner, repo, operated tag, digest,
+// expected generation), the identity IS that generated publication: the
+// signer ATOMICALLY RESERVES a permanent binding row for it (Reserve
+// PublicationBinding — insert-or-read), which serializes with any concurrent
+// explicit preflight at the data plane: there is exactly ONE permanent
+// binding winner per operation identity, and the returned row must match the
+// request registry and the exact binding hash. A pre-existing conflicting row
+// (a preflight bound the generated-looking key to a different payload) is a
+// hard conflict BEFORE the updater; the stale-absence decision is eliminated
+// because the row is created by the reserve itself, never assumed absent.
+//
+// For any NON-generated (explicit) caller key the durable preflight row MUST
+// already exist: the signer reads it (never auto-reserves arbitrary explicit
+// IDs — preflight-before-object-write is the data plane's contract), requires
+// the exact registry and hash, and a missing row is malformed. An explicit
+// caller that chose the exact generated ID semantically IS that generated
+// identity, so it takes the atomic-reserve path above and conflicts with any
+// pre-existing different binding.
+//
+// A DB/query/reserve failure is a backend/uncertain condition and NEVER falls
+// back to accepting without a binding. All errors are data-free (fixed
+// sentinel + fixed message; the DB failure keeps its cause server-side only).
 func (s *FeedSigner) authenticateOperationIdentity(ctx context.Context, req publish.FeedCommitRequest, targetRepo, operatedTag, digest string) error {
+	bindingHash := NormalizePublicationBindingHash(req.RegistryID, req.Owner, targetRepo, operatedTag, digest)
+	if req.OperationID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
+		// Generated identity: ATOMIC insert-or-read. This single statement
+		// serializes with any concurrent explicit preflight for the same key —
+		// one permanent winner per identity, never a stale-absence decision.
+		binding, err := s.Store.ReservePublicationBinding(ctx, req.OperationID, req.RegistryID, bindingHash)
+		if err != nil {
+			return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
+		}
+		if binding.RegistryID != req.RegistryID {
+			return fmt.Errorf("%w: operation identity is bound to another registry", errFeedSignerConflict)
+		}
+		if binding.BindingHash != bindingHash {
+			return fmt.Errorf("%w: operation identity is bound to a different publication", errFeedSignerConflict)
+		}
+		return nil
+	}
+	// Explicit caller key: require the data plane's pre-existing preflight
+	// row; the signer NEVER auto-reserves arbitrary explicit IDs.
 	binding, err := s.Store.GetPublicationBinding(ctx, req.OperationID)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
-			// A failed binding lookup is an uncertain backend condition: the
-			// identity decision is NEVER made on a failed read, so there is no
-			// generated-form fallback here.
 			return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
-		}
-		// Authoritative not-found: the identity is generated exactly when the
-		// deterministic recomputation over the exact immutable transition
-		// reproduces it (the request could not have chosen this ID without
-		// naming this publication); ANY other identity is an explicit caller
-		// key with no durable binding and is malformed.
-		if req.OperationID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
-			return nil
 		}
 		return fmt.Errorf("%w: operation identity is not durably bound to this publication", errFeedSignerMalformed)
 	}
-	// A durable binding row EXISTS: it is the permanent authority for this
-	// operation identity and is enforced whether or not the identity also
-	// equals the deterministic generated form — an existing permanent binding
-	// is never bypassed (fail closed).
 	if binding.RegistryID != req.RegistryID {
 		return fmt.Errorf("%w: operation identity is bound to another registry", errFeedSignerConflict)
 	}
-	if binding.BindingHash != NormalizePublicationBindingHash(req.RegistryID, req.Owner, targetRepo, operatedTag, digest) {
+	if binding.BindingHash != bindingHash {
 		return fmt.Errorf("%w: operation identity is bound to a different publication", errFeedSignerConflict)
 	}
 	return nil
