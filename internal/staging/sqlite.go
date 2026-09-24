@@ -762,25 +762,47 @@ func verifyConnIdentity(ctx context.Context, conn *sql.Conn, parentRoot *os.Root
 //     closes it itself, so Close never races a send on a closed channel (the
 //     channel is never closed) and a handle released after Close is never
 //     leaked.
-//   - close marks the pool closed, waits for every borrowed handle to be
-//     released (each such release closes its handle), then drains and closes
-//     every retained handle and the underlying *sql.DB. Close is therefore
-//     bounded by the behavior of holders: it completes once all borrowed
-//     handles return. Acquires after Close return a fixed closed-pool error.
+//   - close LINEARIZES shutdown so EVERY concurrent or later Close joins one
+//     single completion. Exactly one caller atomically transitions the pool
+//     open→closing and becomes the shutdown owner: it waits until every
+//     reservation and borrowed handle is returned or canceled (it never holds
+//     the mutex while waiting on the cond, the channel, or while closing
+//     handles), drains and closes the exact retained set of idle handles, and
+//     closes the underlying *sql.DB exactly once. Every other Close — racing
+//     or repeated, even after completion — waits on the same never-replaced
+//     `done` channel, so no Close can observe shutdown as finished before the
+//     underlying close completes. Acquires after Close return a fixed
+//     closed-pool error; a reservation or borrow that outlived Close's
+//     mark is either received/returned through this one linearization or
+//     canceled, and is always accounted exactly once.
 type dbPool struct {
 	db       *sql.DB
 	ch       chan *sql.Conn // buffered (size N); NEVER closed
-	closing  chan struct{}  // closed once by close()
+	closing  chan struct{}  // closed once by the shutdown owner
+	done     chan struct{}  // closed exactly once when shutdown fully completes; never replaced
 	mu       sync.Mutex
 	cond     *sync.Cond
 	closed   bool
 	borrowed int
+	// shutdownStarted is set under mu by the single task that owns the drain
+	// (the caller that transitioned open→closing); every other Close joins it.
+	shutdownStarted bool
+
+	// closeHook is a test-only observation barrier fired by the shutdown owner
+	// at named boundaries ("marked", "drained", "dbclose", "done"); nil in
+	// production.
+	closeHook func(phase string)
 }
 
 // newDBPool builds a pool over db with size retained handles already in the
 // channel.
 func newDBPool(db *sql.DB, size int) *dbPool {
-	p := &dbPool{db: db, ch: make(chan *sql.Conn, size), closing: make(chan struct{})}
+	p := &dbPool{
+		db:      db,
+		ch:      make(chan *sql.Conn, size),
+		closing: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
@@ -901,34 +923,76 @@ func (p *dbPool) release(c *sql.Conn) {
 	p.mu.Unlock()
 }
 
-// close marks the pool closed once, wakes every blocked waiter, and waits
-// until every reservation and borrowed handle is returned or canceled
-// before draining the (by then exact) set of idle handles and closing the
-// database. Acquires after close return a fixed closed-pool error; a handle
-// received just before close lanes is already counted and is returned to
-// its holder, whose release closes it.
+// close linearizes staging-pool shutdown so every concurrent or later Close
+// JOINS one shared completion. Exactly one caller atomically transitions the
+// pool open→closing and becomes the shutdown owner: it waits until every
+// reservation and borrowed handle is returned or canceled (never holding the
+// mutex while waiting on the cond or the channel or while closing handles),
+// drains and closes the exact retained set of idle handles, closes the
+// underlying *sql.DB exactly once, and then closes the never-replaced `done`
+// channel. Every other Close — racing it or arriving later, even after
+// completion — waits on that same `done` channel, so no Close can observe
+// shutdown finished before the underlying database close completes. This
+// repairs the prior defect where a second concurrent Close saw `closed` and
+// returned immediately, before shutdown had finished. Acquires after close
+// return a fixed closed-pool error; a handle released during closing is
+// closed by the owner protocol and decremented once.
 func (p *dbPool) close() {
 	p.mu.Lock()
-	if p.closed {
+	if !p.closed {
+		p.closed = true
+		close(p.closing)
+	}
+	var owner bool
+	if !p.shutdownStarted {
+		// This caller transitioned open→closing (or is the first to claim
+		// the drain) and performs the shutdown; every other Close joins it.
+		p.shutdownStarted = true
+		owner = true
+	}
+	if !owner {
+		// A concurrent or later Close joins the SAME completion and never
+		// returns early. We do not hold the mutex while waiting.
 		p.mu.Unlock()
+		<-p.done
 		return
 	}
-	p.closed = true
-	close(p.closing)
+
+	if p.closeHook != nil {
+		p.closeHook("marked")
+	}
+	// Wait for every reservation and borrow to be returned or canceled.
+	// The len of p.ch plus borrowed is an invariant of size, so once
+	// borrowed reaches zero the channel holds exactly the idle retained set.
 	for p.borrowed > 0 {
 		p.cond.Wait()
 	}
 	p.mu.Unlock()
+
+	if p.closeHook != nil {
+		p.closeHook("drained")
+	}
+	// The channel is frozen once `closed` is set: release() closes rather
+	// than re-sends during closing, and no post-close acquire can receive, so
+	// draining here lands exactly the retained idle handles and closes each.
 	for {
 		select {
 		case c := <-p.ch:
 			_ = c.Close()
 		default:
-			goto done
+			goto drainFinished
 		}
 	}
-done:
+drainFinished:
+	if p.closeHook != nil {
+		p.closeHook("dbclose")
+	}
 	_ = p.db.Close()
+	if p.closeHook != nil {
+		p.closeHook("done")
+	}
+	// Publish completion: every joined Close unblocks on the SAME channel.
+	close(p.done)
 }
 
 // basePathOf returns the on-disk path portion of a DSN, stripping any file:

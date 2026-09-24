@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/spec"
@@ -81,6 +82,14 @@ type service struct {
 	now           func() time.Time
 	creationLease time.Duration
 
+	// closeOnce and closeErr make Close IDEMPOTENT and JOINED: exactly one
+	// invocation runs the (pool + spool) shutdown body while every concurrent
+	// or later call waits for it and shares the fixed data-free result, so
+	// the pool and the spool are never closed twice and no Close returns
+	// before shutdown fully finishes.
+	closeOnce sync.Once
+	closeErr  error
+
 	// Test-only fault injection points (nil in production). They are set
 	// before operations and never mutated concurrently.
 	fsyncHook        func() error // replaces the spool-file fsync
@@ -123,19 +132,28 @@ func NewService(ctx context.Context, spoolRoot, dbPath string) (*service, error)
 	return svc, nil
 }
 
-// Close releases the retained database handles and the root descriptor.
+// Close releases the retained database handles and the root descriptor. It is
+// IDEMPOTENT and JOINED: concurrent or repeated Close calls wait for the
+// single shutting-down completion and share its fixed data-free result, so
+// the pool and the spool are never closed twice and no Close returns before
+// shutdown fully finishes. Acquires made after Close return a fixed
+// closed-pool error.
 func (s *service) Close() error {
-	var errs []error
-	if s.pool != nil {
-		s.pool.close()
-		s.pool = nil
-	}
-	if s.spool != nil {
-		if err := s.spool.Close(); err != nil {
-			errs = append(errs, err)
+	s.closeOnce.Do(func() {
+		var errs []error
+		if s.pool != nil {
+			s.pool.close()
+			s.pool = nil
 		}
-	}
-	return errors.Join(errs...)
+		if s.spool != nil {
+			if err := s.spool.Close(); err != nil {
+				errs = append(errs, err)
+			}
+			s.spool = nil
+		}
+		s.closeErr = errors.Join(errs...)
+	})
+	return s.closeErr
 }
 
 // ---------------------------------------------------------------------------
