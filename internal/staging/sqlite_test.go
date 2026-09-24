@@ -857,11 +857,15 @@ func buildSchemaFixture(t *testing.T, mutate func(ddl []string) []string, mutate
 			t.Fatalf("fixture extra stmt: %v", err)
 		}
 	}
-	if _, err := db.Exec(`insert into staging_schema (version, applied_at) values (1, 1)`); err != nil {
+	if _, err := db.Exec(`insert into staging_schema (version, applied_at) values (?, 1)`, schemaGold.Version); err != nil {
 		t.Fatalf("version row: %v", err)
 	}
 	if dupVersion {
-		if _, err := db.Exec(`insert into staging_schema (version, applied_at) values (2, 1)`); err != nil {
+		alt := int64(1)
+		if schemaGold.Version == 1 {
+			alt = 2
+		}
+		if _, err := db.Exec(`insert into staging_schema (version, applied_at) values (?, 1)`, alt); err != nil {
 			t.Fatalf("alternate version row: %v", err)
 		}
 	}

@@ -17,19 +17,33 @@ import (
 	sqlite "modernc.org/sqlite"
 )
 
-// latestSchemaVersion is the only schema version this subsystem knows. A
-// pre-existing database whose version table records anything else — or that
-// carries unknown objects — is rejected, never adopted or guessed at.
-const latestSchemaVersion = 1
+// latestSchemaVersion is the current staging schema version. The migration
+// path accepts exactly two committed v1 predecessor shapes (the exact
+// pre-cleanup-token v1 and the exact cleanup-token-v1 compatibility shape),
+// a fresh empty file, and the current v2 — every shape is recognized ONLY by
+// its exact frozen object surface plus version, never guessed at. A
+// pre-existing database that matches none of them is rejected, never
+// adopted.
+const latestSchemaVersion = 2
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
 const busytimeoutMS = 5000
 
-// migrationFault is a test-only injection point that fails the version-1
-// migration after its DDL and before the version row is recorded, proving
-// the whole migration rolls back atomically.
+// migrationFault is a test-only injection point that fails the fresh v2
+// creation after its DDL and before the version row is recorded, proving
+// the whole creation rolls back atomically.
 var migrationFault error
+
+// migrationCopyFault and migrationVersionFault are test-only injection
+// points for the atomic predecessor->v2 migration: the first fails the
+// migration right after the pre-cleanup row copy (mid-rebuild), the second
+// immediately before the version record is written. Both prove rollback
+// restores the exact predecessor schema, rows, and version.
+var (
+	migrationCopyFault    error
+	migrationVersionFault error
+)
 
 // reconcileSnapshotHook is a test-only injection point (nil in production):
 // it fires after the Phase A row snapshot in startup reconciliation, so a
@@ -281,24 +295,62 @@ type schemaManifest struct {
 	ForeignKeys []goldenFK                `json:"foreign_keys"`
 }
 
-//go:embed schema_golden_v1.json
-var schemaGoldenJSON []byte
+// The three independently frozen schema manifests. The target v2 golden is
+// kept independent of the creation DDL (a parity test binds them), and each
+// predecessor shape — the exact pre-cleanup-token v1 and the exact
+// cleanup-token-v1 compatibility shape — has its own frozen manifest so a
+// single "v1" name can never ambiguously cover two different committed
+// green-task states.
+//
+//go:embed schema_golden_v1_precleanup.json
+var schemaGoldenV1PreJSON []byte
 
-var schemaGold = mustLoadSchemaGolden()
+//go:embed schema_golden_v1_cleanup.json
+var schemaGoldenV1CleanupJSON []byte
 
-func mustLoadSchemaGolden() *schemaManifest {
+//go:embed schema_golden_v2.json
+var schemaGoldenV2JSON []byte
+
+// schemaGold is the current (v2) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV2JSON)
+
+// schemaGoldV1Pre is the exact pre-cleanup-token v1 predecessor manifest.
+var schemaGoldV1Pre = mustLoadSchemaGolden(schemaGoldenV1PreJSON)
+
+// schemaGoldV1Cleanup is the exact cleanup-token-v1 compatibility predecessor
+// manifest (same object surface as v2; frozen at version 1).
+var schemaGoldV1Cleanup = mustLoadSchemaGolden(schemaGoldenV1CleanupJSON)
+
+// mustLoadSchemaGolden parses a committed schema manifest and sanity-checks
+// its structure. It deliberately does NOT panic on a version mismatch with
+// latestSchemaVersion: each manifest records its own frozen version (1 or 2),
+// and package init must remain alive for upgrade-after-recovery even when a
+// manifest's recorded version differs from the current one. Only a manifest
+// that cannot even be parsed or carries no objects is a packaging defect.
+func mustLoadSchemaGolden(data []byte) *schemaManifest {
 	var m schemaManifest
-	if err := json.Unmarshal(schemaGoldenJSON, &m); err != nil {
+	if err := json.Unmarshal(data, &m); err != nil {
 		panic(fmt.Sprintf("staging schema golden is not parseable: %v", err))
 	}
-	if m.Version != latestSchemaVersion || len(m.Objects) == 0 {
+	if len(m.Objects) == 0 || m.Version < 1 || m.Version > latestSchemaVersion {
 		panic(fmt.Sprintf("staging schema golden version/objects mismatch: %d/%d", m.Version, len(m.Objects)))
 	}
 	return &m
 }
 
-// expectedSchema is the frozen object surface from the golden manifest.
-var expectedSchema = schemaGold.Objects
+// manifestColumnShapes maps a manifest's frozen column descriptions into the
+// runtime columnShape list used by table_xinfo verification.
+func manifestColumnShapes(gold *schemaManifest) map[string][]columnShape {
+	out := make(map[string][]columnShape, len(gold.Columns))
+	for table, cols := range gold.Columns {
+		shapes := make([]columnShape, 0, len(cols))
+		for _, c := range cols {
+			shapes = append(shapes, columnShape{name: c.Name, typ: c.Type, notnull: c.NotNull, pk: c.PK})
+		}
+		out[table] = shapes
+	}
+	return out
+}
 
 // parseDDLHead derives (type, name, tbl_name) from the leading tokens of a
 // CREATE statement. The full-statement identity comes from normalizeSQL.
@@ -548,8 +600,13 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		db.SetConnMaxIdleTime(0)
 		db.SetConnMaxLifetime(0)
 	}
-	if state == schemaEmpty {
+	switch state {
+	case schemaEmpty:
 		if err := createFreshSchema(ctx, db); err != nil {
+			return fail(err)
+		}
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup:
+		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
 	}
@@ -1133,18 +1190,28 @@ const (
 	schemaReject schemaState = iota
 	schemaEmpty
 	schemaCurrent
+	schemaMigrateV1Pre
+	schemaMigrateV1Cleanup
 )
 
 // inspectSchemaState examines an existing database on a read-only,
 // mutation-pragma-free connection and returns:
 //
-//	schemaEmpty   — no tables and no version row: an empty file, migratable;
-//	schemaCurrent — every expected object exists with the EXACT expected SQL
-//	                body, physical column/index/FK shape, and version row;
-//	schemaReject  — anything else (foreign schema, lookalike bodies, unknown
-//	                objects, mutated fixtures…).
+//	schemaEmpty           — no tables and no version row: an empty file,
+//	                        created fresh;
+//	schemaCurrent         — the exact current (v2) object surface and version;
+//	schemaMigrateV1Pre    — the exact pre-cleanup-token v1 predecessor (frozen
+//	                        committed shape), ready for an atomic rebuild to v2;
+//	schemaMigrateV1Cleanup— the exact cleanup-token-v1 compatibility
+//	                        predecessor, ready for exact-validation plus version
+//	                        advancement to v2;
+//	schemaReject          — anything else (foreign schema, lookalike bodies,
+//	                        unknown objects, ambiguous/mutated fixtures…).
 //
-// Because the connection is mode=ro, a rejected database is never written.
+// Every recognized shape is accepted ONLY when it fully verifies against its
+// own frozen manifest (objects, columns, indexes, FKs, and version row) — a
+// malformed lookalike never reaches migration. Because the connection is
+// mode=ro, a rejected database is never written.
 func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error) {
 	db, err := sql.Open("sqlite", inspectionDSN(dbPath))
 	if err != nil {
@@ -1162,17 +1229,30 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	if len(tables) == 0 && !hasVersion {
 		return schemaEmpty, nil
 	}
-	if !hasVersion || version != latestSchemaVersion {
+	if !hasVersion {
 		return schemaReject, depErr(errors.New(
 			"staging database is not a supported upload-staging schema"), ctx)
 	}
-	if err := verifySchemaFully(ctx, &txAdapter{db: db}); err != nil {
-		return schemaReject, depErr(err, ctx)
+	adapter := &txAdapter{db: db}
+	// The version value selects WHICH frozen shapes are admissible; the shape
+	// itself must verify byte/structure-exactly against that manifest. Both v1
+	// predecessors record version 1, so the object surface (cleanup_token
+	// presence) distinguishes them; malformed or ambiguous combinations reject.
+	switch version {
+	case latestSchemaVersion:
+		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
+			return schemaCurrent, nil
+		}
+	case 1:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV1Pre, 1); err == nil {
+			return schemaMigrateV1Pre, nil
+		}
+		if err := verifyAgainst(ctx, adapter, schemaGoldV1Cleanup, 1); err == nil {
+			return schemaMigrateV1Cleanup, nil
+		}
 	}
-	if err := verifyVersionRow(ctx, &txAdapter{db: db}); err != nil {
-		return schemaReject, depErr(err, ctx)
-	}
-	return schemaCurrent, nil
+	return schemaReject, depErr(errors.New(
+		"staging database is not a supported upload-staging schema"), ctx)
 }
 
 // inspectionDSN builds a read-only, mutation-pragma-free DSN for the
@@ -1282,7 +1362,7 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 	if migrationFault != nil {
 		return depErr(migrationFault, ctx)
 	}
-	if err := verifySchemaFully(ctx, tx); err != nil {
+	if err := verifySchemaFully(ctx, tx, schemaGold); err != nil {
 		return depErr(err, ctx)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -1294,6 +1374,174 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 	}
 	rollback = false
 	return nil
+}
+
+// migrateSchema atomically upgrades one of the two exact v1 predecessor
+// shapes to v2 on a pinned connection under a serialized BEGIN IMMEDIATE
+// write transaction:
+//
+//   - an EXACT pre-cleanup-token v1 database rebuilds upload_sessions (adding
+//     the cleanup_token column, its CHECK, the tightened coherence CHECK, and
+//     de novo session triggers) preserving every existing row/field exactly —
+//     the newly added column is NULL everywhere, never inventing provenance;
+//   - an EXACT cleanup-token-v1 database (whose object surface already matches
+//     v2) is validated exactly and advances only the version record;
+//   - the full v2 object/column/index/FK surface AND every migrated row
+//     validate before the version record is written, and only after that is
+//     the row committed.
+//
+// The rebuild is performed with foreign_keys temporarily OFF (SQLite's
+// documented table-rewrite procedure, since dropping the parent while the
+// child FK references it is illegal with enforcement on) and re-enables it and
+// runs PRAGMA foreign_key_check before commit; every failure rolls back to the
+// byte-exact predecessor.
+func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return depErr(err, ctx)
+	}
+	defer conn.Close()
+	exec := func(q string, args ...any) error {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		if _, err := conn.ExecContext(ctx, q, args...); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return err
+		}
+		return nil
+	}
+	// The connection inherits foreign_keys=ON from the DSN; take it OFF only
+	// for the atomic rebuild and restore it on the way out.
+	if err := exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		return depErr(err, ctx)
+	}
+	if err := exec(`BEGIN IMMEDIATE`); err != nil {
+		_, _ = conn.ExecContext(context.Background(), `PRAGMA foreign_keys=ON`)
+		return depErr(err, ctx)
+	}
+	rollback := true
+	defer func() {
+		if rollback {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+		_, _ = conn.ExecContext(context.Background(), `PRAGMA foreign_keys=ON`)
+	}()
+	// Preflight inside the transaction, before ANY DDL: the exact predecessor
+	// must still verify byte/structure-identically (a TOCTOU swap after the
+	// read-only inspection cannot slip an unvetted shape into a mutation).
+	switch from {
+	case schemaMigrateV1Pre:
+		if err := verifyAgainst(ctx, conn, schemaGoldV1Pre, 1); err != nil {
+			return depErr(err, ctx)
+		}
+		if err := rebuildUploadSessions(ctx, conn, exec); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV1Cleanup:
+		if err := verifyAgainst(ctx, conn, schemaGoldV1Cleanup, 1); err != nil {
+			return depErr(err, ctx)
+		}
+		// No structural change needed: the cleanup-token surface already
+		// matches v2. Only the version record advances.
+	default:
+		return depErr(errors.New("staging migration does not recognize the source schema"), ctx)
+	}
+	// The full v2 surface must hold on this live write connection, and every
+	// migrated row must satisfy it (the rebuild's copy goes through the new
+	// table's CHECKs; the cleanup path's rows already satisfied v2).
+	if err := verifySchemaFully(ctx, conn, schemaGold); err != nil {
+		return depErr(err, ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return depErr(ctx.Err(), ctx)
+	}
+	now := timeNowNanos()
+	if migrationVersionFault != nil {
+		return depErr(migrationVersionFault, ctx)
+	}
+	if err := exec(`update staging_schema set version = ?, applied_at = ?`, latestSchemaVersion, now); err != nil {
+		return depErr(err, ctx)
+	}
+	if err := exec(`COMMIT`); err != nil {
+		return depErr(err, ctx)
+	}
+	rollback = false
+	return nil
+}
+
+// rebuildUploadSessions rewrites the pre-cleanup upload_sessions table into
+// the exact v2 shape. The new table is created directly under its FINAL name
+// from schemaDDL[0] — never via ALTER TABLE ... RENAME, which makes SQLite
+// store a double-quoted table name that would break the byte-exact golden
+// fingerprint. Rows are moved field-by-field (explicit column lists, never
+// INSERT ... SELECT *), the new cleanup_token column stays NULL everywhere,
+// and the full v2 indexes/triggers are recreated. The scratch copy table is
+// dropped before verification so the live object set is exactly v2.
+func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error) error {
+	copyDDL := strings.Replace(schemaDDL[0], "upload_sessions", "upload_sessions_copy", 1)
+	if err := exec(copyDDL); err != nil {
+		return err
+	}
+	if err := exec(`insert into upload_sessions_copy
+		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, digest, bee_ref, media_type, size )
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, NULL,
+		       digest, bee_ref, media_type, size from upload_sessions`); err != nil {
+		return err
+	}
+	// Test-only fault injection: fail immediately after the row copy (mid-
+	// rebuild) and prove the whole transaction rolls back the predecessor.
+	if migrationCopyFault != nil {
+		return migrationCopyFault
+	}
+	// Drop every trigger/index that references upload_sessions BEFORE dropping
+	// the table (otherwise SQLite reparses them against the missing table).
+	for _, trig := range []string{"trg_blob_insert", "trg_blob_update", "trg_blob_delete",
+		"trg_session_insert", "trg_session_state", "trg_session_metadata",
+		"trg_session_identity", "trg_session_token", "trg_session_delete"} {
+		if err := exec(`drop trigger ` + trig); err != nil {
+			return err
+		}
+	}
+	for _, idx := range []string{"idx_sessions_owner", "idx_sessions_expiry"} {
+		if err := exec(`drop index ` + idx); err != nil {
+			return err
+		}
+	}
+	if err := exec(`drop table upload_sessions`); err != nil {
+		return err
+	}
+	// Recreate the v2 upload_sessions table under its final name, then move
+	// the preserved rows back (cleanup_token stays NULL: provenance is never
+	// invented).
+	if err := exec(schemaDDL[0]); err != nil {
+		return err
+	}
+	if err := exec(`insert into upload_sessions
+		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, digest, bee_ref, media_type, size )
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, NULL,
+		       digest, bee_ref, media_type, size from upload_sessions_copy`); err != nil {
+		return err
+	}
+	if err := exec(`drop table upload_sessions_copy`); err != nil {
+		return err
+	}
+	// Recreate the two session indexes (schemaDDL[3], schemaDDL[4]).
+	for _, idx := range []int{3, 4} {
+		if err := exec(schemaDDL[idx]); err != nil {
+			return err
+		}
+	}
+	// Recreate the seven v2 session triggers (schemaDDL[5..11]) and the three
+	// staged-blob triggers (schemaDDL[12..14]).
+	for i := 5; i <= 14; i++ {
+		if err := exec(schemaDDL[i]); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }
 
 func timeNowNanos() int64 {
@@ -1315,29 +1563,31 @@ func (a *txAdapter) QueryRowContext(ctx context.Context, query string, args ...a
 	return a.db.QueryRowContext(ctx, query, args...)
 }
 
-// verifySchemaFully validates the complete expected sqlite_schema surface:
-// the exact object set with SQL-aware normalized bodies, the exact physical
-// column shapes (table_xinfo incl. hidden columns), the exact index columns
-// (index_xinfo), the exact single foreign key row, FK integrity (no orphan
-// rows), and the absence of temporary objects.
-func verifySchemaFully(ctx context.Context, db schemaChecker) error {
+// verifySchemaFully validates the complete expected sqlite_schema surface
+// against a specific frozen manifest: the exact object set with SQL-aware
+// normalized bodies, the exact physical column shapes (table_xinfo incl.
+// hidden columns), the exact index columns (index_xinfo), the exact foreign
+// key rows, FK integrity (no orphan rows), and the absence of temporary
+// objects.
+func verifySchemaFully(ctx context.Context, db schemaChecker, gold *schemaManifest) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := verifySchemaObjects(ctx, db); err != nil {
+	shapes := manifestColumnShapes(gold)
+	if err := verifySchemaObjects(ctx, db, gold); err != nil {
 		return err
 	}
-	for table := range schemaGold.Columns {
-		if err := verifyColumnShapes(ctx, db, table, expectedColumnShapes[table]); err != nil {
+	for table := range gold.Columns {
+		if err := verifyColumnShapes(ctx, db, table, shapes[table]); err != nil {
 			return err
 		}
 	}
-	for idx := range schemaGold.Indexes {
-		if err := verifyIndexShape(ctx, db, idx); err != nil {
+	for idx := range gold.Indexes {
+		if err := verifyIndexShape(ctx, db, idx, gold.Indexes[idx]); err != nil {
 			return err
 		}
 	}
-	if err := verifyForeignKeys(ctx, db); err != nil {
+	if err := verifyForeignKeys(ctx, db, gold.ForeignKeys); err != nil {
 		return err
 	}
 	// Integrity: no orphan rows.
@@ -1360,11 +1610,24 @@ func verifySchemaFully(ctx context.Context, db schemaChecker) error {
 	return ctx.Err()
 }
 
+// verifyAgainst proves a database matches a specific frozen manifest exactly:
+// full object/column/index/FK surface plus the exact single version row.
+func verifyAgainst(ctx context.Context, db schemaChecker, gold *schemaManifest, expectedVersion int) error {
+	if err := verifySchemaFully(ctx, db, gold); err != nil {
+		return err
+	}
+	if err := verifyVersionRow(ctx, db, expectedVersion); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
 // verifySchemaObjects proves the object set is EXACTLY the expected one and
 // every object's stored body normalizes to the expected SQL: a lookalike
 // that shares a name but relaxes a check, changes a trigger body, reorders
 // index columns, or carries different quoted content is rejected.
-func verifySchemaObjects(ctx context.Context, db schemaChecker) error {
+func verifySchemaObjects(ctx context.Context, db schemaChecker, gold *schemaManifest) error {
+	expected := gold.Objects
 	var total int
 	if err := db.QueryRowContext(ctx,
 		`select count(*) from sqlite_master where type in ('table','index','trigger','view') and name not like 'sqlite_%'`).
@@ -1374,11 +1637,11 @@ func verifySchemaObjects(ctx context.Context, db schemaChecker) error {
 		}
 		return err
 	}
-	if total != len(expectedSchema) {
-		return fmt.Errorf("staging schema has %d objects, want %d", total, len(expectedSchema))
+	if total != len(expected) {
+		return fmt.Errorf("staging schema has %d objects, want %d", total, len(expected))
 	}
-	for i := range expectedSchema {
-		want := &expectedSchema[i]
+	for i := range expected {
+		want := &expected[i]
 		var typ, tbl, sqlText string
 		err := db.QueryRowContext(ctx,
 			`select type, tbl_name, sql from sqlite_master where name = ? and type in ('table','index','trigger','view')`,
@@ -1412,23 +1675,6 @@ type columnShape struct {
 	notnull bool
 	pk      bool
 }
-
-// expectedColumnShapes is the frozen physical column surface from the golden
-// manifest (independently authored; not derived from the migration DDL).
-var expectedColumnShapes = func() map[string][]columnShape {
-	out := make(map[string][]columnShape, len(schemaGold.Columns))
-	for table, cols := range schemaGold.Columns {
-		shapes := make([]columnShape, 0, len(cols))
-		for _, c := range cols {
-			shapes = append(shapes, columnShape{name: c.Name, typ: c.Type, notnull: c.NotNull, pk: c.PK})
-		}
-		out[table] = shapes
-	}
-	return out
-}()
-
-// expectedIndexCols is the frozen index surface from the golden manifest.
-var expectedIndexCols = schemaGold.Indexes
 
 // verifyColumnShapes proves table_xinfo (incl. hidden columns) matches the
 // expected columns EXACTLY — same count, names, storage classes, NOT NULL
@@ -1469,7 +1715,7 @@ func verifyColumnShapes(ctx context.Context, db schemaChecker, table string, wan
 // with no descending columns. The implicit table-rowid auxiliary row that
 // SQLite appends to indexes of rowid tables (NULL name, key=0) is expected
 // and not part of the declared column list.
-func verifyIndexShape(ctx context.Context, db schemaChecker, idx string) error {
+func verifyIndexShape(ctx context.Context, db schemaChecker, idx string, want []string) error {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`pragma index_xinfo(%s)`, idx))
 	if err != nil {
 		return err
@@ -1493,7 +1739,6 @@ func verifyIndexShape(ctx context.Context, db schemaChecker, idx string) error {
 		cols = append(cols, name.String)
 	}
 	rows.Close()
-	want := expectedIndexCols[idx]
 	if len(cols) != len(want) {
 		return fmt.Errorf("staging schema index %s has %d columns, want %d", idx, len(cols), len(want))
 	}
@@ -1508,8 +1753,7 @@ func verifyIndexShape(ctx context.Context, db schemaChecker, idx string) error {
 // verifyForeignKeys proves every declared foreign key matches the frozen
 // golden expectation EXACTLY (table, columns, actions, flags) and that no
 // additional foreign keys exist.
-func verifyForeignKeys(ctx context.Context, db schemaChecker) error {
-	expected := schemaGold.ForeignKeys
+func verifyForeignKeys(ctx context.Context, db schemaChecker, expected []goldenFK) error {
 	for _, want := range expected {
 		rows, err := db.QueryContext(ctx, fmt.Sprintf(`pragma foreign_key_list(%s)`, want.Table))
 		if err != nil {
@@ -1542,9 +1786,9 @@ func verifyForeignKeys(ctx context.Context, db schemaChecker) error {
 	return nil
 }
 
-// verifyVersionRow proves the version row is exactly one row with the latest
-// version and an INTEGER applied_at (never text/numeric-coerced).
-func verifyVersionRow(ctx context.Context, db schemaChecker) error {
+// verifyVersionRow proves the version row is exactly one row with the
+// expected version and an INTEGER applied_at (never text/numeric-coerced).
+func verifyVersionRow(ctx context.Context, db schemaChecker, expectedVersion int) error {
 	rows, err := db.QueryContext(ctx, `select version, typeof(applied_at), applied_at from staging_schema`)
 	if err != nil {
 		return err
@@ -1563,7 +1807,7 @@ func verifyVersionRow(ctx context.Context, db schemaChecker) error {
 			rows.Close()
 			return errors.New("staging_schema has multiple version rows")
 		}
-		if v != latestSchemaVersion || typ != "integer" {
+		if int(v) != expectedVersion || typ != "integer" {
 			rows.Close()
 			return errors.New("staging_schema version row differs from the expected one")
 		}
