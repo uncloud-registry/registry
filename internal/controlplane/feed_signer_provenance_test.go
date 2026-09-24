@@ -331,12 +331,19 @@ func TestFeedSignerAcceptsUnrelatedTagAdvanceRetainingEntries(t *testing.T) {
 			"a": {OperationID: "op-a-prev", Generation: 1, Digest: digestA},
 			"b": {OperationID: "op-b-kept", Generation: 1, Digest: digestB},
 		})
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 2,
+	// The target is DefaultBuilder-faithful: the operated manifest digest C is
+	// ADDED while EVERY existing manifest descriptor (A, B) is retained
+	// verbatim — the reserved manifest shape the signer's complete-transition
+	// validation demands.
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{"a": digestC, "b": digestB},
 		map[string]spec.TagPublication{
 			"a": {OperationID: generated, Generation: 2, Digest: digestC},
 			"b": {OperationID: "op-b-kept", Generation: 1, Digest: digestB},
-		})
+		},
+		manifestsForTags(map[string]string{"a": digestC, "b": digestB},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
+		map[string]spec.BlobDescriptor{})
 
 	signer, updater := w.countingSigner()
 	result, err := signer.Commit(context.Background(), req)
@@ -405,9 +412,14 @@ func TestFeedSignerLegacyCurrentFirstProvenanceAccepted(t *testing.T) {
 	// Legacy current: tag mapping, NO provenance section.
 	w.docs.Documents[refHex('b')] = provenanceRepoDoc(t, testRepo, 1,
 		map[string]string{tag: digestA}, nil)
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 2,
+	// DefaultBuilder-faithful target: the old manifest descriptor for digestA
+	// is RETAINED verbatim and the operated digest C is added.
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{tag: digestC},
-		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 2, Digest: digestC}})
+		map[string]spec.TagPublication{tag: {OperationID: generated, Generation: 2, Digest: digestC}},
+		manifestsForTags(map[string]string{tag: digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
+		map[string]spec.BlobDescriptor{})
 
 	signer, updater := w.countingSigner()
 	if _, err := signer.Commit(context.Background(), req); err != nil {
@@ -654,10 +666,14 @@ func TestFeedSignerRejectsStaleCopiedProvenanceEntry(t *testing.T) {
 		map[string]string{tag: digestA},
 		map[string]spec.TagPublication{tag: {OperationID: "op-stale-origin", Generation: 1, Digest: digestA}})
 	// Stale/copied: same operation ID and OLD generation, digest updated to the
-	// new mapping so the document itself remains fully valid.
-	w.docs.Documents[req.Reference] = provenanceRepoDoc(t, testRepo, 2,
+	// new mapping so the document itself remains fully valid (manifests retain
+	// the old descriptor exactly as DefaultBuilder would).
+	w.docs.Documents[req.Reference] = transitionDoc(t, testRepo, 2,
 		map[string]string{tag: digestC},
-		map[string]spec.TagPublication{tag: {OperationID: "op-stale-origin", Generation: 1, Digest: digestC}})
+		map[string]spec.TagPublication{tag: {OperationID: "op-stale-origin", Generation: 1, Digest: digestC}},
+		manifestsForTags(map[string]string{tag: digestC},
+			map[string]spec.ManifestDescriptor{digestA: fixtureManifestDescriptor(42)}),
+		map[string]spec.BlobDescriptor{})
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)

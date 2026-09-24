@@ -530,7 +530,13 @@ func (s *FeedSigner) verifyBatch(ctx context.Context, req publish.FeedCommitRequ
 // authenticatePublicationProvenance is the signer's AUTHORITATIVE
 // authentication of the operated tag publication. It compares the current and
 // next immutable repo-state documents to identify EXACTLY ONE
-// tag-publication transition for this operation and requires that transition's
+// tag-publication transition for this operation — across the SYMMETRIC union
+// of both documents' Tag and TagPublications keys (so an unrelated tag
+// mapping or provenance entry deleted from the current state, or added to the
+// target, is as much a change as an edited value) and across the Manifests
+// and Blobs maps (existing entries preserved exactly; the operated manifest
+// descriptor added/updated only at the operated digest; new blob records
+// permitted) — and requires that transition's
 // provenance entry to record the request's operation ID at the NEXT
 // generation with the resulting tag digest — rejecting zero-mutation,
 // multi-mutation, forged, stale, or copied entries as malformed BEFORE any
@@ -580,20 +586,17 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 		cur = *curDoc
 	}
 	// The transition cur → target must touch EXACTLY ONE tag — in its mapping,
-	// its provenance entry, or both. Two tags changing means two publications
-	// packed into one document; none changing means this operation has no
-	// record at all. Either is malformed.
-	changing := make(map[string]struct{}, 2)
-	for tag, entry := range targetDoc.TagPublications {
-		if curEntry, exists := cur.TagPublications[tag]; !exists || curEntry != entry {
-			changing[tag] = struct{}{}
-		}
-	}
-	for tag, digest := range targetDoc.Tags {
-		if curDigest, exists := cur.Tags[tag]; !exists || curDigest != digest {
-			changing[tag] = struct{}{}
-		}
-	}
+	// its provenance entry, or both. The comparison is the SYMMETRIC union of
+	// BOTH documents' keys (presence-sensitive: a tag present on only one side
+	// is a change even when the other side would render the zero value), so a
+	// target that deletes an unrelated CURRENT tag mapping, deletes an
+	// unrelated CURRENT provenance entry, or adds a wholly new tag while
+	// operating another can never hide alongside the operated transition: a
+	// current-only delete or a target-only add is exactly as much a change as
+	// an edited value, and any count other than one fails closed. Two tags
+	// changing means two publications packed into one document; none changing
+	// means this operation has no record at all. Either is malformed.
+	changing := changedTransitionTags(cur, targetDoc)
 	if len(changing) != 1 {
 		return fmt.Errorf("%w: target document mutates %d tags, expected exactly one", errFeedSignerMalformed, len(changing))
 	}
@@ -614,35 +617,150 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 	if entry.Digest != targetDoc.Tags[operated] {
 		return fmt.Errorf("%w: provenance digest does not match the operated tag mapping", errFeedSignerMalformed)
 	}
+	// The SAME root class extends to the other state maps: the transition must
+	// be exactly the operation's own, with NO unrelated semantic change
+	// hidden alongside the one tag transition. Manifests follow the actual
+	// DefaultBuilder rule (every existing descriptor preserved verbatim; the
+	// operated descriptor added or replaced ONLY at the operated digest);
+	// blobs follow the builder's clone+add rule (existing records preserved
+	// exactly, referenced staged additions allowed, deletions/mutations
+	// impossible in any legitimate publication).
+	if err := validateManifestTransition(cur.Manifests, targetDoc.Manifests, targetDoc.Tags[operated]); err != nil {
+		return err
+	}
+	if err := validateBlobTransition(cur.Blobs, targetDoc.Blobs); err != nil {
+		return err
+	}
 	return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, entry.Digest)
 }
 
-// authenticateOperationIdentity proves the request's operation identity is NOT
-// attacker-selected. A GENERATED identity must exactly equal the deterministic
-// recomputation of the established ComputeOperationID domain over
-// (registry ID, owner, repo, operated tag, digest, expected generation) — the
-// same pure derivation the data plane uses, so the signer accepts it WITHOUT
-// any durable binding. ANY other identity is an EXPLICIT caller key and must
-// have a permanent publication binding row (the data plane's preflight
-// reservation) whose stored hash equals the derived binding hash over
-// (registry, owner, repo, tag, digest): a MISSING binding is malformed, a
-// MISMATCHED binding (or foreign registry) is a conflict. The two classes are
-// decided without attacker-controlled ambiguity, and both fail before any
-// external feed update. Errors are data-free (fixed sentinel + fixed message).
-func (s *FeedSigner) authenticateOperationIdentity(ctx context.Context, req publish.FeedCommitRequest, targetRepo, operatedTag, digest string) error {
-	if req.OperationID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
-		// Generated identity: the deterministic recomputation over the exact
-		// immutable transition authenticates it — the request could not have
-		// chosen this ID without naming this publication.
-		return nil
+// changedTransitionTags computes the set of tag names whose TAG MAPPING or
+// PROVENANCE ENTRY differs between cur and target, iterating the SYMMETRIC
+// union of both sides' keys with explicit PRESENCE comparison: a key present
+// on one side only is a change (absent and a zero value on the other side are
+// distinct), so current-only deletions and target-only additions are detected
+// exactly like value edits. One tag counts once even when both its mapping and
+// its provenance entry changed.
+func changedTransitionTags(cur, target spec.RepoStateDocument) map[string]struct{} {
+	seen := make(map[string]struct{})
+	note := func(tag string) { seen[tag] = struct{}{} }
+	for tag := range cur.Tags {
+		note(tag)
 	}
+	for tag := range target.Tags {
+		note(tag)
+	}
+	for tag := range cur.TagPublications {
+		note(tag)
+	}
+	for tag := range target.TagPublications {
+		note(tag)
+	}
+	changing := make(map[string]struct{})
+	for tag := range seen {
+		curDigest, curHasTag := cur.Tags[tag]
+		targetDigest, targetHasTag := target.Tags[tag]
+		if curHasTag != targetHasTag || (curHasTag && curDigest != targetDigest) {
+			changing[tag] = struct{}{}
+			continue
+		}
+		curPub, curHasPub := cur.TagPublications[tag]
+		targetPub, targetHasPub := target.TagPublications[tag]
+		if curHasPub != targetHasPub || (curHasPub && curPub != targetPub) {
+			changing[tag] = struct{}{}
+		}
+	}
+	return changing
+}
+
+// validateManifestTransition enforces the actual DefaultBuilder manifest rule
+// across the transition: EVERY existing manifest descriptor is cloned into the
+// next state verbatim, and the operated manifest descriptor may be ADDED or
+// REPLACED only at the operated digest (the digest the operated tag maps to).
+// A current-only deletion, an addition at any other digest, or the mutation
+// of any retained descriptor is an unrelated semantic change and fails closed
+// as malformed. Errors are value-free (no digest ever appears).
+func validateManifestTransition(cur, target map[string]spec.ManifestDescriptor, operatedDigest string) error {
+	for digest, desc := range cur {
+		targetDesc, ok := target[digest]
+		if !ok {
+			return fmt.Errorf("%w: target document deletes an existing manifest descriptor", errFeedSignerMalformed)
+		}
+		if digest != operatedDigest && targetDesc != desc {
+			return fmt.Errorf("%w: target document mutates an unrelated manifest descriptor", errFeedSignerMalformed)
+		}
+	}
+	for digest := range target {
+		if _, ok := cur[digest]; !ok && digest != operatedDigest {
+			return fmt.Errorf("%w: target document adds an unrelated manifest descriptor", errFeedSignerMalformed)
+		}
+	}
+	return nil
+}
+
+// validateBlobTransition enforces the DefaultBuilder blob rule across the
+// transition: EVERY existing blob record is cloned into the next state
+// verbatim; NEW blob records are permitted (the data plane validates the
+// artifact's references and copies only the referenced staged blobs into the
+// next state before the immutable target exists, and the signer cannot
+// re-derive the artifact's reference set from the document alone — an
+// addition never deletes or rewrites existing state). A current-only deletion
+// or the mutation of an existing record is an unrelated semantic change and
+// fails closed as malformed. Errors are value-free.
+func validateBlobTransition(cur, target map[string]spec.BlobDescriptor) error {
+	for digest, desc := range cur {
+		targetDesc, ok := target[digest]
+		if !ok {
+			return fmt.Errorf("%w: target document deletes an existing blob record", errFeedSignerMalformed)
+		}
+		if targetDesc != desc {
+			return fmt.Errorf("%w: target document mutates an existing blob record", errFeedSignerMalformed)
+		}
+	}
+	return nil
+}
+
+// authenticateOperationIdentity proves the request's operation identity is NOT
+// attacker-selected. The PERMANENT publication binding row (the data plane's
+// migration-15 preflight reservation) holds PRECEDENCE and is consulted
+// FIRST: explicit and generated identities share one grammar, so a permanent
+// row that CONFLICTS with the current payload must never be bypassed merely
+// because the identity coincides with the deterministic recomputation of
+// ComputeOperationID over (registry ID, owner, repo, operated tag, digest,
+// expected generation). When the row EXISTS, the binding is authoritative:
+// its registry must equal the request registry and its stored hash must equal
+// the derived binding hash over (registry, owner, repo, tag, digest) — a
+// mismatch (or a foreign registry) is a hard conflict REGARDLESS of the
+// generated form. Only an AUTHORITATIVE not-found (sql.ErrNoRows — never a
+// query/db error) may fall back to the generated-ID recomputation, which
+// authenticates the identity WITHOUT any durable binding; a not-found for
+// any other identity is an EXPLICIT caller key that was never bound and is
+// malformed. A DB/query failure is a backend/uncertain condition and NEVER
+// falls back to the generated form. All errors are data-free (fixed sentinel
+// + fixed message; the query failure keeps its cause server-side only).
+func (s *FeedSigner) authenticateOperationIdentity(ctx context.Context, req publish.FeedCommitRequest, targetRepo, operatedTag, digest string) error {
 	binding, err := s.Store.GetPublicationBinding(ctx, req.OperationID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: operation identity is not durably bound to this publication", errFeedSignerMalformed)
+		if !errors.Is(err, sql.ErrNoRows) {
+			// A failed binding lookup is an uncertain backend condition: the
+			// identity decision is NEVER made on a failed read, so there is no
+			// generated-form fallback here.
+			return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
 		}
-		return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
+		// Authoritative not-found: the identity is generated exactly when the
+		// deterministic recomputation over the exact immutable transition
+		// reproduces it (the request could not have chosen this ID without
+		// naming this publication); ANY other identity is an explicit caller
+		// key with no durable binding and is malformed.
+		if req.OperationID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
+			return nil
+		}
+		return fmt.Errorf("%w: operation identity is not durably bound to this publication", errFeedSignerMalformed)
 	}
+	// A durable binding row EXISTS: it is the permanent authority for this
+	// operation identity and is enforced whether or not the identity also
+	// equals the deterministic generated form — an existing permanent binding
+	// is never bypassed (fail closed).
 	if binding.RegistryID != req.RegistryID {
 		return fmt.Errorf("%w: operation identity is bound to another registry", errFeedSignerConflict)
 	}
