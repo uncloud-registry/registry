@@ -138,7 +138,7 @@ func digestWithoutColon() string { return "sha256" + strings.Repeat("b", 64) }
 // ---------------------------------------------------------------------------
 
 func TestNewSpoolCreatesRootAndRejectsSymlinks(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 
 	t.Run("creates_root_0700", func(t *testing.T) {
 		rootPath := filepath.Join(dir, "spool")
@@ -222,7 +222,7 @@ func TestSpoolModesUnderPermissiveUmask(t *testing.T) {
 	old := syscall.Umask(0)
 	defer syscall.Umask(old)
 
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {
@@ -257,7 +257,7 @@ func TestSpoolModesUnderPermissiveUmask(t *testing.T) {
 // through descriptor-relative operations and that a file created inside the
 // root cannot be reached through any rewritten name.
 func TestSpoolFileLifecycle(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {
@@ -309,7 +309,7 @@ func TestSpoolFileLifecycle(t *testing.T) {
 // bytes beyond the committed offset are dropped, and a file shorter than the
 // committed offset fails closed.
 func TestSpoolAlign(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {
@@ -350,7 +350,7 @@ func TestSpoolAlign(t *testing.T) {
 // TestSpoolRejectsNonRegularFile proves a directory planted at the spool name
 // is never opened as data.
 func TestSpoolRejectsNonRegularFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {
@@ -377,7 +377,7 @@ func TestSpoolRejectsNonRegularFile(t *testing.T) {
 // rejected by validation before any root operation, and the root layer also
 // rejects them (defense in depth).
 func TestSpoolPathRewritesCannotEscape(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {
@@ -408,7 +408,7 @@ func TestSpoolPathRewritesCannotEscape(t *testing.T) {
 // descriptor and remains usable; impossible modes/types are rejected by
 // other tests.
 func TestSpoolRootModeRepair(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	for _, tc := range []struct {
 		name string
 		mode os.FileMode
@@ -447,7 +447,7 @@ func TestSpoolRootModeRepair(t *testing.T) {
 // TestSpoolRejectsSymlinkPathComponent proves a symlink in any below-anchor
 // component of the root path is rejected, never followed.
 func TestSpoolRejectsSymlinkPathComponent(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	real := filepath.Join(dir, "real")
 	if err := os.Mkdir(real, 0o700); err != nil {
 		t.Fatalf("mkdir real: %v", err)
@@ -471,7 +471,7 @@ func TestSpoolRejectsSymlinkPathComponent(t *testing.T) {
 // is replaced with a symlink: every operation targets the ORIGINAL directory
 // and never follows the planted link.
 func TestSpoolAnchoredAcrossRootSwap(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {
@@ -521,7 +521,7 @@ func TestSpoolAnchoredAcrossRootSwap(t *testing.T) {
 // an absent file is a no-op, and a non-empty directory entry is left intact
 // (the durable-removal contract for tombstoned deletions).
 func TestSpoolRemoveDurable(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
 	sp, err := newSpool(context.Background(), rootPath)
 	if err != nil {

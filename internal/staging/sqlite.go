@@ -3,11 +3,15 @@ package staging
 import (
 	"context"
 	"database/sql"
+	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -59,6 +63,7 @@ var schemaDDL = []string{
 		offset     not null,
 		created_at not null,
 		expires_at not null,
+		create_token text,
 		digest     text,
 		bee_ref    text,
 		media_type text,
@@ -70,8 +75,10 @@ var schemaDDL = []string{
 		check (typeof(offset) = 'integer' and offset >= 0),
 		check (typeof(created_at) = 'integer' and typeof(expires_at) = 'integer' and expires_at > created_at),
 		check (
-			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null)
-			or (state = 'creating' and digest is null and bee_ref is null and media_type is null and size is null and offset = 0)
+			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null)
+			or (state = 'creating' and digest is null and bee_ref is null and media_type is null and size is null and offset = 0
+				and typeof(create_token) = 'text' and length(hex(create_token)) = 128 and create_token = lower(create_token)
+				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0)
 			or (state = 'finalized' and digest is not null and bee_ref is not null and media_type is not null
 				and size is not null and typeof(size) = 'integer' and size = offset
 				and typeof(digest) = 'text' and length(hex(digest)) = 142 and instr(hex(digest), '00') = 0
@@ -79,8 +86,9 @@ var schemaDDL = []string{
 				and typeof(bee_ref) = 'text' and length(hex(bee_ref)) = 128 and instr(hex(bee_ref), '00') = 0
 				and bee_ref = lower(bee_ref) and bee_ref not glob '*[^0-9a-f]*'
 				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
-				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*')
-			or (state = 'deleting')
+				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
+				and create_token is null)
+			or (state = 'deleting' and create_token is null)
 		)
 	)`,
 	`create table staged_blobs (
@@ -155,6 +163,18 @@ var schemaDDL = []string{
 			or old.created_at <> new.created_at or old.expires_at <> new.expires_at
 			then raise(abort, 'session identity immutable') else null end;
 	end`,
+	// The unforgeable per-create token is immutable once set, may never be
+	// set after INSERT, and may only be CLEARED while the row is still in
+	// the creating phase (activation and rollback both clear it; a live
+	// row's token can never be rewritten, which is what guarantees an
+	// attacker-planted file can never be attributed to a creating row).
+	`create trigger trg_session_token before update of create_token on upload_sessions begin
+		select case
+			when old.create_token is not null and new.create_token is not null then raise(abort, 'create token immutable')
+			when old.create_token is null and new.create_token is not null then raise(abort, 'cannot set create token after insert')
+			when old.create_token is not null and new.create_token is null and old.state <> 'creating' then raise(abort, 'create token cannot be cleared outside creating')
+			else null end;
+	end`,
 	// Rows may only be removed through the deleting tombstone.
 	`create trigger trg_session_delete before delete on upload_sessions begin
 		select case when old.state <> 'deleting' then raise(abort, 'delete only via deleting state') else null end;
@@ -193,34 +213,63 @@ const (
 // schemaObject is the exact expected sqlite_master surface of one object:
 // type, name, table, and the SQL-aware normalized body.
 type schemaObject struct {
-	typ  string
-	name string
-	tbl  string
-	sql  string
+	Typ  string `json:"type"`
+	Name string `json:"name"`
+	Tbl  string `json:"tbl"`
+	SQL  string `json:"sql"`
 }
 
-// expectedSchema is built once from the subsystem's own DDL: the version
-// table plus every schemaDDL statement. Verification compares against this,
-// so any drift between the DDL used to migrate and the DDL expected on
-// reopen is impossible.
-var expectedSchema = mustSchemaObjects()
+// goldenColumn is one expected physical column of a table.
+type goldenColumn struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	NotNull bool   `json:"notnull"`
+	PK      bool   `json:"pk"`
+}
 
-func mustSchemaObjects() []schemaObject {
-	all := append([]string{versionTableDDL}, schemaDDL...)
-	objs := make([]schemaObject, 0, len(all))
-	for _, ddl := range all {
-		typ, name, tbl, err := parseDDLHead(ddl)
-		if err != nil {
-			panic(fmt.Sprintf("staging schema DDL is not parseable: %v", err))
-		}
-		norm, err := normalizeSQL(ddl)
-		if err != nil {
-			panic(fmt.Sprintf("staging schema DDL is not normalizable: %v", err))
-		}
-		objs = append(objs, schemaObject{typ: typ, name: name, tbl: tbl, sql: norm})
+// goldenFK is one expected foreign-key declaration row.
+type goldenFK struct {
+	Table    string `json:"table"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	RefTable string `json:"ref_table"`
+	OnUpdate string `json:"on_update"`
+	OnDelete string `json:"on_delete"`
+	Match    string `json:"match"`
+}
+
+// schemaManifest is the FROZEN, independently authored expectation for the
+// staging schema. It is deliberately NOT derived from the migration DDL:
+// verification compares a real database against this manifest, and a parity
+// test compares the DDL constants against it, so a unilateral change to
+// either the creation DDL or this golden fails one of the checks. Mutated
+// adversarial fixtures are also built from these bodies, never from the DDL.
+type schemaManifest struct {
+	Version     int                       `json:"version"`
+	Objects     []schemaObject            `json:"objects"`
+	Columns     map[string][]goldenColumn `json:"columns"`
+	Indexes     map[string][]string       `json:"indexes"`
+	ForeignKeys []goldenFK                `json:"foreign_keys"`
+}
+
+//go:embed schema_golden_v1.json
+var schemaGoldenJSON []byte
+
+var schemaGold = mustLoadSchemaGolden()
+
+func mustLoadSchemaGolden() *schemaManifest {
+	var m schemaManifest
+	if err := json.Unmarshal(schemaGoldenJSON, &m); err != nil {
+		panic(fmt.Sprintf("staging schema golden is not parseable: %v", err))
 	}
-	return objs
+	if m.Version != latestSchemaVersion || len(m.Objects) == 0 {
+		panic(fmt.Sprintf("staging schema golden version/objects mismatch: %d/%d", m.Version, len(m.Objects)))
+	}
+	return &m
 }
+
+// expectedSchema is the frozen object surface from the golden manifest.
+var expectedSchema = schemaGold.Objects
 
 // parseDDLHead derives (type, name, tbl_name) from the leading tokens of a
 // CREATE statement. The full-statement identity comes from normalizeSQL.
@@ -364,7 +413,10 @@ func openStagingDB(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	base := basePathOf(dbPath)
+	base, err := basePathOf(dbPath)
+	if err != nil {
+		return nil, typed(ErrDependency, err)
+	}
 	if base == "" || strings.Contains(base, ":memory:") {
 		// Pure in-memory target: always fresh, no filesystem involvement.
 		db, err := sql.Open("sqlite", normalizeDSN(dbPath))
@@ -428,8 +480,14 @@ func openStagingDB(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, er
 		}
 	}()
 	if maxOpen > 0 {
+		// Bound the pool to exactly the permitted number of connections and
+		// keep every one of them alive forever (no idle/lifetime expiry), so
+		// the covering check below is exhaustive for the pool lifetime and a
+		// later swapped path can never be quietly reopened.
 		db.SetMaxOpenConns(maxOpen)
 		db.SetMaxIdleConns(maxOpen)
+		db.SetConnMaxIdleTime(0)
+		db.SetConnMaxLifetime(0)
 	}
 	if state == schemaEmpty {
 		if err := createFreshSchema(ctx, db); err != nil {
@@ -441,6 +499,14 @@ func openStagingDB(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, er
 	if err := verifyDBIdentity(parentRoot, dbName, preFi); err != nil {
 		return nil, err
 	}
+	if maxOpen > 0 {
+		// Force-open every permitted connection now and verify each one's
+		// actual opened file identity and pragma settings, so no later
+		// path-based connection can exist.
+		if err := forceOpenAndVerifyAllConns(ctx, db, maxOpen, parentRoot, dbName, preFi); err != nil {
+			return nil, err
+		}
+	}
 	if err := syncRootDir(parentRoot); err != nil {
 		return nil, typed(ErrDependency, err)
 	}
@@ -448,15 +514,234 @@ func openStagingDB(ctx context.Context, dbPath string, maxOpen int) (*sql.DB, er
 	return db, nil
 }
 
-// basePathOf returns the on-disk path portion of a DSN (stripping any file:
-// scheme and query parameters).
-func basePathOf(dsn string) string {
+// forceOpenAndVerifyAllConns opens every one of the permitted pool
+// connections now, proves each physical connection is on the verified
+// database file (pragma database_list plus descriptor-relative SameFile) and
+// carries the required pragma settings, then leaves the connections retained
+// as idle pool connections for the service lifetime.
+func forceOpenAndVerifyAllConns(ctx context.Context, db *sql.DB, n int, parentRoot *os.Root, dbName string, preFi os.FileInfo) error {
+	for i := 0; i < n; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return typed(ErrDependency, err)
+		}
+		verr := verifyConnIdentity(ctx, conn, parentRoot, dbName, preFi)
+		conn.Close()
+		if verr != nil {
+			return verr
+		}
+	}
+	return nil
+}
+
+// verifyConnIdentity proves a live connection is on exactly the verified
+// database inode with the exact pragma settings the service depends on.
+func verifyConnIdentity(ctx context.Context, conn *sql.Conn, parentRoot *os.Root, dbName string, preFi os.FileInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rows, err := conn.QueryContext(ctx, `pragma database_list`)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return typed(ErrDependency, err)
+	}
+	var main string
+	for rows.Next() {
+		var seq int
+		var name, path string
+		if err := rows.Scan(&seq, &name, &path); err != nil {
+			rows.Close()
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return typed(ErrDependency, err)
+		}
+		if name == "main" {
+			main = path
+		}
+	}
+	rows.Close()
+	cur, err := parentRoot.Lstat(dbName)
+	if err != nil || preFi == nil || !os.SameFile(cur, preFi) {
+		return typed(ErrDependency, errors.New("database file changed before pool pinning"))
+	}
+	if main != "" {
+		if sfi, serr := os.Stat(main); serr == nil && !os.SameFile(sfi, cur) {
+			return typed(ErrDependency, errors.New("pool connection opened a different database file"))
+		}
+	}
+	var fk int
+	if err := conn.QueryRowContext(ctx, `pragma foreign_keys`).Scan(&fk); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return typed(ErrDependency, err)
+	}
+	if fk != 1 {
+		return typed(ErrDependency, errors.New("pool connection has foreign_keys disabled"))
+	}
+	var jm string
+	if err := conn.QueryRowContext(ctx, `pragma journal_mode`).Scan(&jm); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return typed(ErrDependency, err)
+	}
+	if jm != "wal" {
+		return typed(ErrDependency, errors.New("pool connection is not in wal journal mode"))
+	}
+	return nil
+}
+
+// dbPool is a retained, pinned connection pool: every *sql.Conn available to
+// the service was physically opened and identity-verified against the
+// anchored database file at construction and stays checked out of
+// database/sql for the pool lifetime, so no later path-based connection can
+// be opened behind the service's back.
+type dbPool struct {
+	db     *sql.DB
+	ch     chan *sql.Conn
+	mu     sync.Mutex
+	closed bool
+}
+
+// openStagingPool opens and verifies the staging database exactly like
+// openStagingDB (with the connection count bounded and each connection
+// forced open and verified), then pins every permitted connection as a
+// retained handle. Callers hold one connection at a time via acquire.
+func openStagingPool(ctx context.Context, dbPath string, size int) (*dbPool, error) {
+	if size <= 0 {
+		size = 4
+	}
+	base, err := basePathOf(dbPath)
+	if err != nil {
+		return nil, typed(ErrDependency, err)
+	}
+	if base == "" || strings.Contains(base, ":memory:") {
+		// A memory database cannot share multiple physical connections;
+		// pin exactly one.
+		size = 1
+	}
+	db, err := openStagingDB(ctx, dbPath, size)
+	if err != nil {
+		return nil, err
+	}
+	p := &dbPool{db: db, ch: make(chan *sql.Conn, size)}
+	for i := 0; i < size; i++ {
+		if err := ctx.Err(); err != nil {
+			p.close()
+			return nil, err
+		}
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				err = cerr
+			}
+			p.close()
+			return nil, typed(ErrDependency, err)
+		}
+		p.ch <- conn
+	}
+	// No idle connections remain: database/sql cannot open or reuse anything
+	// beyond the pinned handles.
+	db.SetMaxIdleConns(0)
+	return p, nil
+}
+
+func (p *dbPool) acquire(ctx context.Context) (*sql.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errors.New("staging database pool is closed")
+	}
+	c := <-p.ch
+	p.mu.Unlock()
+	return c, nil
+}
+
+func (p *dbPool) release(c *sql.Conn) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.ch <- c
+	p.mu.Unlock()
+}
+
+func (p *dbPool) close() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	for {
+		select {
+		case c := <-p.ch:
+			_ = c.Close()
+		default:
+			goto done
+		}
+	}
+done:
+	p.mu.Unlock()
+	_ = p.db.Close()
+}
+
+// basePathOf returns the on-disk path portion of a DSN, stripping any file:
+// scheme, decoding percent-escapes, and rejecting ambiguous or unsupported
+// URI forms so the filesystem target we anchor is exactly the target SQLite
+// opens.
+func basePathOf(dsn string) (string, error) {
 	p := dsn
 	if i := strings.IndexByte(p, '?'); i >= 0 {
 		p = p[:i]
 	}
-	p = strings.TrimPrefix(p, "file:")
-	return p
+	switch {
+	case strings.HasPrefix(p, "file://"):
+		// Only the absolute file:/// form (empty authority) is supported.
+		// file://host/... is ambiguous across SQLite revisions and rejected.
+		if !strings.HasPrefix(p, "file:///") {
+			return "", errors.New("unsupported file URI authority")
+		}
+		p = p[len("file://"):]
+	case strings.HasPrefix(p, "file:"):
+		p = p[len("file:"):]
+	}
+	if strings.Contains(p, "%") {
+		// Escapes that would alter the COMPONENT STRUCTURE of the target
+		// (separators inside an escape, dot-dot, NUL) are ambiguous against
+		// SQLite's own decoding rules: reject them fail-closed. Plain
+		// escapes like %20 never change which filesystem object the raw
+		// path denotes, so they decode.
+		lower := strings.ToLower(p)
+		for _, forbidden := range []string{"%2f", "%5c", "%2e", "%00"} {
+			if strings.Contains(lower, forbidden) {
+				return "", errors.New("ambiguous percent-escape in database path")
+			}
+		}
+		dec, err := url.PathUnescape(p)
+		if err != nil {
+			return "", errors.New("malformed percent-escape in database path")
+		}
+		p = dec
+	}
+	if strings.ContainsRune(p, 0) {
+		return "", errors.New("database path contains a NUL byte")
+	}
+	return p, nil
 }
 
 // prepareDBTarget splits dbPath into its parent anchor and basename,
@@ -470,7 +755,10 @@ func prepareDBTarget(ctx context.Context, dbPath string) (root *os.Root, dbName 
 	if err := ctx.Err(); err != nil {
 		return nil, "", nil, false, err
 	}
-	base := basePathOf(dbPath)
+	base, berr := basePathOf(dbPath)
+	if berr != nil {
+		return nil, "", nil, false, typed(ErrDependency, berr)
+	}
 	if base == "" {
 		return nil, "", nil, false, typed(ErrDependency, errors.New("empty database path"))
 	}
@@ -659,30 +947,29 @@ const (
 func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error) {
 	db, err := sql.Open("sqlite", inspectionDSN(dbPath))
 	if err != nil {
-		return schemaReject, typed(ErrDependency, err)
+		return schemaReject, depErr(err, ctx)
 	}
 	defer db.Close()
 	tables, err := userTables(ctx, db)
 	if err != nil {
-		return schemaReject, typed(ErrDependency, err)
+		return schemaReject, depErr(err, ctx)
 	}
 	version, hasVersion, err := currentVersion(ctx, db)
 	if err != nil {
-		return schemaReject, typed(ErrDependency, err)
+		return schemaReject, depErr(err, ctx)
 	}
 	if len(tables) == 0 && !hasVersion {
 		return schemaEmpty, nil
 	}
 	if !hasVersion || version != latestSchemaVersion {
-		return schemaReject, typed(ErrDependency, fmt.Errorf(
-			"staging database is not a supported upload-staging schema (tables=%v, version=%v)",
-			tables, version))
+		return schemaReject, depErr(errors.New(
+			"staging database is not a supported upload-staging schema"), ctx)
 	}
 	if err := verifySchemaFully(ctx, &txAdapter{db: db}); err != nil {
-		return schemaReject, typed(ErrDependency, err)
+		return schemaReject, depErr(err, ctx)
 	}
 	if err := verifyVersionRow(ctx, &txAdapter{db: db}); err != nil {
-		return schemaReject, typed(ErrDependency, err)
+		return schemaReject, depErr(err, ctx)
 	}
 	return schemaCurrent, nil
 }
@@ -719,23 +1006,26 @@ func inspectionDSN(dsn string) string {
 func userTables(ctx context.Context, db *sql.DB) ([]string, error) {
 	rows, err := db.QueryContext(ctx, `select name from sqlite_master where type = 'table' and name not like 'sqlite_%' order by name`)
 	if err != nil {
-		return nil, err
+		return nil, ctxOr(err, ctx)
 	}
 	defer rows.Close()
 	var names []string
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
-			return nil, err
+			return nil, ctxOr(err, ctx)
 		}
 		names = append(names, n)
 	}
-	return names, rows.Err()
+	return names, ctxOr(rows.Err(), ctx)
 }
 
 func currentVersion(ctx context.Context, db *sql.DB) (int64, bool, error) {
 	rows, err := db.QueryContext(ctx, `select version from staging_schema`)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, false, cerr
+		}
 		if strings.Contains(err.Error(), "no such table") {
 			return 0, false, nil
 		}
@@ -746,9 +1036,12 @@ func currentVersion(ctx context.Context, db *sql.DB) (int64, bool, error) {
 	for rows.Next() {
 		var v int64
 		if err := rows.Scan(&v); err != nil {
-			return 0, false, err
+			return 0, false, ctxOr(err, ctx)
 		}
 		versions = append(versions, v)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, ctxOr(err, ctx)
 	}
 	if len(versions) == 0 {
 		return 0, false, nil
@@ -766,7 +1059,7 @@ func currentVersion(ctx context.Context, db *sql.DB) (int64, bool, error) {
 func createFreshSchema(ctx context.Context, db *sql.DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return typed(ErrDependency, err)
+		return depErr(err, ctx)
 	}
 	rollback := true
 	defer func() {
@@ -778,25 +1071,25 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 	// The version table is the first object so a partially created database
 	// can never be re-adopted as fresh.
 	if _, err := tx.ExecContext(ctx, versionTableDDL); err != nil {
-		return typed(ErrDependency, err)
+		return depErr(err, ctx)
 	}
 	for _, stmt := range schemaDDL {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return typed(ErrDependency, err)
+			return depErr(err, ctx)
 		}
 	}
 	if migrationFault != nil {
-		return typed(ErrDependency, migrationFault)
+		return depErr(migrationFault, ctx)
 	}
 	if err := verifySchemaFully(ctx, tx); err != nil {
-		return typed(ErrDependency, err)
+		return depErr(err, ctx)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`insert into staging_schema (version, applied_at) values (?, ?)`, latestSchemaVersion, now); err != nil {
-		return typed(ErrDependency, err)
+		return depErr(err, ctx)
 	}
 	if err := tx.Commit(); err != nil {
-		return typed(ErrDependency, err)
+		return depErr(err, ctx)
 	}
 	rollback = false
 	return nil
@@ -827,15 +1120,18 @@ func (a *txAdapter) QueryRowContext(ctx context.Context, query string, args ...a
 // (index_xinfo), the exact single foreign key row, FK integrity (no orphan
 // rows), and the absence of temporary objects.
 func verifySchemaFully(ctx context.Context, db schemaChecker) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := verifySchemaObjects(ctx, db); err != nil {
 		return err
 	}
-	for _, table := range []string{versionTable, sessionTable, blobTable} {
-		if err := verifyColumnShapes(ctx, db, table); err != nil {
+	for table := range schemaGold.Columns {
+		if err := verifyColumnShapes(ctx, db, table, expectedColumnShapes[table]); err != nil {
 			return err
 		}
 	}
-	for _, idx := range []string{"idx_staged_blobs_owner", "idx_sessions_owner", "idx_sessions_expiry"} {
+	for idx := range schemaGold.Indexes {
 		if err := verifyIndexShape(ctx, db, idx); err != nil {
 			return err
 		}
@@ -860,7 +1156,7 @@ func verifySchemaFully(ctx context.Context, db schemaChecker) error {
 	if temp != 0 {
 		return errors.New("staging schema must not create temporary objects")
 	}
-	return nil
+	return ctx.Err()
 }
 
 // verifySchemaObjects proves the object set is EXACTLY the expected one and
@@ -872,6 +1168,9 @@ func verifySchemaObjects(ctx context.Context, db schemaChecker) error {
 	if err := db.QueryRowContext(ctx,
 		`select count(*) from sqlite_master where type in ('table','index','trigger','view') and name not like 'sqlite_%'`).
 		Scan(&total); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		return err
 	}
 	if total != len(expectedSchema) {
@@ -882,22 +1181,25 @@ func verifySchemaObjects(ctx context.Context, db schemaChecker) error {
 		var typ, tbl, sqlText string
 		err := db.QueryRowContext(ctx,
 			`select type, tbl_name, sql from sqlite_master where name = ? and type in ('table','index','trigger','view')`,
-			want.name).Scan(&typ, &tbl, &sqlText)
+			want.Name).Scan(&typ, &tbl, &sqlText)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("staging schema lacks object %s", want.name)
+			return fmt.Errorf("staging schema lacks object %s", want.Name)
 		}
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return err
 		}
-		if typ != want.typ || tbl != want.tbl {
-			return fmt.Errorf("staging schema object %s does not match its expected type/table", want.name)
+		if typ != want.Typ || tbl != want.Tbl {
+			return fmt.Errorf("staging schema object %s does not match its expected type/table", want.Name)
 		}
 		norm, err := normalizeSQL(sqlText)
 		if err != nil {
 			return err
 		}
-		if norm != want.sql {
-			return fmt.Errorf("staging schema object %s body differs from the expected schema", want.name)
+		if norm != want.SQL {
+			return fmt.Errorf("staging schema object %s body differs from the expected schema", want.Name)
 		}
 	}
 	return nil
@@ -910,41 +1212,27 @@ type columnShape struct {
 	pk      bool
 }
 
-var expectedColumnShapes = map[string][]columnShape{
-	versionTable: {
-		{name: "version", typ: "integer", pk: true},
-		{name: "applied_at", typ: "integer", notnull: true},
-	},
-	sessionTable: {
-		{name: "id", typ: "text", pk: true},
-		{name: "repo", typ: "text", notnull: true},
-		{name: "actor", typ: "text", notnull: true},
-		{name: "state", typ: "text", notnull: true},
-		{name: "offset", typ: "", notnull: true},
-		{name: "created_at", typ: "", notnull: true},
-		{name: "expires_at", typ: "", notnull: true},
-		{name: "digest", typ: "text"},
-		{name: "bee_ref", typ: "text"},
-		{name: "media_type", typ: "text"},
-		{name: "size", typ: ""},
-	},
-	blobTable: {
-		{name: "upload_id", typ: "text", pk: true},
-		{name: "repo", typ: "text", notnull: true},
-		{name: "actor", typ: "text", notnull: true},
-		{name: "digest", typ: "text", notnull: true},
-		{name: "bee_ref", typ: "text", notnull: true},
-		{name: "size", typ: "", notnull: true},
-		{name: "media_type", typ: "text", notnull: true},
-		{name: "created_at", typ: "", notnull: true},
-		{name: "expires_at", typ: "", notnull: true},
-	},
-}
+// expectedColumnShapes is the frozen physical column surface from the golden
+// manifest (independently authored; not derived from the migration DDL).
+var expectedColumnShapes = func() map[string][]columnShape {
+	out := make(map[string][]columnShape, len(schemaGold.Columns))
+	for table, cols := range schemaGold.Columns {
+		shapes := make([]columnShape, 0, len(cols))
+		for _, c := range cols {
+			shapes = append(shapes, columnShape{name: c.Name, typ: c.Type, notnull: c.NotNull, pk: c.PK})
+		}
+		out[table] = shapes
+	}
+	return out
+}()
+
+// expectedIndexCols is the frozen index surface from the golden manifest.
+var expectedIndexCols = schemaGold.Indexes
 
 // verifyColumnShapes proves table_xinfo (incl. hidden columns) matches the
 // expected columns EXACTLY — same count, names, storage classes, NOT NULL
 // flags, PK flags, and no hidden columns.
-func verifyColumnShapes(ctx context.Context, db schemaChecker, table string) error {
+func verifyColumnShapes(ctx context.Context, db schemaChecker, table string, want []columnShape) error {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`pragma table_xinfo(%s)`, table))
 	if err != nil {
 		return err
@@ -965,7 +1253,6 @@ func verifyColumnShapes(ctx context.Context, db schemaChecker, table string) err
 		}
 	}
 	rows.Close()
-	want := expectedColumnShapes[table]
 	if len(got) != len(want) {
 		return fmt.Errorf("staging schema table %s has %d columns, want %d", table, len(got), len(want))
 	}
@@ -975,12 +1262,6 @@ func verifyColumnShapes(ctx context.Context, db schemaChecker, table string) err
 		}
 	}
 	return nil
-}
-
-var expectedIndexCols = map[string][]string{
-	"idx_staged_blobs_owner": {"repo", "actor", "created_at", "upload_id"},
-	"idx_sessions_owner":     {"repo", "actor"},
-	"idx_sessions_expiry":    {"expires_at"},
 }
 
 // verifyIndexShape proves index_xinfo matches the expected ordered columns
@@ -1023,36 +1304,39 @@ func verifyIndexShape(ctx context.Context, db schemaChecker, idx string) error {
 	return nil
 }
 
-// verifyForeignKeys proves the staged_blobs FK is EXACTLY the single
-// expected row: upload_id -> upload_sessions(id), ON DELETE CASCADE, NO
-// ACTION update, NONE match.
+// verifyForeignKeys proves every declared foreign key matches the frozen
+// golden expectation EXACTLY (table, columns, actions, flags) and that no
+// additional foreign keys exist.
 func verifyForeignKeys(ctx context.Context, db schemaChecker) error {
-	rows, err := db.QueryContext(ctx, `pragma foreign_key_list(staged_blobs)`)
-	if err != nil {
-		return err
-	}
-	count := 0
-	for rows.Next() {
-		var id, seq int
-		var t, from, to, onUpdate, onDelete, match string
-		if err := rows.Scan(&id, &seq, &t, &from, &to, &onUpdate, &onDelete, &match); err != nil {
-			rows.Close()
+	expected := schemaGold.ForeignKeys
+	for _, want := range expected {
+		rows, err := db.QueryContext(ctx, fmt.Sprintf(`pragma foreign_key_list(%s)`, want.Table))
+		if err != nil {
 			return err
 		}
-		count++
-		if count > 1 {
-			rows.Close()
-			return errors.New("staging schema has more than one foreign key on staged_blobs")
+		count := 0
+		for rows.Next() {
+			var id, seq int
+			var t, from, to, onUpdate, onDelete, match string
+			if err := rows.Scan(&id, &seq, &t, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+				rows.Close()
+				return err
+			}
+			count++
+			if count > 1 {
+				rows.Close()
+				return fmt.Errorf("staging schema has more than one foreign key on %s", want.Table)
+			}
+			if t != want.RefTable || from != want.From || to != want.To ||
+				onDelete != want.OnDelete || onUpdate != want.OnUpdate || match != want.Match || id != 0 || seq != 0 {
+				rows.Close()
+				return fmt.Errorf("staging schema foreign key on %s differs from the expected one", want.Table)
+			}
 		}
-		if t != sessionTable || from != "upload_id" || to != "id" ||
-			onDelete != "CASCADE" || onUpdate != "NO ACTION" || match != "NONE" || id != 0 || seq != 0 {
-			rows.Close()
-			return errors.New("staging schema staged_blobs foreign key differs from the expected one")
+		rows.Close()
+		if count != 1 {
+			return fmt.Errorf("staging schema lacks the expected foreign key on %s", want.Table)
 		}
-	}
-	rows.Close()
-	if count != 1 {
-		return errors.New("staging schema lacks the expected staged_blobs foreign key")
 	}
 	return nil
 }

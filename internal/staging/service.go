@@ -3,6 +3,7 @@ package staging
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -28,15 +29,24 @@ import (
 // offset, fsync of the spool file, then the SQLite offset commit. The
 // database offset never advances beyond durable file bytes; a crash between
 // fsync and commit leaves a recoverable tail that reconciliation truncates
-// on startup and before every subsequent access. A file shorter than the
-// committed offset is fail-closed corruption.
+// on startup and before every subsequent access — the truncation itself is
+// fsynced, so an acknowledged reconciliation can never reappear. A file
+// shorter than the committed offset is fail-closed corruption.
 //
 // Filesystem deletion protocol: a durable `deleting` tombstone is committed
 // BEFORE any unlink; the unlink and the containing-directory fsync happen
 // OUTSIDE any transaction (a transaction could roll back and strand live
 // rows with removed files); the metadata row is removed only after the file
 // is durably gone. Any failure retains the tombstone for a later run, so a
-// restart is always exact.
+// restart is always exact. Delete is idempotent and confidential: absent and
+// wrong-owner ids return identically nil.
+//
+// Create protocol: a durable `creating` row carrying an unforgeable random
+// token and a bounded lease anchor commits FIRST; only after the spool file
+// durably carries the token bytes does the creator activate the row with a
+// token-and-anchor-guarded update. Startup never activates a creating row:
+// stale leases are rolled back only when attributable to their token file,
+// live leases are left alone, and unknown residue fails startup closed.
 type Service interface {
 	Create(ctx context.Context, repo, actor string, ttl time.Duration) (Session, error)
 	Status(ctx context.Context, id, repo, actor string) (Session, error)
@@ -53,29 +63,41 @@ var _ Service = (*service)(nil)
 // maxTxAttempts bounds BEGIN IMMEDIATE serialization retries per operation.
 const maxTxAttempts = 50
 
+// creationLease bounds how long a `creating` row may exist before another
+// instance may treat it as abandoned. A crashed creator whose row is older
+// than the lease is rolled back (its attributable file removed); a live
+// creator's row is never touched.
+const creationLease = 5 * time.Minute
+
+// creatingTokenLen is the byte length of the unforgeable per-create token
+// written to a creating file and bound to its row.
+const creatingTokenLen = 32
+
 // service is the concrete durable staging service.
 type service struct {
-	spool *spool
-	db    *sql.DB
-	now   func() time.Time
+	spool         *spool
+	pool          *dbPool
+	now           func() time.Time
+	creationLease time.Duration
 
 	// Test-only fault injection points (nil in production). They are set
 	// before operations and never mutated concurrently.
-	fsyncHook   func() error // replaces the spool-file fsync
-	dirSyncHook func() error // replaces the spool-directory fsync
-	dbWriteHook func() error // fires before the offset UPDATE
-	commitHook  func() error // fires before COMMIT
+	fsyncHook     func() error // replaces the spool-file fsync
+	dirSyncHook   func() error // replaces the spool-directory fsync
+	dbWriteHook   func() error // fires before the offset UPDATE
+	commitHook    func() error // fires before COMMIT
+	createBarrier func()       // fires after the durable creating file, before activation
 }
 
 // NewService constructs the durable staging service: it validates and
 // creates the private spool root and the database parent (descriptor-
 // relative, symlink-rejecting), opens and migrates the dedicated staging
-// database after exact schema verification, and reconciles spool files
-// against the committed database state (truncating crashed tails, finishing
-// interrupted deletions, rolling back or finishing interrupted creates,
-// failing closed on unowned files) before returning. Every constructor
-// failure is a data-free ErrDependency; only an actually canceled context
-// surfaces as the exact context error.
+// database after exact schema verification, pins every database connection
+// to the verified file, and reconciles spool files against the committed
+// database state before returning. Interrupted creates are only ever rolled
+// back from stale, token-attributable state and live creating leases are
+// never touched. Every constructor failure is a data-free ErrDependency;
+// only an actually canceled context surfaces as the exact context error.
 func NewService(ctx context.Context, spoolRoot, dbPath string) (*service, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -84,26 +106,27 @@ func NewService(ctx context.Context, spoolRoot, dbPath string) (*service, error)
 	if err != nil {
 		return nil, err
 	}
-	db, err := openStagingDB(ctx, dbPath, 4)
+	pool, err := openStagingPool(ctx, dbPath, 4)
 	if err != nil {
 		sp.Close()
 		return nil, err
 	}
-	svc := &service{spool: sp, db: db, now: time.Now}
+	svc := &service{spool: sp, pool: pool, now: time.Now, creationLease: creationLease}
+	svc.spool.syncFile = func(f *os.File) error { return svc.syncFile(f) }
 	if err := svc.reconcileStartup(ctx); err != nil {
+		pool.close()
 		sp.Close()
-		db.Close()
 		return nil, err
 	}
 	return svc, nil
 }
 
-// Close releases the database handle and the root descriptor.
+// Close releases the retained database handles and the root descriptor.
 func (s *service) Close() error {
 	var errs []error
-	if s.db != nil {
-		errs = append(errs, s.db.Close())
-		s.db = nil
+	if s.pool != nil {
+		s.pool.close()
+		s.pool = nil
 	}
 	if s.spool != nil {
 		if err := s.spool.Close(); err != nil {
@@ -117,22 +140,20 @@ func (s *service) Close() error {
 // BEGIN IMMEDIATE serialization
 // ---------------------------------------------------------------------------
 
-// withTx pins one connection, runs BEGIN IMMEDIATE (retried on BUSY/LOCKED
-// with bounded context-aware backoff), executes fn on that connection, and
-// COMMITs. Any failure rolls back; a busy failure mid-transaction retries the
-// WHOLE read-decision-write body, never a single statement.
+// withTx pins one retained connection, runs BEGIN IMMEDIATE (retried on
+// BUSY/LOCKED with bounded context-aware backoff), executes fn on that
+// connection, and COMMITs. Any failure rolls back; a busy failure
+// mid-transaction retries the WHOLE read-decision-write body, never a single
+// statement.
 func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	conn, err := s.db.Conn(ctx)
+	conn, err := s.pool.acquire(ctx)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		return typed(ErrDependency, err)
+		return err
 	}
-	defer conn.Close()
+	defer s.pool.release(conn)
 
 	for attempt := 0; attempt < maxTxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -144,6 +165,9 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 					return waitErr
 				}
 				continue
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
 			}
 			return typed(ErrDependency, err)
 		}
@@ -157,7 +181,11 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 		committed := false
 		if runErr == nil {
 			if _, err := conn.ExecContext(ctx, "commit"); err != nil {
-				runErr = typed(ErrDependency, err)
+				if cerr := ctx.Err(); cerr != nil {
+					runErr = cerr
+				} else {
+					runErr = typed(ErrDependency, err)
+				}
 			} else {
 				committed = true
 			}
@@ -179,7 +207,7 @@ func (s *service) withTx(ctx context.Context, fn func(conn *sql.Conn) error) err
 	return typed(ErrDependency, errors.New("staging transaction serialization exceeded retry bound"))
 }
 
-// queryer abstracts *sql.DB and the pinned *sql.Conn used inside withTx.
+// queryer abstracts the pinned *sql.Conn used inside withTx.
 type queryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
@@ -198,9 +226,10 @@ type sessionRow struct {
 	beeRef                 sql.NullString
 	mediaType              sql.NullString
 	size                   sql.NullInt64
+	createToken            sql.NullString
 }
 
-const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size`
+const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size, create_token`
 
 func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool, error) {
 	var row sessionRow
@@ -208,11 +237,16 @@ func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool,
 		`select `+sessionColumns+` from upload_sessions where id = ?`, id).
 		Scan(&row.id, &row.repo, &row.actor, &row.state, &row.offset,
 			&row.createdNanos, &row.expiresNanos, &row.digest, &row.beeRef,
-			&row.mediaType, &row.size)
+			&row.mediaType, &row.size, &row.createToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
+		// An actually canceled context is authoritative over any wrapped
+		// driver error.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, false, cerr
+		}
 		return nil, false, err
 	}
 	return &row, true, nil
@@ -224,6 +258,17 @@ func ownsSession(row *sessionRow, repo, actor string) bool {
 
 func (s *service) expiredNanos(expiresNanos int64) bool {
 	return s.now().UTC().UnixNano() >= expiresNanos
+}
+
+// creatingLeaseStale reports whether a creating row's lease has expired:
+// only the creator may activate it while the lease is live; after the lease
+// another instance may roll it back.
+func (s *service) creatingLeaseStale(createdNanos int64) bool {
+	lease := s.creationLease
+	if lease <= 0 {
+		lease = creationLease
+	}
+	return s.now().UTC().UnixNano() >= createdNanos+lease.Nanoseconds()
 }
 
 // buildSession maps a durable row to the exported Session.
@@ -250,13 +295,17 @@ func buildSession(row *sessionRow) Session {
 // Create
 // ---------------------------------------------------------------------------
 
-// Create commits a durable `creating` row FIRST (transaction 1), then
-// creates the spool file and makes both the file bytes and the directory
-// entry durable, and only then activates the session (transaction 2). A
-// crash at ANY point is attributable: startup either finishes the create
-// (row + durable empty file) or rolls it back (row without file). Any
-// durability failure rolls the creating row back and removes the file, so a
-// failed create leaves no residue.
+// Create commits a durable `creating` row FIRST (transaction 1) with an
+// unforgeable per-create token and a bounded lease anchor (created_at),
+// then creates the spool file, writes the token bytes into it and makes the
+// file and its directory entry durable, verifies the file still carries the
+// token, and only then activates the session (transaction 2) guarded by
+// `state='creating' AND create_token=? AND created_at=?`. A crash at ANY
+// point is attributable: startup rolls a stale lease back (removing the
+// attributable file) and leaves a live lease alone — the creator alone can
+// activate, and unknown residue fails startup closed. Any durability failure
+// rolls the creating row back and removes the file, so a failed create
+// leaves no residue.
 func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Duration) (Session, error) {
 	if err := validateRepo(repo); err != nil {
 		return Session{}, err
@@ -280,14 +329,22 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 	}
 	id := hex.EncodeToString(raw[:])
 
-	// Transaction 1: the durable creating tombstone-eligible row. Committed
-	// BEFORE any file byte exists, so startup can finish or roll back only
-	// rows it owns and never sweeps a file it cannot attribute.
+	var tokenRaw [creatingTokenLen]byte
+	if _, err := rand.Read(tokenRaw[:]); err != nil {
+		return Session{}, typed(ErrDependency, err)
+	}
+	token := hex.EncodeToString(tokenRaw[:])
+
+	// Transaction 1: the durable creating row carrying the unforgeable
+	// token and lease anchor. Committed BEFORE any file byte exists.
 	if err := s.withTx(ctx, func(conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx,
-			`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at)
-			 values (?, ?, ?, 'creating', 0, ?, ?)`,
-			id, repo, actor, createdNanos, expiresNanos); err != nil {
+			`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token)
+			 values (?, ?, ?, 'creating', 0, ?, ?, ?)`,
+			id, repo, actor, createdNanos, expiresNanos, token); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
 		return nil
@@ -295,12 +352,17 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		return Session{}, err
 	}
 
-	// Create the file and make the file and its directory entry durable
-	// before the session becomes visible.
+	// Create the file and make the token bytes and the directory entry
+	// durable before the session becomes visible.
 	f, err := s.spool.create(id)
 	if err != nil {
 		_ = s.rollbackCreate(ctx, id)
 		return Session{}, typed(ErrDependency, err)
+	}
+	if _, werr := f.Write(tokenRaw[:]); werr != nil {
+		_ = f.Close()
+		_ = s.rollbackCreate(ctx, id)
+		return Session{}, typed(ErrDependency, werr)
 	}
 	serr := s.syncFile(f)
 	cerr := f.Close()
@@ -316,12 +378,29 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		return Session{}, typed(ErrDependency, err)
 	}
 
-	// Activate: creating -> active.
+	// The file must still carry exactly our token before activation is even
+	// attempted; anything else is a fail-closed dependency error.
+	if err := s.verifyCreatingFile(ctx, id, token); err != nil {
+		_ = s.rollbackCreate(ctx, id)
+		return Session{}, err
+	}
+
+	if s.createBarrier != nil {
+		s.createBarrier()
+	}
+
+	// Activate: creating -> active, guarded by token and lease anchor so
+	// only this creator can activate this exact row.
 	activated := false
 	err = s.withTx(ctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'active' where id = ? and state = 'creating'`, id)
+			`update upload_sessions set state = 'active', create_token = null
+			 where id = ? and state = 'creating' and create_token = ? and created_at = ?`,
+			id, token, createdNanos)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
 		n, err := res.RowsAffected()
@@ -338,6 +417,13 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		}
 		return Session{}, err
 	}
+
+	// The token lobe is now mere tail; shrink it to the committed offset and
+	// make that durable. A failure here fails the create closed (the
+	// session is already active; the lobe is aligned away at next access).
+	if err := s.truncateToCommitted(id, 0); err != nil {
+		return Session{}, err
+	}
 	return Session{
 		ID:        id,
 		Repo:      repo,
@@ -348,17 +434,61 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 	}, nil
 }
 
-// rollbackCreate tears down a creating row and its file (idempotent, safe
-// when the row or file is already absent). It runs its own transactions —
-// never inside a caller's transaction — under a cancellation-proof context so
-// a failed create always converges. It is also the startup rollback path for
-// interrupted creates whose file never became durable.
+// verifyCreatingFile reads exactly the token lobe of a creating file and
+// compares it constant-time with the row token. Any mismatch is a
+// fail-closed dependency error; the file is never touched.
+func (s *service) verifyCreatingFile(ctx context.Context, id, tokenHex string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	want, err := hex.DecodeString(tokenHex)
+	if err != nil {
+		return typed(ErrDependency, err)
+	}
+	got, err := s.spool.readExact(id, creatingTokenLen)
+	if err != nil {
+		return typed(ErrDependency, err)
+	}
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return typed(ErrDependency, errors.New("creating session file does not carry its token"))
+	}
+	return nil
+}
+
+// truncateToCommitted verifies the file at the current committed lobe (so a
+// swapped/removed file fails closed) and shrinks it to offset with a durable
+// sync, exactly like the rollback path.
+func (s *service) truncateToCommitted(id string, offset int64) error {
+	f, err := s.spool.openForAppend(id, offset)
+	if err != nil {
+		return typed(ErrDependency, err)
+	}
+	terr := f.Truncate(offset)
+	if terr == nil {
+		terr = s.syncFile(f)
+	}
+	cerr := f.Close()
+	if terr == nil {
+		terr = cerr
+	}
+	if terr != nil {
+		return typed(ErrDependency, terr)
+	}
+	return nil
+}
+
+// rollbackCreate tears down a creating row and its attributable file
+// (idempotent, safe when the row or file is already absent). It runs its own
+// transactions — never inside a caller's transaction — under a
+// cancellation-proof context so a failed create always converges. It is also
+// the startup rollback path for interrupted creates. It never unlinks a file
+// whose row it did not tombstone.
 func (s *service) rollbackCreate(ctx context.Context, id string) error {
 	rctx := context.WithoutCancel(ctx)
 	proceed := false
 	if err := s.withTx(rctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(rctx,
-			`update upload_sessions set state = 'deleting' where id = ? and state = 'creating'`, id)
+			`update upload_sessions set state = 'deleting', create_token = null where id = ? and state = 'creating'`, id)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
@@ -382,18 +512,29 @@ func (s *service) rollbackCreate(ctx context.Context, id string) error {
 	if err := s.syncDir(); err != nil {
 		return typed(ErrDependency, err)
 	}
-	return s.deleteTombstonedRow(rctx, id)
+	_, err := s.deleteTombstonedRow(rctx, id)
+	return err
 }
 
-// deleteTombstonedRow removes the metadata row of a deleting tombstone.
-func (s *service) deleteTombstonedRow(ctx context.Context, id string) error {
-	return s.withTx(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx,
-			`delete from upload_sessions where id = ? and state = 'deleting'`, id); err != nil {
+// deleteTombstonedRow removes the metadata row of a deleting tombstone and
+// reports whether THIS call performed the removal (the single deletion
+// winner among concurrent instances).
+func (s *service) deleteTombstonedRow(ctx context.Context, id string) (bool, error) {
+	removed := false
+	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		res, err := conn.ExecContext(ctx,
+			`delete from upload_sessions where id = ? and state = 'deleting'`, id)
+		if err != nil {
 			return typed(ErrDependency, err)
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return typed(ErrDependency, err)
+		}
+		removed = n == 1
 		return nil
 	})
+	return removed, err
 }
 
 // syncFile fsyncs a spool file (hookable for fault injection).
@@ -426,8 +567,16 @@ func (s *service) Status(ctx context.Context, id, repo, actor string) (Session, 
 	if err := validateActor(actor); err != nil {
 		return Session{}, err
 	}
-	row, found, err := fetchSession(ctx, s.db, id)
+	conn, err := s.pool.acquire(ctx)
 	if err != nil {
+		return Session{}, err
+	}
+	defer s.pool.release(conn)
+	row, found, err := fetchSession(ctx, conn, id)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return Session{}, cerr
+		}
 		return Session{}, typed(ErrDependency, err)
 	}
 	if !found {
@@ -436,8 +585,8 @@ func (s *service) Status(ctx context.Context, id, repo, actor string) (Session, 
 	if !ownsSession(row, repo, actor) {
 		return Session{}, ErrNotFound
 	}
-	// A committed creating row is invisible: only startup reconciliation may
-	// attribute it.
+	// A committed creating row is invisible: only its creator may activate
+	// it and startup reconciliation may roll it back.
 	if row.state == string(StateCreating) {
 		return Session{}, ErrNotFound
 	}
@@ -474,7 +623,7 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
-			return typed(ErrDependency, err)
+			return err // exact context error or raw mapped below
 		}
 		if !found {
 			return ErrNotFound
@@ -526,6 +675,9 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 		res, err := conn.ExecContext(ctx,
 			`update upload_sessions set offset = ? where id = ?`, newOffset, id)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
 		if affected, err := res.RowsAffected(); err != nil || affected != 1 {
@@ -539,9 +691,15 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 	if fd != nil {
 		// Any failure after bytes were written (source error, overflow,
 		// fsync, update, or commit) must leave the file exactly at the
-		// committed offset: a partial append is never accepted.
+		// committed offset: a partial append is never accepted. The rollback
+		// truncate is itself made durable and a sync failure propagates, so
+		// the tail cannot reappear after an acknowledged failure.
 		if err != nil {
-			_ = fd.Truncate(oldOffset)
+			if terr := fd.Truncate(oldOffset); terr != nil {
+				err = typed(ErrDependency, terr)
+			} else if serr := s.syncFile(fd); serr != nil {
+				err = typed(ErrDependency, serr)
+			}
 		}
 		_ = fd.Close()
 	}
@@ -602,7 +760,7 @@ func (s *service) Open(ctx context.Context, id, repo, actor string) (io.ReadClos
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
-			return typed(ErrDependency, err)
+			return err
 		}
 		if !found {
 			return ErrNotFound
@@ -668,7 +826,7 @@ func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, digest, be
 	return s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
-			return typed(ErrDependency, err)
+			return err
 		}
 		if !found {
 			return ErrNotFound
@@ -707,11 +865,17 @@ func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, digest, be
 				`insert into staged_blobs (upload_id, repo, actor, digest, bee_ref, size, media_type, created_at, expires_at)
 				 values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				id, row.repo, row.actor, digest, beeRef, size, mediaType, row.createdNanos, row.expiresNanos); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
 				return typed(ErrDependency, err)
 			}
 			if _, err := conn.ExecContext(ctx,
 				`update upload_sessions set state = 'finalized', digest = ?, bee_ref = ?, media_type = ?, size = ? where id = ?`,
 				digest, beeRef, mediaType, size, id); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
 				return typed(ErrDependency, err)
 			}
 			return nil
@@ -732,10 +896,18 @@ func (s *service) ListFinalized(ctx context.Context, repo, actor string) ([]spec
 	if err := validateActor(actor); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx,
+	conn, err := s.pool.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer s.pool.release(conn)
+	rows, err := conn.QueryContext(ctx,
 		`select upload_id, repo, actor, digest, bee_ref, size, media_type, created_at, expires_at
 		 from staged_blobs where repo = ? and actor = ? order by created_at, upload_id`, repo, actor)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, typed(ErrDependency, err)
 	}
 	defer rows.Close()
@@ -744,6 +916,9 @@ func (s *service) ListFinalized(ctx context.Context, repo, actor string) ([]spec
 		var b spec.StagedBlob
 		var created, expires int64
 		if err := rows.Scan(&b.UploadID, &b.Repo, &b.Actor, &b.Digest, &b.SwarmRef, &b.Size, &b.MediaType, &created, &expires); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
 			return nil, typed(ErrDependency, err)
 		}
 		b.CreatedAt = time.Unix(0, created).UTC().Format(time.RFC3339)
@@ -751,6 +926,9 @@ func (s *service) ListFinalized(ctx context.Context, repo, actor string) ([]spec
 		blobs = append(blobs, b)
 	}
 	if err := rows.Err(); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, typed(ErrDependency, err)
 	}
 	return blobs, nil
@@ -764,7 +942,10 @@ func (s *service) ListFinalized(ctx context.Context, repo, actor string) ([]spec
 // a durable deleting row is committed first, the file is unlinked and the
 // directory fsynced OUTSIDE any transaction, and only then is the metadata
 // row removed. A failed unlink retains the tombstone; the caller's retry —
-// or startup reconciliation — finishes the deletion.
+// or startup reconciliation — finishes the deletion. Delete is idempotent:
+// an absent id returns nil WITHOUT touching anything, and a row owned by a
+// different tenant returns identically nil — the API is never an existence
+// oracle for foreign sessions.
 func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 	if err := validateID(id); err != nil {
 		return err
@@ -781,21 +962,27 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
-			return typed(ErrDependency, err)
+			return err
 		}
 		if !found {
-			return nil // idempotent: nothing to delete
+			return nil // idempotent: nothing to delete; same public result as a foreign row
 		}
 		if !ownsSession(row, repo, actor) {
-			return ErrNotFound
+			// Confidential: a wrong-owner id is indistinguishable from an
+			// absent id — the foreign row is NEVER touched and the result is
+			// identically nil.
+			return nil
 		}
 		proceed = true
 		if row.state == string(StateDeleting) {
 			return nil // tombstone already durable
 		}
 		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting' where id = ? and state <> 'deleting'`, id)
+			`update upload_sessions set state = 'deleting', create_token = null where id = ? and state <> 'deleting'`, id)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
 		if n, err := res.RowsAffected(); err != nil || n != 1 {
@@ -820,7 +1007,8 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 	}
 
 	// Tx 2: metadata removal — only now is the file durably gone.
-	return s.deleteTombstonedRow(ctx, id)
+	_, err = s.deleteTombstonedRow(ctx, id)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -830,10 +1018,12 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 // Expire removes expired sessions in deterministic (expires_at, id) order,
 // limited to limit rows. For each row the same tombstone state machine as
 // Delete runs; the returned count is the number of FULLY completed
-// deletions (tombstone + durable unlink + metadata removal). A failure at
-// any phase stops the run with an ErrDependency and leaves a coherent
-// state: the row either still active or durably tombstoned, never missing
-// its file.
+// deletions (tombstone + durable unlink + metadata removal) performed by
+// THIS instance: the final DELETE's RowsAffected decides, so across any
+// number of concurrent expirers the aggregate count for one logical row is
+// exactly 1. A failure at any phase stops the run with an ErrDependency and
+// leaves a coherent state: the row either still active or durably
+// tombstoned, never missing its file.
 func (s *service) Expire(ctx context.Context, now time.Time, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, ErrInvalidInput
@@ -863,7 +1053,12 @@ func (s *service) Expire(ctx context.Context, now time.Time, limit int) (int, er
 // expiredIDs lists the limit oldest-expiring row ids whose expiry has
 // passed, in deterministic order.
 func (s *service) expiredIDs(ctx context.Context, nowNanos int64, limit int) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx,
+	conn, err := s.pool.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer s.pool.release(conn)
+	rows, err := conn.QueryContext(ctx,
 		`select id from upload_sessions where expires_at <= ? order by expires_at, id limit ?`, nowNanos, limit)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
@@ -884,13 +1079,16 @@ func (s *service) expiredIDs(ctx context.Context, nowNanos int64, limit int) ([]
 		ids = append(ids, id)
 	}
 	if err := rows.Err(); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		return nil, typed(ErrDependency, err)
 	}
 	return ids, nil
 }
 
 // expireOne deletes one expired row with the crash-safe tombstone protocol.
-// It reports whether the deletion fully completed.
+// It reports whether THIS call performed the final metadata removal.
 func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 	// Tx 1: durable tombstone — committed before any unlink. A row that
 	// vanished (another instance) is skipped; a row already tombstoned
@@ -899,7 +1097,7 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
-			return typed(ErrDependency, err)
+			return err
 		}
 		if !found {
 			return nil
@@ -909,8 +1107,11 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 			return nil
 		}
 		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting' where id = ? and state <> 'deleting'`, id)
+			`update upload_sessions set state = 'deleting', create_token = null where id = ? and state <> 'deleting'`, id)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
 		if n, err := res.RowsAffected(); err != nil || n != 1 {
@@ -934,11 +1135,10 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 		return false, typed(ErrDependency, err)
 	}
 
-	// Tx 2: metadata removal — only now is the file durably gone.
-	if err := s.deleteTombstonedRow(ctx, id); err != nil {
-		return false, err
-	}
-	return true, nil
+	// Tx 2: metadata removal — only now is the file durably gone. The
+	// RowsAffected decides completion: exactly one instance's DELETE may
+	// remove the row, so concurrent expirers sum to one completion per row.
+	return s.deleteTombstonedRow(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -951,24 +1151,28 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 //     read-only transaction).
 //   - Phase B repairs each row WITHOUT any unlink inside a transaction:
 //     deleting rows are finished (durable unlink, then metadata removal);
-//     creating rows are finished (durable empty file -> active) or rolled
-//     back (no file -> row removed); active/finalized rows are aligned to
-//     the committed offset (crash tails truncated, short files fail closed);
-//     unknown states fail closed.
-//   - Phase C enumerates the spool THROUGH the anchored descriptor and
-//     demands exact attribution: any entry with no database row makes
-//     startup fail closed with its file UNTOUCHED — a foreign or unowned
-//     file is never swept.
+//     stale creating rows are rolled back ONLY when attributable through
+//     their unforgeable token file (no file -> row removed; matching file ->
+//     row AND attributable file removed; anything else fails closed) while
+//     live creating leases are left strictly alone; active/finalized rows
+//     are aligned to the committed offset (crash tails truncated, short
+//     files fail closed); unknown states fail closed.
+//   - Phase C re-queries the database FRESH (not the Phase A snapshot) and
+//     demands exact attribution of every spool entry against it: any entry
+//     with no database row makes startup fail closed with its file UNTOUCHED
+//     — a foreign or unowned file is never swept.
 func (s *service) reconcileStartup(ctx context.Context) error {
 	type rowInfo struct {
-		id, state string
-		offset    int64
+		id           string
+		state        string
+		offset       int64
+		createdNanos int64
+		token        string
 	}
 	var rows []rowInfo
-	idset := map[string]bool{}
 	// Phase A: durable-consistent snapshot.
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
-		r, err := conn.QueryContext(ctx, `select id, state, offset from upload_sessions`)
+		r, err := conn.QueryContext(ctx, `select id, state, offset, created_at, create_token from upload_sessions`)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
@@ -978,13 +1182,20 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 				return ctx.Err()
 			}
 			var ri rowInfo
-			if err := r.Scan(&ri.id, &ri.state, &ri.offset); err != nil {
+			var tok sql.NullString
+			if err := r.Scan(&ri.id, &ri.state, &ri.offset, &ri.createdNanos, &tok); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
 				return typed(ErrDependency, err)
 			}
+			ri.token = tok.String
 			rows = append(rows, ri)
-			idset[ri.id] = true
 		}
 		if err := r.Err(); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
 		return nil
@@ -1006,32 +1217,50 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 			if err := s.syncDir(); err != nil {
 				return typed(ErrDependency, err)
 			}
-			if err := s.deleteTombstonedRow(ctx, ri.id); err != nil {
+			if _, err := s.deleteTombstonedRow(ctx, ri.id); err != nil {
 				return err
 			}
 		case StateCreating:
 			if ri.offset != 0 {
 				return typed(ErrDependency, errors.New("creating session has a nonzero offset"))
 			}
+			if ri.token == "" {
+				return typed(ErrDependency, errors.New("creating session lacks its create token"))
+			}
+			stale := s.creatingLeaseStale(ri.createdNanos)
 			fi, err := s.spool.root.Lstat(ri.id)
 			switch {
 			case os.IsNotExist(err):
-				// The file never became durable: roll the row back.
-				if err := s.rollbackCreate(ctx, ri.id); err != nil {
-					return err
+				if stale {
+					// The token was never durably written: roll the row back.
+					if err := s.rollbackCreate(ctx, ri.id); err != nil {
+						return err
+					}
 				}
+				// Live lease: the creator is still between row commit and
+				// file durability; leave it strictly alone.
 			case err != nil:
 				return typed(ErrDependency, err)
 			case fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular():
 				return typed(ErrDependency, errors.New("creating session file is not a regular file"))
-			case fi.Size() != 0:
-				return typed(ErrDependency, errors.New("creating session file carries uncommitted bytes"))
 			default:
-				// Finish: make the (possibly pre-existing) entry durable,
-				// then activate.
-				if err := s.finishCreating(ctx, ri.id); err != nil {
-					return err
+				// The file exists. It is attributable ONLY if it carries
+				// exactly this row's unforgeable token; an empty, short,
+				// long, or wrong-token file is unknown residue and startup
+				// fails closed without touching it (a file never proves a
+				// creator).
+				if stale {
+					if err := s.verifyCreatingFile(ctx, ri.id, ri.token); err != nil {
+						return err
+					}
+					// Stale AND attributable: roll the row back and remove
+					// its attributable file. Never adopt.
+					if err := s.rollbackCreate(ctx, ri.id); err != nil {
+						return err
+					}
 				}
+				// Live lease: the creator may still be between durably
+				// writing its token lobe and activating; leave it alone.
 			}
 		case StateActive, StateFinalized:
 			if err := s.spool.align(ri.id, ri.offset); err != nil {
@@ -1042,59 +1271,50 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 		}
 	}
 
-	// Phase C: exact attribution. An entry with no database row means an
-	// interrupted create that predates the creating row, or a foreign file:
-	// either way it is preserved untouched and startup fails closed.
+	// Phase C: exact attribution against FRESH database state (a Create
+	// committed while Phase B ran is visible here, not in the snapshot). An
+	// entry with no database row means an interrupted pre-row create or a
+	// foreign file: either way it is preserved untouched and startup fails
+	// closed.
 	names, err := s.spool.entries()
 	if err != nil {
 		return typed(ErrDependency, err)
 	}
-	for _, name := range names {
-		if !idset[name] {
-			return typed(ErrDependency, errors.New("unexpected file in spool"))
-		}
-	}
-	return nil
-}
-
-// finishCreating makes the empty file of a creating row durably linked
-// (file fsync + directory fsync) and activates the row. Idempotent across
-// instances: a row another instance already activated is left alone.
-func (s *service) finishCreating(ctx context.Context, id string) error {
-	f, err := s.spool.openForAppend(id, 0)
-	if err != nil {
-		return typed(ErrDependency, err)
-	}
-	serr := s.syncFile(f)
-	cerr := f.Close()
-	if serr == nil {
-		serr = cerr
-	}
-	if serr != nil {
-		return typed(ErrDependency, serr)
-	}
-	if err := s.syncDir(); err != nil {
-		return typed(ErrDependency, err)
-	}
-	activated := false
+	dbIDs := make(map[string]bool, len(names))
 	err = s.withTx(ctx, func(conn *sql.Conn) error {
-		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'active' where id = ? and state = 'creating'`, id)
+		r, err := conn.QueryContext(ctx, `select id from upload_sessions`)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
+		defer r.Close()
+		for r.Next() {
+			if err := ctx.Err(); err != nil {
+				return ctx.Err()
+			}
+			var id string
+			if err := r.Scan(&id); err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				return typed(ErrDependency, err)
+			}
+			dbIDs[id] = true
+		}
+		if err := r.Err(); err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			return typed(ErrDependency, err)
 		}
-		activated = n == 1
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if !activated {
-		return nil // another instance finished it
+	for _, name := range names {
+		if !dbIDs[name] {
+			return typed(ErrDependency, errors.New("unexpected file in spool"))
+		}
 	}
 	return nil
 }

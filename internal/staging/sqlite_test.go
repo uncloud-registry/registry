@@ -127,7 +127,7 @@ func TestSchemaColumnsAndTypes(t *testing.T) {
 		// type): REAL or numeric TEXT can never be coerced into them, so
 		// the typeof() CHECKs are the sole storage-class authority.
 		"offset": "", "created_at": "", "expires_at": "",
-		"digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
+		"create_token": "text", "digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
 	}
 	assertColumns(t, db, "upload_sessions", wantSessions, map[string]bool{"id": true})
 
@@ -212,8 +212,8 @@ func TestSchemaPhysicalFK(t *testing.T) {
 	// Required triggers.
 	for _, trg := range []string{
 		"trg_session_insert", "trg_session_state", "trg_session_metadata",
-		"trg_session_identity", "trg_session_delete", "trg_blob_insert",
-		"trg_blob_update", "trg_blob_delete",
+		"trg_session_identity", "trg_session_token", "trg_session_delete",
+		"trg_blob_insert", "trg_blob_update", "trg_blob_delete",
 	} {
 		var n int
 		if err := db.QueryRow(`select count(*) from sqlite_master where type='trigger' and name=?`, trg).Scan(&n); err != nil {
@@ -818,13 +818,24 @@ func TestTimeNow(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // buildSchemaFixture creates a standalone staging database by executing the
-// version-1 DDL (with an optional per-statement mutation) and recording the
-// version row — exercising exactly the OPEN-AFTER-VERIFICATION path, never
-// the migration path.
+// FROZEN GOLDEN manifest bodies (with an optional per-statement mutation)
+// and recording the version row — exercising exactly the open-after-
+// verification path, never the migration path. Building the adversarial
+// fixtures from the golden (never from the migration DDL constants) keeps
+// the fixtures independently authored: a unilateral change to the creation
+// DDL alone cannot silently reshape them, and a unilateral golden change is
+// caught by the parity test. The mutate hook operates on the golden bodies.
 func buildSchemaFixture(t *testing.T, mutate func(ddl []string) []string, mutateVersion bool, dupVersion bool, extraStmts []string) string {
 	t.Helper()
 	dbPath := filepath.Join(tempPrivate(t), "fixture.db")
-	ddl := append([]string(nil), schemaDDL...)
+	versionDDL := schemaGold.Objects[0].SQL
+	if mutateVersion {
+		versionDDL = strings.Replace(versionDDL, "not null", "", 1)
+	}
+	ddl := make([]string, 0, len(schemaGold.Objects)-1)
+	for _, o := range schemaGold.Objects[1:] {
+		ddl = append(ddl, o.SQL)
+	}
 	if mutate != nil {
 		ddl = mutate(ddl)
 	}
@@ -833,14 +844,8 @@ func buildSchemaFixture(t *testing.T, mutate func(ddl []string) []string, mutate
 		t.Fatalf("open fixture: %v", err)
 	}
 	defer db.Close()
-	if mutateVersion {
-		if _, err := db.Exec(`create table staging_schema (version integer primary key, applied_at integer)`); err != nil {
-			t.Fatalf("version table (mutated): %v", err)
-		}
-	} else {
-		if _, err := db.Exec(`create table staging_schema (version integer primary key, applied_at integer not null)`); err != nil {
-			t.Fatalf("version table: %v", err)
-		}
+	if _, err := db.Exec(versionDDL); err != nil {
+		t.Fatalf("version table: %v", err)
 	}
 	for i, stmt := range ddl {
 		if _, err := db.Exec(stmt); err != nil {
@@ -862,6 +867,21 @@ func buildSchemaFixture(t *testing.T, mutate func(ddl []string) []string, mutate
 	}
 	db.Close()
 	return dbPath
+}
+
+// assertRejectedDBClean proves a rejected database was not modified (byte
+// identity) and created no -wal/-shm/-journal sidecars: the inspection
+// connection must be read-only-mutation-free.
+func assertRejectedDBClean(t *testing.T, dbPath string, before string) {
+	t.Helper()
+	if after := hashFile(t, dbPath); after != before {
+		t.Fatal("rejected database bytes were modified")
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(dbPath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("rejected database created a %s sidecar", suffix)
+		}
+	}
 }
 
 // TestSchemaReopenControl proves an unmutated fixture reopens (the fixture
@@ -919,6 +939,14 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			d[0] = strings.Replace(d[0], "size = offset", "size = offset + 1", 1)
 			return d
 		}, false, false, nil, "finalized size != offset allowed"},
+		{"sessions_token_check", func(d []string) []string {
+			d[0] = strings.Replace(d[0], "and create_token is null", "and 1", 1)
+			return d
+		}, false, false, nil, "creating rows allowed without a token"},
+		{"sessions_token_glob", func(d []string) []string {
+			d[0] = strings.Replace(d[0], "create_token not glob '*[^0-9a-f]*'", "create_token glob '*[0-9a-f]*'", 1)
+			return d
+		}, false, false, nil, "token chars loosened"},
 		{"sessions_digest_glob_suffix", func(d []string) []string {
 			d[0] = strings.Replace(d[0], "substr(digest, 8) not glob '*[^0-9a-f]*'", "digest glob 'sha256:[0-9a-f]*'", 1)
 			return d
@@ -955,20 +983,29 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			d[8] = strings.Replace(d[8], "'session identity immutable'", "'x'", 1)
 			return d
 		}, false, false, nil, "identity trigger body changed"},
+		{"trigger_token_softened", func(d []string) []string {
+			d[9] = strings.Replace(d[9], "'create token immutable'", "'x'", 1)
+			return d
+		}, false, false, nil, "token trigger body changed"},
+		{"trigger_token_cleared_outside_creating", func(d []string) []string {
+			d[9] = strings.Replace(d[9], "when old.create_token is not null and new.create_token is null and old.state <> 'creating' then raise(abort, 'create token cannot be cleared outside creating')",
+				"when old.create_token is not null and new.create_token is null then raise(abort, 'x')", 1)
+			return d
+		}, false, false, nil, "token clearing allowed outside creating"},
 		{"trigger_delete_softened", func(d []string) []string {
-			d[9] = strings.Replace(d[9], "'delete only via deleting state'", "'x'", 1)
+			d[10] = strings.Replace(d[10], "'delete only via deleting state'", "'x'", 1)
 			return d
 		}, false, false, nil, "delete trigger body changed"},
 		{"trigger_blob_insert_softened", func(d []string) []string {
-			d[10] = strings.Replace(d[10], "'staged blob must match active session'", "'x'", 1)
+			d[11] = strings.Replace(d[11], "'staged blob must match active session'", "'x'", 1)
 			return d
 		}, false, false, nil, "blob insert trigger body changed"},
 		{"trigger_blob_update_wrong_table", func(d []string) []string {
-			d[11] = strings.Replace(d[11], "on staged_blobs", "on upload_sessions", 1)
+			d[12] = strings.Replace(d[12], "on staged_blobs", "on upload_sessions", 1)
 			return d
 		}, false, false, nil, "blob update trigger on the wrong table"},
 		{"trigger_blob_delete_softened", func(d []string) []string {
-			d[12] = strings.Replace(d[12], "'cannot delete staged blob of live session'", "'x'", 1)
+			d[13] = strings.Replace(d[13], "'cannot delete staged blob of live session'", "'x'", 1)
 			return d
 		}, false, false, nil, "blob delete trigger body changed"},
 		{"version_table_shape", nil, true, false, nil, "version table without not null"},
@@ -983,7 +1020,7 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			return d
 		}, false, false, nil, "quoted identifier lookalike"},
 		{"comment_inserted", func(d []string) []string {
-			d[6] = strings.Replace(d[6], "begin\n		select case\n			when", "begin\n		-- softened comment\n		select case\n			when", 1)
+			d[6] = strings.Replace(d[6], "begin select case", "begin\n		-- softened comment\n		select case", 1)
 			return d
 		}, false, false, nil, "comment in trigger body"},
 	}
@@ -995,9 +1032,7 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 				db.Close()
 				t.Fatalf("lookalike schema accepted: %s", tc.description)
 			}
-			if after := hashFile(t, dbPath); after != before {
-				t.Fatal("rejected lookalike database bytes were modified")
-			}
+			assertRejectedDBClean(t, dbPath, before)
 		})
 	}
 }
@@ -1020,6 +1055,7 @@ func TestSchemaExactPhysicalShape(t *testing.T) {
 		{"offset", "", true, false},
 		{"created_at", "", true, false},
 		{"expires_at", "", true, false},
+		{"create_token", "text", false, false},
 		{"digest", "text", false, false},
 		{"bee_ref", "text", false, false},
 		{"media_type", "text", false, false},
@@ -1134,45 +1170,78 @@ func TestSchemaExactPhysicalShape(t *testing.T) {
 }
 
 // TestSchemaCreatingStateMachine proves the creating lifecycle is enforced by
-// the schema: born-active-or-creating, creating→active finish, creating→
-// deleting rollback, and no other creating transitions.
+// the schema: born-active-or-creating (creating REQUIRES an unforgeable
+// 64-hex token), creating→active finish (token cleared), creating→deleting
+// rollback (token cleared), and no other creating transitions; the token is
+// immutable while set and can never be set after insert.
 func TestSchemaCreatingStateMachine(t *testing.T) {
 	db, _ := newStagingDB(t)
 	dig := "sha256:" + strings.Repeat("b", 64)
 	ref := strings.Repeat("c", 64)
+	tok := strings.Repeat("a1", 32) // 64 lowercase hex
 	id := strings.Repeat("a", 64)
 
-	// Born creating: legal.
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000)`, id); err != nil {
+	// Born creating: legal WITH a token.
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000, ?)`, id, tok); err != nil {
 		t.Fatalf("born creating: %v", err)
 	}
-	// Finish: creating -> active.
-	if _, err := db.Exec(`update upload_sessions set state='active' where id=? and state='creating'`, id); err != nil {
+	// Born creating WITHOUT a token is rejected (no file may ever prove a
+	// creator; the token alone attributes the row).
+	idNoTok := strings.Repeat("0", 64)
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000)`, idNoTok); err == nil {
+		t.Fatal("born creating without a token accepted")
+	}
+	// Token grammar: exactly 64 lowercase hex.
+	for _, bad := range []string{
+		strings.ToUpper(tok), strings.Repeat("a", 63), strings.Repeat("a", 65),
+		strings.Repeat("g", 64), strings.Repeat("a", 32) + "/" + strings.Repeat("a", 31),
+		tok[:32] + "\\" + tok[:31], "a\x00" + tok[1:], "",
+	} {
+		bid := fmt.Sprintf("%016x%048d", len(bad), 7) // 64-hex id for the probe
+		if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000, ?)`, bid, bad); err == nil {
+			t.Fatalf("creating row with malformed token %q accepted", printable(bad))
+		}
+	}
+	// Finish: creating -> active, clearing the token.
+	if _, err := db.Exec(`update upload_sessions set state='active', create_token=null where id=? and state='creating'`, id); err != nil {
 		t.Fatalf("creating->active: %v", err)
 	}
 	// Active cannot go back to creating.
 	if _, err := db.Exec(`update upload_sessions set state='creating' where id=?`, id); err == nil {
 		t.Fatal("active->creating accepted")
 	}
+	// Active cannot SET a token.
+	if _, err := db.Exec(`update upload_sessions set create_token='`+tok+`' where id=?`, id); err == nil {
+		t.Fatal("setting a token on a live row accepted")
+	}
 
 	// A fresh creating row that is rolled back through the tombstone.
 	id2 := strings.Repeat("b", 64)
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000)`, id2); err != nil {
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000, ?)`, id2, tok); err != nil {
 		t.Fatalf("born creating 2: %v", err)
 	}
-	if _, err := db.Exec(`update upload_sessions set state='deleting' where id=? and state='creating'`, id2); err != nil {
+	if _, err := db.Exec(`update upload_sessions set state='deleting', create_token=null where id=? and state='creating'`, id2); err != nil {
 		t.Fatalf("creating->deleting: %v", err)
 	}
 	if _, err := db.Exec(`delete from upload_sessions where id=? and state='deleting'`, id2); err != nil {
 		t.Fatalf("delete rolled-back creating: %v", err)
 	}
+	// The token cannot be cleared on a live lease except as part of a
+	// creating transition: tombstoning an active row clears nothing illicit.
+	idDel := strings.Repeat("e", 64)
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'active', 0, 1000, 2000)`, idDel); err != nil {
+		t.Fatalf("born active: %v", err)
+	}
+	if _, err := db.Exec(`update upload_sessions set state='deleting', create_token=null where id=? and state <> 'deleting'`, idDel); err != nil {
+		t.Fatalf("tombstone: %v", err)
+	}
 
 	// Creating rows may not jump to finalized and may not be deleted directly.
 	id3 := strings.Repeat("c", 64)
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000)`, id3); err != nil {
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000, ?)`, id3, tok); err != nil {
 		t.Fatalf("born creating 3: %v", err)
 	}
-	if _, err := db.Exec(`update upload_sessions set state='finalized', digest='` + dig + `', bee_ref='` + ref + `', media_type='application/octet-stream', size=0 where id='` + id3 + `'`); err == nil {
+	if _, err := db.Exec(`update upload_sessions set state='finalized', create_token=null, digest='` + dig + `', bee_ref='` + ref + `', media_type='application/octet-stream', size=0 where id='` + id3 + `'`); err == nil {
 		t.Fatal("creating->finalized accepted")
 	}
 	if _, err := db.Exec(`delete from upload_sessions where id='` + id3 + `'`); err == nil {
@@ -1181,15 +1250,15 @@ func TestSchemaCreatingStateMachine(t *testing.T) {
 	// Born creating with a nonzero offset or metadata is rejected by the
 	// insert trigger and the coherence check.
 	id4 := strings.Repeat("d", 64)
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 5, 1000, 2000)`, id4); err == nil {
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 5, 1000, 2000, ?)`, id4, tok); err == nil {
 		t.Fatal("born creating with nonzero offset accepted")
 	}
 	// Deleting is terminal.
-	id5 := strings.Repeat("e", 64)
+	id5 := strings.Repeat("f", 64)
 	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'active', 0, 1000, 2000)`, id5); err != nil {
 		t.Fatalf("born active: %v", err)
 	}
-	if _, err := db.Exec(`update upload_sessions set state='deleting' where id=?`, id5); err != nil {
+	if _, err := db.Exec(`update upload_sessions set state='deleting', create_token=null where id=?`, id5); err != nil {
 		t.Fatalf("tombstone: %v", err)
 	}
 	if _, err := db.Exec(`update upload_sessions set state='finalized' where id=?`, id5); err == nil {
@@ -1265,7 +1334,7 @@ func TestSchemaGrammarParityExtended(t *testing.T) {
 	} {
 		inserted := seedSession()
 		parity("id-insert-"+printable(v.val), v.ok, func() error {
-			_, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, 1000, 2000)`, v.val)
+			_, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'active', 0, 1000, 2000)`, v.val)
 			return err
 		})
 		if v.ok {
@@ -1320,7 +1389,7 @@ func TestSchemaGrammarParityExtended(t *testing.T) {
 	for _, v := range repos {
 		id := seedSession()
 		parity("repo-insert-"+printable(v.val), validateRepo(v.val) == nil, func() error {
-			_, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, ?, 'user:alice', 'creating', 0, 1000, 2000)`, hex64[:len(hex64)-8]+fmt.Sprintf("%08x", sessionN), v.val)
+			_, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, ?, 'user:alice', 'active', 0, 1000, 2000)`, hex64[:len(hex64)-8]+fmt.Sprintf("%08x", sessionN), v.val)
 			return err
 		})
 		_ = id
@@ -1354,7 +1423,7 @@ func TestSchemaGrammarParityExtended(t *testing.T) {
 	for _, v := range actors {
 		id := seedSession()
 		parity("actor-insert-"+printable(v.val), validateActor(v.val) == nil, func() error {
-			_, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', ?, 'creating', 0, 1000, 2000)`, hex64[:len(hex64)-8]+fmt.Sprintf("%08x", sessionN*7), v.val)
+			_, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', ?, 'active', 0, 1000, 2000)`, hex64[:len(hex64)-8]+fmt.Sprintf("%08x", sessionN*7), v.val)
 			return err
 		})
 		_ = id

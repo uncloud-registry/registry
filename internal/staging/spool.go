@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // spoolErrorKind identifies fail-closed filesystem divergences so the
@@ -72,76 +73,63 @@ func spoolErrorCause(err error) error {
 type spool struct {
 	root     *os.Root
 	rootPath string
+	// syncFile replaces the fsync of spool files (spool-level fault
+	// injection). The service wires its own hook here at construction.
+	syncFile func(f *os.File) error
 }
 
 // openPrivateDirChain resolves `path` to a private 0700 directory and
-// returns an os.Root anchored at it. Only the components BELOW the deepest
-// existing ancestor are created or mode-repaired, all through the anchored
-// descriptor; OS-standard symlink prefixes (/var, /tmp) and unrelated
-// ancestors are neither followed into nor touched, so e.g. /var/lib or
-// $HOME need not themselves be private. Every below-anchor component is
-// verified to be a real non-symlink directory and repaired to exactly 0700;
-// a component that cannot be made private, or that is a symlink or
-// non-directory, is rejected. When enforce is false (the implied "." parent
-// of a bare database name) only the anchor is opened and nothing is created
-// or modified.
+// returns an os.Root anchored at it by walking EVERY path component from a
+// trusted descriptor anchor — absolute "/" for absolute paths, the
+// descriptor-opened CWD (".") for relative ones. Each component is Lstat'd
+// in the CURRENT root: a symlink or non-directory is rejected, a missing
+// component is created (0700) only when enforce is true, then OpenRoot'd
+// and compared against a post-open snapshot so a swap of any component is
+// detected. The deepest whole path is never Lstat'd or OpenRoot'd directly.
+// Only the components BELOW the anchor may be created or mode-repaired,
+// always through the anchored descriptor; OS-standard symlink prefixes
+// (/var, /tmp) therefore reject the path rather than being followed. The
+// final directory is verified and repaired to exactly 0700. When enforce is
+// false (the implied "." parent of a bare database name) only the anchor is
+// opened and nothing is created or modified.
 func openPrivateDirChain(path string, enforce bool) (*os.Root, error) {
 	if path == "" {
 		return nil, spoolErr(spoolErrGeneric, errors.New("empty directory path"))
 	}
 	clean := filepath.Clean(path)
-	if clean == "." {
-		root, err := os.OpenRoot(".")
+	var anchor *os.Root
+	var comps []string
+	if filepath.IsAbs(clean) {
+		r, err := os.OpenRoot("/")
 		if err != nil {
 			return nil, spoolErr(spoolErrGeneric, err)
 		}
-		if !enforce {
-			return root, nil
+		anchor = r
+		for _, c := range strings.Split(clean, "/") {
+			if c != "" {
+				comps = append(comps, c)
+			}
 		}
-		if err := verifyPrivateDir(root, ".", 0o700, true, clean); err != nil {
-			root.Close()
-			return nil, err
-		}
-		return root, nil
-	}
-	// Bootstrap: find the deepest existing ancestor by path. Every
-	// subsequent access is descriptor-relative.
-	var tail []string
-	cur := clean
-	var anchor *os.Root
-	for {
-		fi, err := os.Lstat(cur)
-		switch {
-		case err == nil:
-			if fi.Mode()&os.ModeSymlink != 0 {
-				return nil, spoolErr(spoolErrGeneric, errors.New("path component is a symbolic link"))
-			}
-			if !fi.IsDir() {
-				return nil, spoolErr(spoolErrGeneric, errors.New("path component is not a directory"))
-			}
-			r, err := os.OpenRoot(cur)
-			if err != nil {
-				if os.IsNotExist(err) {
-					continue // raced away between Lstat and open; walk up
-				}
-				return nil, spoolErr(spoolErrGeneric, err)
-			}
-			anchor = r
-			goto descend
-		case os.IsNotExist(err):
-			parent := filepath.Dir(cur)
-			if parent == cur {
-				return nil, spoolErr(spoolErrGeneric, fmt.Errorf("cannot resolve directory %q", path))
-			}
-			tail = append([]string{filepath.Base(cur)}, tail...)
-			cur = parent
-		default:
+	} else {
+		r, err := os.OpenRoot(".")
+		if err != nil {
 			return nil, spoolErr(spoolErrGeneric, err)
+		}
+		anchor = r
+		if clean != "." {
+			for _, c := range strings.Split(clean, "/") {
+				if c != "" {
+					comps = append(comps, c)
+				}
+			}
 		}
 	}
 
-descend:
-	for _, comp := range tail {
+	for _, comp := range comps {
+		if comp == "." || comp == ".." {
+			anchor.Close()
+			return nil, spoolErr(spoolErrGeneric, errors.New("path component is not a plain name"))
+		}
 		fi, err := anchor.Lstat(comp)
 		switch {
 		case err == nil:
@@ -162,22 +150,48 @@ descend:
 				anchor.Close()
 				return nil, spoolErr(spoolErrGeneric, err)
 			}
+			fi, err = anchor.Lstat(comp)
+			if err != nil {
+				anchor.Close()
+				return nil, spoolErr(spoolErrGeneric, err)
+			}
+			if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+				anchor.Close()
+				return nil, spoolErr(spoolErrGeneric, errors.New("path component is not a real directory"))
+			}
 		default:
 			anchor.Close()
 			return nil, spoolErr(spoolErrGeneric, err)
 		}
+		// Open the component in the CURRENT root and prove its identity with
+		// a post-open snapshot of the same component: a swap between the
+		// pre-open Lstat and the open is detected and the descent fails
+		// closed.
 		sub, err := anchor.OpenRoot(comp)
 		if err != nil {
 			anchor.Close()
 			return nil, spoolErr(spoolErrGeneric, err)
 		}
+		post, err := anchor.Lstat(comp)
+		if err != nil || post.Mode()&os.ModeSymlink != 0 || !post.IsDir() || !os.SameFile(fi, post) {
+			sub.Close()
+			anchor.Close()
+			return nil, spoolErr(spoolErrGeneric, errors.New("path component changed during descent"))
+		}
 		anchor.Close()
 		anchor = sub
 	}
 	// Final directory: verify and repair exact 0700 through the descriptor.
-	if err := verifyPrivateDir(anchor, ".", 0o700, enforce, clean); err != nil {
-		anchor.Close()
-		return nil, err
+	if clean != "." {
+		if err := verifyPrivateDir(anchor, ".", 0o700, enforce, clean); err != nil {
+			anchor.Close()
+			return nil, err
+		}
+	} else if enforce {
+		if err := verifyPrivateDir(anchor, ".", 0o700, true, clean); err != nil {
+			anchor.Close()
+			return nil, err
+		}
 	}
 	return anchor, nil
 }
@@ -310,6 +324,13 @@ func newSpool(ctx context.Context, rootPath string) (*spool, error) {
 	return &spool{root: root, rootPath: rootPath}, nil
 }
 
+// ensureRootMode keeps the spool root directory EXACTLY 0700: every
+// operation that touches the spool verifies (and repairs through the
+// descriptor, identity-checked) the root mode first.
+func (sp *spool) ensureRootMode() error {
+	return verifyPrivateDir(sp.root, ".", 0o700, true, sp.rootPath)
+}
+
 func (sp *spool) Close() error {
 	if sp.root == nil {
 		return nil
@@ -320,16 +341,28 @@ func (sp *spool) Close() error {
 }
 
 // create makes the empty 0600 spool file for a validated id and returns the
-// writable descriptor open at offset 0. It never follows an existing symlink
-// (os.Root O_EXCL semantics): a pre-existing name of any kind is rejected.
-// The caller owns durability: fsync the returned descriptor (or roll the row
-// back) and fsync the directory before activating the session.
+// writable descriptor open at offset 0. The mode is forced to EXACTLY 0600
+// immediately (fchmod through the descriptor, never a path, never following
+// a symlink) and verified; a restrictive umask cannot leave it looser or
+// stricter. It never follows an existing symlink (os.Root O_EXCL semantics):
+// a pre-existing name of any kind is rejected. The caller owns durability:
+// fsync the returned descriptor (or roll the row back) and fsync the
+// directory before activating the session.
 func (sp *spool) create(id string) (*os.File, error) {
 	if err := validateID(id); err != nil {
 		return nil, err
 	}
+	if err := sp.ensureRootMode(); err != nil {
+		return nil, err
+	}
 	f, err := sp.root.OpenFile(id, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	// Immediate chmod, then exact verification — regardless of umask.
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		_ = sp.remove(id)
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
 	st, err := f.Stat()
@@ -338,10 +371,10 @@ func (sp *spool) create(id string) (*os.File, error) {
 		_ = sp.remove(id)
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
-	if !st.Mode().IsRegular() || st.Mode().Perm()&0o077 != 0 {
+	if !st.Mode().IsRegular() || st.Mode().Perm() != 0o600 {
 		f.Close()
 		_ = sp.remove(id)
-		return nil, spoolErr(spoolErrGeneric, errors.New("spool file is not a private regular file"))
+		return nil, spoolErr(spoolErrGeneric, errors.New("spool file is not an exact 0600 regular file"))
 	}
 	// Descriptor identity: no swap between creation and hand-off.
 	lst, err := sp.root.Lstat(id)
@@ -353,12 +386,46 @@ func (sp *spool) create(id string) (*os.File, error) {
 	return f, nil
 }
 
+// repairFileMode forces a verified spool file's mode to EXACTLY 0600 through
+// the already-open descriptor (fchmod never follows symlinks); a mode that
+// cannot be repaired fails closed. The descriptor must already be identity-
+// verified by the caller.
+func repairFileMode(f *os.File) error {
+	st, err := f.Stat()
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	if !st.Mode().IsRegular() {
+		return spoolErr(spoolErrNotRegular, errors.New("opened spool path is not a regular file"))
+	}
+	if st.Mode().Perm() == 0o600 {
+		return nil
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return spoolErr(spoolErrGeneric, errors.New("cannot make spool file private"))
+	}
+	st, err = f.Stat()
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		return spoolErr(spoolErrGeneric, errors.New("spool file mode repair failed"))
+	}
+	return nil
+}
+
 // openFile is the single descriptor-relative open path: one Lstat captures
 // the expected identity, every subsequent open is verified SameFile against
-// it, an overlong crash tail is truncated through the fd, a shorter file
-// fails closed, and the returned descriptor is positioned at offset.
+// it, the exact mode 0600 is verified and repaired through the descriptor on
+// EVERY existing-file open, an overlong crash tail is truncated through the
+// fd AND the truncation is fsynced (a sync failure propagates before any
+// success), a shorter file fails closed, and the returned descriptor is
+// positioned at offset.
 func (sp *spool) openFile(id string, offset int64, flag int) (*os.File, error) {
 	if err := validateID(id); err != nil {
+		return nil, err
+	}
+	if err := sp.ensureRootMode(); err != nil {
 		return nil, err
 	}
 	fi, err := sp.root.Lstat(id)
@@ -378,17 +445,42 @@ func (sp *spool) openFile(id string, offset int64, flag int) (*os.File, error) {
 		return nil, spoolErr(spoolErrShort, errors.New("durable file is shorter than the committed offset"))
 	}
 	if fi.Size() > offset {
-		// ftruncate requires a writable descriptor.
+		// ftruncate requires a writable descriptor. The mode is verified and
+		// repaired here too; the truncation is made durable BEFORE the
+		// operation reports success.
 		tf, err := sp.root.OpenFile(id, os.O_WRONLY, 0)
 		if err != nil {
 			return nil, spoolErr(spoolErrGeneric, err)
 		}
 		st, err := tf.Stat()
-		if err != nil || !st.Mode().IsRegular() || st.Size() < offset || !os.SameFile(st, fi) {
+		if err != nil {
+			tf.Close()
+			return nil, spoolErr(spoolErrGeneric, err)
+		}
+		if !st.Mode().IsRegular() || !os.SameFile(st, fi) {
 			tf.Close()
 			return nil, spoolErr(spoolErrNotRegular, errors.New("opened spool path is not the verified file"))
 		}
+		if err := repairFileMode(tf); err != nil {
+			tf.Close()
+			return nil, err
+		}
+		if st.Size() < offset {
+			tf.Close()
+			return nil, spoolErr(spoolErrShort, errors.New("opened spool file is shorter than the committed offset"))
+		}
 		if err := tf.Truncate(offset); err != nil {
+			tf.Close()
+			return nil, spoolErr(spoolErrGeneric, err)
+		}
+		// Durable truncation: the tail must be gone from stable storage
+		// before success is acknowledged.
+		if sp.syncFile != nil {
+			if err := sp.syncFile(tf); err != nil {
+				tf.Close()
+				return nil, spoolErr(spoolErrGeneric, err)
+			}
+		} else if err := tf.Sync(); err != nil {
 			tf.Close()
 			return nil, spoolErr(spoolErrGeneric, err)
 		}
@@ -409,6 +501,10 @@ func (sp *spool) openFile(id string, offset int64, flag int) (*os.File, error) {
 		f.Close()
 		return nil, spoolErr(spoolErrNotRegular, errors.New("opened spool path is not the verified file"))
 	}
+	if err := repairFileMode(f); err != nil {
+		f.Close()
+		return nil, err
+	}
 	if flag == os.O_WRONLY {
 		// Append semantics: position exactly at the committed offset. The
 		// read path returns the descriptor at position 0 (the reader is
@@ -421,10 +517,11 @@ func (sp *spool) openFile(id string, offset int64, flag int) (*os.File, error) {
 	return f, nil
 }
 
-// align verifies the spool file at id is a regular, symlink-free file whose
-// durable bytes are at least offset; a longer file is an uncommitted crash
-// tail and is truncated back to offset. A shorter file means the database is
-// ahead of durable file bytes and fails closed.
+// align verifies the spool file at id is a regular, symlink-free,
+// exactly-0600 file whose durable bytes are at least offset; a longer file
+// is an uncommitted crash tail and is truncated back to offset with a
+// durable sync. A shorter file means the database is ahead of durable file
+// bytes and fails closed.
 func (sp *spool) align(id string, offset int64) error {
 	f, err := sp.openFile(id, offset, os.O_WRONLY)
 	if err != nil {
@@ -443,6 +540,56 @@ func (sp *spool) openForAppend(id string, offset int64) (*os.File, error) {
 // bytes.
 func (sp *spool) openForRead(id string, offset int64) (*os.File, error) {
 	return sp.openFile(id, offset, os.O_RDONLY)
+}
+
+// readExact reads exactly n bytes from the spool file at id, first proving
+// through the anchored descriptor that the entry is a symlink-free regular
+// file of exactly that size, and refusing any extra byte. It is used to
+// attribute a creating file through its unforgeable token; an empty, short,
+// long, symlinked, or wrong-identity file is an error and is NEVER touched.
+func (sp *spool) readExact(id string, n int64) ([]byte, error) {
+	if err := validateID(id); err != nil {
+		return nil, err
+	}
+	fi, err := sp.root.Lstat(id)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, spoolErr(spoolErrMissing, err)
+		}
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil, spoolErr(spoolErrSymlink, errors.New("spool path is a symbolic link"))
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, spoolErr(spoolErrNotRegular, errors.New("spool path is not a regular file"))
+	}
+	if fi.Size() != n {
+		return nil, spoolErr(spoolErrShort, errors.New("spool file size does not match the expected lobe"))
+	}
+	f, err := sp.root.OpenFile(id, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() || st.Size() != n || !os.SameFile(st, fi) {
+		f.Close()
+		return nil, spoolErr(spoolErrNotRegular, errors.New("opened spool path is not the verified file"))
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		f.Close()
+		return nil, spoolErr(spoolErrGeneric, err)
+	}
+	// The lobe must be exact: an extra byte (concurrent extension or swap)
+	// fails closed.
+	var probe [1]byte
+	if m, err := f.Read(probe[:]); err != io.EOF || m != 0 {
+		f.Close()
+		return nil, spoolErr(spoolErrShort, errors.New("spool file carries more bytes than expected"))
+	}
+	f.Close()
+	return buf, nil
 }
 
 // remove unlinks the spool file for a validated id. Removing an already
@@ -477,6 +624,9 @@ func (sp *spool) removeDurable(id string) error {
 // syncDir fsyncs the spool root directory through the retained descriptor,
 // making a just-created or just-unlinked entry durable.
 func (sp *spool) syncDir() error {
+	if err := sp.ensureRootMode(); err != nil {
+		return err
+	}
 	f, err := sp.root.Open(".")
 	if err != nil {
 		return spoolErr(spoolErrGeneric, err)
@@ -493,6 +643,9 @@ func (sp *spool) syncDir() error {
 // descriptor (never through a path), so a renamed-away root or a planted
 // symlink at the original path cannot redirect enumeration.
 func (sp *spool) entries() ([]string, error) {
+	if err := sp.ensureRootMode(); err != nil {
+		return nil, err
+	}
 	f, err := sp.root.Open(".")
 	if err != nil {
 		return nil, spoolErr(spoolErrGeneric, err)

@@ -3,6 +3,7 @@ package staging
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,13 +36,35 @@ func newTestService(t *testing.T) (*service, string) {
 
 // tempPrivate returns a private 0700 temporary directory (t.TempDir() may be
 // 0755 on some platforms, which a fail-closed service correctly rejects).
+// On darwin the /var -> /private/var symlink prefix is rewritten to the real
+// directory because the strict component walk from "/" rejects symlink
+// components by design.
 func tempPrivate(t *testing.T) string {
 	t.Helper()
 	d := t.TempDir()
 	if err := os.Chmod(d, 0o700); err != nil {
 		t.Fatalf("chmod tempdir: %v", err)
 	}
-	return d
+	return symlinkFreeBase(d)
+}
+
+// symlinkFreeBase rewrites the OS-standard /var and /tmp symlink prefixes to
+// their real directories so the strict component walk never trips on them.
+func symlinkFreeBase(p string) string {
+	if runtime.GOOS != "darwin" {
+		return p
+	}
+	switch {
+	case p == "/var":
+		return "/private/var"
+	case strings.HasPrefix(p, "/var/"):
+		return "/private" + p
+	case p == "/tmp":
+		return "/private/tmp"
+	case strings.HasPrefix(p, "/tmp/"):
+		return "/private" + p
+	}
+	return p
 }
 
 // sqlOpenForTest gives a direct-SQL handle to the staging database with the
@@ -1123,8 +1147,8 @@ func TestServiceDeleteCrossOwnerLeavesSessionUntouched(t *testing.T) {
 		{"backend/api", "user:eve"},
 		{"other/app", "user:alice"},
 	} {
-		if err := svc.Delete(ctx, s.ID, p.repo, p.actor); !errors.Is(err, ErrNotFound) {
-			t.Fatalf("cross-owner delete: %v, want ErrNotFound family", err)
+		if err := svc.Delete(ctx, s.ID, p.repo, p.actor); err != nil {
+			t.Fatalf("cross-owner delete must be idempotent nil, got %v", err)
 		}
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "spool", s.ID)); err != nil {
@@ -1132,6 +1156,13 @@ func TestServiceDeleteCrossOwnerLeavesSessionUntouched(t *testing.T) {
 	}
 	if st, _ := svc.Status(ctx, s.ID, s.Repo, s.Actor); st.State != StateActive || st.Offset != 4 {
 		t.Fatalf("session damaged by cross-owner delete: %+v", st)
+	}
+
+	// The absent-id and wrong-owner surfaces must be EXACTLY identical (nil),
+	// with the foreign row untouched: Delete is never an existence oracle.
+	missing := strings.Repeat("e", 64)
+	if a, b := svc.Delete(ctx, missing, "backend/api", "user:alice"), svc.Delete(ctx, s.ID, "backend/api", "user:eve"); a != b {
+		t.Fatalf("absent=%v wrongOwner=%v, want the identical nil surface", a, b)
 	}
 }
 
@@ -1443,8 +1474,8 @@ func TestServiceRestartFailsClosedOnUnknownSpoolFiles(t *testing.T) {
 
 // TestServiceRestartRollsBackCreatingRowWithoutFile proves an interrupted
 // create whose row committed but whose file never became durable is rolled
-// back on startup: the row disappears, no file appears, and the next restart
-// is clean.
+// back on startup once the lease is stale: the row disappears, no file
+// appears, and the next restart is clean.
 func TestServiceRestartRollsBackCreatingRowWithoutFile(t *testing.T) {
 	svc, dir := newTestService(t)
 	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
@@ -1453,7 +1484,7 @@ func TestServiceRestartRollsBackCreatingRowWithoutFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raw open: %v", err)
 	}
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano()); err != nil {
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?, ?)`, id, now.Add(-time.Hour).UnixNano(), now.Add(time.Hour).UnixNano(), strings.Repeat("5", 64)); err != nil {
 		t.Fatalf("seed creating row: %v", err)
 	}
 	db.Close()
@@ -1479,23 +1510,29 @@ func TestServiceRestartRollsBackCreatingRowWithoutFile(t *testing.T) {
 	svc3.Close()
 }
 
-// TestServiceRestartFinishesCreatingRowWithFile proves an interrupted create
-// whose file IS durable (crash after file fsync, before the activating
-// commit) is finished on startup: the session becomes active and usable.
-func TestServiceRestartFinishesCreatingRowWithFile(t *testing.T) {
+// TestServiceRestartRollsBackCreatingRowWithTokenFile proves a stale
+// interrupted create whose file IS durable (crash after file fsync, before
+// the activating commit) is rolled back — never adopted: the session is
+// gone, and its attributable file is removed with it.
+func TestServiceRestartRollsBackCreatingRowWithTokenFile(t *testing.T) {
 	svc, dir := newTestService(t)
 	now := time.Now().UTC()
 	id := strings.Repeat("f", 64)
+	token := strings.Repeat("7", 64)
 	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
 	if err != nil {
 		t.Fatalf("raw open: %v", err)
 	}
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano()); err != nil {
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?, ?)`, id, now.Add(-time.Hour).UnixNano(), now.Add(time.Hour).UnixNano(), token); err != nil {
 		t.Fatalf("seed creating row: %v", err)
 	}
 	db.Close()
-	if err := os.WriteFile(filepath.Join(dir, "spool", id), nil, 0o600); err != nil {
-		t.Fatalf("plant durable empty file: %v", err)
+	tokenBytes, err := hex.DecodeString(token)
+	if err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "spool", id), tokenBytes, 0o600); err != nil {
+		t.Fatalf("plant durable token file: %v", err)
 	}
 	svc.Close()
 
@@ -1504,16 +1541,273 @@ func TestServiceRestartFinishesCreatingRowWithFile(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer svc2.Close()
-	st, err := svc2.Status(context.Background(), id, "backend/api", "user:alice")
+	if _, err := svc2.Status(context.Background(), id, "backend/api", "user:alice"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale creating row survived as a session: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "spool", id)); !os.IsNotExist(err) {
+		t.Fatalf("attributable file survived rollback: %v", err)
+	}
+}
+
+// TestServiceRestartLeavesLiveCreatingAlone proves startup never touches a
+// LIVE creating lease (created_at fresh): with and without a durable token
+// file the row and the file are left exactly as they are, and a subsequent
+// Create still works.
+func TestServiceRestartLeavesLiveCreatingAlone(t *testing.T) {
+	svc, dir := newTestService(t)
+	now := time.Now().UTC()
+	id := strings.Repeat("a", 64)
+	token := strings.Repeat("6", 64)
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
 	if err != nil {
-		t.Fatalf("finished creating row not active: %v", err)
+		t.Fatalf("raw open: %v", err)
 	}
-	if st.State != StateActive || st.Offset != 0 {
-		t.Fatalf("finished session: %+v", st)
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?, ?)`, id, now.Add(-time.Second).UnixNano(), now.Add(time.Hour).UnixNano(), token); err != nil {
+		t.Fatalf("seed live creating row: %v", err)
 	}
-	st = mustAppend(t, svc2, st, "data")
-	if st.Offset != 4 {
-		t.Fatalf("offset after append = %d, want 4", st.Offset)
+	db.Close()
+	tokenBytes, err := hex.DecodeString(token)
+	if err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "spool", id), tokenBytes, 0o600); err != nil {
+		t.Fatalf("plant durable token file: %v", err)
+	}
+	svc.Close()
+
+	svc2, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("reopen with live lease: %v", err)
+	}
+	defer svc2.Close()
+	if _, err := svc2.Status(context.Background(), id, "backend/api", "user:alice"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("creating row became visible: %v", err)
+	}
+	// The file is untouched and unadopted.
+	fi, err := os.Lstat(filepath.Join(dir, "spool", id))
+	if err != nil || fi.Size() != int64(len(tokenBytes)) {
+		t.Fatalf("live lease file was modified: %v size=%v", err, fi.Size())
+	}
+	// A genuinely new create still works alongside the live lease.
+	s := mustCreate(t, svc2, "backend/api", "user:alice")
+	if s.ID == id {
+		t.Fatalf("create collided with the live creating id")
+	}
+}
+
+// TestServiceRestartRejectsWrongTokenFile proves a creating-row file that
+// does NOT carry the row's token is unknown residue: startup fails closed
+// and the file is never touched.
+func TestServiceRestartRejectsWrongTokenFile(t *testing.T) {
+	svc, dir := newTestService(t)
+	now := time.Now().UTC()
+	id := strings.Repeat("b", 64)
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?, ?)`, id, now.Add(-time.Hour).UnixNano(), now.Add(time.Hour).UnixNano(), strings.Repeat("8", 64)); err != nil {
+		t.Fatalf("seed creating row: %v", err)
+	}
+	db.Close()
+	// Attacker plants a 32-byte file with a DIFFERENT token.
+	if err := os.WriteFile(filepath.Join(dir, "spool", id), make([]byte, 32), 0o600); err != nil {
+		t.Fatalf("plant file: %v", err)
+	}
+	svc.Close()
+
+	svc2, err := NewService(context.Background(), filepath.Join(dir, "spool"), filepath.Join(dir, "staging.db"))
+	if err == nil {
+		svc2.Close()
+		t.Fatal("startup accepted a wrong-token creating file")
+	}
+	if !errors.Is(err, ErrDependency) {
+		t.Fatalf("startup error: %v, want ErrDependency", err)
+	}
+	fi, err := os.Lstat(filepath.Join(dir, "spool", id))
+	if err != nil || fi.Size() != 32 {
+		t.Fatalf("attacker file was modified: %v size=%v", err, fi.Size())
+	}
+}
+
+// TestServiceCreateBarrierAcrossInstances proves startup never touches a
+// live Create on another instance: A is paused after its durable token file
+// (before activation), B constructs cleanly, and A's guarded activation
+// still completes. A stale variant proves a rollback by a third instance
+// makes A's activation fail closed with no residue.
+func TestServiceCreateBarrierAcrossInstances(t *testing.T) {
+	dir := tempPrivate(t)
+	spoolDir := filepath.Join(dir, "spool")
+	dbPath := filepath.Join(dir, "staging.db")
+
+	svcA, err := NewService(context.Background(), spoolDir, dbPath)
+	if err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	defer svcA.Close()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var barrierOnce sync.Once
+	svcA.createBarrier = func() {
+		barrierOnce.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+
+	var ses Session
+	var createErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ses, createErr = svcA.Create(context.Background(), "backend/api", "user:alice", time.Hour)
+	}()
+	<-entered // A is at the activation barrier with a durable token file.
+
+	// B constructs while A's create is live: the lease is fresh, so startup
+	// leaves A's row and file alone.
+	svcB, err := NewService(context.Background(), spoolDir, dbPath)
+	if err != nil {
+		t.Fatalf("B during live create: %v", err)
+	}
+	defer svcB.Close()
+	if _, err := svcB.Status(context.Background(), strings.Repeat("a", 64), "backend/api", "user:alice"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("B sees a phantom session: %v", err)
+	}
+
+	close(release)
+	wg.Wait()
+	if createErr != nil {
+		t.Fatalf("A create after barrier: %v", createErr)
+	}
+	// The session is active and usable by both instances.
+	st, err := svcB.Status(context.Background(), ses.ID, "backend/api", "user:alice")
+	if err != nil || st.State != StateActive {
+		t.Fatalf("B cannot see the completed session: %+v %v", st, err)
+	}
+	_ = mustAppend(t, svcB, st, "data")
+
+	// Stale variant: another instance rolls the live create back by aging
+	// its lease, and A's guarded activation then fails closed.
+	svcA2, err := NewService(context.Background(), spoolDir, dbPath)
+	if err != nil {
+		t.Fatalf("A2: %v", err)
+	}
+	entered2 := make(chan struct{})
+	release2 := make(chan struct{})
+	svcA2.createBarrier = func() {
+		close(entered2)
+		<-release2
+	}
+	var createErr2 error
+	wg = sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, createErr2 = svcA2.Create(context.Background(), "backend/api", "user:alice", time.Hour)
+	}()
+	<-entered2
+	// Age the lease: recreate the SAME creating row with the same token but
+	// an old created_at (the identity trigger forbids updating timestamps,
+	// so the row is tombstoned and re-inserted). The durable token file
+	// stays in place, so the row becomes stale-and-attributable to a third
+	// instance, and A2's activation — guarded by the created_at anchor —
+	// must then fail closed.
+	db, err := sqlOpenForTest(dbPath)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	var rowID, rowTok string
+	if err := db.QueryRow(`select id, create_token from upload_sessions where state='creating'`).Scan(&rowID, &rowTok); err != nil {
+		t.Fatalf("read live row: %v", err)
+	}
+	if _, err := db.Exec(`update upload_sessions set state='deleting', create_token=null where id = ?`, rowID); err != nil {
+		t.Fatalf("tombstone live row: %v", err)
+	}
+	if _, err := db.Exec(`delete from upload_sessions where id = ?`, rowID); err != nil {
+		t.Fatalf("drop live row: %v", err)
+	}
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?, ?)`,
+		rowID, time.Now().Add(-time.Hour).UnixNano(), time.Now().Add(time.Hour).UnixNano(), rowTok); err != nil {
+		t.Fatalf("recreate aged row: %v", err)
+	}
+	db.Close()
+	// C's startup sees a stale, token-attributable creating row: it rolls it
+	// back AND removes its attributable file.
+	svcC, err := NewService(context.Background(), spoolDir, dbPath)
+	if err != nil {
+		t.Fatalf("C during stale create: %v", err)
+	}
+	var creating sql.NullString
+	dbb, err := sqlOpenForTest(dbPath)
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if err := dbb.QueryRow(`select state from upload_sessions where id = ?`, rowID).Scan(&creating); err == nil || !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("C left the stale creating row (state=%v err=%v)", creating, err)
+	}
+	dbb.Close()
+	if _, err := os.Lstat(filepath.Join(spoolDir, rowID)); !os.IsNotExist(err) {
+		t.Fatalf("C left the stale create's attributable file: %v", err)
+	}
+	close(release2)
+	wg.Wait()
+	if createErr2 == nil || !errors.Is(createErr2, ErrDependency) {
+		t.Fatalf("A's stale activation must fail closed, got %v", createErr2)
+	}
+	files, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	// The stale create left no residue: the only spool entry is the first
+	// (successful) session.
+	var names []string
+	for _, e := range files {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != ses.ID {
+		t.Fatalf("stale create left residue: %v (want only %s)", names, ses.ID)
+	}
+	svcC.Close()
+	svcA2.Close()
+}
+
+// TestServiceCreateActivationCommitFault proves a commit fault on the
+// ACTIVATING transaction (the creating row committed, the activation did
+// not) is rolled back fully: the attributable file is removed and the row
+// disappears.
+func TestServiceCreateActivationCommitFault(t *testing.T) {
+	svc, dir := newTestService(t)
+	var once atomic.Int32
+	svc.commitHook = func() error {
+		if once.Add(1) == 2 {
+			return errors.New("activation commit fault")
+		}
+		return nil
+	}
+	if _, err := svc.Create(context.Background(), "backend/api", "user:alice", time.Hour); !errors.Is(err, ErrDependency) {
+		t.Fatalf("Create: %v, want ErrDependency", err)
+	}
+	// The rollback is convergent: no row, no file.
+	var n int
+	db, err := sqlOpenForTest(filepath.Join(dir, "staging.db"))
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	if err := db.QueryRow(`select count(*) from upload_sessions`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	db.Close()
+	if n != 0 {
+		t.Fatalf("activation fault left %d rows", n)
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "spool"))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("activation fault left spool entries: %v", entries)
 	}
 }
 
@@ -2119,21 +2413,6 @@ func TestServiceOwnerMismatchIdentityEqualsNotFound(t *testing.T) {
 				return svc.MarkFinalized(ctx, s.ID, "other/app", "user:alice", digest, ref, media, size)
 			},
 		},
-		{
-			name: "Delete",
-			missing: func() error {
-				// Deleting a never-existing row is the documented idempotent
-				// no-op (not part of the not-found family); what must be the
-				// exact ErrNotFound sentinel is the wrong-owner delete.
-				if err := svc.Delete(ctx, missingID, "backend/api", "user:alice"); err != nil {
-					t.Fatalf("idempotent delete of a missing row must succeed, got: %v", err)
-				}
-				return svc.Delete(ctx, s.ID, "other/app", "user:alice")
-			},
-			foreign: func() error {
-				return svc.Delete(ctx, s.ID, "other/app", "user:alice")
-			},
-		},
 	}
 	for _, p := range pairs {
 		t.Run(p.name, func(t *testing.T) {
@@ -2172,6 +2451,12 @@ func TestServiceOwnerMismatchIdentityEqualsNotFound(t *testing.T) {
 			}
 		})
 	}
+	// Delete is idempotent and confidential: absent and wrong-owner ids are
+	// EXACTLY nil and identical, and the foreign row is untouched (no
+	// existence oracle).
+	if a, b := svc.Delete(ctx, missingID, "backend/api", "user:alice"), svc.Delete(ctx, s.ID, "other/app", "user:alice"); a != nil || b != nil {
+		t.Fatalf("absent delete = %v, wrong-owner delete = %v; both must be identical nil", a, b)
+	}
 	// Wrong-owner Delete over the REAL owner's session was already exercised
 	// above (foreign Delete); the session must still be owned by alice.
 	st, err := svc.Status(ctx, s.ID, s.Repo, s.Actor)
@@ -2192,7 +2477,7 @@ func TestServiceCreatingInvisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raw open: %v", err)
 	}
-	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano()); err != nil {
+	if _, err := db.Exec(`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at, create_token) values (?, 'backend/api', 'user:alice', 'creating', 0, ?, ?, ?)`, id, now.UnixNano(), now.Add(time.Hour).UnixNano(), strings.Repeat("2", 64)); err != nil {
 		t.Fatalf("seed creating row: %v", err)
 	}
 	db.Close()

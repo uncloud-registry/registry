@@ -295,6 +295,31 @@ func causeOf(err error) error {
 	return nil
 }
 
+// ctxOr is the context-authority gate for every context-capable call: when
+// the live context is done, the EXACT context error (context.Canceled or
+// context.DeadlineExceeded) is the only sanctioned result — the raw driver
+// error is dropped and never wrapped or echoed. When the context is alive
+// the raw error is returned unchanged (callers wrap it with their sentinel
+// after this gate). Attacker-controlled sentinels carried inside a raw
+// error can therefore never masquerade as a context result: only ctx.Err()
+// of the actual request context decides.
+func ctxOr(err error, ctx context.Context) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return err
+}
+
+// depErr is ctxOr followed by the data-free ErrDependency wrap: a canceled
+// context surfaces as the exact context error, everything else becomes the
+// fixed dependency sentinel with the raw cause retained privately.
+func depErr(err error, ctx context.Context) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return typed(ErrDependency, err)
+}
+
 // copyBufSize is the fixed streaming-copy buffer used by Append. Bounded
 // memory by construction: no production read path allocates by body size.
 const copyBufSize = 32 * 1024
