@@ -363,7 +363,7 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 	ref, err := h.Uploader.PutStream(r.Context(), rc2, n, batchID)
 	rc2.Close()
 	if err != nil {
-		if errors.Is(err, ErrUploaderPreSideEffect) {
+		if errors.Is(err, resolve.ErrUploaderPreSideEffect) {
 			// CONCLUSIVELY no external write occurred (the request was never
 			// sent): safe to RELEASE the durable claim back to active so a
 			// corrected finalize flows through a fresh claim. The release is

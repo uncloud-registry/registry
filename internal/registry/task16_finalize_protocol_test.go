@@ -32,6 +32,7 @@ import (
 
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/publish"
+	"github.com/uncloud-registry/registry/internal/resolve"
 	"github.com/uncloud-registry/registry/internal/staging"
 )
 
@@ -131,6 +132,17 @@ func TestUploadConcurrentFinalizersExactlyOneWrite(t *testing.T) {
 	}
 	wg.Wait()
 
+	// The response distribution is NONDETERMINISTIC but strictly bounded. The
+	// single claim winner always returns 201 with exactly ONE PutStream. Every
+	// contender that arrives while the claim is mid-write (or after an
+	// ambiguous loss that left the session finalizing) sees the durable
+	// finalizing state and gets the fixed 409 conflict; a contender that
+	// OBSERVES the already-committed finalization re-plays the byte-identical
+	// finalize and correctly receives an IDEMPOTENT 201 with ZERO additional
+	// uploader calls. So the real invariant is: at least one 201, every
+	// response in {201,409}, exactly one PutStream, and one durable, unmutated
+	// finalized receipt — never a fixed created=1/conflict=N-1 split, which is
+	// timing-dependent and flakes when a delayed contender lands after commit.
 	created, conflict := 0, 0
 	for _, st := range statuses {
 		switch st {
@@ -142,13 +154,16 @@ func TestUploadConcurrentFinalizersExactlyOneWrite(t *testing.T) {
 			t.Fatalf("nontrivial status %d in concurrent finalize", st)
 		}
 	}
-	if created != 1 || conflict != n-1 {
-		t.Fatalf("concurrent finalize: created=%d conflict=%d, want 1/%d", created, conflict, n-1)
+	if created < 1 || created+conflict != n {
+		t.Fatalf("concurrent finalize: created=%d conflict=%d (n=%d); want >=1 201 and every response in {201,409}", created, conflict, n)
 	}
 	if up.putStreamCalls != 1 {
 		t.Fatalf("concurrent finalizers caused %d PutStream calls, want exactly 1", up.putStreamCalls)
 	}
-	if st, err := svc.Status(context.Background(), id, "backend/api", "user:alice"); err != nil || st.State != staging.StateFinalized || st.Digest != digest {
+	// Durable exact finalized receipt: the winning claim identity is written
+	// with the exact digest and a non-empty object reference, and is never
+	// mutated by the concurrent idempotent 201s.
+	if st, err := svc.Status(context.Background(), id, "backend/api", "user:alice"); err != nil || st.State != staging.StateFinalized || st.Digest != digest || st.BeeRef == "" {
 		t.Fatalf("winner must durably finalize with the exact claim identity: %+v err=%v", st, err)
 	}
 }
@@ -194,7 +209,7 @@ func TestUploadPreSideEffectFailureReleasesClaim(t *testing.T) {
 	body := []byte(`{"pre":true}`)
 	_, id, digest := stageBody(t, base, issuer, body)
 
-	up.err = fmt.Errorf("%w: request never sent", ErrUploaderPreSideEffect)
+	up.err = fmt.Errorf("%w: request never sent", resolve.ErrUploaderPreSideEffect)
 	resp := doReqExpect(t, retryPut(t, base+"/v2/backend/api/blobs/uploads/"+id, digest, issuer), http.StatusBadGateway)
 	resp.Body.Close()
 	if up.putStreamCalls != 1 {

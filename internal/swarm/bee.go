@@ -20,7 +20,6 @@ import (
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
-	"github.com/uncloud-registry/registry/internal/registry"
 	"github.com/uncloud-registry/registry/internal/resolve"
 )
 
@@ -350,13 +349,13 @@ func (s *BeeObjectStore) Put(ctx context.Context, data []byte, batchID string) (
 // before any request.
 func (s *BeeObjectStore) PutStream(ctx context.Context, src io.Reader, size int64, batchID string) (string, error) {
 	if src == nil {
-		return "", fmt.Errorf("%w: stream source is nil", registry.ErrUploaderPreSideEffect)
+		return "", fmt.Errorf("%w: stream source is nil", resolve.ErrUploaderPreSideEffect)
 	}
 	if size < 0 {
-		return "", fmt.Errorf("%w: negative stream size", registry.ErrUploaderPreSideEffect)
+		return "", fmt.Errorf("%w: negative stream size", resolve.ErrUploaderPreSideEffect)
 	}
 	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
-		return "", fmt.Errorf("%w: empty or oversized postage batch id", registry.ErrUploaderPreSideEffect)
+		return "", fmt.Errorf("%w: empty or oversized postage batch id", resolve.ErrUploaderPreSideEffect)
 	}
 
 	reqCtx, cancel := writeRequestContext(ctx)
@@ -365,7 +364,7 @@ func (s *BeeObjectStore) PutStream(ctx context.Context, src io.Reader, size int6
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, s.BaseURL+"/bytes", src)
 	if err != nil {
 		// No request was ever sent: conclusively no side effect.
-		return "", fmt.Errorf("%w: %v", registry.ErrUploaderPreSideEffect, sanitizeBeeTransportError(reqCtx, "create bee bytes stream put request", err))
+		return "", fmt.Errorf("%w: %v", resolve.ErrUploaderPreSideEffect, sanitizeBeeTransportError(reqCtx, "create bee bytes stream put request", err))
 	}
 	req.ContentLength = size
 	req.Header.Set("Content-Type", "application/octet-stream")
