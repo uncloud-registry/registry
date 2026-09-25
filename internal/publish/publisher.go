@@ -132,6 +132,49 @@ func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current 
 	return receipt, err
 }
 
+// IsGenerationConflict reports whether err is the AUTHORITATIVE
+// control-plane generation-conflict sentinel — the repository-generation
+// comparison at the feed signer found the expected generation stale because
+// the feed advanced elsewhere. Only this conflict class is safe to recover by
+// a rebuild; a binding conflict (same operation ID, different logical payload)
+// is a hard 409 to the caller and must NEVER be retried or rebuilt.
+func IsGenerationConflict(err error) bool { return errors.Is(err, ErrCommitConflict) }
+
+// RebuildResolver re-resolves the current repository state (its generation and
+// content) inside the caller's held publication lock. found=false reports a
+// conclusively absent (generation-zero, never-written) repository.
+type RebuildResolver func(ctx context.Context) (current spec.RepoStateDocument, found bool, err error)
+
+// PublishCommitWithConflictRebuild is the conflict-safe publication entry
+// point. It commits the immutable state reference exactly like PublishCommit,
+// but when the control plane reports an AUTHORITATIVE generation conflict (the
+// repository feed advanced elsewhere) it re-resolves the newest state through
+// reResolve and rebuilds ONCE, reusing the exact stable operation ID and its
+// deterministic timestamp (input.UpdatedAt derives from operationID) so a
+// lost-response retry of this same logical publication stays byte-stable. The
+// rebuild re-runs the strict input validation (via PublishCommit) against the
+// fresh state, so it proceeds only while the original staged inputs remain
+// valid and coherent — otherwise it fails typed with zero feed writes. Retries
+// are bounded to this single rebuild: if the fresh state did not actually
+// advance, re-resolving failed, or the rebuild itself conflicts again, the
+// ORIGINAL conflict (mapped to 409 by the caller) is returned. Different
+// operations never inherit another operation's success: the operation ID is
+// unchanged, and only a feed that never recorded it is re-advanced.
+func (p Publisher) PublishCommitWithConflictRebuild(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, operationID string, reResolve RebuildResolver) (PublicationReceipt, error) {
+	receipt, err := p.PublishCommit(ctx, stateFeed, current, input, batchID, registryID, owner, operationID)
+	if err == nil || !IsGenerationConflict(err) {
+		return receipt, err
+	}
+	fresh, _, rerr := reResolve(ctx)
+	if rerr != nil || fresh.Generation <= current.Generation {
+		// Not safely rebuildable: the feed did not durably advance for us, so
+		// surrender the original conflict rather than risk an orphaned write
+		// becoming authoritative.
+		return PublicationReceipt{}, err
+	}
+	return p.PublishCommit(ctx, stateFeed, fresh, input, batchID, registryID, owner, operationID)
+}
+
 func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, PublicationReceipt, error) {
 	// Strict pre-upload validation: parse the artifact, verify the
 	// handler-provided digest/size/media against the actual body, and confirm

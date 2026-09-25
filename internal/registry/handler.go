@@ -56,7 +56,14 @@ type Handler struct {
 	// It is nil in modes without a control plane (in-memory/dev), where the
 	// feed read-back retry recognition still governs idempotency but no
 	// durable cross-request binding exists.
-	Preflight  publish.OperationBinder
+	Preflight publish.OperationBinder
+	// Locker serializes the read/build/commit/verify decision per canonical
+	// owner+repository inside the registry process. It is an in-process
+	// corrective boundary only; cross-process correctness is enforced by the
+	// authoritative control-plane generation comparison at commit. NewHandler
+	// always installs a fresh locker; callers that construct Handler directly
+	// must set it before serving manifest PUTs.
+	Locker     *publish.RepositoryLocker
 	SessionTTL time.Duration
 	AuthRealm  string
 	// MaxUploadBytes bounds any single upload; when >0 it also bounds the
@@ -78,6 +85,7 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 		Staging:        stageStore,
 		Publisher:      publisher,
 		Preflight:      preflight,
+		Locker:         publish.NewRepositoryLocker(),
 		SessionTTL:     15 * time.Minute,
 		AuthRealm:      authRealm,
 	}
@@ -331,37 +339,6 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		return
 	}
 
-	// Safe first-publication resolution: a CONCLUSIVELY absent repository feed
-	// (generation zero, never written) is NOT an error — publication proceeds
-	// to create the repository as generation zero. Network, timeout, decode,
-	// integrity, and repo-mismatch failures stay typed errors. This optional
-	// resolution runs ONLY on the authorized manifest PUT path; pull and list
-	// paths keep the strict resolver and never synthesize missing state.
-	//
-	// Task 13 (round 1): the handler BRANCHES on found — when the feed is
-	// conclusively absent it constructs the EXACT generation-zero document
-	// (version 1, the canonical REQUEST repo, generation 0, NON-NIL empty
-	// Tags/Manifests/Blobs maps) BEFORE handing it to the Publisher/Builder.
-	// A found=true state is passed through UNCHANGED. The constructed maps are
-	// fresh per request, so concurrent first pushes can never alias each
-	// other's state.
-	current, found, err := h.Resolver.ResolveRepoStateOptional(r.Context(), registryIdentity, repo)
-	if err != nil {
-		status, code, message := classifyPublicationError(err)
-		writeError(w, status, code, message)
-		return
-	}
-	if !found {
-		current = spec.RepoStateDocument{
-			Version:    1,
-			Repo:       repo,
-			Generation: 0,
-			Tags:       map[string]string{},
-			Manifests:  map[string]spec.ManifestDescriptor{},
-			Blobs:      map[string]spec.BlobDescriptor{},
-		}
-	}
-
 	body, err := io.ReadAll(io.LimitReader(r.Body, publish.MaxArtifactBodyBytes+1))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", "failed to read the manifest body")
@@ -401,159 +378,192 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		},
 	}
 
-	// Restart-safe retry recognition BEFORE any write: the effective feed is
-	// the durable truth — if it already carries this exact tag→digest mapping
-	// at generation >= 1, the client may be retrying a lost response. The
-	// prior publication's IDENTITY is recovered from the DURABLE per-tag
-	// publication provenance recorded in the immutable repo-state document —
-	// the exact operation that produced THIS tag's mapping, retained across
-	// unrelated publications — never re-inferred from the current generation.
-	// The prior publication is re-VERIFIED through the production
-	// feed/document path and the verified 201 is returned without touching
-	// the feed, the object store, or staging again.
+	// The ENTIRE read/build/commit/verify decision for one owner+repository is
+	// serialized through the per-repository publication lock, so two concurrent
+	// publications to the same owner+repo cannot interleave their state reads,
+	// object writes, commits, or staging consumption. Current repository state
+	// is RE-RESOLVED inside the lock — a state read taken before waiting may be
+	// stale by the time the lock is granted — and every side effect (retry
+	// recognition, preflight binding, staging read, object upload, feed commit,
+	// read-after-write verification, staging consumption) happens under it. A
+	// canceled waiter therefore performs ZERO immutable/feed/staging writes.
 	//
-	// An explicit key can fast-path ONLY when it equals the exact recorded
-	// operation ID (and its durable binding is validated below, before any
-	// answer). A DISTINCT explicit key — including an arbitrary, new, or
-	// previously-conflicting one — never fast-paths: it falls through to the
-	// preflight where it becomes a genuine new operation or a hard conflict,
-	// and is never echoed as a prior success. A document WITHOUT provenance
-	// (legacy valid state) falls through to a fresh publication. If the feed
-	// advanced incompatibly, the effort falls through to a fresh publication
-	// whose generation check at the control plane conflicts rather than
-	// overwrites.
-	if found && current.Generation >= 1 {
-		if mappedDigest, mapped := current.Tags[reference]; mapped && mappedDigest == manifestDigest {
-			if pub, hasProvenance := current.TagPublications[reference]; hasProvenance && pub.OperationID != "" && pub.Digest == manifestDigest {
-				if clientOperationID == "" || clientOperationID == pub.OperationID {
-					if clientOperationID != "" {
-						// An explicit key is never echoed as prior success
-						// without a VALID durable binding to this exact
-						// logical payload: revalidate the binding first.
-						if err := h.Preflight.Bind(r.Context(), publish.OperationBindingRequest{
-							OperationID:    clientOperationID,
-							RegistryID:     registryIdentity.RegistryID,
-							Owner:          registryIdentity.Owner,
-							Repo:           repo,
-							Tag:            reference,
-							ManifestDigest: manifestDigest,
-						}); err != nil {
-							status, code, message := classifyPublicationError(err)
-							writeError(w, status, code, message)
-							return
-						}
-					}
-					verr := VerifyPublishedRetryState(r.Context(), h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
-					if verr == nil {
-						writePublishedSuccess(w, repo, reference, manifestDigest, pub.OperationID)
-						return
-					}
-					if errors.Is(verr, ErrTargetNotCurrentState) {
-						// Effective feed advanced incompatibly since
-						// resolution: not a retry. Fall through to the normal
-						// publish path.
-					} else {
-						status, code, message := classifyPublicationError(verr)
-						writeError(w, status, code, message)
-						return
-					}
-				}
-				// A distinct explicit key: not a retry of the recorded
-				// operation. Fall through to the preflight/publish path.
+	// The lock is an IN-PROCESS corrective boundary only. Cross-process
+	// correctness across independent registry instances is enforced by the
+	// AUTHORITATIVE control-plane generation comparison at commit (see
+	// PublishCommitWithConflictRebuild), never by this lock alone.
+	err = h.Locker.WithLock(r.Context(), registryIdentity.Owner, repo, func(ctx context.Context) error {
+		// Re-resolve the current state inside the lock. Safe first-publication
+		// resolution: a CONCLUSIVELY absent repository feed (generation zero,
+		// never written) is NOT an error — publication proceeds to create the
+		// repository as generation zero. Network, timeout, decode, integrity,
+		// and repo-mismatch failures stay typed errors. When the feed is absent
+		// the handler constructs the EXACT generation-zero document (version 1,
+		// the canonical REQUEST repo, generation 0, NON-NIL empty Tags/
+		// Manifests/Blobs maps); found=true state is passed through UNCHANGED.
+		// The constructed maps are fresh per request, so concurrent first pushes
+		// can never alias each other's state.
+		current, found, err := h.Resolver.ResolveRepoStateOptional(ctx, registryIdentity, repo)
+		if err != nil {
+			return err
+		}
+		if !found {
+			current = spec.RepoStateDocument{
+				Version:    1,
+				Repo:       repo,
+				Generation: 0,
+				Tags:       map[string]string{},
+				Manifests:  map[string]spec.ManifestDescriptor{},
+				Blobs:      map[string]spec.BlobDescriptor{},
 			}
-			// No provenance for this tag (legacy document): the exact prior
-			// operation identity is not recoverable and is NEVER fabricated —
-			// fall through to a fresh publication.
 		}
-	}
 
-	// Explicit-key PREFLIGHT binding BEFORE any immutable object write. The
-	// control plane durably reserves this operation key for exactly this
-	// logical payload (registry + owner + repo + tag + manifest digest), so a
-	// reused key with a DIFFERENT payload is a 409 here — before the manifest
-	// and draft-state objects are uploaded, before any feed write, and before
-	// any staging consumption — and the durable binding survives process
-	// restarts, so a reconstructed handler rejects the same conflict with
-	// zero writes. The already-published case was answered above, so a
-	// genuine retry never pays a binding call; a same-key-same-payload
-	// request whose feed has NOT advanced passes the binding (a reservation
-	// never blocks its matching commit) and proceeds to the normal publish
-	// path. The key grammar was validated at the top of this handler, so an
-	// invalid or oversized key never reaches the control plane.
-	if clientOperationID != "" && h.Preflight != nil {
-		if err := h.Preflight.Bind(r.Context(), publish.OperationBindingRequest{
-			OperationID:    clientOperationID,
-			RegistryID:     registryIdentity.RegistryID,
-			Owner:          registryIdentity.Owner,
-			Repo:           repo,
-			Tag:            reference,
-			ManifestDigest: manifestDigest,
-		}); err != nil {
-			status, code, message := classifyPublicationError(err)
-			writeError(w, status, code, message)
-			return
+		// Restart-safe retry recognition inside the lock, against the freshly
+		// resolved state: if the effective feed already carries this exact
+		// tag→digest mapping at generation >= 1, the client may be retrying a
+		// lost response. The prior publication's IDENTITY is recovered from the
+		// DURABLE per-tag publication provenance in the immutable repo-state
+		// document — the exact operation that produced THIS tag's mapping,
+		// retained across unrelated publications — never re-inferred from the
+		// current generation. The prior publication is re-VERIFIED through the
+		// production feed/document path and the verified 201 is returned
+		// without touching the feed, the object store, or staging again.
+		//
+		// An explicit key can fast-path ONLY when it equals the exact recorded
+		// operation ID (and its durable binding is validated below, before any
+		// answer). A DISTINCT explicit key never fast-paths. A document WITHOUT
+		// provenance (legacy valid state) falls through to a fresh publication.
+		if found && current.Generation >= 1 {
+			if mappedDigest, mapped := current.Tags[reference]; mapped && mappedDigest == manifestDigest {
+				if pub, hasProvenance := current.TagPublications[reference]; hasProvenance && pub.OperationID != "" && pub.Digest == manifestDigest {
+					if clientOperationID == "" || clientOperationID == pub.OperationID {
+						if clientOperationID != "" {
+							// An explicit key is never echoed as prior success
+							// without a VALID durable binding to this exact
+							// logical payload: revalidate the binding first.
+							if err := h.Preflight.Bind(ctx, publish.OperationBindingRequest{
+								OperationID:    clientOperationID,
+								RegistryID:     registryIdentity.RegistryID,
+								Owner:          registryIdentity.Owner,
+								Repo:           repo,
+								Tag:            reference,
+								ManifestDigest: manifestDigest,
+							}); err != nil {
+								return err
+							}
+						}
+						verr := VerifyPublishedRetryState(ctx, h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
+						if verr == nil {
+							writePublishedSuccess(w, repo, reference, manifestDigest, pub.OperationID)
+							return nil
+						}
+						if !errors.Is(verr, ErrTargetNotCurrentState) {
+							return verr
+						}
+						// Effective feed advanced incompatibly: not a retry.
+						// Fall through to a fresh publication whose generation
+						// check at the control plane conflicts rather than
+						// overwrites.
+					}
+					// A distinct explicit key: not a retry. Fall through to the
+					// preflight/publish path. No-provenance documents also fall
+					// through; the exact prior operation identity is NEVER
+					// fabricated.
+				}
+			}
 		}
-	}
 
-	stagedBlobs, err := h.Staging.ListStagedBlobs(r.Context(), repo, actor)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "UNKNOWN", "internal server error")
-		return
-	}
-	blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
-	for _, blob := range stagedBlobs {
-		// Referenced-only staging selection: staged blobs this manifest does
-		// not reference never enter the build input.
-		if _, isRef := referencedDigests[blob.Digest]; !isRef {
-			continue
+		// Explicit-key PREFLIGHT binding BEFORE any immutable object write. The
+		// control plane durably reserves this operation key for exactly this
+		// logical payload, so a reused key with a DIFFERENT payload is a hard
+		// 409 here — before any object upload, feed write, or staging
+		// consumption — and the durable binding survives process restarts.
+		if clientOperationID != "" && h.Preflight != nil {
+			if err := h.Preflight.Bind(ctx, publish.OperationBindingRequest{
+				OperationID:    clientOperationID,
+				RegistryID:     registryIdentity.RegistryID,
+				Owner:          registryIdentity.Owner,
+				Repo:           repo,
+				Tag:            reference,
+				ManifestDigest: manifestDigest,
+			}); err != nil {
+				return err
+			}
 		}
-		blobMap[blob.Digest] = spec.BlobDescriptor{
-			SwarmRef:  blob.SwarmRef,
-			Size:      blob.Size,
-			MediaType: blob.MediaType,
+
+		stagedBlobs, err := h.Staging.ListStagedBlobs(ctx, repo, actor)
+		if err != nil {
+			return err
 		}
-	}
+		blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
+		for _, blob := range stagedBlobs {
+			// Referenced-only staging selection: staged blobs this manifest
+			// does not reference never enter the build input.
+			if _, isRef := referencedDigests[blob.Digest]; !isRef {
+				continue
+			}
+			blobMap[blob.Digest] = spec.BlobDescriptor{
+				SwarmRef:  blob.SwarmRef,
+				Size:      blob.Size,
+				MediaType: blob.MediaType,
+			}
+		}
 
-	operationID := clientOperationID
-	if operationID == "" {
-		operationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation)
-	}
-	input.StagedBlobs = blobMap
-	// Byte-stable state rebuilds across retries: the state timestamp is
-	// derived deterministically from the operation identity, never the clock.
-	input.UpdatedAt = publish.DeterministicUpdatedAt(operationID)
+		// The operation identity is derived from the CURRENT (lock-resolved)
+		// generation: two concurrent publications to the same owner+repo get
+		// distinct deterministic operation IDs matching their actual resulting
+		// generations, while a lost-response retry of one logical publication
+		// recomputes the identical ID and timestamp.
+		operationID := clientOperationID
+		if operationID == "" {
+			operationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation)
+		}
+		input.StagedBlobs = blobMap
+		// Byte-stable state rebuilds across retries and conflict rebuilds: the
+		// state timestamp is derived deterministically from the operation
+		// identity, never the clock.
+		input.UpdatedAt = publish.DeterministicUpdatedAt(operationID)
 
-	receipt, err := h.Publisher.PublishCommit(r.Context(), stateFeed, current, input, batchID, registryIdentity.RegistryID, registryIdentity.Owner, operationID)
+		// Publish through the conflict-safe commit path. On an AUTHORITATIVE
+		// generation conflict (feed advanced elsewhere) it re-resolves the
+		// newest state and rebuilds ONCE with the same operation id/timestamp,
+		// so concurrent publications and crash-point retries advance the feed
+		// at most once per resolved operation. Distinct operations never
+		// inherit another operation's success.
+		receipt, err := h.Publisher.PublishCommitWithConflictRebuild(ctx, stateFeed, current, input, batchID, registryIdentity.RegistryID, registryIdentity.Owner, operationID, func(cctx context.Context) (spec.RepoStateDocument, bool, error) {
+			return h.Resolver.ResolveRepoStateOptional(cctx, registryIdentity, repo)
+		})
+		if err != nil {
+			return err
+		}
+
+		// Read-after-write verification BEFORE the 201: the exact committed
+		// state reference must resolve through the effective feed and decode to
+		// exact, coherent repository state. A 201 is only ever produced after
+		// this verification passes; on failure the referenced staging is
+		// RETAINED for a safe retry (never cleared before verified publication).
+		if err := VerifyPublishedState(ctx, h.Resolver.Feeds, h.Resolver.Docs, receipt, input, artifact); err != nil {
+			return err
+		}
+
+		// Consume ONLY the staged digests the published manifest referenced;
+		// unrelated staged blobs remain staged for a later manifest.
+		consumed := make([]string, 0, len(referencedDigests))
+		for digest := range referencedDigests {
+			consumed = append(consumed, digest)
+		}
+		if err := h.Staging.ClearStagedBlobsByDigest(ctx, repo, actor, consumed); err != nil {
+			return err
+		}
+
+		writePublishedSuccess(w, repo, reference, manifestDigest, operationID)
+		return nil
+	})
+
 	if err != nil {
 		status, code, message := classifyPublicationError(err)
 		writeError(w, status, code, message)
-		return
 	}
-
-	// Read-after-write verification BEFORE the 201: the exact committed state
-	// reference must resolve through the effective feed and decode to exact,
-	// coherent repository state (generation, repo, tag→digest, manifest
-	// descriptor and object bytes, referenced blob records). A 201 is only
-	// ever produced after this verification passes; on failure the referenced
-	// staging is RETAINED for a safe retry.
-	if err := VerifyPublishedState(r.Context(), h.Resolver.Feeds, h.Resolver.Docs, receipt, input, artifact); err != nil {
-		status, code, message := classifyPublicationError(err)
-		writeError(w, status, code, message)
-		return
-	}
-
-	// Consume ONLY the staged digests the published manifest referenced;
-	// unrelated staged blobs remain staged for a later manifest.
-	consumed := make([]string, 0, len(referencedDigests))
-	for digest := range referencedDigests {
-		consumed = append(consumed, digest)
-	}
-	if err := h.Staging.ClearStagedBlobsByDigest(r.Context(), repo, actor, consumed); err != nil {
-		writeError(w, http.StatusInternalServerError, "UNKNOWN", "internal server error")
-		return
-	}
-
-	writePublishedSuccess(w, repo, reference, manifestDigest, operationID)
 }
 
 // writePublishedSuccess emits the verified 201 publication response with the

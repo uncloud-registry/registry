@@ -673,9 +673,21 @@ func TestMemoryDocumentStoreRoundTrip(t *testing.T) {
 // audience. It returns the handler plus the issuer used to sign fixtures.
 func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) (http.Handler, *auth.RegistryTokenIssuer) {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
+	h, issuer := newTestHandlerWithKeys(t, docs, feeds, nil, nil)
+	return h, issuer
+}
+
+// newTestHandlerWithKeys builds a handler like newTestHandler but from an
+// EXPLICIT key pair so multiple handlers can share one issuer/verifier during a
+// test. A nil pub/priv generates a fresh pair (identical to newTestHandler).
+func newTestHandlerWithKeys(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore, pub ed25519.PublicKey, priv ed25519.PrivateKey) (*Handler, *auth.RegistryTokenIssuer) {
+	t.Helper()
+	if pub == nil || priv == nil {
+		var err error
+		pub, priv, err = ed25519.GenerateKey(nil)
+		if err != nil {
+			t.Fatalf("generate key: %v", err)
+		}
 	}
 	keys := testKeySet{testKeyID: pub}
 	issuer, err := auth.NewRegistryTokenIssuer(priv, auth.RegistryIssuer, testKeyID)
@@ -718,7 +730,7 @@ func newTestHandler(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *reso
 		nil,
 		"https://auth.uncloud-registry.com/token",
 	)
-	return handler, issuer
+	return handler.(*Handler), issuer
 }
 
 // registryBearer issues a signed registry token through the given issuer and
