@@ -87,11 +87,15 @@ func TestRound4PoolCloseCannotReturnWhileReservationOutstanding(t *testing.T) {
 	}
 }
 
-// TestRound4PoolSuccessfulAcquireLinearizes proves that an acquire which
-// legitimately wins a free handle races Close correctly: the acquire is
-// accounted BEFORE Close may finish, so Close waits for that successful
-// handle's release instead of draining mid-flight and returning a handle
-// backed by a closed database.
+// TestRound4PoolSuccessfulAcquireLinearizes proves the linearization for an
+// acquire that actually WINS a free handle: once a handle is successfully
+// received it is already accounted (borrowed==1), so Close must wait for that
+// borrow's release instead of draining the channel mid-flight and returning a
+// handle backed by a closed database. The handle is acquired synchronously
+// BEFORE Close starts, so there is no select-to-resolve here (a racing acquire
+// may legally take either p.ch success or the p.closing errPoolClosed branch
+// — the losing branches are covered deterministically by the sibling
+// reservation-vs-close test and the round5 cancellation/close race tests).
 func TestRound4PoolSuccessfulAcquireLinearizes(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
@@ -105,44 +109,37 @@ func TestRound4PoolSuccessfulAcquireLinearizes(t *testing.T) {
 	p.ch <- c
 	ctx := context.Background()
 
-	type res struct {
-		conn *sql.Conn
-		err  error
+	// Deterministically win the only handle before Close can be in play.
+	h, err := p.acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
 	}
-	got := make(chan res, 1)
-	go func() {
-		h, err := p.acquire(ctx)
-		got <- res{h, err}
-	}()
-	// Wait until the acquire has reserved (borrowed==1): from here on close
-	// is structurally unable to complete before this acquire resolves.
-	waitBorrowed(t, p, 1)
+	if h == nil {
+		t.Fatal("acquire returned a nil handle")
+	}
+
+	// Close must block on this borrowed handle: it may not drain the idle set
+	// or close the database while a successful acquire is outstanding.
 	closeDone := make(chan struct{})
 	go func() { p.close(); close(closeDone) }()
 	select {
 	case <-closeDone:
-		t.Fatal("close completed while a successful acquire was in flight")
+		t.Fatal("close completed while a successful acquire's handle was borrowed")
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	r := <-got
-	if r.err != nil {
-		t.Fatalf("acquire racing close must succeed: %v", r.err)
-	}
-	if r.conn == nil {
-		t.Fatal("acquire returned a nil handle")
-	}
-	// Close is still blocked on this borrowed handle.
-	select {
-	case <-closeDone:
-		t.Fatal("close returned before the racing acquire's handle was released")
-	case <-time.After(50 * time.Millisecond):
-	}
-	p.release(r.conn)
+	// Release the borrow: close now drains the exact idle set (the released
+	// handle) and closes the database.
+	p.release(h)
 	select {
 	case <-closeDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("close did not complete after the racing handle was released")
+		t.Fatal("close did not complete after the successful acquirer released")
+	}
+
+	// No successful acquire may follow Close.
+	if _, err := p.acquire(context.Background()); !errors.Is(err, errPoolClosed) {
+		t.Fatalf("acquire after close: %v, want errPoolClosed", err)
 	}
 }
 
