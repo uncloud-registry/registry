@@ -23,9 +23,14 @@ import (
 // Request bodies are STREAMED through staging.Append with a fixed buffer and
 // a real limit+1 boundary — never io.ReadAll. Content-Range is parsed with one
 // strict grammar; stale/future offsets make zero durable change and answer a
-// documented 416 with the accurate current Range. Digest is verified by a
-// streaming hash BEFORE any Bee write; finalization streams the staged bytes
-// to the object uploader with an exact size and the explicit postage batch.
+// documented 416 with the accurate current Range. A declared range whose
+// chunked body is short or over-long is rejected BEFORE the durable offset
+// advances (the exact-span reader makes Append roll back its tail). Digest is
+// verified by a streaming hash BEFORE any Bee write; finalization streams the
+// staged bytes to the object uploader with an exact size and the explicit
+// postage batch. A finalize retried on an already-finalized session with the
+// matching canonical digest and no body is answered idempotently with ZERO
+// uploader calls.
 func (h *Handler) handleUploadV1(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, uploadID string, principal auth.Principal) {
 	actor := principal.Subject
 
@@ -116,8 +121,9 @@ func (h *Handler) uploadPatch(w http.ResponseWriter, r *http.Request, repo, uplo
 			return
 		}
 		if start != session.Offset {
-			// Noncontiguous start: 416 with the accurate current Range.
-			h.respondRangeNotSatisfiable(w, repo, uploadID, actor)
+			// Noncontiguous start: 416 with the accurate current Range
+			// (refetched under the REQUEST context, never a detached read).
+			h.respondRangeNotSatisfiable(w, r.Context(), repo, uploadID, actor)
 			return
 		}
 		if r.ContentLength >= 0 && r.ContentLength != span {
@@ -132,13 +138,32 @@ func (h *Handler) uploadPatch(w http.ResponseWriter, r *http.Request, repo, uplo
 		maxBytes = h.uploadMaxBytes()
 	}
 
-	updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, r.Body, maxBytes)
+	body := io.Reader(r.Body)
+	var exact *exactSpanReader
+	if present && r.ContentLength < 0 {
+		// A chunked/unknown-length body with a declared range: enforce the
+		// EXACT span so a short body fails the append BEFORE the durable
+		// offset advances (Task 15 rolls back the tail), and an over-long
+		// body trips the bounded overflow probe.
+		exact = newExactSpanReader(r.Body, maxBytes)
+		body = exact
+	}
+
+	updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, body, maxBytes)
 	if err != nil {
+		if exact != nil && exact.short {
+			// Short of the declared span: fixed range-invalid error, zero
+			// durable change.
+			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
+			return
+		}
 		h.classifyAppendError(w, r, repo, uploadID, actor, err)
 		return
 	}
+	// Defensive invariant: with the exact-span reader (chunked) or the
+	// pre-validated Content-Length, the committed offset always fills the
+	// declared span. The check is retained as a fail-closed guard.
 	if present && updated.Offset != end+1 {
-		// The body did not fill the declared range (shorter than span).
 		writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
 		return
 	}
@@ -158,6 +183,27 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 		return
 	}
 
+	// A finalized session is immutable. A retry that replays the SAME
+	// canonical digest with NO body and NO Content-Range is answered
+	// idempotently as 201 with the exact stored digest/location and ZERO
+	// object-uploader calls and ZERO staging mutation (the decision uses only
+	// the DURABLE finalized metadata, so it survives handler recreation and
+	// service restart). Any body, any Content-Range, or a differing digest on
+	// a finalized session is a fixed 409 invalid-state with zero uploader
+	// calls and zero staging mutation.
+	if session.State == staging.StateFinalized {
+		_, _, rangePresent, _ := parseContentRangeHeader(r.Header)
+		hasBody := r.ContentLength != 0
+		if rangePresent || hasBody || session.Digest != digest {
+			writeError(w, http.StatusConflict, "BLOB_UPLOAD_INVALID", messageAlreadyFinalized)
+			return
+		}
+		w.Header().Set("Docker-Content-Digest", session.Digest)
+		w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/%s", repo, digest))
+		w.WriteHeader(http.StatusCreated)
+		return
+	}
+
 	// Optional final chunk, subject to the same strict range/offset rules.
 	if r.ContentLength != 0 {
 		start, end, present, perr := parseContentRangeHeader(r.Header)
@@ -174,7 +220,7 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 				return
 			}
 			if start != session.Offset {
-				h.respondRangeNotSatisfiable(w, repo, uploadID, actor)
+				h.respondRangeNotSatisfiable(w, r.Context(), repo, uploadID, actor)
 				return
 			}
 			if r.ContentLength >= 0 && r.ContentLength != span {
@@ -188,11 +234,23 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 			writeError(w, http.StatusRequestEntityTooLarge, "BLOB_UPLOAD_INVALID", messageUploadTooLarge)
 			return
 		}
-		updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, r.Body, maxBytes)
+		body := io.Reader(r.Body)
+		var exact *exactSpanReader
+		if present && r.ContentLength < 0 {
+			exact = newExactSpanReader(r.Body, maxBytes)
+			body = exact
+		}
+		updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, body, maxBytes)
 		if err != nil {
+			if exact != nil && exact.short {
+				writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
+				return
+			}
 			h.classifyAppendError(w, r, repo, uploadID, actor, err)
 			return
 		}
+		// Defensive invariant (see uploadPatch): in reachable states the
+		// committed offset always fills the declared span.
 		if present && updated.Offset != end+1 {
 			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
 			return
@@ -261,7 +319,7 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 // stale/future offset is answered as 416 with the accurate current Range.
 func (h *Handler) classifyAppendError(w http.ResponseWriter, r *http.Request, repo, uploadID, actor string, err error) {
 	if errors.Is(err, staging.ErrOffsetMismatch) {
-		h.respondRangeNotSatisfiable(w, repo, uploadID, actor)
+		h.respondRangeNotSatisfiable(w, r.Context(), repo, uploadID, actor)
 		return
 	}
 	if errors.Is(err, staging.ErrTooLarge) {
@@ -273,14 +331,65 @@ func (h *Handler) classifyAppendError(w http.ResponseWriter, r *http.Request, re
 }
 
 // respondRangeNotSatisfiable answers 416 with the accurate current Range by
-// reloading the durable session.
-func (h *Handler) respondRangeNotSatisfiable(w http.ResponseWriter, repo, uploadID, actor string) {
-	if cur, err := h.Staging.Status(context.Background(), uploadID, repo, actor); err == nil {
+// reloading the durable session. The refetch runs under the REQUEST context —
+// never a detached context.Background read — so cancellation propagates and
+// can never start a detached database read. When the authoritative status is
+// unavailable (refetch failed or cancelled), the fixed data-free 416 is still
+// answered but without an authoritative Range header; nothing leaks or hangs.
+func (h *Handler) respondRangeNotSatisfiable(w http.ResponseWriter, ctx context.Context, repo, uploadID, actor string) {
+	if cur, err := h.Staging.Status(ctx, uploadID, repo, actor); err == nil {
 		w.Header().Set("Range", uploadRange(cur.Offset))
 		w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/uploads/%s", repo, uploadID))
 		w.Header().Set("Docker-Upload-UUID", uploadID)
 	}
 	writeError(w, http.StatusRequestedRangeNotSatisfiable, "RANGE_NOT_SATISFIABLE", "the upload offset does not match the reported range")
+}
+
+// errRangeTruncated is the fixed, data-free sentinel the exact-span reader
+// yields when a chunked/unknown-length request body reaches EOF before filling
+// the declared Content-Range span. It is distinct from io.ErrUnexpectedEOF so
+// a genuine transport-level truncation is not conflated with a short declared
+// range.
+var errRangeTruncated = errors.New("upload body shorter than declared range")
+
+// exactSpanReader wraps a chunked/unknown-length request body to enforce an
+// EXACT declared Content-Range span while streaming with bounded memory. It
+// returns errRangeTruncated (and sets short) the moment the underlying body
+// hits EOF before the span fills, so the durable Append sees a reader fault
+// and rolls back its tail and offset BEFORE any commit — a short body never
+// advances the durable offset. Bytes beyond the span are handed through so
+// the append's maxBytes+1 overflow probe rejects an over-long body. It owns
+// only a counter and a flag, never buffers the payload, and delegates reads to
+// the underlying body so request cancellation propagates identically.
+type exactSpanReader struct {
+	src   io.Reader
+	want  int64
+	count int64
+	short bool // body reached EOF before the declared span
+}
+
+// newExactSpanReader wraps src to require exactly want bytes (want >= 1).
+func newExactSpanReader(src io.Reader, want int64) *exactSpanReader {
+	return &exactSpanReader{src: src, want: want}
+}
+
+func (e *exactSpanReader) Read(p []byte) (int, error) {
+	if e.count >= e.want {
+		// The declared span is already satisfied; the bounded append is
+		// draining or probing for overflow. Pass the underlying bytes through
+		// so an over-long body is still rejected by the maxBytes+1 probe.
+		return e.src.Read(p)
+	}
+	n, err := e.src.Read(p)
+	e.count += int64(n)
+	if err == io.EOF && e.count < e.want {
+		// Body exhausted before the declared span: flag it and surface a
+		// fixed source error so the append fails and rolls back before any
+		// durable commit.
+		e.short = true
+		return n, errRangeTruncated
+	}
+	return n, err
 }
 
 // classifyUploadError is the single fixed, DATA-FREE mapper from durable
@@ -443,8 +552,9 @@ func isValidDigest(s string) bool {
 }
 
 const (
-	defaultUploadMaxBytes = 1 << 30 // 1 GiB handler copy bound when unconfigured
-	messageRangeInvalid   = "the upload range or offset is invalid"
-	messageUploadTooLarge = "the upload exceeds the configured size limit"
-	messageUploadInvalid  = "the upload request is invalid"
+	defaultUploadMaxBytes   = 1 << 30 // 1 GiB handler copy bound when unconfigured
+	messageRangeInvalid     = "the upload range or offset is invalid"
+	messageUploadTooLarge   = "the upload exceeds the configured size limit"
+	messageUploadInvalid    = "the upload request is invalid"
+	messageAlreadyFinalized = "the upload is already finalized and cannot be modified"
 )
