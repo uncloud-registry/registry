@@ -116,23 +116,25 @@ func (m *MemoryStore) Append(ctx context.Context, id, repo, actor string, expect
 	if s.offset != expectedOffset {
 		return Session{}, ErrOffsetMismatch
 	}
-	wrote, overflowing, err := copyBounded(&memoryWriter{s: s}, src, maxBytes, copyBufSize)
+	// TRANSACTIONAL bounded append: the streamed bytes are staged into a
+	// TEMPORARY buffer (which the bounded copy can never grow beyond
+	// maxBytes, plus the one-byte overflow probe that never reaches the
+	// buffer), and the session payload is committed ONLY after the copy
+	// fully succeeds within the bound. This mirrors the durable service's
+	// tail rollback: a mid-stream source read error or a bounded-overflow
+	// rejection leaves BOTH the committed payload and the offset byte-exact
+	// unchanged, so a later retry or digest computation sees pristine data.
+	var tmp bytes.Buffer
+	wrote, overflowing, err := copyBounded(&tmp, src, maxBytes, copyBufSize)
 	if err != nil {
 		return Session{}, ErrSourceRead
 	}
 	if overflowing {
 		return Session{}, ErrTooLarge
 	}
+	s.data = append(s.data, tmp.Bytes()...)
 	s.offset += wrote
 	return m.toSession(s), nil
-}
-
-// memoryWriter appends streamed bytes into a session's in-memory payload.
-type memoryWriter struct{ s *memorySession }
-
-func (w *memoryWriter) Write(p []byte) (int, error) {
-	w.s.data = append(w.s.data, p...)
-	return len(p), nil
 }
 
 func (m *MemoryStore) Open(ctx context.Context, id, repo, actor string) (io.ReadCloser, Session, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -203,3 +204,110 @@ func TestMemoryStoreConfidentiality(t *testing.T) {
 
 // The memory store must satisfy the registry-facing contract.
 var _ RegistryStore = (*MemoryStore)(nil)
+
+// faultSrc emits data then faults with a non-EOF error, so an append against
+// it writes partial bytes before failing (a genuine mid-stream source error).
+type faultSrc struct {
+	data []byte
+	n    int
+}
+
+func (f *faultSrc) Read(p []byte) (int, error) {
+	if f.n >= len(f.data) {
+		return 0, errors.New("boom")
+	}
+	c := copy(p, f.data[f.n:])
+	f.n += c
+	return c, nil
+}
+
+// memoryReadAll reads the full committed payload of a session through Open.
+func memoryReadAll(t *testing.T, store *MemoryStore, id, repo, actor string) []byte {
+	t.Helper()
+	rc, _, err := store.Open(context.Background(), id, repo, actor)
+	if err != nil {
+		t.Fatalf("open session %s: %v", id, err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read session %s: %v", id, err)
+	}
+	return b
+}
+
+// TestMemoryStoreAppendSourceReadErrorLeavesPayloadAndOffsetUnchanged proves a
+// mid-stream source read error rolls back the in-memory append exactly like
+// the durable service's tail restoration: the NOT-YET-COMMITTED partial bytes
+// must never leak into the session payload while the offset stays put, so a
+// later retry or digest computation sees pristine committed data.
+func TestMemoryStoreAppendSourceReadErrorLeavesPayloadAndOffsetUnchanged(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+	ctx := context.Background()
+	s, err := store.Create(ctx, "backend/api", "user:alice", time.Minute)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if s, err = store.Append(ctx, s.ID, "backend/api", "user:alice", 0, bytes.NewReader([]byte("abcd")), 100); err != nil {
+		t.Fatalf("base append: %v", err)
+	}
+
+	// The faulting source yields "xyz" before faulting mid-stream. On success
+	// those partial bytes would corrupt the committed payload; on the stable
+	// contract they are rolled back and the offset never advances.
+	if _, err := store.Append(ctx, s.ID, "backend/api", "user:alice", 4, &faultSrc{data: []byte("xyz")}, 100); !errors.Is(err, ErrSourceRead) {
+		t.Fatalf("expected ErrSourceRead, got %v", err)
+	}
+	if got := memoryReadAll(t, store, s.ID, "backend/api", "user:alice"); !bytes.Equal(got, []byte("abcd")) {
+		t.Fatalf("payload corrupted by failed append: got %q, want %q", got, "abcd")
+	}
+	snap, err := store.Status(ctx, s.ID, "backend/api", "user:alice")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if snap.Offset != 4 {
+		t.Fatalf("offset advanced to %d on failed append", snap.Offset)
+	}
+	// The retry at the unchanged offset succeeds with pristine data.
+	if s, err = store.Append(ctx, s.ID, "backend/api", "user:alice", 4, bytes.NewReader([]byte("efgh")), 100); err != nil {
+		t.Fatalf("retry append after failed append: %v", err)
+	}
+	if got := memoryReadAll(t, store, s.ID, "backend/api", "user:alice"); !bytes.Equal(got, []byte("abcdefgh")) {
+		t.Fatalf("retry saw corrupted base payload: got %q", got)
+	}
+}
+
+// TestMemoryStoreAppendOverflowLeavesPayloadAndOffsetUnchanged proves a
+// bounded-overflow rejection leaves BOTH the payload and the offset untouched
+// (mirroring the durable service, which rolls back the over-long tail): the
+// bytes the failed append streamed into the bounded buffer must never leak
+// into the committed payload.
+func TestMemoryStoreAppendOverflowLeavesPayloadAndOffsetUnchanged(t *testing.T) {
+	t.Parallel()
+	store := NewMemoryStore()
+	ctx := context.Background()
+	s, err := store.Create(ctx, "backend/api", "user:alice", time.Minute)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if s, err = store.Append(ctx, s.ID, "backend/api", "user:alice", 0, bytes.NewReader([]byte("abcd")), 100); err != nil {
+		t.Fatalf("base append: %v", err)
+	}
+
+	// 6-byte body against a 5-byte bound overflows; the 5 streamed bytes must
+	// be discarded, not appended.
+	if _, err := store.Append(ctx, s.ID, "backend/api", "user:alice", 4, bytes.NewReader([]byte("hello!")), 5); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("expected ErrTooLarge, got %v", err)
+	}
+	if got := memoryReadAll(t, store, s.ID, "backend/api", "user:alice"); !bytes.Equal(got, []byte("abcd")) {
+		t.Fatalf("payload corrupted by overflow rejection: got %q, want %q", got, "abcd")
+	}
+	snap, err := store.Status(ctx, s.ID, "backend/api", "user:alice")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if snap.Offset != 4 {
+		t.Fatalf("offset advanced to %d on overflow rejection", snap.Offset)
+	}
+}

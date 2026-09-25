@@ -151,9 +151,11 @@ func (h *Handler) uploadPatch(w http.ResponseWriter, r *http.Request, repo, uplo
 
 	updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, body, maxBytes)
 	if err != nil {
-		if exact != nil && exact.short {
-			// Short of the declared span: fixed range-invalid error, zero
-			// durable change.
+		if exact != nil && (exact.short || exact.long) {
+			// The chunked body did NOT fill the declared span exactly —
+			// either short of it or over it. Both are framing/range
+			// mismatches: a fixed range-invalid error with ZERO durable
+			// change, never a quota-limit overflow.
 			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
 			return
 		}
@@ -242,7 +244,7 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 		}
 		updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, body, maxBytes)
 		if err != nil {
-			if exact != nil && exact.short {
+			if exact != nil && (exact.short || exact.long) {
 				writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
 				return
 			}
@@ -347,25 +349,35 @@ func (h *Handler) respondRangeNotSatisfiable(w http.ResponseWriter, ctx context.
 
 // errRangeTruncated is the fixed, data-free sentinel the exact-span reader
 // yields when a chunked/unknown-length request body reaches EOF before filling
-// the declared Content-Range span. It is distinct from io.ErrUnexpectedEOF so
-// a genuine transport-level truncation is not conflated with a short declared
-// range.
-var errRangeTruncated = errors.New("upload body shorter than declared range")
+// the declared Content-Range span. errRangeExceeded is the matching sentinel
+// for a body LARGER than the declared span: a frame/range mismatch, distinct
+// from a broken quota-limit so an over-long body is never misclassified as an
+// upload-quota overflow. Both are distinct from io.ErrUnexpectedEOF and the
+// underlying source error so genuine transport-level truncation/faults are not
+// conflated with a misstated declared range.
+var (
+	errRangeTruncated = errors.New("upload body shorter than declared range")
+	errRangeExceeded  = errors.New("upload body longer than declared range")
+)
 
 // exactSpanReader wraps a chunked/unknown-length request body to enforce an
-// EXACT declared Content-Range span while streaming with bounded memory. It
-// returns errRangeTruncated (and sets short) the moment the underlying body
-// hits EOF before the span fills, so the durable Append sees a reader fault
-// and rolls back its tail and offset BEFORE any commit — a short body never
-// advances the durable offset. Bytes beyond the span are handed through so
-// the append's maxBytes+1 overflow probe rejects an over-long body. It owns
-// only a counter and a flag, never buffers the payload, and delegates reads to
-// the underlying body so request cancellation propagates identically.
+// EXACT declared Content-Range span while streaming with bounded memory and
+// WITHOUT buffering (it owns only two counters and two flags; the payload is
+// never held, reads delegate to the underlying body so request cancellation
+// propagates identically). It returns errRangeTruncated (and sets short) the
+// moment the underlying body hits EOF before the span fills, so the durable
+// Append sees a reader fault and rolls back its tail and offset BEFORE any
+// commit — a short body never advances the durable offset. It returns
+// errRangeExceeded (and sets long) the moment the underlying body yields a byte
+// BEYOND the span, so an over-long body is a framing/range mismatch that rolls
+// back too — never a quota-limit overflow. A body that exactly fills the span
+// ends on EOF and is accepted.
 type exactSpanReader struct {
 	src   io.Reader
 	want  int64
 	count int64
 	short bool // body reached EOF before the declared span
+	long  bool // body exceeded the declared span
 }
 
 // newExactSpanReader wraps src to require exactly want bytes (want >= 1).
@@ -375,10 +387,21 @@ func newExactSpanReader(src io.Reader, want int64) *exactSpanReader {
 
 func (e *exactSpanReader) Read(p []byte) (int, error) {
 	if e.count >= e.want {
-		// The declared span is already satisfied; the bounded append is
-		// draining or probing for overflow. Pass the underlying bytes through
-		// so an over-long body is still rejected by the maxBytes+1 probe.
-		return e.src.Read(p)
+		// The declared span is already served. Probe the underlying body to
+		// tell an EXACTLY-span body (EOF) from an OVER-LONG one (a yielded
+		// byte is a framing violation), without buffering anything.
+		n, err := e.src.Read(p)
+		if n > 0 {
+			e.long = true
+			return n, errRangeExceeded
+		}
+		return n, err
+	}
+	// Only ever claim the remaining bytes of the declared span from the
+	// underlying body; anything past the span is caught by the probe above.
+	remaining := e.want - e.count
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
 	}
 	n, err := e.src.Read(p)
 	e.count += int64(n)

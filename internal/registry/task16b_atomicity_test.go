@@ -191,8 +191,9 @@ func TestUploadPatchChunkedLongRangeZeroMutation(t *testing.T) {
 	id := uploadIDFromLoc(loc)
 
 	// Chunked PATCH declaring span 0-9 (10 bytes) with a 13-byte body: the
-	// over-long body trips the bounded overflow probe → 413, zero mutation.
-	resp := doReqExpect(t, chunkedReq(t, http.MethodPatch, loc, issuer, "0-9", []byte("0123456789abc")), http.StatusRequestEntityTooLarge)
+	// over-long body is a FRAMING/range mismatch (not a quota overflow) →
+	// fixed 400, zero mutation (the exact-span reader rolls the tail back).
+	resp := doReqExpect(t, chunkedReq(t, http.MethodPatch, loc, issuer, "0-9", []byte("0123456789abc")), http.StatusBadRequest)
 	defer resp.Body.Close()
 
 	if got := stagedBytes(t, svc, id); len(got) != 0 {
@@ -254,7 +255,7 @@ func TestUploadPutChunkedLongFinalChunkZeroMutation(t *testing.T) {
 	patch(t, loc, issuer, "0-4", []byte("aaaaa"), false)
 	digest := publish.ComputeDigest([]byte("aaaaabbbbbbbbb"))
 
-	resp := doReqExpect(t, chunkedReq(t, http.MethodPut, loc+"?digest="+digest, issuer, "5-9", []byte("bbbbbbbb")), http.StatusRequestEntityTooLarge)
+	resp := doReqExpect(t, chunkedReq(t, http.MethodPut, loc+"?digest="+digest, issuer, "5-9", []byte("bbbbbbbb")), http.StatusBadRequest)
 	defer resp.Body.Close()
 
 	if up.putStreamCalls != 0 {
