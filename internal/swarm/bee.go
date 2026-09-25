@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -335,6 +336,119 @@ func (s *BeeObjectStore) Put(ctx context.Context, data []byte, batchID string) (
 	}
 
 	return payload.Reference, nil
+}
+
+// PutStream uploads an object to /bytes by streaming an io.Reader with an
+// EXACT declared size and an explicit postage batch id — the registry blob
+// finalization path. It never buffers the payload in memory: the request body
+// is the caller's reader with Content-Length pinned to size. Errors and the
+// response body are handled with the same bounded, data-free discipline as
+// every other Bee writer (the response is read to a fixed bound, overflow
+// fails closed, and transport failures are sanitized so no URL or body detail
+// leaks). Null byte-count / negative size and an empty batch id fail closed
+// before any request.
+func (s *BeeObjectStore) PutStream(ctx context.Context, src io.Reader, size int64, batchID string) (string, error) {
+	if src == nil {
+		return "", errors.New("bee bytes stream source is nil")
+	}
+	if size < 0 {
+		return "", errors.New("bee bytes stream requires a non-negative size")
+	}
+	if len(batchID) == 0 || len(batchID) > beeFeedWriteMaxRef {
+		return "", errors.New("postage batch id is empty or exceeds the bound")
+	}
+
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, s.BaseURL+"/bytes", src)
+	if err != nil {
+		return "", sanitizeBeeTransportError(reqCtx, "create bee bytes stream put request", err)
+	}
+	req.ContentLength = size
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
+	req.Header.Set("Swarm-Pin", strconv.FormatBool(s.Pin))
+	req.Header.Set("Swarm-Deferred-Upload", strconv.FormatBool(s.DeferredUpload))
+
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		return "", sanitizeBeeTransportError(reqCtx, "bee bytes stream put request", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		return "", fmt.Errorf("bee bytes put failed with status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+	if err != nil {
+		return "", sanitizeBeeTransportError(reqCtx, "read bee bytes stream put response body", err)
+	}
+	if len(body) > beeFeedWriteMaxBody {
+		return "", errors.New("bee bytes stream put response exceeded the bound")
+	}
+	return parseReferenceBody(body)
+}
+
+// parseReferenceBody STRICTLY parses a single-object JSON response carrying
+// exactly one "reference" member whose value is a 64-hex string — used by the
+// streaming /bytes success path. Duplicate/unknown members, non-string or
+// malformed references, and trailing JSON all fail closed with data-free
+// errors.
+func parseReferenceBody(body []byte) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", errors.New("upload response is not a JSON object")
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return "", errors.New("upload response is not a JSON object")
+	}
+	var (
+		ref    string
+		sawRef bool
+	)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", errors.New("upload response is not a JSON object")
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return "", errors.New("upload response is not a JSON object")
+		}
+		if key != "reference" {
+			return "", errors.New("upload response carries an unknown member")
+		}
+		if sawRef {
+			return "", errors.New("upload response repeats the reference member")
+		}
+		valTok, err := dec.Token()
+		if err != nil {
+			return "", errors.New("upload response reference is not a string")
+		}
+		value, ok := valTok.(string)
+		if !ok {
+			return "", errors.New("upload response reference is not a string")
+		}
+		ref = value
+		sawRef = true
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return "", errors.New("upload response is not a JSON object")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return "", errors.New("upload response has trailing data")
+	}
+	if !sawRef {
+		return "", errors.New("upload response is missing the reference member")
+	}
+	if !isHexString(ref, 64) {
+		return "", errors.New("upload response reference is not a 64-hex object reference")
+	}
+	return strings.ToLower(ref), nil
 }
 
 func (r SubdomainENSRegistryResolver) ResolveRegistry(_ context.Context, host string) (resolve.RegistryIdentity, error) {

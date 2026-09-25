@@ -556,7 +556,7 @@ func TestInvalidPushCredentialsProduceNoSideEffects(t *testing.T) {
 
 	handler, issuer := newTestHandler(t, docs, feeds)
 	h := handler.(*Handler)
-	stage := &countingStaging{Store: staging.NewMemoryStore()}
+	stage := &countingStaging{RegistryStore: staging.NewMemoryStore()}
 	h.Staging = stage
 	pushAuthz := &recordingPushAuthorizer{allowed: true, batchID: "batch-repo"}
 	h.PushAuthorizer = pushAuthz
@@ -853,13 +853,13 @@ func (r *recordingPushAuthorizer) Authorize(_ context.Context, _ resolve.Registr
 }
 
 type countingStaging struct {
-	staging.Store
+	staging.RegistryStore
 	created int
 }
 
-func (c *countingStaging) CreateSession(ctx context.Context, repo string, actor string, ttl time.Duration) (spec.UploadSession, error) {
+func (c *countingStaging) Create(ctx context.Context, repo string, actor string, ttl time.Duration) (staging.Session, error) {
 	c.created++
-	return c.Store.CreateSession(ctx, repo, actor, ttl)
+	return c.RegistryStore.Create(ctx, repo, actor, ttl)
 }
 
 type countingObjects struct {

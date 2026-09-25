@@ -95,6 +95,69 @@ func TestBeeObjectStorePutAndGet(t *testing.T) {
 	}
 }
 
+// TestBeeObjectStorePutStreamExactSize proves the streaming blob upload binds
+// Content-Length to the EXACT declared size (reader stays un-read in memory)
+// and requires an explicit postage batch: the registry blob finalization
+// contract. A negative size or empty batch id fails closed BEFORE any HTTP
+// request; the /bytes handler sees the full streamed payload and returns the
+// canonical reference.
+func TestBeeObjectStorePutStreamExactSize(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("streamed blob payload 0123456789")
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Method != http.MethodPost || r.URL.Path != "/bytes" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Swarm-Postage-Batch-Id"); got != "batch-staging" {
+			t.Fatalf("unexpected batch id header: %s", got)
+		}
+		// Content-Length MUST equal the declared exact size.
+		if got := r.ContentLength; got != int64(len(payload)) {
+			t.Fatalf("expected Content-Length %d, got %d", len(payload), got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read streamed body: %v", err)
+		}
+		if !bytes.Equal(body, payload) {
+			t.Fatalf("streamed body mismatch at PUTStream")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"reference":"` + strings.Repeat("cd", 32) + `"}`))
+	}))
+	defer server.Close()
+
+	store := NewBeeObjectStore(server.URL, server.Client())
+	ref, err := store.PutStream(context.Background(), bytes.NewReader(payload), int64(len(payload)), "batch-staging")
+	if err != nil {
+		t.Fatalf("PutStream: %v", err)
+	}
+	if ref != strings.Repeat("cd", 32) {
+		t.Fatalf("unexpected ref: %s", ref)
+	}
+	if hits != 1 {
+		t.Fatalf("expected exactly one HTTP request, got %d", hits)
+	}
+
+	// Failures fail closed with zero requests.
+	if _, err := store.PutStream(context.Background(), bytes.NewReader(payload), -1, "batch-staging"); err == nil {
+		t.Fatal("expected negative size to fail")
+	}
+	if _, err := store.PutStream(context.Background(), bytes.NewReader(payload), int64(len(payload)), ""); err == nil {
+		t.Fatal("expected empty batch id to fail")
+	}
+	if _, err := store.PutStream(context.Background(), nil, int64(len(payload)), "batch-staging"); err == nil {
+		t.Fatal("expected nil source to fail")
+	}
+	if hits != 1 {
+		t.Fatalf("expected rejected PutStream calls to issue no HTTP requests, got %d hits", hits)
+	}
+}
+
 func TestSubdomainENSRegistryResolver(t *testing.T) {
 	t.Parallel()
 

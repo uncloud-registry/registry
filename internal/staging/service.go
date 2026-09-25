@@ -63,6 +63,20 @@ type Service interface {
 
 var _ Service = (*service)(nil)
 
+// SetLimits installs the atomic durable staging quotas enforced inside every
+// Append BEGIN IMMEDIATE transaction. It must be called before serving and
+// never concurrently with Appends. Zero calls leave all quotas unbounded.
+func (s *service) SetLimits(l Limits) { s.limits = l }
+
+// SetStreamBuffer installs the fixed streaming-copy buffer size used by
+// Append. It must be called before serving and never concurrently. n<=0
+// keeps the default copyBufSize.
+func (s *service) SetStreamBuffer(n int) {
+	if n > 0 {
+		s.copyBuf = n
+	}
+}
+
 // maxTxAttempts bounds BEGIN IMMEDIATE serialization retries per operation.
 const maxTxAttempts = 50
 
@@ -82,6 +96,16 @@ type service struct {
 	pool          *dbPool
 	now           func() time.Time
 	creationLease time.Duration
+
+	// limits are the atomic quotas enforced inside every Append BEGIN
+	// IMMEDIATE transaction across independent service processes. Zero
+	// fields leave that kind of quota unbounded. Set via SetLimits before
+	// serving; never mutated concurrently.
+	limits Limits
+	// copyBuf is the fixed streaming-copy buffer size used by Append
+	// (default copyBufSize). Set to an explicit bounded value via
+	// SetStreamBuffer before serving; never mutated concurrently.
+	copyBuf int
 
 	// closeOnce and closeErr make Close IDEMPOTENT and JOINED: exactly one
 	// invocation runs the (pool + spool) shutdown body while every concurrent
@@ -131,7 +155,7 @@ func NewService(ctx context.Context, spoolRoot, dbPath string) (*service, error)
 		sp.Close()
 		return nil, err
 	}
-	svc := &service{spool: sp, pool: pool, now: time.Now, creationLease: creationLease}
+	svc := &service{spool: sp, pool: pool, now: time.Now, creationLease: creationLease, copyBuf: copyBufSize}
 	svc.spool.syncFile = func(f *os.File) error { return svc.syncFile(f) }
 	if err := svc.reconcileStartup(ctx); err != nil {
 		pool.close()
@@ -1160,7 +1184,7 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 		}
 		fd = f
 
-		n, overflowing, err := copyBounded(f, src, maxBytes)
+		n, overflowing, err := copyBounded(f, src, maxBytes, s.copyBuf)
 		if err != nil {
 			return typed(ErrSourceRead, err)
 		}
@@ -1176,6 +1200,15 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 			}
 		}
 		newOffset := oldOffset + n
+		// Atomic quota gate: per-upload, per-repository, and total-staging
+		// usage are all evaluated inside this same BEGIN IMMEDIATE write
+		// transaction against the OTHER processes' committed rows, so
+		// concurrent independent service processes admit only valid winners
+		// and a rejected append returns before any durable change (the tail
+		// is truncated back by restoreTail on this non-committed exit).
+		if err := s.checkQuota(ctx, conn, repo, oldOffset, newOffset); err != nil {
+			return err
+		}
 		res, err := conn.ExecContext(ctx,
 			`update upload_sessions set offset = ? where id = ?`, newOffset, id)
 		if err != nil {
@@ -1206,14 +1239,217 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 	return result, nil
 }
 
-// copyBounded streams src into dst with a fixed-size buffer, reading at most
+// checkQuota evaluates the per-upload, per-repository, and total-staging
+// quotas atomically against durable committed usage INSIDE the caller's
+// BEGIN IMMEDIATE append transaction. Zero limit fields are skipped.
+// Usage counts active+finalized session offsets (creating rows are offset 0
+// and deleting rows are tombstoned). newOffset must be the session offset
+// AFTER this append and oldOffset the offset before it; delta = newOffset -
+// oldOffset. Overflow fails closed: an irrecoverable usage SUM collapses to
+// an unbounded sentinel so the append is rejected rather than admitted.
+func (s *service) checkQuota(ctx context.Context, conn *sql.Conn, repo string, oldOffset, newOffset int64) error {
+	l := s.limits
+	if l.MaxUploadBytes > 0 && newOffset > l.MaxUploadBytes {
+		return ErrTooLarge
+	}
+	if newOffset == oldOffset {
+		return nil // no growth: repo/total usage is unchanged
+	}
+	delta := newOffset - oldOffset
+	if l.MaxRepositoryBytes > 0 {
+		usage, err := usageSum(ctx, conn, &repo)
+		if err != nil {
+			return depErr(err, ctx)
+		}
+		// usage already includes this session's oldOffset (it is active);
+		// after commit the repo total becomes usage + delta.
+		if usage > l.MaxRepositoryBytes-delta {
+			return ErrTooLarge
+		}
+	}
+	if l.MaxTotalStagingBytes > 0 {
+		usage, err := usageSum(ctx, conn, nil)
+		if err != nil {
+			return depErr(err, ctx)
+		}
+		if usage > l.MaxTotalStagingBytes-delta {
+			return ErrTooLarge
+		}
+	}
+	return nil
+}
+
+// usageSum returns the total active+finalized staged offset, optionally
+// scoped to one repository. The bounded SQL runs on the caller's connection
+// (inside the shared transaction), so the result reflects the OTHER
+// processes' committed rows at the serialization point. A SUM that overflows
+// signed int64 is returned by SQLite as a float: that non-integral result
+// fails the int64 scan and is collapsed to math.MaxInt64 (fail closed — an
+// astronomically large usage can never pass any positive quota). A genuine
+// query failure is returned for the caller to wrap as a dependency error.
+func usageSum(ctx context.Context, conn *sql.Conn, repo *string) (int64, error) {
+	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalized')`
+	args := []any{}
+	if repo != nil {
+		query += ` and repo = ?`
+		args = append(args, *repo)
+	}
+	var raw any
+	if err := conn.QueryRowContext(ctx, query, args...).Scan(&raw); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, cerr
+		}
+		return 0, err
+	}
+	switch v := raw.(type) {
+	case int64:
+		return v, nil
+	case float64:
+		// Non-integral / overflowing SUM: fail closed beyond any positive
+		// quota rather than admitting an unbounded append.
+		return math.MaxInt64, nil
+	case nil:
+		return 0, nil
+	default:
+		return 0, errors.New("staging usage sum returned an unrepresentable value")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ListStagedBlobs (registry-facing alias of the durable finalization listing)
+// ---------------------------------------------------------------------------
+
+// ListStagedBlobs returns every finalized blob for the caller's repo/actor as
+// the registry-facing spec.StagedBlob shape (identical outcome to
+// ListFinalized). It is the publication input: the manifest references a
+// subset of these for referenced-only consumption.
+func (s *service) ListStagedBlobs(ctx context.Context, repo, actor string) ([]spec.StagedBlob, error) {
+	return s.ListFinalized(ctx, repo, actor)
+}
+
+// ---------------------------------------------------------------------------
+// ClearStagedBlobsByDigest (referenced-only consumption)
+// ---------------------------------------------------------------------------
+
+// ClearStagedBlobsByDigest durably consumes ONLY the finalized blobs whose
+// digests are in digests for the caller's repo/actor, leaving every unrelated
+// finalized blob (and every active session) in place; unknown digests are a
+// no-op. Each affected blob runs the same crash-safe tombstone + atomic
+// quarantine deletion as Delete, so a restart always finishes it exactly and
+// no staged file is ever stranded. This is the referenced-only consumption
+// primitive: after a successful publication, exactly the digests the
+// published manifest referenced are removed while unrelated staged blobs
+// survive for a later manifest.
+func (s *service) ClearStagedBlobsByDigest(ctx context.Context, repo, actor string, digests []string) error {
+	if err := validateRepo(repo); err != nil {
+		return err
+	}
+	if err := validateActor(actor); err != nil {
+		return err
+	}
+	if len(digests) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(digests))
+	for _, d := range digests {
+		if err := validateDigest(d); err != nil {
+			return err
+		}
+		wanted[d] = struct{}{}
+	}
+
+	var ids []string
+	conn, err := s.pool.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	rows, err := conn.QueryContext(ctx,
+		`select upload_id from staged_blobs where repo = ? and actor = ?`, repo, actor)
+	if err != nil {
+		s.pool.release(conn)
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return typed(ErrDependency, err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			s.pool.release(conn)
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return typed(ErrDependency, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		s.pool.release(conn)
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return typed(ErrDependency, err)
+	}
+	rows.Close()
+	s.pool.release(conn)
+
+	for _, id := range ids {
+		// Confirm the culprit digest before consuming (each Delete re-reads
+		// ownership inside its own tx). Consumption of a wrong digest is
+		// never attempted: we join upload_sessions to fetch the digest.
+		digest, err := s.digestOf(ctx, id)
+		if err != nil {
+			return err
+		}
+		if _, ok := wanted[digest]; !ok {
+			continue
+		}
+		if err := s.Delete(ctx, id, repo, actor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// digestOf returns the durable digest of a session by upload_id, or
+// ErrNotFound when absent. It confirms the digest BEFORE any consumption
+// side effect so an unrelated digest is never deleted.
+func (s *service) digestOf(ctx context.Context, id string) (string, error) {
+	conn, err := s.pool.acquire(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer s.pool.release(conn)
+	var digest sql.NullString
+	if err := conn.QueryRowContext(ctx,
+		`select digest from upload_sessions where id = ? and state = 'finalized'`, id).Scan(&digest); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return "", cerr
+		}
+		return "", typed(ErrDependency, err)
+	}
+	if !digest.Valid {
+		return "", ErrNotFound
+	}
+	return digest.String, nil
+}
+
 // maxBytes+1 bytes from src without arithmetic overflow: exactly maxBytes
 // bytes are copied through an io.LimitedReader, then a single probe read
-// detects the (maxBytes+1)-th byte. Bounded memory by construction.
-func copyBounded(dst io.Writer, src io.Reader, maxBytes int64) (written int64, overflowing bool, err error) {
+// detects the (maxBytes+1)-th byte. Bounded memory by construction: bufSize
+// is the fixed allocation, never derived from the body length.
+func copyBounded(dst io.Writer, src io.Reader, maxBytes int64, bufSize int) (written int64, overflowing bool, err error) {
+	if bufSize <= 0 {
+		bufSize = copyBufSize
+	}
 	lr := &io.LimitedReader{R: src, N: maxBytes}
-	var buf [copyBufSize]byte
-	n, err := io.CopyBuffer(dst, lr, buf[:])
+	buf := make([]byte, bufSize)
+	n, err := io.CopyBuffer(dst, lr, buf)
 	if err != nil {
 		return n, false, err
 	}

@@ -110,7 +110,7 @@ func TestPublicationErrorMatrixThroughRealHandler(t *testing.T) {
 
 	t.Run("401 missing token", func(t *testing.T) {
 		h, _, feeds, _, serverURL := task14World(t)
-		stage := &countingStaging{Store: h.Staging}
+		stage := &countingStaging{RegistryStore: h.Staging}
 		h.Staging = stage
 		req, err := http.NewRequest(http.MethodPut, serverURL+"/v2/backend/api/manifests/latest", strings.NewReader(`{}`))
 		if err != nil {

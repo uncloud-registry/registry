@@ -184,15 +184,19 @@ func buildWiredBeeHandler(t *testing.T, fixture *beeReadFixture) (*registry.Hand
 	t.Setenv("REGISTRY_TOKEN_PUBLIC_KEYS_FILE", writeConfigJWKS(t, key))
 	t.Setenv("REGISTRY_TOKEN_ISSUER", configIssuer)
 	t.Setenv("REGISTRY_TOKEN_AUDIENCE", beeWiringHost)
+	setupRegistryStagingEnv(t)
 
 	h, err := buildBeeHandler()
 	if err != nil {
-		t.Fatalf("buildBeeHandler: %v", err)
+		t.Fatalf("build wired bee handler: %v", err)
 	}
+	// Release the durable staging service (spool + SQLite) when the test ends
+	// so the handle is not leaked across tests in this process.
 	hr, ok := h.(*registry.Handler)
 	if !ok {
 		t.Fatalf("unexpected handler type %T", h)
 	}
+	t.Cleanup(func() { _ = hr.Close() })
 	issuer, err := auth.NewRegistryTokenIssuer(key.priv, configIssuer, configKeyID)
 	if err != nil {
 		t.Fatalf("test token issuer: %v", err)

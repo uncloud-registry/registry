@@ -25,6 +25,10 @@ type ObjectStore interface {
 
 type ObjectUploader interface {
 	Put(ctx context.Context, data []byte, batchID string) (string, error)
+	// PutStream uploads a blob by streaming src with an EXACT size and an
+	// explicit postage batch id — the registry blob finalization path. It
+	// never buffers the whole payload in memory.
+	PutStream(ctx context.Context, src io.Reader, size int64, batchID string) (string, error)
 }
 
 type PullAuthorizer interface {
@@ -42,7 +46,7 @@ type Handler struct {
 	PullAuthorizer PullAuthorizer
 	PushAuthorizer PushAuthorizer
 	Authenticator  Authenticator
-	Staging        staging.Store
+	Staging        staging.RegistryStore
 	Publisher      publish.Publisher
 	// Preflight durably binds an EXPLICIT caller operation key to exactly one
 	// logical payload (registry + owner + repo + tag + manifest digest) in the
@@ -55,9 +59,15 @@ type Handler struct {
 	Preflight  publish.OperationBinder
 	SessionTTL time.Duration
 	AuthRealm  string
+	// MaxUploadBytes bounds any single upload; when >0 it also bounds the
+	// copy boundary the handler passes to streaming Append for requests
+	// without an explicit Content-Range. Zero means the handler uses a
+	// bounded default copy cap (the durable service still enforces the
+	// configured per-upload quota atomically).
+	MaxUploadBytes int64
 }
 
-func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.Store, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
+func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.RegistryStore, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
 	return &Handler{
 		Resolver:       resolver,
 		Objects:        objects,
@@ -266,127 +276,7 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 }
 
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, uploadID string, principal auth.Principal) {
-	actor := principal.Subject
-
-	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
-	if err != nil {
-		status, code, message := classifyRequestBoundaryError(err)
-		writeError(w, status, code, message)
-		return
-	}
-	if !authorized {
-		w.Header().Set("WWW-Authenticate", bearerChallenge(h.AuthRealm, registryIdentity.Host, repo, "push"))
-		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "push access denied")
-		return
-	}
-
-	if uploadID == "" {
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", "POST")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		session, err := h.Staging.CreateSession(r.Context(), repo, actor, h.SessionTTL)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", messageUnknown)
-			return
-		}
-		location := fmt.Sprintf("/v2/%s/blobs/uploads/%s", repo, session.ID)
-		w.Header().Set("Location", location)
-		w.Header().Set("Docker-Upload-UUID", session.ID)
-		w.Header().Set("Range", "0-0")
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-
-	session, ok, err := h.Staging.GetSession(r.Context(), uploadID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", messageUnknown)
-		return
-	}
-	if !ok || session.Repo != repo || session.Actor != actor {
-		writeError(w, http.StatusNotFound, "BLOB_UPLOAD_UNKNOWN", "upload session not found")
-		return
-	}
-
-	switch r.Method {
-	case http.MethodGet:
-		writeUploadStatus(w, repo, session)
-	case http.MethodPatch:
-		chunk, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageUploadBodyRead)
-			return
-		}
-		updated, err := h.Staging.Append(r.Context(), uploadID, chunk)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
-			return
-		}
-		writeUploadAccepted(w, repo, updated)
-	case http.MethodPut:
-		digest := r.URL.Query().Get("digest")
-		if digest == "" {
-			writeError(w, http.StatusBadRequest, "DIGEST_INVALID", "missing digest parameter")
-			return
-		}
-		finalBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageUploadBodyRead)
-			return
-		}
-		if len(finalBytes) > 0 {
-			session, err = h.Staging.Append(r.Context(), uploadID, finalBytes)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
-				return
-			}
-		}
-		data, err := h.Staging.Bytes(r.Context(), uploadID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
-			return
-		}
-		if computeDigest(data) != digest {
-			writeError(w, http.StatusBadRequest, "DIGEST_INVALID", "digest mismatch")
-			return
-		}
-		ref, err := h.Uploader.Put(r.Context(), data, batchID)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, "BLOB_UPLOAD_INVALID", messageBlobUploadFailed)
-			return
-		}
-		if err := h.Staging.StageBlob(r.Context(), spec.StagedBlob{
-			UploadID:  uploadID,
-			Repo:      repo,
-			Actor:     actor,
-			Digest:    digest,
-			SwarmRef:  ref,
-			Size:      int64(len(data)),
-			MediaType: r.Header.Get("Content-Type"),
-			CreatedAt: session.CreatedAt,
-			ExpiresAt: session.ExpiresAt,
-		}); err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
-			return
-		}
-		if err := h.Staging.DeleteSession(r.Context(), uploadID); err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_INVALID", messageUnknown)
-			return
-		}
-		w.Header().Set("Docker-Content-Digest", digest)
-		w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/%s", repo, digest))
-		w.WriteHeader(http.StatusCreated)
-	case http.MethodDelete:
-		if err := h.Staging.DeleteSession(r.Context(), uploadID); err != nil {
-			writeError(w, http.StatusInternalServerError, "BLOB_UPLOAD_UNKNOWN", messageUnknown)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		w.Header().Set("Allow", "GET, PATCH, PUT, DELETE")
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
+	h.handleUploadV1(w, r, registryIdentity, repo, uploadID, principal)
 }
 
 func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string, principal auth.Principal) {
@@ -697,25 +587,14 @@ func bearerChallenge(realm string, service string, repo string, action string) s
 	return fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, realm, service, "repository:"+repo+":"+action)
 }
 
-func writeUploadStatus(w http.ResponseWriter, repo string, session spec.UploadSession) {
-	w.Header().Set("Docker-Upload-UUID", session.ID)
-	w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/uploads/%s", repo, session.ID))
-	w.Header().Set("Range", uploadRange(session.Offset))
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func writeUploadAccepted(w http.ResponseWriter, repo string, session spec.UploadSession) {
-	w.Header().Set("Docker-Upload-UUID", session.ID)
-	w.Header().Set("Location", fmt.Sprintf("/v2/%s/blobs/uploads/%s", repo, session.ID))
-	w.Header().Set("Range", uploadRange(session.Offset))
-	w.WriteHeader(http.StatusAccepted)
-}
-
-func uploadRange(offset int64) string {
-	if offset <= 0 {
-		return "0-0"
+// Close releases any durable staging resource the handler owns (spool root +
+// SQLite). Drivers backed by in-memory state close as a no-op. Called by the
+// registry process on shutdown so a handle is never leaked.
+func (h *Handler) Close() error {
+	if c, ok := h.Staging.(io.Closer); ok {
+		return c.Close()
 	}
-	return fmt.Sprintf("0-%d", offset-1)
+	return nil
 }
 
 func computeDigest(data []byte) string {

@@ -3,191 +3,21 @@ package staging
 import (
 	"context"
 	"errors"
-	"fmt"
-	"sync"
+	"io"
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/spec"
 )
 
-type Store interface {
-	CreateSession(ctx context.Context, repo string, actor string, ttl time.Duration) (spec.UploadSession, error)
-	GetSession(ctx context.Context, uploadID string) (spec.UploadSession, bool, error)
-	Append(ctx context.Context, uploadID string, chunk []byte) (spec.UploadSession, error)
-	Bytes(ctx context.Context, uploadID string) ([]byte, error)
-	DeleteSession(ctx context.Context, uploadID string) error
-	StageBlob(ctx context.Context, blob spec.StagedBlob) error
-	GetStagedBlob(ctx context.Context, uploadID string) (spec.StagedBlob, bool, error)
-	ListStagedBlobs(ctx context.Context, repo string, actor string) ([]spec.StagedBlob, error)
-	// ClearStagedBlobs removes every staged entry for the repo/actor pair.
-	ClearStagedBlobs(ctx context.Context, repo string, actor string) error
-	// ClearStagedBlobsByDigest removes ONLY the staged entries whose digests
-	// are in digests for the repo/actor pair; unrelated staged blobs are
-	// retained. Clearing an unknown digest is a no-op. This is the
-	// referenced-only consumption primitive: after a successful publication,
-	// exactly the digests the published manifest referenced are consumed while
-	// unrelated staged blobs survive for a later manifest.
-	ClearStagedBlobsByDigest(ctx context.Context, repo string, actor string, digests []string) error
-}
-
-type MemoryStore struct {
-	mu       sync.Mutex
-	nextID   int64
-	sessions map[string]memorySession
-	staged   map[string]spec.StagedBlob
-}
-
-type memorySession struct {
-	spec.UploadSession
-	data []byte
-}
-
-func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
-		nextID:   1,
-		sessions: map[string]memorySession{},
-		staged:   map[string]spec.StagedBlob{},
-	}
-}
-
-func (m *MemoryStore) CreateSession(_ context.Context, repo string, actor string, ttl time.Duration) (spec.UploadSession, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	now := time.Now().UTC()
-	id := fmt.Sprintf("upload-%d", m.nextID)
-	m.nextID++
-
-	session := spec.UploadSession{
-		ID:        id,
-		Repo:      repo,
-		Actor:     actor,
-		Offset:    0,
-		CreatedAt: now.Format(time.RFC3339),
-		ExpiresAt: now.Add(ttl).Format(time.RFC3339),
-	}
-	m.sessions[id] = memorySession{UploadSession: session, data: nil}
-	return session, nil
-}
-
-func (m *MemoryStore) GetSession(_ context.Context, uploadID string) (spec.UploadSession, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	session, ok := m.sessions[uploadID]
-	if !ok {
-		return spec.UploadSession{}, false, nil
-	}
-	return session.UploadSession, true, nil
-}
-
-func (m *MemoryStore) Append(_ context.Context, uploadID string, chunk []byte) (spec.UploadSession, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	session, ok := m.sessions[uploadID]
-	if !ok {
-		return spec.UploadSession{}, fmt.Errorf("upload session %q not found", uploadID)
-	}
-
-	session.data = append(session.data, chunk...)
-	session.Offset = int64(len(session.data))
-	m.sessions[uploadID] = session
-	return session.UploadSession, nil
-}
-
-func (m *MemoryStore) Bytes(_ context.Context, uploadID string) ([]byte, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	session, ok := m.sessions[uploadID]
-	if !ok {
-		return nil, fmt.Errorf("upload session %q not found", uploadID)
-	}
-
-	out := make([]byte, len(session.data))
-	copy(out, session.data)
-	return out, nil
-}
-
-func (m *MemoryStore) DeleteSession(_ context.Context, uploadID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	delete(m.sessions, uploadID)
-	return nil
-}
-
-func (m *MemoryStore) StageBlob(_ context.Context, blob spec.StagedBlob) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.staged[blob.UploadID] = blob
-	return nil
-}
-
-func (m *MemoryStore) GetStagedBlob(_ context.Context, uploadID string) (spec.StagedBlob, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	blob, ok := m.staged[uploadID]
-	if !ok {
-		return spec.StagedBlob{}, false, nil
-	}
-	return blob, true, nil
-}
-
-func (m *MemoryStore) ListStagedBlobs(_ context.Context, repo string, actor string) ([]spec.StagedBlob, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	blobs := make([]spec.StagedBlob, 0)
-	for _, blob := range m.staged {
-		if blob.Repo == repo && blob.Actor == actor {
-			blobs = append(blobs, blob)
-		}
-	}
-	return blobs, nil
-}
-
-func (m *MemoryStore) ClearStagedBlobs(_ context.Context, repo string, actor string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for uploadID, blob := range m.staged {
-		if blob.Repo == repo && blob.Actor == actor {
-			delete(m.staged, uploadID)
-		}
-	}
-	return nil
-}
-
-// ClearStagedBlobsByDigest removes only the staged entries whose digest is in
-// digests for the given repo/actor pair, leaving every unrelated staged entry
-// in place. Unknown digests are ignored.
-func (m *MemoryStore) ClearStagedBlobsByDigest(_ context.Context, repo string, actor string, digests []string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	wanted := make(map[string]struct{}, len(digests))
-	for _, digest := range digests {
-		wanted[digest] = struct{}{}
-	}
-	for uploadID, blob := range m.staged {
-		if blob.Repo == repo && blob.Actor == actor {
-			if _, ok := wanted[blob.Digest]; ok {
-				delete(m.staged, uploadID)
-			}
-		}
-	}
-	return nil
-}
+// The in-memory dev/test store and the registry-facing RegistryStore contract
+// live in memory.go (formerly here as the byte-buffer Store/MemoryStore API).
 
 // ---------------------------------------------------------------------------
 // Durable staging service: shared types, sentinel errors, and validators.
 //
 // These definitions are shared by the durable Service (Task 15) and are kept
-// compatible with the in-memory Store above: nothing here changes the Store
-// contract used by Tasks 1-14 callers.
+// compatible with the in-memory store in memory.go: nothing here changes the
+// RegistryStore contract used by the registry handler.
 // ---------------------------------------------------------------------------
 
 // State is the durable session lifecycle state persisted in SQLite.
@@ -210,6 +40,43 @@ const (
 	// startup reconciliation instead of stranding an unknown file.
 	StateDeleting State = "deleting"
 )
+
+// RegistryStore is the narrow registry-facing staging contract the HTTP
+// handler needs. Both the durable Service (Task 15) and the in-memory
+// dev/test store implement it, so the handler never branches on durability.
+// Every upload operation is repo+actor bound; ownership mismatches surface
+// as the identical ErrNotFound (never an existence oracle). Publication uses
+// ListStagedBlobs + ClearStagedBlobsByDigest for referenced-only consumption.
+type RegistryStore interface {
+	Create(ctx context.Context, repo, actor string, ttl time.Duration) (Session, error)
+	Status(ctx context.Context, id, repo, actor string) (Session, error)
+	Append(ctx context.Context, id, repo, actor string, expectedOffset int64, src io.Reader, maxBytes int64) (Session, error)
+	Open(ctx context.Context, id, repo, actor string) (io.ReadCloser, Session, error)
+	MarkFinalized(ctx context.Context, id, repo, actor, digest, beeRef, mediaType string, size int64) error
+	Delete(ctx context.Context, id, repo, actor string) error
+	ListStagedBlobs(ctx context.Context, repo, actor string) ([]spec.StagedBlob, error)
+	ClearStagedBlobsByDigest(ctx context.Context, repo, actor string, digests []string) error
+}
+
+// Limits configures the atomic durable staging quotas enforced INSIDE the
+// Append BEGIN IMMEDIATE transaction (never handler-side status checks), so
+// independent service processes admit only valid winners at every boundary
+// and a rejected append performs zero file/offset/state change. Zero means
+// that kind of quota is unbounded. Active and finalized session bytes are
+// both counted toward per-repository and total-staging usage (the documented
+// policy: a finalized blob awaiting a manifest still occupies staging, so a
+// restart or retry can never bypass a quota by "finishing"); creating rows
+// carry offset 0 and deleting rows are tombstoned, so neither is counted.
+type Limits struct {
+	// MaxUploadBytes bounds a single session's cumulative durable offset.
+	MaxUploadBytes int64
+	// MaxRepositoryBytes bounds the sum of active+finalized offsets for one
+	// repository across concurrent and restarted processes.
+	MaxRepositoryBytes int64
+	// MaxTotalStagingBytes bounds the sum of active+finalized offsets across
+	// every repository.
+	MaxTotalStagingBytes int64
+}
 
 // Session is the durable upload-session snapshot returned by Service
 // methods. Timestamps are native time.Time values derived from signed Unix

@@ -39,6 +39,7 @@ func TestBeeRegistryCannotSignLocally(t *testing.T) {
 	t.Setenv("REGISTRY_OWNER_MAP", "registry.test=0xabcdefabcdefabcdefabcdefabcdefabcdefabcdef")
 	t.Setenv("REGISTRY_ID_MAP", "registry.test=7")
 	beeAuthEnv(t)
+	setupRegistryStagingEnv(t)
 
 	// Even with a feed-owner signing key present, the Bee path MUST NOT use it:
 	// without the control-plane URL the handler fails closed.
@@ -88,6 +89,7 @@ func TestBeeHandlerRejectsNonLoopbackHTTPControlPlane(t *testing.T) {
 	t.Setenv("CONTROLPLANE_CA_BUNDLE_FILE", "")
 	t.Setenv("CONTROLPLANE_USE_SYSTEM_ROOTS", "")
 	beeAuthEnv(t)
+	setupRegistryStagingEnv(t)
 
 	t.Setenv("CONTROLPLANE_URL", "http://controlplane.internal:8080")
 	if _, err := buildBeeHandler(); err == nil {
@@ -152,6 +154,7 @@ func TestOperationPreflightWiring(t *testing.T) {
 	t.Setenv("CONTROLPLANE_CA_BUNDLE_FILE", "")
 	t.Setenv("CONTROLPLANE_USE_SYSTEM_ROOTS", "")
 	beeAuthEnv(t)
+	setupRegistryStagingEnv(t)
 	h, err := buildBeeHandler()
 	if err != nil {
 		t.Fatalf("build bee handler: %v", err)

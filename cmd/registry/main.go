@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/config"
 	"github.com/uncloud-registry/registry/internal/credential"
 	"github.com/uncloud-registry/registry/internal/policy"
 	"github.com/uncloud-registry/registry/internal/publish"
@@ -31,8 +34,16 @@ func main() {
 	}
 
 	log.Printf("registry listening on %s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatal(err)
+	serveErr := http.ListenAndServe(addr, handler)
+	// Close durable staging (spool root + SQLite) on shutdown; never leak the
+	// handle. Drivers that didn't open real state (in-memory) close as a no-op.
+	if c, ok := handler.(io.Closer); ok {
+		if closeErr := c.Close(); closeErr != nil {
+			log.Printf("registry close: %v", closeErr)
+		}
+	}
+	if serveErr != nil {
+		log.Fatal(serveErr)
 	}
 }
 
@@ -79,6 +90,25 @@ func buildMemoryHandler() (http.Handler, error) {
 		nil,
 		authRealm,
 	), nil
+}
+
+// buildStagingService constructs the durable Task 15 staging service from a
+// fully validated RegistryConfig, applies the atomic quota + stream buffer,
+// and returns it as the registry-facing RegistryStore. It is only called
+// AFTER every security-sensitive configuration and credential has validated,
+// so an invalid config can never open a database or sidecar.
+func buildStagingService(rc config.RegistryConfig) (staging.RegistryStore, error) {
+	svc, err := staging.NewService(context.Background(), rc.StagingRoot, rc.StagingDB)
+	if err != nil {
+		return nil, err
+	}
+	svc.SetLimits(staging.Limits{
+		MaxUploadBytes:       rc.MaxUploadBytes,
+		MaxRepositoryBytes:   rc.MaxRepositoryBytes,
+		MaxTotalStagingBytes: rc.MaxTotalStagingBytes,
+	})
+	svc.SetStreamBuffer(rc.StreamBufferBytes)
+	return svc, nil
 }
 
 func buildBeeHandler() (http.Handler, error) {
@@ -152,7 +182,20 @@ func buildBeeHandler() (http.Handler, error) {
 		HTTPClient: cpHTTPClient,
 	}
 
-	return registry.NewHandler(
+	// Durable bounded uploads (Task 16): the staging config is validated
+	// BEFORE any database is opened or any listener exposed, and the durable
+	// Task 15 service enforces the atomic per-upload/repo/total quotas inside
+	// BEGIN IMMEDIATE transactions.
+	stageCfg, err := config.LoadRegistryConfig()
+	if err != nil {
+		return nil, fmt.Errorf("registry staging config: %w", err)
+	}
+	stageStore, err := buildStagingService(stageCfg)
+	if err != nil {
+		return nil, fmt.Errorf("staging service: %w", err)
+	}
+
+	handler := registry.NewHandler(
 		resolve.RegistryResolver{
 			Registries: registryResolver,
 			Docs:       docs,
@@ -166,7 +209,7 @@ func buildBeeHandler() (http.Handler, error) {
 			StampPolicies: policy.StampPolicyResolver{Docs: docs, Feeds: feeds},
 		},
 		authenticator,
-		staging.NewMemoryStore(),
+		stageStore,
 		publish.Publisher{
 			Builder: publish.DefaultBuilder{},
 			Objects: objects,
@@ -174,7 +217,12 @@ func buildBeeHandler() (http.Handler, error) {
 		},
 		binder,
 		authRealm,
-	), nil
+	)
+	if rh, ok := handler.(*registry.Handler); ok {
+		rh.MaxUploadBytes = stageCfg.MaxUploadBytes
+		rh.SessionTTL = stageCfg.UploadTTL
+	}
+	return handler, nil
 }
 
 // validateBeeBaseURL rejects anything but an absolute http/https ORIGIN with

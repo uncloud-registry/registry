@@ -375,7 +375,7 @@ func TestUnauthorizedFirstPushZeroWrites(t *testing.T) {
 	t.Parallel()
 
 	h, _, feeds, _ := newFirstPushWorld(t)
-	stage := &countingStaging{Store: staging.NewMemoryStore()}
+	stage := &countingStaging{RegistryStore: staging.NewMemoryStore()}
 	h.Staging = stage
 	server := httptest.NewServer(h)
 	defer server.Close()

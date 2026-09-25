@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -216,6 +217,28 @@ func (m *MemoryDocumentStore) Put(_ context.Context, data []byte, _ string) (str
 	copy(out, data)
 	m.Documents[ref] = out
 	return ref, nil
+}
+
+// PutStream is the streaming dev/test counterpart of Put: it reads exactly
+// size bytes from src (bounded at size+1, failing closed on overflow) into a
+// content-addressed in-memory document. It exists so the memory handler passes
+// the same reader+size object-uploader contract as production Bee without
+// buffering the payload twice in the handler.
+func (m *MemoryDocumentStore) PutStream(ctx context.Context, src io.Reader, size int64, _ string) (string, error) {
+	if size < 0 {
+		return "", fmt.Errorf("streamed put requires a non-negative size")
+	}
+	if src == nil {
+		return "", fmt.Errorf("streamed put requires a source reader")
+	}
+	data, err := io.ReadAll(io.LimitReader(src, size+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) > size {
+		return "", fmt.Errorf("streamed put payload exceeds the declared size")
+	}
+	return m.Put(ctx, data, "")
 }
 
 type MemoryFeedStore struct {

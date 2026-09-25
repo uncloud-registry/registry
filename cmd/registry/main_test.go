@@ -23,6 +23,32 @@ const (
 	configRepo     = "backend/api"
 )
 
+// setupRegistryStagingEnv configures a VALID durable-staging environment so a
+// fully-wired Bee handler can build its Task 15 staging service (spool +
+// dedicated SQLite in a per-test temp dir). The examples pass the spool root
+// and DB path through symlink resolution: the strict Task 15 component walk
+// rejects symlink components by design, and macOS's /var -> /private/var
+// prefix must be materialized (exactly as an operator-provided absolute,
+// symlink-free path must be). See symlink-resistant openPrivateDirChain.
+func setupRegistryStagingEnv(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve temp dir symlinks: %v", err)
+	}
+	if err := os.Chmod(resolved, 0o700); err != nil {
+		t.Fatalf("chmod staging dir: %v", err)
+	}
+	t.Setenv("REGISTRY_STAGING_ROOT", filepath.Join(resolved, "spool"))
+	t.Setenv("REGISTRY_STAGING_DB", filepath.Join(resolved, "staging.db"))
+	t.Setenv("REGISTRY_UPLOAD_TTL", "24h")
+	t.Setenv("REGISTRY_MAX_UPLOAD_BYTES", "1073741824")        // 1 GiB
+	t.Setenv("REGISTRY_MAX_REPOSITORY_BYTES", "2147483648")    // 2 GiB
+	t.Setenv("REGISTRY_MAX_TOTAL_STAGING_BYTES", "4294967296") // 4 GiB
+	t.Setenv("REGISTRY_STREAM_BUFFER_BYTES", "65536")
+}
+
 // configTestKey holds a generated Ed25519 pair plus the JWKS document that
 // carries its public half.
 type configTestKey struct {
