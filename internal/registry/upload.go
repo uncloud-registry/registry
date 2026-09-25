@@ -217,35 +217,49 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 	}
 
 	// Optional final chunk, subject to the same strict range/offset rules.
-	if r.ContentLength != 0 {
-		start, end, present, perr := parseContentRangeHeader(r.Header)
-		if perr != nil {
+	// Content-Range is parsed INDEPENDENTLY of the request body length, so a
+	// malformed, stale, future, or span-unsatisfiable range is always
+	// validated on an ACTIVE PUT — even when the body is EMPTY (known
+	// Content-Length 0) — before any staging mutation, hash, or uploader call.
+	start, end, present, perr := parseContentRangeHeader(r.Header)
+	if perr != nil {
+		writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
+		return
+	}
+	expected := session.Offset
+	maxBytes := h.uploadMaxBytes()
+	if present {
+		span, ok := rangeSpan(start, end)
+		if !ok {
 			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
 			return
 		}
-		expected := session.Offset
-		maxBytes := h.uploadMaxBytes()
-		if present {
-			span, ok := rangeSpan(start, end)
-			if !ok {
-				writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
-				return
-			}
-			if start != session.Offset {
-				h.respondRangeNotSatisfiable(w, r.Context(), repo, uploadID, actor)
-				return
-			}
-			if r.ContentLength >= 0 && r.ContentLength != span {
-				writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
-				return
-			}
-			expected = start
-			maxBytes = span
-		} else if r.ContentLength >= 0 && int64(r.ContentLength) > h.uploadMaxBytes() {
-			// Oversized final body rejected before any side effect.
-			writeError(w, http.StatusRequestEntityTooLarge, "BLOB_UPLOAD_INVALID", messageUploadTooLarge)
+		if start != session.Offset {
+			h.respondRangeNotSatisfiable(w, r.Context(), repo, uploadID, actor)
 			return
 		}
+		// A declared range is the EXACT byte count this request writes. The
+		// inclusive span is ALWAYS >= 1 byte, so an EMPTY (known
+		// Content-Length 0) body can never fill a positive span: reject before
+		// any side effect. A chunked/unknown body is enforced by the
+		// exact-span reader instead (it faults short on an empty body).
+		if r.ContentLength >= 0 && r.ContentLength != span {
+			writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)
+			return
+		}
+		expected = start
+		maxBytes = span
+	} else if r.ContentLength > 0 && int64(r.ContentLength) > h.uploadMaxBytes() {
+		// Oversized final body rejected before any side effect. An empty body
+		// with no declared range is a PURE finalize of the already staged
+		// bytes and needs no append.
+		writeError(w, http.StatusRequestEntityTooLarge, "BLOB_UPLOAD_INVALID", messageUploadTooLarge)
+		return
+	}
+
+	// Append the final chunk unless this is a body-free finalize (empty body
+	// with no declared range) of the already staged bytes.
+	if present || r.ContentLength != 0 {
 		body := io.Reader(r.Body)
 		var exact *exactSpanReader
 		if present && r.ContentLength < 0 {
