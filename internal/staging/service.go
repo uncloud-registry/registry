@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -99,6 +100,13 @@ type service struct {
 	createBarrier    func()       // fires after both durable files exist, before activation
 	postActivateHook func()       // fires immediately after the activation commit, before token-file removal
 	truncateHook     func() error // fires before the rollback tail-truncate (fault injection)
+	// quarantineBarrier is a deterministic test-only barrier (nil in
+	// production) fired at "pre-rename" (managed name, before the quarantine
+	// rename) and "pre-unlink" (quarantine name, immediately before the final
+	// unlink) of every atomic-quarantine deletion, so swap injection proves a
+	// replaced occupant is detected and preserved at every former final-check
+	// window while the cross-process lock is held.
+	quarantineBarrier func(phase, name string)
 }
 
 // NewService constructs the durable staging service: it validates and
@@ -656,17 +664,22 @@ func (s *service) Create(ctx context.Context, repo, actor string, ttl time.Durat
 		s.postActivateHook()
 	}
 
-	// Phase R: token-sidecar removal — the FINAL token-clearing step, itself
-	// durable (directory fsync), followed by clearing the cleanup provenance
-	// in a guarded transaction. This is pure sidecar maintenance: the
-	// canonical payload is never touched. Any failure leaves the durable
-	// provenance (cleanup_token + the authenticated .tok file) for startup
-	// reconciliation, and Create STILL returns the committed active session
-	// — a committed activation is never reported as failed solely because
-	// post-commit cleanup could not finish.
+	// Phase R: token-sidecar maintenance — the FINAL token-clearing step, now
+	// performed by the serialized atomic-quarantine protocol (cleanupTokenSidecar):
+	// `<id>.tok` is atomically renamed into quarantine, authenticated byte-for-byte
+	// against the durable cleanup token, and only then unlinked with the directory
+	// fsynced and the provenance cleared, all under BEGIN IMMEDIATE. The canonical
+	// payload is never touched, so bytes accepted by a concurrent Append are safe
+	// by construction. Any failure (mismatch, fault, swap) restores/retains the
+	// sidecar, keeps cleanup_token durable, and Create STILL returns the committed
+	// active session — a committed activation is never reported as failed solely
+	// because post-commit cleanup could not finish; startup reconciliation finishes
+	// the same path.
 	rctx := context.WithoutCancel(ctx)
-	if err := s.removeTokDurable(id); err == nil {
-		_ = s.clearCleanupToken(rctx, id, token)
+	if err := s.cleanupTokenSidecar(rctx, id, token); err != nil {
+		// The committed session stands; the durable provenance remains for a
+		// later retry or startup reconciliation. Surface no raw cause.
+		_ = err
 	}
 	return Session{
 		ID:        id,
@@ -699,40 +712,117 @@ func (s *service) verifyCreatingTok(ctx context.Context, id, tokenHex string) er
 	return nil
 }
 
-// removeTokDurable unlinks the creating session's token file and fsyncs the
-// spool directory, so a completed create leaves no token bytes anywhere.
-func (s *service) removeTokDurable(id string) error {
-	if err := s.spool.removeTok(id); err != nil {
-		return typed(ErrDependency, err)
+// sidecarByteVerify returns a quarantine verify predicate authenticating the
+// opened sidecar descriptor byte-for-byte (constant-time) against want, with
+// an EXACT size lobe and no extra byte.
+func sidecarByteVerify(st os.FileInfo, f *os.File, want []byte) error {
+	if st.Size() != creatingTokenLen {
+		return errors.New("sidecar size is not the token lobe")
 	}
-	if err := s.syncDir(); err != nil {
-		return typed(ErrDependency, err)
+	got := make([]byte, creatingTokenLen)
+	if _, err := io.ReadFull(f, got); err != nil {
+		return err
+	}
+	var probe [1]byte
+	if m, perr := f.Read(probe[:]); perr != io.EOF || m != 0 {
+		return errors.New("sidecar carries more than the token lobe")
+	}
+	if subtle.ConstantTimeCompare(got, want) != 1 {
+		return errors.New("sidecar does not carry the expected token")
 	}
 	return nil
 }
 
-// removeFiles unlinks BOTH files of a session (the canonical payload file
-// and its token file) through the anchored descriptor, idempotent when
-// either is absent. The caller must hold a durable tombstone for the row
-// before calling (the row-id ownership proof); the containing directory is
-// fsynced by the caller afterwards.
-func (s *service) removeFiles(id string) error {
-	if err := s.spool.remove(id); err != nil {
-		return err
+// cleanupTokenSidecar is the atomic AUTHENTICATED quarantine deletion of the
+// post-activation token sidecar (`<id>.tok`), shared by Create's Phase R, by
+// startup reconciliation, and by deletion cleanup. Under a serialized BEGIN
+// IMMEDIATE transaction (the cross-process lock, held through the final unlink
+// and directory fsync) it:
+//
+//  1. atomically renames `<id>.tok` from the managed namespace into the
+//     deterministic quarantine `q-<id>.t` of the same retained root;
+//  2. opens that quarantine NO-FOLLOW, requires a real regular exact-0600 file
+//     of exactly creatingTokenLen bytes, verifies descriptor identity, and
+//     constant-time-compares the bytes against the durable cleanup token;
+//  3. on success fsyncs the directory, unlinks the quarantine, fsyncs the
+//     directory again, and ONLY THEN clears cleanup_token (guarded to live
+//     rows) in the same transaction;
+//  4. on any wrong/empty/mismatch/swap/occupied, NEVER deletes — it restores
+//     the quarantined entry non-clobberingly to `<id>.tok` when that name is
+//     free (or retains it at the private quarantine when occupied) and fails
+//     closed with cleanup_token retained.
+//
+// A crash/fault at rename, auth, unlink, dir fsync, or metadata clear
+// converges idempotently: an outstanding quarantine `q-<id>.t` is finished by
+// any retry or startup, and the managed name is never touched by the resume.
+// The canonical payload is never removed, so concurrent-appended bytes are
+// always safe.
+func (s *service) cleanupTokenSidecar(ctx context.Context, id, tokenHex string) error {
+	if tokenHex == "" {
+		// No authenticating provenance at all: nothing is authenticated to
+		// remove. A leftover <id>.tok is benign residue (Phase C tolerates it
+		// for a live row) and is never removed.
+		return nil
 	}
-	return s.spool.removeTok(id)
+	want, err := hex.DecodeString(tokenHex)
+	if err != nil || len(want) != creatingTokenLen {
+		return typed(ErrDependency, errors.New("staging cleanup token is not a valid lobe"))
+	}
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		// Re-read the row inside the same serialization: only finish the
+		// cleanup for a live row carrying exactly this cleanup token. An
+		// absent or tombstoned row leaves the sidecar to the deletion path.
+		row, found, err := fetchSession(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		if !found || (row.state != string(StateActive) && row.state != string(StateFinalized)) || row.cleanupToken.String != tokenHex {
+			return nil
+		}
+		_, qerr := s.spool.quarantineUnlink(
+			tokName(id), quarantineTokNameFor(id),
+			nil, // identity is not durable; authentication is BY the token bytes
+			func(st os.FileInfo, f *os.File) error { return sidecarByteVerify(st, f, want) },
+			s.syncDir, s.quarantineBarrier,
+		)
+		if qerr != nil {
+			// Wrong/empty/mismatch/swap/occupied: never deleted; restored or
+			// retained; cleanup_token stays durable for a retry / startup.
+			return typed(ErrDependency, qerr)
+		}
+		// The sidecar is durably gone: clear the provenance on the live row.
+		if _, err := conn.ExecContext(ctx,
+			`update upload_sessions set cleanup_token = null where id = ? and cleanup_token = ? and state in ('active','finalized')`, id, tokenHex); err != nil {
+			return typed(ErrDependency, err)
+		}
+		return nil
+	})
+}
+
+// deleteAuth is the durable / transition-observed provenance captured under
+// the tombstone serialization and used to authenticate quarantined files
+// before unlink during atomic-quarantine deletion.
+type deleteAuth struct {
+	canonical       os.FileInfo // Lstat(<id>) observed at the transition (nil if absent)
+	creating        bool        // this is a creating-row rollback (payload size not durable)
+	tokenBytes      []byte      // create/cleanup token bytes, if known and valid
+	tokenBytesKnown bool        // tokenBytes is authoritative (byte-authenticates the sidecar)
 }
 
 // rollbackCreate tears down a creating row and its attributable files
-// (idempotent, safe when the row or files are already absent). The guarded
-// tombstone update — `state='creating' AND create_token=?` — is the
-// serialization point: a row concurrently activated by its creator (or
-// tombstoned by another instance) is NOT touched, and no file is ever
-// unlinked whose row this call did not tombstone. It runs its own
-// transactions under a cancellation-proof context so a failed create always
-// converges. It is also the startup rollback path for interrupted creates.
+// (idempotent, safe when the row or files are already absent) using the atomic
+// authenticated quarantine protocol. The guarded tombstone update —
+// `state='creating' AND create_token=?` — is the serialization point: a row
+// concurrently activated by its creator (or tombstoned by another instance) is
+// NOT touched, and no file is ever unlinked whose row this call did not
+// tombstone. The create token is captured at the tombstone transition so the
+// sidecar is byte-authenticated, and the canonical file is authenticated
+// against its observed identity. It runs its own transactions under a
+// cancellation-proof context so a failed create always converges. It is also
+// the startup rollback path for interrupted creates.
 func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 	rctx := context.WithoutCancel(ctx)
+	var a deleteAuth
 	proceed := false
 	if err := s.withTx(rctx, func(conn *sql.Conn) error {
 		res, err := conn.ExecContext(rctx,
@@ -745,7 +835,24 @@ func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
-		proceed = n == 1
+		if n == 0 {
+			return nil // not ours to roll back (activated or already tombstoned)
+		}
+		// This call owns the tombstone: capture the create's provenance under
+		// the lock (canonical identity + byte-authenticating create token).
+		proceed = true
+		a.creating = true
+		if fi, _, err := s.spool.nameInfo(id); err != nil {
+			return typed(ErrDependency, err)
+		} else {
+			a.canonical = fi
+		}
+		want, derr := hex.DecodeString(token)
+		if derr != nil || len(want) != creatingTokenLen {
+			return typed(ErrDependency, errors.New("creating token is not a valid lobe"))
+		}
+		a.tokenBytes = want
+		a.tokenBytesKnown = true
 		return nil
 	}); err != nil {
 		return err
@@ -755,67 +862,108 @@ func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 		// tombstoned by another instance); never unlink files we do not own.
 		return nil
 	}
-	if err := s.removeFiles(id); err != nil {
-		return typed(ErrDependency, err)
-	}
-	if err := s.syncDir(); err != nil {
-		return typed(ErrDependency, err)
-	}
-	_, err := s.deleteTombstonedRow(rctx, id)
+	_, err := s.finishDeletion(rctx, id, a)
 	return err
 }
 
-// clearCleanupToken clears the durable post-activation sidecar provenance
-// once the token sidecar is durably gone (or verified absent). The guarded
-// update — `cleanup_token = ? AND state IN (active,finalized)` — makes it
-// idempotent across instances and a no-op once another instance (or a
-// tombstone) already resolved the row. It runs under a cancellation-proof
-// context so a committed create always converges.
-func (s *service) clearCleanupToken(ctx context.Context, id, token string) error {
-	return s.withTx(ctx, func(conn *sql.Conn) error {
-		if _, err := conn.ExecContext(ctx,
-			`update upload_sessions set cleanup_token = null
-			 where id = ? and cleanup_token = ? and state in ('active', 'finalized')`, id, token); err != nil {
+// finishDeletion completes an already-tombstoned (deleting) row's filesystem
+// deletion with the atomic AUTHENTICATED quarantine protocol. It holds BEGIN
+// IMMEDIATE across the rename/authenticate/unlink/fsync/metadata-delete and
+// reports whether THIS call removed the row (the single deletion winner among
+// concurrent instances). The canonical file and any token sidecar are moved
+// atomically into their deterministic quarantine names, authenticated against
+// the durable session provenance (the committed offset) and the object
+// observed/owned at the deletion transition (`a`), and only then unlinked with
+// the directory fsynced. It NEVER deletes by a mutable managed name: a
+// replaced occupant is preserved non-clobberingly and the tombstone retained
+// (fail closed) until the obstruction clears. A crash at rename, auth, unlink,
+// dir fsync, or metadata-delete converges idempotently via the deterministic
+// quarantines.
+func (s *service) finishDeletion(ctx context.Context, id string, a deleteAuth) (bool, error) {
+	removed := false
+	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		row, found, err := fetchSession(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			// Another instance already finished the deletion; never unlink
+			// anything on a stale identity.
+			return nil
+		}
+		if row.state != string(StateDeleting) {
+			return typed(ErrDependency, errors.New("cleanup row left the deleting tombstone"))
+		}
+		// Attempt EVERY file cleanup (canonical payload + token sidecar),
+		// even if an earlier one fails, so no spool residue accumulates on
+		// a partially-faulted run. The metadata row is deleted ONLY when all
+		// cleanups succeeded; any failure (including a directory fsync on an
+		// absent-at-both-names canonical) retains the durable tombstone and
+		// reports count 0 for a later run.
+		var cleanupErr error
+		if _, err := s.spool.quarantineUnlink(
+			id, quarantineNameFor(id),
+			a.canonical,
+			func(st os.FileInfo, f *os.File) error {
+				// Durable session provenance lower bound: the canonical file
+				// holds at least the committed bytes (offset). Tail bytes
+				// (uncommitted) are allowed — the session is being deleted
+				// wholesale. A creating-row payload size is not durable, so
+				// identity authentication alone governs it.
+				if !a.creating && st.Size() < row.offset {
+					return fmt.Errorf("canonical size %d is below the committed offset %d", st.Size(), row.offset)
+				}
+				return nil
+			},
+			s.syncDir, s.quarantineBarrier,
+		); err != nil {
+			cleanupErr = typed(ErrDependency, err)
+		}
+		// Token sidecar residue: byte-authenticated when the create/cleanup
+		// token was captured at the deletion transition; otherwise only an
+		// OUTSTANDING quarantine (a prior crash-faulted rename of this same
+		// session's sidecar) may be finished, and a managed `.tok` is never
+		// touched without token provenance.
+		verify := func(st os.FileInfo, f *os.File) error { return sidecarByteVerify(st, f, a.tokenBytes) }
+		if a.tokenBytesKnown {
+			if _, err := s.spool.quarantineUnlink(
+				tokName(id), quarantineTokNameFor(id),
+				nil, verify, s.syncDir, s.quarantineBarrier,
+			); err != nil && cleanupErr == nil {
+				cleanupErr = typed(ErrDependency, err)
+			}
+		} else if err := s.spool.resumeQuarantine(
+			quarantineTokNameFor(id),
+			func(st os.FileInfo, f *os.File) error {
+				if st.Size() != creatingTokenLen {
+					return errors.New("sidecar quarantine is not the token lobe size")
+				}
+				return nil
+			},
+			s.syncDir, s.quarantineBarrier,
+		); err != nil && cleanupErr == nil {
+			cleanupErr = typed(ErrDependency, err)
+		}
+		if cleanupErr != nil {
+			// A file (or an absent-names absence) is not durably established:
+			// retain the tombstone for a later run; count is not incremented.
+			return cleanupErr
+		}
+		// Only now, with the files durably gone, remove the row (exactly once
+		// across racing instances).
+		res, err := conn.ExecContext(ctx,
+			`delete from upload_sessions where id = ? and state = 'deleting'`, id)
+		if err != nil {
 			return typed(ErrDependency, err)
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return typed(ErrDependency, err)
+		} else {
+			removed = n == 1
 		}
 		return nil
 	})
-}
-
-// finishTokCleanup is the startup (and retry) path for a committed
-// activation whose token-sidecar removal is still pending: it removes the
-// sidecar ONLY when it provably carries exactly the row's cleanup token,
-// fsyncs the directory, and clears the cleanup provenance. A sidecar that
-// is absent is treated as already removed (the metadata is cleared); a
-// sidecar carrying foreign or empty bytes is NEVER removed, the provenance
-// is retained, and the startup fails closed with the foreign leaf untouched.
-func (s *service) finishTokCleanup(ctx context.Context, id, token string) error {
-	if token == "" {
-		// No provenance at all: nothing is authenticated to remove, and a
-		// leftover <id>.tok is benign residue (Phase C tolerates it). The
-		// row itself is already clean.
-		return nil
-	}
-	_, exists, err := s.spool.tokInfo(id)
-	if err != nil {
-		return typed(ErrDependency, err)
-	}
-	if !exists {
-		// The sidecar is already gone (its unlink succeeded before the
-		// directory sync faulted, or another instance removed it): clear the
-		// durable provenance.
-		return s.clearCleanupToken(ctx, id, token)
-	}
-	if err := s.verifyCreatingTok(ctx, id, token); err != nil {
-		// The sidecar does not carry OUR token: foreign/empty residue is
-		// NEVER removed and the provenance is retained (fail closed,
-		// untouched).
-		return err
-	}
-	if err := s.removeTokDurable(id); err != nil {
-		return err
-	}
-	return s.clearCleanupToken(ctx, id, token)
+	return removed, err
 }
 
 // deleteTombstonedRow removes the metadata row of a deleting tombstone and
@@ -1274,14 +1422,18 @@ func (s *service) ListFinalized(ctx context.Context, repo, actor string) ([]spec
 // Delete
 // ---------------------------------------------------------------------------
 
-// Delete removes a session with the same tombstone state machine as Expire:
-// a durable deleting row is committed first, the file is unlinked and the
-// directory fsynced OUTSIDE any transaction, and only then is the metadata
-// row removed. A failed unlink retains the tombstone; the caller's retry —
-// or startup reconciliation — finishes the deletion. Delete is idempotent:
-// an absent id returns nil WITHOUT touching anything, and a row owned by a
-// different tenant returns identically nil — the API is never an existence
-// oracle for foreign sessions.
+// Delete removes a session with the crash-safe tombstone state machine and the
+// atomic AUTHENTICATED quarantine protocol: a durable deleting row is committed
+// first while the canonical inode (and byte-authenticating token, when known)
+// are captured under the lock; then finishDeletion atomically renames the
+// canonical file and any token sidecar into their deterministic quarantines,
+// authenticates them against the captured provenance, unlinks them with the
+// directory fsynced, and only then removes the metadata row — all inside one
+// serialized transaction. A failed unlink retains the tombstone; the caller's
+// retry — or startup reconciliation — finishes the deletion idempotently via
+// the deterministic quarantines. Delete is idempotent: an absent id returns nil
+// WITHOUT touching anything, and a row owned by a different tenant returns
+// identically nil — the API is never an existence oracle for foreign sessions.
 func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 	if err := validateID(id); err != nil {
 		return err
@@ -1293,7 +1445,8 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 		return err
 	}
 
-	// Tx 1: durable tombstone.
+	// Tx 1: durable tombstone + transition provenance capture.
+	var a deleteAuth
 	proceed := false
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
@@ -1310,19 +1463,37 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 			return nil
 		}
 		proceed = true
-		if row.state == string(StateDeleting) {
-			return nil // tombstone already durable
-		}
-		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
-		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
+		if row.state != string(StateDeleting) {
+			// Capture the byte-authenticating token BEFORE the tombstone nulls
+			// it (creating rows and active/finalized rows with a pending sidecar
+			// cleanup both carry their authenticating token in the row).
+			switch {
+			case row.state == string(StateCreating):
+				a.creating = true
+				a.tokenBytes, _ = hex.DecodeString(row.createToken.String)
+				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
+			case row.cleanupToken.Valid:
+				a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
+				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
 			}
-			return typed(ErrDependency, err)
+			res, err := conn.ExecContext(ctx,
+				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
+			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				return typed(ErrDependency, err)
+			}
+			if n, err := res.RowsAffected(); err != nil || n != 1 {
+				return typed(ErrDependency, errors.New("staging tombstone update affected no row"))
+			}
 		}
-		if n, err := res.RowsAffected(); err != nil || n != 1 {
-			return typed(ErrDependency, errors.New("staging tombstone update affected no row"))
+		// Capture the canonical identity observed at the transition, under the
+		// lock, so a later replacement of the managed name is detected.
+		if fi, _, err := s.spool.nameInfo(id); err != nil {
+			return typed(ErrDependency, err)
+		} else {
+			a.canonical = fi
 		}
 		return nil
 	})
@@ -1333,19 +1504,10 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 		return nil
 	}
 
-	// Unlink + directory fsync OUTSIDE any transaction (a rollback must
-	// never revive rows whose files are gone). Both the canonical payload
-	// file and the session's token file (residue of an interrupted create)
-	// are removed through the anchored descriptor.
-	if err := s.removeFiles(id); err != nil {
-		return typed(ErrDependency, err)
-	}
-	if err := s.syncDir(); err != nil {
-		return typed(ErrDependency, err)
-	}
-
-	// Tx 2: metadata removal — only now is the file durably gone.
-	_, err = s.deleteTombstonedRow(ctx, id)
+	// Atomic authenticated quarantine deletion (rename → authenticate →
+	// unlink → fsync → metadata remove) under one serialized transaction,
+	// held through the final unlink so no legitimate writer can race it.
+	_, err = s.finishDeletion(ctx, id, a)
 	return err
 }
 
@@ -1425,12 +1587,15 @@ func (s *service) expiredIDs(ctx context.Context, nowNanos int64, limit int) ([]
 	return ids, nil
 }
 
-// expireOne deletes one expired row with the crash-safe tombstone protocol.
-// It reports whether THIS call performed the final metadata removal.
+// expireOne deletes one expired row with the crash-safe tombstone state machine
+// and the atomic AUTHENTICATED quarantine protocol. It reports whether THIS call
+// performed the final metadata removal (the single deletion winner among
+// concurrent instances).
 func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
-	// Tx 1: durable tombstone — committed before any unlink. A row that
+	// Tx 1: durable tombstone + transition provenance capture. A row that
 	// vanished (another instance) is skipped; a row already tombstoned
-	// proceeds to the unlink phase.
+	// proceeds to the quarantine-unlink phase with a fresh capture.
+	var a deleteAuth
 	proceed := false
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
 		row, found, err := fetchSession(ctx, conn, id)
@@ -1441,19 +1606,32 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 			return nil
 		}
 		proceed = true
-		if row.state == string(StateDeleting) {
-			return nil
-		}
-		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
-		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
+		if row.state != string(StateDeleting) {
+			switch {
+			case row.state == string(StateCreating):
+				a.creating = true
+				a.tokenBytes, _ = hex.DecodeString(row.createToken.String)
+				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
+			case row.cleanupToken.Valid:
+				a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
+				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
 			}
-			return typed(ErrDependency, err)
+			res, err := conn.ExecContext(ctx,
+				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
+			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				return typed(ErrDependency, err)
+			}
+			if n, err := res.RowsAffected(); err != nil || n != 1 {
+				return typed(ErrDependency, errors.New("staging tombstone update affected no row"))
+			}
 		}
-		if n, err := res.RowsAffected(); err != nil || n != 1 {
-			return typed(ErrDependency, errors.New("staging tombstone update affected no row"))
+		if fi, _, err := s.spool.nameInfo(id); err != nil {
+			return typed(ErrDependency, err)
+		} else {
+			a.canonical = fi
 		}
 		return nil
 	})
@@ -1464,20 +1642,10 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 		return false, nil
 	}
 
-	// Unlink + directory fsync OUTSIDE any transaction. On failure the
-	// tombstone stays durable for the retry. Both the canonical payload file
-	// and the session's token file are removed.
-	if err := s.removeFiles(id); err != nil {
-		return false, typed(ErrDependency, err)
-	}
-	if err := s.syncDir(); err != nil {
-		return false, typed(ErrDependency, err)
-	}
-
-	// Tx 2: metadata removal — only now is the file durably gone. The
-	// RowsAffected decides completion: exactly one instance's DELETE may
-	// remove the row, so concurrent expirers sum to one completion per row.
-	return s.deleteTombstonedRow(ctx, id)
+	// Atomic authenticated quarantine deletion under one serialized
+	// transaction held through the final unlink. On failure the tombstone
+	// stays durable for the retry.
+	return s.finishDeletion(ctx, id, a)
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,13 +1726,29 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 		}
 		switch State(ri.state) {
 		case StateDeleting:
-			if err := s.removeFiles(ri.id); err != nil {
-				return typed(ErrDependency, err)
+			// Finish the tombstoned deletion via the atomic authenticated
+			// quarantine protocol (a fresh transition capture is made under
+			// the lock, then the recognized files are quarantined and
+			// authenticated before unlink).
+			var a deleteAuth
+			if err := s.withTx(ctx, func(conn *sql.Conn) error {
+				row, found, err := fetchSession(ctx, conn, ri.id)
+				if err != nil {
+					return err
+				}
+				if !found || row.state != string(StateDeleting) {
+					return nil
+				}
+				if fi, _, err := s.spool.nameInfo(ri.id); err != nil {
+					return typed(ErrDependency, err)
+				} else {
+					a.canonical = fi
+				}
+				return nil
+			}); err != nil {
+				return err
 			}
-			if err := s.syncDir(); err != nil {
-				return typed(ErrDependency, err)
-			}
-			if _, err := s.deleteTombstonedRow(ctx, ri.id); err != nil {
+			if _, err := s.finishDeletion(ctx, ri.id, a); err != nil {
 				return err
 			}
 		case StateCreating:
@@ -1577,9 +1761,9 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 			}
 			// A committed activation with a pending sidecar cleanup carries
 			// the authenticated cleanup token: finish the cleanup now
-			// (verify the sidecar, remove it durably, clear the metadata).
+			// (atomic quarantine + byte auth + metadata clear).
 			if ri.cleanupToken != "" {
-				if err := s.finishTokCleanup(ctx, ri.id, ri.cleanupToken); err != nil {
+				if err := s.cleanupTokenSidecar(ctx, ri.id, ri.cleanupToken); err != nil {
 					return err
 				}
 			}
@@ -1704,19 +1888,15 @@ func (s *service) reconcileCreatingRow(ctx context.Context, ri rowInfo) error {
 			return typed(ErrDependency, err)
 		}
 		if curCleanup != "" {
-			return s.finishTokCleanup(ctx, ri.id, curCleanup)
+			return s.cleanupTokenSidecar(ctx, ri.id, curCleanup)
 		}
 		return nil
 	case StateDeleting:
 		// Another instance already tombstoned the interrupted create;
-		// finish the deletion (remove both files, then the row).
-		if err := s.removeFiles(ri.id); err != nil {
-			return typed(ErrDependency, err)
-		}
-		if err := s.syncDir(); err != nil {
-			return typed(ErrDependency, err)
-		}
-		_, err := s.deleteTombstonedRow(ctx, ri.id)
+		// finish the deletion with the atomic authenticated quarantine
+		// protocol (renamed managed leaf -> quarantine, authenticated,
+		// unlinked under the lock, then the tombstone row removed).
+		_, err := s.expireOne(ctx, ri.id)
 		return err
 	case StateCreating:
 		// Still creating: decide with the CURRENT token and lease.

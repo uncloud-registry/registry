@@ -255,14 +255,14 @@ func TestSpoolFileLifecycle(t *testing.T) {
 		t.Fatalf("read %q, want hello", got)
 	}
 
-	if err := sp.remove(id); err != nil {
+	if _, err := sp.quarantineUnlink(id, quarantineNameFor(id), nil, nil, sp.syncDir, nil); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(rootPath, id)); !os.IsNotExist(err) {
 		t.Fatalf("file remains after remove: %v", err)
 	}
 	// Removing an already-absent file is tolerated (idempotent cleanup).
-	if err := sp.remove(id); err != nil {
+	if _, err := sp.quarantineUnlink(id, quarantineNameFor(id), nil, nil, sp.syncDir, nil); err != nil {
 		t.Fatalf("second remove: %v", err)
 	}
 }
@@ -479,9 +479,10 @@ func TestSpoolAnchoredAcrossRootSwap(t *testing.T) {
 	}
 }
 
-// TestSpoolRemoveDurable proves unlink + directory fsync semantics: removing
-// an absent file is a no-op, and a non-empty directory entry is left intact
-// (the durable-removal contract for tombstoned deletions).
+// TestSpoolRemoveDurable proves the atomic-quarantine removal contract: the
+// quarantined unlink + directory fsync leaves an absent file as a no-op, and a
+// non-empty directory planted at a session name is left intact (a tombstoned
+// deletion retries later; nothing is ever unlinked by a mutable managed name).
 func TestSpoolRemoveDurable(t *testing.T) {
 	dir := tempPrivate(t)
 	rootPath := filepath.Join(dir, "spool")
@@ -497,14 +498,18 @@ func TestSpoolRemoveDurable(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	f.Close()
-	if err := sp.removeDurable(id); err != nil {
+	fi, _, err := sp.nameInfo(id)
+	if err != nil {
+		t.Fatalf("nameInfo: %v", err)
+	}
+	if _, err := sp.quarantineUnlink(id, quarantineNameFor(id), fi, nil, sp.syncDir, nil); err != nil {
 		t.Fatalf("removeDurable: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(rootPath, id)); !os.IsNotExist(err) {
 		t.Fatalf("file survives removeDurable: %v", err)
 	}
 	// Idempotent when already absent.
-	if err := sp.removeDurable(id); err != nil {
+	if _, err := sp.quarantineUnlink(id, quarantineNameFor(id), nil, nil, sp.syncDir, nil); err != nil {
 		t.Fatalf("second removeDurable: %v", err)
 	}
 
@@ -517,7 +522,7 @@ func TestSpoolRemoveDurable(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(rootPath, dd, "keep"), []byte("x"), 0o600); err != nil {
 		t.Fatalf("plant content: %v", err)
 	}
-	if err := sp.removeDurable(dd); err == nil {
+	if _, err := sp.quarantineUnlink(dd, quarantineNameFor(dd), nil, nil, sp.syncDir, nil); err == nil {
 		t.Fatal("removeDurable removed a non-empty directory")
 	}
 	if _, err := os.Lstat(filepath.Join(rootPath, dd, "keep")); err != nil {

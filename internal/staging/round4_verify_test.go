@@ -169,7 +169,7 @@ func waitBorrowed(t *testing.T, p *dbPool, n int) {
 // ---------------------------------------------------------------------------
 // Round 4 issue 4: leaf-replacement-safe mode/removal. Deterministic swap
 // barriers prove that a foreign replacement swapped in between stat and
-// open (verifyPrivateDir) or before cleanup (removeNameGuarded /
+// open (verifyPrivateDir) or before cleanup (quarantineUnlinkRoot /
 // createName / createDBFile) is NEVER chmod'd or unlinked.
 // ---------------------------------------------------------------------------
 
@@ -214,8 +214,11 @@ func TestRound4LeafSwapNeverMutatesForeignReplacement(t *testing.T) {
 		t.Fatalf("verifyPrivateDir mutated the foreign replacement: mode=%v err=%v", fi.Mode().Perm(), lerr)
 	}
 
-	// (b) removeNameGuarded / createName cleanup: a foreign file swapped in
-	// at cleanup time must survive with its exact name and content.
+	// (b) quarantineUnlinkRoot cleanup: a foreign file swapped in at the
+	// pre-rename boundary must survive with its exact name and content — the
+	// quarantine protocol authenticates the renamed occupant against the
+	// observed `want` identity, never deletes a foreign/replaced leaf, and
+	// restores it non-clobberingly while failing closed.
 	victim := filepath.Join(dir, "victim")
 	if err := os.WriteFile(victim, []byte("ours"), 0o600); err != nil {
 		t.Fatalf("write victim: %v", err)
@@ -224,10 +227,15 @@ func TestRound4LeafSwapNeverMutatesForeignReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lstat victim: %v", err)
 	}
-	ascLeafSwapHook = func(phase, name string) {
-		if phase != "remove" || name != "victim" {
+	swapped := false
+	var barrier = func(phase, name string) {
+		if phase != "pre-rename" || name != "victim" {
 			return
 		}
+		if swapped {
+			return
+		}
+		swapped = true
 		if err := os.Rename(victim, filepath.Join(dir, "victim.orig")); err != nil {
 			t.Fatal(err)
 		}
@@ -235,11 +243,12 @@ func TestRound4LeafSwapNeverMutatesForeignReplacement(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := removeNameGuarded(root, "victim", want); err != nil {
-		ascLeafSwapHook = nil
-		t.Fatalf("guarded remove returned an error: %v", err)
+	if _, err := quarantineUnlinkRoot(root, "victim", quarantineNameFor("victim"), want, nil, nil, barrier); err == nil {
+		t.Fatalf("guarded remove must FAIL CLOSED on a swapped foreign replacement, got nil")
 	}
-	ascLeafSwapHook = nil
+	if !swapped {
+		t.Fatal("quarantine barrier never fired")
+	}
 	fi2, lerr := os.Lstat(victim)
 	if lerr != nil || fi2.Size() != int64(len("foreign-bytes")) {
 		t.Fatalf("guarded cleanup removed a foreign replacement: err=%v", lerr)

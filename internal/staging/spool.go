@@ -69,6 +69,19 @@ func spoolErrorCause(err error) error {
 // the root and no symlink is ever followed. The descriptor is retained for
 // the lifetime of the service, so a rename/swap of the root path never
 // redirects production access.
+//
+// PRIVACY BOUNDARY: the spool is EXACT-PRIVATE — every leaf is verified to
+// exact 0600 and every directory in the chain to exact 0700 through anchored
+// descriptors, so a foreign or looser-mode leaf is never chmod'd, opened, or
+// unlinked. The threat model is an ATTACKER OUTSIDE THE UID: the owner UID by
+// definition may chmod/chown/unlink these files directly, so the quarantine
+// protocol defends against another process racing a swap under a DIFFERENT
+// owner only insofar as that process cannot already write the directory. It
+// does NOT defend an untrusted process sharing the service's UID (same-UID),
+// nor root; a same-UID adversary can stat/open/rename the files regardless of
+// mode. All pointers, SameFile, and quarantine-guarantees therefore assume
+// mount-owner-equivalent access and provide atomicity/durability guarantees
+// strictly below that boundary.
 
 // ascLeafSwapHook, when non-nil, runs at a leaf-boundary decision point (in
 // verifyPrivateDir before its descriptor open, in removeNameGuarded before
@@ -440,28 +453,338 @@ func (sp *spool) createTok(id string) (*os.File, error) {
 	return sp.createName(tokName(id))
 }
 
-// removeNameGuarded unlinks name, relative to root, only if the CURRENT
-// directory entry is the very inode described by want (the object this call
-// created/verified). A leaf that was swapped or replaced after identity
-// verification is NEVER removed — cleanup fails closed and leaves the
-// foreign entry untouched.
-func removeNameGuarded(root *os.Root, name string, want os.FileInfo) error {
-	if ascLeafSwapHook != nil {
-		ascLeafSwapHook("remove", name)
+// ---------------------------------------------------------------------------
+// Atomic quarantine deletion (repair 4).
+//
+// Quarantine names use a SEPARATE strict grammar, derived deterministically
+// from a session id so a crash-faulted quarantine is attributable and
+// convergent, but never valid as a session name or a .tok name:
+//
+//	canonical quarantine: "q-" + <64 lowercase hex id>          (e.g. q-a3..f0)
+//	token quarantine:     "q-" + <64 lowercase hex id> + ".t"
+//
+// The protection of the quarantine protocol comes from the cross-process
+// serialization (BEGIN IMMEDIATE) held over the WHOLE rename/authenticate/
+// unlink/fsync sequence and from byte/identity authentication — never from
+// the secrecy of the name. An unchanged deterministic name keeps interruption
+// (rename committed, unlink not yet) recoverable by any instance. POSIX
+// offers no conditional unlink-by-inode, so the accepted boundary is: the
+// exact-private spool excludes other principals, and every legitimate
+// same-UID writer obeys the same BEGIN IMMEDIATE lock, which no legitimate
+// process can hold while another quarantines. A malicious same-UID process is
+// out of scope (it can already read or delete everything); the protocol still
+// detects and preserves a replaced occupant whenever the swap happens within
+// an observable boundary.
+// ---------------------------------------------------------------------------
+
+// quarantineNameFor returns the deterministic quarantine name of the canonical
+// spool file for a validated id.
+func quarantineNameFor(id string) string { return "q-" + id }
+
+// quarantineTokNameFor returns the deterministic quarantine name of the token
+// sidecar for a validated id.
+func quarantineTokNameFor(id string) string { return "q-" + id + ".t" }
+
+// quarantineForManaged maps a managed spool name (a canonical id or its .tok
+// sidecar) to its quarantine name.
+func quarantineForManaged(name string) string {
+	if base, ok := strings.CutSuffix(name, ".tok"); ok {
+		return quarantineTokNameFor(base)
 	}
-	cur, err := root.Lstat(name)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // already gone; nothing to remove
+	return quarantineNameFor(name)
+}
+
+// isQuarantineName reports whether name uses the quarantine grammar and, if
+// so, returns its base id and whether it is the token sidecar quarantine.
+func isQuarantineName(name string) (base string, tok bool, ok bool) {
+	if !strings.HasPrefix(name, "q-") {
+		return "", false, false
+	}
+	rest := name[2:]
+	if len(rest) == 64 && isHex64(rest) {
+		return rest, false, true
+	}
+	if len(rest) == 66 && strings.HasSuffix(rest, ".t") && isHex64(rest[:64]) {
+		return rest[:64], true, true
+	}
+	return "", false, false
+}
+
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < 64; i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'f':
+		default:
+			return false
 		}
+	}
+	return true
+}
+
+// quarantineUnlink atomically removes a leaf after moving it from its mutable
+// managed name into the private quarantine name, then AUTHENTICATING the
+// quarantined entry as the object the caller owns / observed at a serialized
+// transition. It NEVER unlinks a mutable managed name directly.
+//
+//	... managed -> quarantine (atomic rename, same retained root)
+//	... open the quarantine NO-FOLLOW, require a real regular exact-0600 file
+//	    whose inode is SameFile against `want` (when non-nil, the created or
+//	    transition-observed identity) and which satisfies `verify` (a durably
+//	    proven contract such as exact size, or exact sidecar bytes).
+//	... on success, unlink the quarantine and fsync the directory.
+//	... on ANY mismatch/swap/wrong-size/symlink, the quarantined entry is
+//	    RESTORED non-clobberingly to `managed` when that name is free, or
+//	    retained at `quarantine` when occupied, and an error is returned:
+//	    a foreign or unowned entry is NEVER deleted.
+//	... a crash between rename and unlink is recovered by a later call: when
+//	    `managed` is absent but `quarantine` is present, the outstanding
+//	    quarantine is authenticated and finished (deterministic name).
+//
+// The caller MUST hold the cross-process serialization (BEGIN IMMEDIATE) or —
+// for constructor cleanup — the unique created-object identity for the whole
+// call; that is what prevents a legitimate writer from replacing the
+// quarantine name between authentication and unlink. A test-only `barrier`
+// fires before the rename and immediately before the final unlink so swap
+// injection proves the protocol detects and preserves replacements at every
+// former final-check window.
+func (sp *spool) quarantineUnlink(managed, quarantine string, want os.FileInfo, verify func(st os.FileInfo, f *os.File) error, syncDir func() error, barrier func(phase, name string)) (bool, error) {
+	return quarantineUnlinkRoot(sp.root, managed, quarantine, want, verify, syncDir, barrier)
+}
+
+func quarantineUnlinkRoot(root *os.Root, managed, quarantine string, want os.FileInfo, verify func(st os.FileInfo, f *os.File) error, syncDir func() error, barrier func(phase, name string)) (bool, error) {
+	if barrier != nil {
+		barrier("pre-rename", managed)
+	}
+
+	srcFi, serr := root.Lstat(managed)
+	var captured os.FileInfo
+	renamed := false
+	switch {
+	case serr == nil:
+		if srcFi.Mode()&os.ModeSymlink != 0 {
+			// Managed names are never symlinks; reject without moving.
+			return false, spoolErr(spoolErrGeneric, errors.New("spool leaf is a symbolic link"))
+		}
+		// The destination must be ABSENT: POSIX rename would atomically
+		// replace it. An occupied quarantine (e.g. a crashed sibling's
+		// outstanding rename, or an attacker) is never clobbered.
+		if _, derr := root.Lstat(quarantine); derr == nil {
+			return false, spoolErr(spoolErrGeneric, errors.New("quarantine destination is already occupied"))
+		} else if !os.IsNotExist(derr) {
+			return false, spoolErr(spoolErrGeneric, derr)
+		}
+		if err := root.Rename(managed, quarantine); err != nil {
+			if os.IsNotExist(err) {
+				// The managed name vanished between Lstat and rename: recover
+				// to the outstanding-quarantine branch below.
+				serr = err
+				break
+			}
+			return false, spoolErr(spoolErrGeneric, err)
+		}
+		renamed = true
+		captured = srcFi
+		// Prove the rename moved exactly the inspected inode: a swap between
+		// the Lstat and the rename is a FOREIGN capture and is restored, never
+		// unlinked.
+		pdst, lerr := root.Lstat(quarantine)
+		if lerr != nil || !os.SameFile(srcFi, pdst) {
+			_ = restoreQuarantine(root, quarantine, managed)
+			if syncDir != nil {
+				// Directory fsync after every restore (best-effort; the
+				// failed cleanup already retains durable metadata).
+				_ = syncDir()
+			}
+			return false, spoolErr(spoolErrGeneric, errors.New("quarantine captured a replaced leaf"))
+		}
+	case os.IsNotExist(serr):
+		// Fall through: an outstanding quarantine from an earlier rename
+		// (managed absent) is finished when present.
+	default:
+		return false, spoolErr(spoolErrGeneric, serr)
+	}
+	if !renamed {
+		// managed was absent at Lstat (or vanished before rename): recover an
+		// outstanding quarantine, or treat as already-clean idempotency.
+		if _, qerr := root.Lstat(quarantine); os.IsNotExist(qerr) {
+			// Nothing at either name. The ABSENCE is a durable fact only once
+			// the containing directory fsync succeeds: a crash before that sync
+			// could resurrect the unlink, so a clean result here must not be
+			// acknowledged without the same directory sync an unlink performs.
+			// A failing sync fails closed exactly like it would after an unlink,
+			// retaining the tombstone and count for a later run. Idempotency is
+			// preserved for a previously-durable unlink (the dir is already
+			// synced, so a follow-up sync succeeds).
+			if syncDir != nil {
+				if err := syncDir(); err != nil {
+					return false, err
+				}
+			}
+			return false, nil
+		} else if qerr != nil {
+			return false, spoolErr(spoolErrGeneric, qerr)
+		}
+		qFi, lerr := root.Lstat(quarantine)
+		if lerr != nil {
+			return false, spoolErr(spoolErrGeneric, lerr)
+		}
+		captured = qFi
+	}
+
+	if err := authAndUnlinkQuarantine(root, quarantine, captured, want, verify, syncDir, barrier); err != nil {
+		// Foreign / unowned / wrong content: the caller restores after a
+		// fresh rename; a resumed quarantine is retained (fail closed).
+		if renamed {
+			_ = restoreQuarantine(root, quarantine, managed)
+			if syncDir != nil {
+				// Directory fsync after every restore (best-effort; the
+				// failed cleanup already retains durable metadata).
+				_ = syncDir()
+			}
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// authAndUnlinkQuarantine authenticates an existing quarantine entry against
+// its captured inode / owned identity / durable contract, re-checks identity
+// immediately before the final unlink (the last replacement window) while the
+// serialization is held, then unlinks it and fsyncs the directory. A swap of
+// the quarantine name between authentication and unlink is detected and the
+// replacement is never unlinked (the caller restores it non-clobberingly or
+// retains it fail-closed).
+func authAndUnlinkQuarantine(root *os.Root, quarantine string, captured, want os.FileInfo, verify func(st os.FileInfo, f *os.File) error, syncDir func() error, barrier func(phase, name string)) error {
+	if err := ensureQuarantinedLeaf(root, quarantine, captured, want, verify); err != nil {
+		return err
+	}
+	if barrier != nil {
+		barrier("pre-unlink", quarantine)
+	}
+	// FINAL identity re-check immediately before the unlink.
+	if err := ensureQuarantinedLeaf(root, quarantine, captured, want, verify); err != nil {
+		return err
+	}
+	if err := root.Remove(quarantine); err != nil && !os.IsNotExist(err) {
 		return spoolErr(spoolErrGeneric, err)
 	}
-	if !os.SameFile(want, cur) {
-		// A foreign replacement occupies the name: leave it, fail closed.
+	if syncDir != nil {
+		if err := syncDir(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resumeQuarantine finishes a pending quarantine left by a prior crash-faulted
+// rename (the managed name is already free and this call stays off that
+// mutable name entirely). If the quarantine is absent it is a NO-OP. A
+// quarantine that does not authenticate (foreign or unowned content) is NEVER
+// deleted; it is retained and an error is returned.
+func (sp *spool) resumeQuarantine(quarantine string, verify func(st os.FileInfo, f *os.File) error, syncDir func() error, barrier func(phase, name string)) error {
+	root := sp.root
+	if _, err := root.Lstat(quarantine); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	qFi, lerr := root.Lstat(quarantine)
+	if lerr != nil {
+		return spoolErr(spoolErrGeneric, lerr)
+	}
+	return authAndUnlinkQuarantine(root, quarantine, qFi, nil, verify, syncDir, barrier)
+}
+
+// ensureQuarantinedLeaf verifies the entry at name is a real regular,
+// non-symlink, exact-0600 file whose inode is SameFile against both `captured`
+// (the inode the rename moved / is resuming) and `want` (the owned or observed
+// identity, when non-nil) and against the opened descriptor, and which
+// satisfies `verify`. Used both for the authentication decision and for the
+// identity re-check immediately before the final unlink.
+func ensureQuarantinedLeaf(root *os.Root, name string, captured, want os.FileInfo, verify func(st os.FileInfo, f *os.File) error) error {
+	fi, err := root.Lstat(name)
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return spoolErr(spoolErrGeneric, errors.New("quarantine path is a symbolic link"))
+	}
+	if !fi.Mode().IsRegular() {
+		return spoolErr(spoolErrGeneric, errors.New("quarantine path is not a regular file"))
+	}
+	if p := fi.Mode().Perm(); p != 0o600 {
+		return spoolErr(spoolErrGeneric, fmt.Errorf("quarantine mode %o is not exact 0600", p))
+	}
+	if captured != nil && !os.SameFile(captured, fi) {
+		return spoolErr(spoolErrGeneric, errors.New("quarantine does not match the captured inode"))
+	}
+	f, err := root.OpenFile(name, os.O_RDONLY, 0) // os.Root uses O_NOFOLLOW
+	if err != nil {
+		return spoolErr(spoolErrGeneric, err)
+	}
+	st, serr := f.Stat()
+	if serr != nil || !st.Mode().IsRegular() {
+		f.Close()
+		return spoolErr(spoolErrGeneric, errors.New("opened quarantine is not a regular file"))
+	}
+	if !os.SameFile(fi, st) {
+		f.Close()
+		return spoolErr(spoolErrGeneric, errors.New("quarantine changed between stat and open"))
+	}
+	if want != nil && !os.SameFile(want, st) {
+		f.Close()
+		return spoolErr(spoolErrGeneric, errors.New("quarantine identity does not match the owned object"))
+	}
+	if verify != nil {
+		if verr := verify(st, f); verr != nil {
+			f.Close()
+			return spoolErr(spoolErrGeneric, verr)
+		}
+	}
+	return f.Close()
+}
+
+// restoreQuarantine moves a quarantined entry back to its managed name ONLY
+// when that name is currently FREE (never clobbering); when it is occupied the
+// entry is retained at the private quarantine name and restore reports false.
+func restoreQuarantine(root *os.Root, quarantine, managed string) bool {
+	if _, err := root.Lstat(managed); err != nil {
+		if !os.IsNotExist(err) {
+			return false
+		}
+	} else {
+		return false // occupied: never clobber; keep it quarantined
+	}
+	return root.Rename(quarantine, managed) == nil
+}
+
+// quarantineCreated is the created-object failure cleanup: it atomically
+// quarantines a leaf the CALLER just created (O_EXCL) and authenticates it
+// against the retained created descriptor identity. A foreign replacement
+// occupying the name is never removed and never clobbered. Used by createName
+// and createDBFile. The directory is fsynced after every rename/unlink.
+func quarantineCreated(root *os.Root, managed string, created os.FileInfo, syncDir func() error, barrier func(phase, name string)) error {
+	if created == nil {
+		// No created identity to authenticate against: never remove a name.
 		return nil
 	}
-	if err := root.Remove(name); err != nil && !os.IsNotExist(err) {
-		return spoolErr(spoolErrGeneric, err)
+	if barrier != nil {
+		barrier("pre-rename", managed)
+	}
+	// Atomic capture then authenticate against the created inode.
+	_, err := quarantineUnlinkRoot(root, managed, quarantineForManaged(managed), created,
+		func(st os.FileInfo, f *os.File) error { return nil }, // identity + regular/0600 suffice
+		syncDir, barrier)
+	if err != nil {
+		// The quarantined leaf did not match the created identity (a swap
+		// replaced it) or the destination was occupied: the foreign or
+		// replacement object is preserved and the cleanup fails closed.
+		return err
 	}
 	return nil
 }
@@ -482,12 +805,14 @@ func (sp *spool) createName(name string) (*os.File, error) {
 		return nil, spoolErr(spoolErrGeneric, err)
 	}
 	// Immediate chmod on the descriptor, then exact verification —
-	// regardless of umask. The cleaned-up residue is always OUR inode.
+	// regardless of umask. The cleaned-up residue is always OUR inode,
+	// authenticated against it by the atomic quarantine protocol (never a
+	// check-then-name unlink).
 	cleanup := func(e error) (*os.File, error) {
 		st, serr := f.Stat()
 		_ = f.Close()
 		if serr == nil {
-			_ = removeNameGuarded(sp.root, name, st)
+			_ = quarantineCreated(sp.root, name, st, func() error { return sp.syncDir() }, nil)
 		}
 		return nil, e
 	}
@@ -507,24 +832,6 @@ func (sp *spool) createName(name string) (*os.File, error) {
 		return cleanup(spoolErr(spoolErrGeneric, errors.New("spool file changed during creation")))
 	}
 	return f, nil
-}
-
-// removeTok unlinks the token file for a validated id (idempotent when
-// absent), through the anchored descriptor — never through a path.
-func (sp *spool) removeTok(id string) error {
-	return sp.removeName(tokName(id))
-}
-
-// removeName unlinks an internal spool name (idempotent when absent).
-func (sp *spool) removeName(name string) error {
-	err := sp.root.Remove(name)
-	if err != nil && os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return spoolErr(spoolErrGeneric, err)
-	}
-	return nil
 }
 
 // readTokExact reads exactly n bytes from the token file of a validated id,
@@ -798,35 +1105,6 @@ func (sp *spool) readExact(id string, n int64) ([]byte, error) {
 	}
 	f.Close()
 	return buf, nil
-}
-
-// remove unlinks the spool file for a validated id. Removing an already
-// absent file is a no-op (idempotent cleanup). os.Root.Remove never follows
-// a symlink: the link itself is removed. A non-empty directory entry cannot
-// be unlinked and is left intact.
-func (sp *spool) remove(id string) error {
-	if err := validateID(id); err != nil {
-		return err
-	}
-	err := sp.root.Remove(id)
-	if err != nil && os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return spoolErr(spoolErrGeneric, err)
-	}
-	return nil
-}
-
-// removeDurable unlinks the spool file (idempotent when absent) and fsyncs
-// the containing directory before returning, so a completed removal is
-// durable even across a crash. On error the entry state is reported as-is
-// (the unlink may or may not have happened); callers keep the tombstone.
-func (sp *spool) removeDurable(id string) error {
-	if err := sp.remove(id); err != nil {
-		return err
-	}
-	return sp.syncDir()
 }
 
 // syncDir fsyncs the spool root directory through the retained descriptor,

@@ -1197,18 +1197,20 @@ func createDBFile(parentRoot *os.Root, dbName string) (os.FileInfo, error) {
 		return nil, typed(ErrDependency, errors.New("cannot create database file"))
 	}
 	fail := func(e error) (os.FileInfo, error) {
-		// Clean up ONLY the inode this call created: a foreign replacement
-		// swapped in after creation is detected via the descriptor identity
-		// and left untouched.
+		// Clean up ONLY the inode this call created: the residue is removed
+		// through the atomic authenticated quarantine protocol
+		// (rename -> authenticate against the created descriptor identity ->
+		// unlink + directory fsync), so a foreign replacement swapped in after
+		// creation is NEVER removed and the parent directory is fsynced after
+		// every rename/unlink — never a check-then-name unlink on the mutable
+		// database name.
 		if ascLeafSwapHook != nil {
 			ascLeafSwapHook("db", dbName)
 		}
 		st, serr := f.Stat()
 		_ = f.Close()
 		if serr == nil {
-			if cur, lerr := parentRoot.Lstat(dbName); lerr == nil && os.SameFile(st, cur) {
-				_ = parentRoot.Remove(dbName)
-			}
+			_ = quarantineCreated(parentRoot, dbName, st, func() error { return syncRootDir(parentRoot) }, nil)
 		}
 		return nil, e
 	}
