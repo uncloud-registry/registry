@@ -269,19 +269,25 @@ func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn
 		}
 		uncertain := false
 		var (
-			cleanupErr   error
 			cleanupPanic any
 		)
 		if onFailure != nil {
 			// 1. Callback-specific restoration runs while the write lock is
 			// still held: an interrupted append truncates and fsyncs its tail
-			// BEFORE the serialization point can pass to another writer. A
-			// panicking restoration is always uncertainty; a FAILING
-			// restoration is uncertainty on the PANIC path (nothing else can
-			// report it), while on an ordinary error path it folds into the
-			// returned error exactly like the pre-existing contract (the
-			// truncate result is itself durable and a sync failure
-			// propagates), leaving the pool usable.
+			// BEFORE the serialization point can pass to another writer. ANY
+			// failed restoration — the truncate, the settle fsync, or the
+			// descriptor close — means the file's tail durability cannot be
+			// confirmed, on BOTH the panic path and the ordinary error path.
+			// The pool is atomically quarantined and the connection retired
+			// (below) before its serialization is released, so the live
+			// service never reuses or hands out a handle while the tail state
+			// is uncertain: every later operation fails closed fixed/data-free
+			// and a fresh restart reconciles or fails closed. The ordinary
+			// primary error never leaks; the exact context sentinel wins when
+			// the caller's own context fired. Only a SUCCESSFUL restoration
+			// keeps the ordinary error path healthy (clean pool, its normal
+			// fixed classification). A panicking restoration is always
+			// uncertainty and re-raises its own value.
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -290,11 +296,7 @@ func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn
 					}
 				}()
 				if cerr := onFailure(); cerr != nil {
-					if didPanic {
-						uncertain = true
-					} else {
-						cleanupErr = cerr
-					}
+					uncertain = true
 				}
 			}()
 		}
@@ -332,16 +334,6 @@ func (s *service) runTxAttempt(ctx context.Context, conn *sql.Conn, fn func(conn
 			return
 		}
 		s.pool.release(conn)
-		if cleanupErr != nil {
-			// Ordinary-path restoration failure: the rollback succeeded and
-			// the connection is healthy; surface the fixed dependency with
-			// the restoration cause retained only privately.
-			if cerr := ctx.Err(); cerr != nil {
-				err = cerr
-			} else {
-				err = typed(ErrDependency, errors.Join(err, cleanupErr))
-			}
-		}
 		if didPanic {
 			panic(panicked)
 		}

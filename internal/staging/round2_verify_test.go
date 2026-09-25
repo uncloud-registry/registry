@@ -198,8 +198,10 @@ func assertRowState(t *testing.T, dbPath, id, want string) {
 // ---------------------------------------------------------------------------
 
 // TestRound2AppendSyncFailurePropagates proves the rollback truncate is
-// itself synced and a sync failure propagates, leaving the file exactly at
-// the committed offset.
+// itself synced on the ordinary (non-panic) path, and a FAILED restore fsync
+// means the tail's durability is UNCERTAIN: the live service is atomically
+// poisoned (never left usable), the file stays exactly at the committed
+// offset, and a FRESH service reconciles so a later append succeeds.
 func TestRound2AppendSyncFailurePropagates(t *testing.T) {
 	svc, dir := newTestService(t)
 	ctx := context.Background()
@@ -220,11 +222,24 @@ func TestRound2AppendSyncFailurePropagates(t *testing.T) {
 	if string(got) != "abc" {
 		t.Fatalf("tail leaked after failed append: %q", got)
 	}
+	// The RESTORE fsync also faulted (the same hook fired during the tail
+	// truncation), so the truncation's durability cannot be confirmed: the
+	// pool is atomically poisoned and the live service fails closed fixed.
+	if poisoned, _, _ := snapPool(svc.pool); !poisoned {
+		t.Fatal("pool not poisoned after a failed restore fsync on an ordinary error path")
+	}
+	if _, err := svc.Append(ctx, s.ID, s.Repo, s.Actor, 3, strings.NewReader("def"), 100); !errors.Is(err, ErrDependency) {
+		t.Fatalf("poisoned service still accepts an append: %v", err)
+	}
 
-	// Recovery: a later append succeeds and reads back exactly.
-	svc.fsyncHook = nil
-	s = mustAppend(t, svc, s, "def")
-	r, _, err := svc.Open(ctx, s.ID, s.Repo, s.Actor)
+	// Recovery: a FRESH service reconciles and a later append succeeds.
+	svc.Close()
+	svc2 := newTestServiceOn(t, dir)
+	if st, err := svc2.Status(ctx, s.ID, s.Repo, s.Actor); err != nil || st.Offset != int64(len("abc")) {
+		t.Fatalf("fresh status after fsync-fault poison: offset=%d err=%v", st.Offset, err)
+	}
+	s = mustAppend(t, svc2, s, "def")
+	r, _, err := svc2.Open(ctx, s.ID, s.Repo, s.Actor)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

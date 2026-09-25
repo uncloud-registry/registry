@@ -489,8 +489,10 @@ func assertSpoolSize(t *testing.T, svc *service, id string, want int64) {
 // ---------------------------------------------------------------------------
 
 // TestServiceAppendFsyncFault proves an fsync failure rejects the append,
-// keeps the committed offset, truncates the tail, and survives a restart
-// with exactly the last committed bytes.
+// keeps the committed offset, truncates the tail, and — because the restore
+// fsync also faulted (durability uncertain) — atomically poisons the live
+// service so it fails closed; a FRESH service restart reconciles to exactly
+// the last committed bytes.
 func TestServiceAppendFsyncFault(t *testing.T) {
 	svc, dir := newTestService(t)
 	ctx := context.Background()
@@ -504,11 +506,14 @@ func TestServiceAppendFsyncFault(t *testing.T) {
 	svc.fsyncHook = nil
 	assertSpoolSize(t, svc, s.ID, int64(len("committed")))
 
-	if st, _ := svc.Status(ctx, s.ID, s.Repo, s.Actor); st.Offset != int64(len("committed")) {
-		t.Fatalf("offset after fsync fault: %d", st.Offset)
+	// The RESTORE fsync also faulted (the same persistent hook fired during
+	// the tail truncation), so the tail's durability is uncertain: the live
+	// service is atomically poisoned and must not remain usable.
+	if poisoned, _, _ := snapPool(svc.pool); !poisoned {
+		t.Fatal("pool not poisoned after a failed restore fsync on the ordinary path")
 	}
-	if opened := mustOpenAll(t, svc, s); opened != "committed" {
-		t.Fatalf("bytes after fsync fault: %q", opened)
+	if _, err := svc.Append(ctx, s.ID, s.Repo, s.Actor, s.Offset, strings.NewReader("x"), 100); !errors.Is(err, ErrDependency) {
+		t.Fatalf("poisoned service still accepts an append: %v", err)
 	}
 
 	// Restart yields exactly the last committed bytes.
