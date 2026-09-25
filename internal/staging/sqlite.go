@@ -21,11 +21,16 @@ import (
 // latestSchemaVersion is the current staging schema version. The migration
 // path accepts exactly two committed v1 predecessor shapes (the exact
 // pre-cleanup-token v1 and the exact cleanup-token-v1 compatibility shape),
-// a fresh empty file, and the current v2 — every shape is recognized ONLY by
-// its exact frozen object surface plus version, never guessed at. A
-// pre-existing database that matches none of them is rejected, never
-// adopted.
-const latestSchemaVersion = 2
+// an exact v2 predecessor, and a fresh empty file — every shape is recognized
+// ONLY by its exact frozen object surface plus version, never guessed at. A
+// pre-existing database that matches none of them is rejected, never adopted.
+//
+// v3 is the current schema. It carries one forward change over v2: a deleting
+// tombstone may retain the authenticated sidecar cleanup token (exact 64-hex
+// lowercase) as durable provenance, so a crash between the tombstone commit
+// and the filesystem cleanup leaves a restart able to authenticate the
+// quarantined `.tok` sidecar. v2 never persisted that token on a deleting row.
+const latestSchemaVersion = 3
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -111,7 +116,11 @@ var schemaDDL = []string{
 				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
 				and create_token is null)
-			or (state = 'deleting' and create_token is null and cleanup_token is null)
+			or (state = 'deleting' and create_token is null
+				and (cleanup_token is null
+					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
+						and cleanup_token = lower(cleanup_token)
+						and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)))
 		)
 	)`,
 	`create table staged_blobs (
@@ -201,20 +210,26 @@ var schemaDDL = []string{
 			when old.create_token is not null and new.create_token is null and old.state <> 'creating' then raise(abort, 'create token cannot be cleared outside creating')
 			else null end;
 	end`,
-	// The cleanup token is the durable post-activation provenance of the
-	// token sidecar: it may only be SET by the activation itself (as the
-	// creating row's create token is atomically cleared), is immutable while
-	// set, and may only be CLEARED from a live row — the Go side clears it
+	// The cleanup token is the durable sidecar provenance. It may be SET at
+	// activation (the creating row's create token atomically becomes the
+	// cleanup token) or at the deleting transition (an interrupted create's
+	// create token, or an already-present cleanup token, becomes the tombstone's
+	// authenticating provenance while create_token is cleared). It is immutable
+	// while set, and may only be CLEARED from a live row — the Go side clears it
 	// only after the sidecar removal and directory fsync, or at startup
 	// reconciliation after verifying the sidecar is gone or carries exactly
 	// that token.
 	`create trigger trg_session_cleanup before update of cleanup_token on upload_sessions begin
 		select case
 			when old.cleanup_token is not null and new.cleanup_token is not null and old.cleanup_token <> new.cleanup_token then raise(abort, 'cleanup token immutable')
-			when new.cleanup_token is not null and old.cleanup_token is null
-				and not (old.state = 'creating' and new.state = 'active' and old.create_token is not null
+			when new.cleanup_token is not null and old.cleanup_token is null and new.state = 'active'
+				and not (old.state = 'creating' and old.create_token is not null
 					and old.create_token = new.cleanup_token and new.create_token is null)
 				then raise(abort, 'cleanup token may only be set at activation')
+			when new.cleanup_token is not null and old.cleanup_token is null and new.state = 'deleting'
+				and not (old.state = 'creating' and old.create_token is not null
+					and old.create_token = new.cleanup_token and new.create_token is null)
+				then raise(abort, 'cleanup token may only be set at activation or delete transition')
 			when old.cleanup_token is not null and new.cleanup_token is null and old.state not in ('active','finalized')
 				then raise(abort, 'cleanup token may only be cleared from a live row')
 			else null end;
@@ -312,8 +327,16 @@ var schemaGoldenV1CleanupJSON []byte
 //go:embed schema_golden_v2.json
 var schemaGoldenV2JSON []byte
 
-// schemaGold is the current (v2) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV2JSON)
+//go:embed schema_golden_v3.json
+var schemaGoldenV3JSON []byte
+
+// schemaGold is the current (v3) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV3JSON)
+
+// schemaGoldV2 is the exact frozen v2 predecessor manifest (the previously
+// committed "current" shape before v3), retained for migration detection and
+// parity. It is never renamed or called v3.
+var schemaGoldV2 = mustLoadSchemaGolden(schemaGoldenV2JSON)
 
 // schemaGoldV1Pre is the exact pre-cleanup-token v1 predecessor manifest.
 var schemaGoldV1Pre = mustLoadSchemaGolden(schemaGoldenV1PreJSON)
@@ -324,8 +347,8 @@ var schemaGoldV1Cleanup = mustLoadSchemaGolden(schemaGoldenV1CleanupJSON)
 
 // mustLoadSchemaGolden parses a committed schema manifest and sanity-checks
 // its structure. It deliberately does NOT panic on a version mismatch with
-// latestSchemaVersion: each manifest records its own frozen version (1 or 2),
-// and package init must remain alive for upgrade-after-recovery even when a
+// latestSchemaVersion: each manifest records its own frozen version (1, 2, or
+// 3), and package init must remain alive for upgrade-after-recovery even when a
 // manifest's recorded version differs from the current one. Only a manifest
 // that cannot even be parsed or carries no objects is a packaging defect.
 func mustLoadSchemaGolden(data []byte) *schemaManifest {
@@ -606,7 +629,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1358,6 +1381,7 @@ const (
 	schemaCurrent
 	schemaMigrateV1Pre
 	schemaMigrateV1Cleanup
+	schemaMigrateV2
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1401,13 +1425,18 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	}
 	adapter := &txAdapter{db: db}
 	// The version value selects WHICH frozen shapes are admissible; the shape
-	// itself must verify byte/structure-exactly against that manifest. Both v1
-	// predecessors record version 1, so the object surface (cleanup_token
-	// presence) distinguishes them; malformed or ambiguous combinations reject.
+	// itself must verify byte/structure-exactly against that manifest. The two
+	// v1 predecessors record version 1 (the cleanup_token presence on the same
+	// frozen surface distinguishes them); v2 and v3 each have their own frozen
+	// manifest. Malformed or ambiguous combinations reject.
 	switch version {
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 2:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV2, 2); err == nil {
+			return schemaMigrateV2, nil
 		}
 	case 1:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV1Pre, 1); err == nil {
@@ -1542,17 +1571,20 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// migrateSchema atomically upgrades one of the two exact v1 predecessor
-// shapes to v2 on a pinned connection under a serialized BEGIN IMMEDIATE
+// migrateSchema atomically upgrades one of the exact predecessor shapes to the
+// current schema on a pinned connection under a serialized BEGIN IMMEDIATE
 // write transaction:
 //
 //   - an EXACT pre-cleanup-token v1 database rebuilds upload_sessions (adding
 //     the cleanup_token column, its CHECK, the tightened coherence CHECK, and
 //     de novo session triggers) preserving every existing row/field exactly —
 //     the newly added column is NULL everywhere, never inventing provenance;
-//   - an EXACT cleanup-token-v1 database (whose object surface already matches
-//     v2) is validated exactly and advances only the version record;
-//   - the full v2 object/column/index/FK surface AND every migrated row
+//   - an EXACT cleanup-token-v1 database (whose object surface equals v2)
+//     rebuilds upload_sessions to the current shape preserving every row/field;
+//   - an EXACT v2 database rebuilds upload_sessions to v3 preserving every
+//     row/field exactly, including any cleanup_token (deleting rows with NULL
+//     stay NULL, so an ambiguous old sidecar is never adopted);
+//   - the full current object/column/index/FK surface AND every migrated row
 //     validate before the version record is written, and only after that is
 //     the row committed.
 //
@@ -1603,21 +1635,36 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		if err := verifyAgainst(ctx, conn, schemaGoldV1Pre, 1); err != nil {
 			return depErr(err, ctx)
 		}
-		if err := rebuildUploadSessions(ctx, conn, exec); err != nil {
+		// v1-pre copies the reconstructed cleanup_token as NULL everywhere.
+		if err := rebuildUploadSessions(ctx, conn, exec, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV1Cleanup:
 		if err := verifyAgainst(ctx, conn, schemaGoldV1Cleanup, 1); err != nil {
 			return depErr(err, ctx)
 		}
-		// No structural change needed: the cleanup-token surface already
-		// matches v2. Only the version record advances.
+		// The cleanup-token-v1 surface equals v2, but the current surface (v3)
+		// differs (the deleting-tombstone provenance change), so this shape
+		// also rebuilds upload_sessions to v3, carrying rows and any
+		// cleanup_token exactly across.
+		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV2:
+		if err := verifyAgainst(ctx, conn, schemaGoldV2, 2); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v2 -> v3: rebuild upload_sessions carrying every row/field
+		// across, including any cleanup_token (NULL deleting rows stay NULL).
+		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+			return depErr(err, ctx)
+		}
 	default:
 		return depErr(errors.New("staging migration does not recognize the source schema"), ctx)
 	}
-	// The full v2 surface must hold on this live write connection, and every
-	// migrated row must satisfy it (the rebuild's copy goes through the new
-	// table's CHECKs; the cleanup path's rows already satisfied v2).
+	// The full current surface must hold on this live write connection, and
+	// every migrated row must satisfy it (the rebuild's copy goes through the
+	// new table's CHECKs; the cleanup path's rows already satisfied v3).
 	if err := verifySchemaFully(ctx, conn, schemaGold); err != nil {
 		return depErr(err, ctx)
 	}
@@ -1638,22 +1685,29 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 	return nil
 }
 
-// rebuildUploadSessions rewrites the pre-cleanup upload_sessions table into
-// the exact v2 shape. The new table is created directly under its FINAL name
-// from schemaDDL[0] — never via ALTER TABLE ... RENAME, which makes SQLite
-// store a double-quoted table name that would break the byte-exact golden
-// fingerprint. Rows are moved field-by-field (explicit column lists, never
-// INSERT ... SELECT *), the new cleanup_token column stays NULL everywhere,
-// and the full v2 indexes/triggers are recreated. The scratch copy table is
-// dropped before verification so the live object set is exactly v2.
-func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error) error {
+// rebuildUploadSessions rewrites the previous-major upload_sessions table into
+// the exact current (v3) shape. The new table is created directly under its
+// FINAL name from schemaDDL[0] — never via ALTER TABLE ... RENAME, which makes
+// SQLite store a double-quoted table name that would break the byte-exact
+// golden fingerprint. Rows are moved field-by-field (explicit column lists,
+// never INSERT ... SELECT *). preserveCleanup selects whether the source
+// already carries a cleanup_token column that must be carried over exactly
+// (v2), or whether the reconstructed column is synthesized NULL everywhere
+// (v1-pre, which never had it; provenance is never invented). The full current
+// indexes/triggers are recreated. The scratch copy table is dropped before
+// verification so the live object set is exactly the current one.
+func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error, preserveCleanup bool) error {
+	cleanupExpr := "NULL"
+	if preserveCleanup {
+		cleanupExpr = "cleanup_token"
+	}
 	copyDDL := strings.Replace(schemaDDL[0], "upload_sessions", "upload_sessions_copy", 1)
 	if err := exec(copyDDL); err != nil {
 		return err
 	}
 	if err := exec(`insert into upload_sessions_copy
 		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, digest, bee_ref, media_type, size )
-		select id, repo, actor, state, offset, created_at, expires_at, create_token, NULL,
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `,
 		       digest, bee_ref, media_type, size from upload_sessions`); err != nil {
 		return err
 	}
@@ -1663,10 +1717,17 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 		return migrationCopyFault
 	}
 	// Drop every trigger/index that references upload_sessions BEFORE dropping
-	// the table (otherwise SQLite reparses them against the missing table).
-	for _, trig := range []string{"trg_blob_insert", "trg_blob_update", "trg_blob_delete",
+	// the table (otherwise SQLite reparses them against the missing table). The
+	// pre-cleanup v1 source predates the cleanup trigger, so it is dropped only
+	// when the source carried it (v2); the final table is rebuilt with the
+	// full current trigger set regardless.
+	trigs := []string{"trg_blob_insert", "trg_blob_update", "trg_blob_delete",
 		"trg_session_insert", "trg_session_state", "trg_session_metadata",
-		"trg_session_identity", "trg_session_token", "trg_session_delete"} {
+		"trg_session_identity", "trg_session_token", "trg_session_delete"}
+	if preserveCleanup {
+		trigs = append(trigs, "trg_session_cleanup")
+	}
+	for _, trig := range trigs {
 		if err := exec(`drop trigger ` + trig); err != nil {
 			return err
 		}
@@ -1679,15 +1740,14 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 	if err := exec(`drop table upload_sessions`); err != nil {
 		return err
 	}
-	// Recreate the v2 upload_sessions table under its final name, then move
-	// the preserved rows back (cleanup_token stays NULL: provenance is never
-	// invented).
+	// Recreate the current upload_sessions table under its final name, then
+	// move the preserved rows back.
 	if err := exec(schemaDDL[0]); err != nil {
 		return err
 	}
 	if err := exec(`insert into upload_sessions
 		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, digest, bee_ref, media_type, size )
-		select id, repo, actor, state, offset, created_at, expires_at, create_token, NULL,
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `,
 		       digest, bee_ref, media_type, size from upload_sessions_copy`); err != nil {
 		return err
 	}
@@ -1700,7 +1760,7 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 			return err
 		}
 	}
-	// Recreate the seven v2 session triggers (schemaDDL[5..11]) and the three
+	// Recreate the seven v3 session triggers (schemaDDL[5..11]) and the three
 	// staged-blob triggers (schemaDDL[12..14]).
 	for i := 5; i <= 14; i++ {
 		if err := exec(schemaDDL[i]); err != nil {

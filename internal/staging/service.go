@@ -801,6 +801,22 @@ type deleteAuth struct {
 	tokenBytesKnown bool        // tokenBytes is authoritative (byte-authenticates the sidecar)
 }
 
+// deletingTransitionToken returns the durable sidecar cleanup token to copy
+// onto a deleting tombstone from a live row: the existing cleanup token when
+// present (active/finalized rows with a pending sidecar cleanup), else the
+// interrupted create's create_token (a creating row, or a freshly committed
+// active row whose sidecar was never removed). It NEVER invents provenance
+// from file bytes or the current path — the source is the durable row alone.
+func deletingTransitionToken(row *sessionRow) sql.NullString {
+	if row.cleanupToken.Valid {
+		return row.cleanupToken
+	}
+	if row.createToken.Valid {
+		return row.createToken
+	}
+	return sql.NullString{}
+}
+
 // rollbackCreate tears down a creating row and its attributable files
 // (idempotent, safe when the row or files are already absent) using the atomic
 // authenticated quarantine protocol. The guarded tombstone update —
@@ -817,9 +833,14 @@ func (s *service) rollbackCreate(ctx context.Context, id, token string) error {
 	var a deleteAuth
 	proceed := false
 	if err := s.withTx(rctx, func(conn *sql.Conn) error {
+		// The interrupted create's token becomes the tombstone's durable
+		// cleanup_token (create_token is cleared), so a crash between this
+		// rollback tombstone and the filesystem cleanup leaves a restart able
+		// to authenticate the sidecar. The guard still proves this call owns
+		// the creating row (state + exact token).
 		res, err := conn.ExecContext(rctx,
-			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null
-			 where id = ? and state = 'creating' and create_token = ?`, id, token)
+			`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = ?
+			 where id = ? and state = 'creating' and create_token = ?`, token, id, token)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
@@ -1456,9 +1477,13 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 		}
 		proceed = true
 		if row.state != string(StateDeleting) {
-			// Capture the byte-authenticating token BEFORE the tombstone nulls
-			// it (creating rows and active/finalized rows with a pending sidecar
-			// cleanup both carry their authenticating token in the row).
+			// Capture the byte-authenticating token BEFORE the tombstone
+			// clears it (creating rows and active/finalized rows with a pending
+			// sidecar cleanup both carry their authenticating token in the
+			// row). The SAME durable token is atomically copied onto the
+			// deleting tombstone as its cleanup_token, so a crash between this
+			// commit and the filesystem cleanup leaves a restart able to
+			// authenticate the quarantined sidecar (create_token is cleared).
 			switch {
 			case row.state == string(StateCreating):
 				a.creating = true
@@ -1468,8 +1493,9 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 				a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
 				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
 			}
+			newCleanup := deletingTransitionToken(row)
 			res, err := conn.ExecContext(ctx,
-				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
+				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = ? where id = ? and state <> 'deleting'`, newCleanup, id)
 			if err != nil {
 				if cerr := ctx.Err(); cerr != nil {
 					return cerr
@@ -1599,6 +1625,10 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 		}
 		proceed = true
 		if row.state != string(StateDeleting) {
+			// Capture the byte-authenticating token and copy the SAME durable
+			// token onto the deleting tombstone as its cleanup_token, so a
+			// crash between this commit and the filesystem cleanup leaves a
+			// restart able to authenticate the quarantined sidecar.
 			switch {
 			case row.state == string(StateCreating):
 				a.creating = true
@@ -1608,8 +1638,9 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 				a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
 				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
 			}
+			newCleanup := deletingTransitionToken(row)
 			res, err := conn.ExecContext(ctx,
-				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = null where id = ? and state <> 'deleting'`, id)
+				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = ? where id = ? and state <> 'deleting'`, newCleanup, id)
 			if err != nil {
 				if cerr := ctx.Err(); cerr != nil {
 					return cerr
@@ -1721,7 +1752,12 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 			// Finish the tombstoned deletion via the atomic authenticated
 			// quarantine protocol (a fresh transition capture is made under
 			// the lock, then the recognized files are quarantined and
-			// authenticated before unlink).
+			// authenticated before unlink). The durable cleanup_token carried
+			// by the deleting row (persisted at the tombstone transition) is
+			// the byte-authenticating sidecar provenance: with it a restart
+			// can quarantine and authenticate a MANAGED `.tok` left behind by
+			// a crash before the previous cleanup, joining a prior crash's
+			// outstanding quarantine, or finish a row with no sidecar at all.
 			var a deleteAuth
 			if err := s.withTx(ctx, func(conn *sql.Conn) error {
 				row, found, err := fetchSession(ctx, conn, ri.id)
@@ -1730,6 +1766,10 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 				}
 				if !found || row.state != string(StateDeleting) {
 					return nil
+				}
+				if row.cleanupToken.Valid {
+					a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
+					a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
 				}
 				if fi, _, err := s.spool.nameInfo(ri.id); err != nil {
 					return typed(ErrDependency, err)

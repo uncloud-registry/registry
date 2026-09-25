@@ -532,6 +532,9 @@ func isHex64(s string) bool {
 // transition. It NEVER unlinks a mutable managed name directly.
 //
 //	... managed -> quarantine (atomic rename, same retained root)
+//	... fsync the containing directory so the rename is durable BEFORE any
+//	    authentication or unlink proceeds (a sync failure fails closed with the
+//	    quarantine retained, never restored via another unsynced rename)
 //	... open the quarantine NO-FOLLOW, require a real regular exact-0600 file
 //	    whose inode is SameFile against `want` (when non-nil, the created or
 //	    transition-observed identity) and which satisfies `verify` (a durably
@@ -589,19 +592,6 @@ func quarantineUnlinkRoot(root *os.Root, managed, quarantine string, want os.Fil
 		}
 		renamed = true
 		captured = srcFi
-		// Prove the rename moved exactly the inspected inode: a swap between
-		// the Lstat and the rename is a FOREIGN capture and is restored, never
-		// unlinked.
-		pdst, lerr := root.Lstat(quarantine)
-		if lerr != nil || !os.SameFile(srcFi, pdst) {
-			_ = restoreQuarantine(root, quarantine, managed)
-			if syncDir != nil {
-				// Directory fsync after every restore (best-effort; the
-				// failed cleanup already retains durable metadata).
-				_ = syncDir()
-			}
-			return false, spoolErr(spoolErrGeneric, errors.New("quarantine captured a replaced leaf"))
-		}
 	case os.IsNotExist(serr):
 		// Fall through: an outstanding quarantine from an earlier rename
 		// (managed absent) is finished when present.
@@ -611,6 +601,7 @@ func quarantineUnlinkRoot(root *os.Root, managed, quarantine string, want os.Fil
 	if !renamed {
 		// managed was absent at Lstat (or vanished before rename): recover an
 		// outstanding quarantine, or treat as already-clean idempotency.
+		// (Nothing was moved this call, so NO post-rename sync is needed here.)
 		if _, qerr := root.Lstat(quarantine); os.IsNotExist(qerr) {
 			// Nothing at either name. The ABSENCE is a durable fact only once
 			// the containing directory fsync succeeds: a crash before that sync
@@ -634,6 +625,39 @@ func quarantineUnlinkRoot(root *os.Root, managed, quarantine string, want os.Fil
 			return false, spoolErr(spoolErrGeneric, lerr)
 		}
 		captured = qFi
+	} else {
+		// A successful same-root rename moved the managed leaf into the
+		// quarantine name. That rename MUST be durable before any
+		// authentication or unlink of the quarantined entry proceeds: fsync
+		// the containing directory immediately. A sync failure fails closed
+		// with the quarantine RETAINED — never restored through another
+		// unsynced rename (which could itself be lost) — so a crash cannot
+		// leave the leaf half-moved between names or unaccounted. The
+		// post-sync barrier fires only after the directory sync has completed,
+		// immediately before authentication and the pre-unlink barrier.
+		if syncDir != nil {
+			if err := syncDir(); err != nil {
+				return false, err
+			}
+		}
+		if barrier != nil {
+			barrier("post-sync", quarantine)
+		}
+		// Prove the rename moved exactly the inspected inode: a swap between
+		// the Lstat and the rename is a FOREIGN capture and is restored, never
+		// unlinked. This is the FIRST authentication and it runs ONLY after
+		// the containing directory was fsynced (the post-sync barrier above),
+		// so any unsynced-restore decision is impossible on a failed fsync.
+		pdst, lerr := root.Lstat(quarantine)
+		if lerr != nil || !os.SameFile(srcFi, pdst) {
+			_ = restoreQuarantine(root, quarantine, managed)
+			if syncDir != nil {
+				// Directory fsync after every restore (best-effort; the
+				// failed cleanup already retains durable metadata).
+				_ = syncDir()
+			}
+			return false, spoolErr(spoolErrGeneric, errors.New("quarantine captured a replaced leaf"))
+		}
 	}
 
 	if err := authAndUnlinkQuarantine(root, quarantine, captured, want, verify, syncDir, barrier); err != nil {

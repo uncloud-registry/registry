@@ -1,12 +1,15 @@
 package staging
 
-// Frozen-parity holdings for the two v1 predecessor schemas. Each predecessor
-// golden is bound to the EXACT historical DDL of the committed green state it
+// Frozen-parity holdings for the predecessor schemas. Each predecessor golden
+// is bound to the EXACT historical DDL of the committed green state it
 // represents (recovered from the git predecessor commit and frozen here), so a
 // unilateral change to either a predecessor golden OR its frozen DDL breaks
-// parity independently. The cleanup-token-v1 predecessor's object surface is
-// additionally asserted to equal the current (v2) surface, which is exactly
-// what makes that path a pure version advance.
+// parity independently. The cleanup-token-v1 predecessor shipped the SAME
+// object bodies as v2 (that is exactly why its migration is a pure version
+// advance); both are bound to the same frozen v2 DDL. The current v3 golden is
+// bound separately by the production DDL parity test (deriveFromDDL), so a
+// unilateral change to either the v3 golden or the v3 production DDL breaks
+// that parity independently.
 
 import (
 	_ "embed"
@@ -21,6 +24,13 @@ import (
 //
 //go:embed schema_ddl_v1_precleanup.json
 var schemaV1PreDDLJSON []byte
+
+// Frozen historical DDL of the previously committed v2 shape (the exact object
+// bodies the v1-cleanup and v2 goldens describe). Independently frozen so it
+// cannot drift silently with the v3 production DDL constants.
+//
+//go:embed schema_ddl_v2.json
+var schemaV2DDLJSON []byte
 
 type frozenDDL struct {
 	VersionTable string   `json:"version_table"`
@@ -82,29 +92,66 @@ func TestSchemaGoldenParityV1PreCleanup(t *testing.T) {
 	}
 }
 
-func TestSchemaGoldenParityV1CleanupSharesV2Surface(t *testing.T) {
+func TestSchemaGoldenParityV1CleanupAndV2ShareFrozenV2Surface(t *testing.T) {
+	var frozen frozenDDL
+	if err := json.Unmarshal(schemaV2DDLJSON, &frozen); err != nil {
+		t.Fatalf("frozen v2 DDL not parseable: %v", err)
+	}
 	// The cleanup-token-v1 predecessor shipped the SAME object bodies as v2
 	// (that is exactly why its migration is a pure version advance). Both
-	// frozen goldens must agree on the object surface, and both must match the
-	// current production DDL-derived surface.
-	if len(schemaGoldV1Cleanup.Objects) != len(schemaGold.Objects) {
-		t.Fatalf("cleanup-v1 objects = %d, v2 objects = %d", len(schemaGoldV1Cleanup.Objects), len(schemaGold.Objects))
+	// frozen goldens must agree on the object surface and both must match the
+	// frozen v2 DDL.
+	if len(schemaGoldV1Cleanup.Objects) != len(schemaGoldV2.Objects) {
+		t.Fatalf("cleanup-v1 objects = %d, v2 objects = %d", len(schemaGoldV1Cleanup.Objects), len(schemaGoldV2.Objects))
 	}
 	for i := range schemaGoldV1Cleanup.Objects {
-		a, b := schemaGoldV1Cleanup.Objects[i], schemaGold.Objects[i]
+		a, b := schemaGoldV1Cleanup.Objects[i], schemaGoldV2.Objects[i]
 		if a.Typ != b.Typ || a.Name != b.Name || a.Tbl != b.Tbl || a.SQL != b.SQL {
 			t.Fatalf("cleanup-v1 predecessor object %d differs from the v2 surface: %+v vs %+v", i, a, b)
 		}
 	}
-	derived := deriveFromDDL() // current production DDL-derived surface (v2)
-	if derived == nil || !reflect.DeepEqual(derived.Objects, schemaGoldV1Cleanup.Objects) {
-		t.Fatal("cleanup-token-v1 predecessor surface drifted from the production DDL")
+	derived := deriveFromFrozenDDL(schemaGoldV2, frozen.VersionTable, frozen.Objects)
+	if derived == nil {
+		t.Fatal("cannot derive a manifest from the frozen v2 DDL")
 	}
-	// A golden-only change to the cleanup predecessor must fail parity.
-	goldMut := *schemaGoldV1Cleanup
-	goldMut.Objects = append([]schemaObject(nil), schemaGoldV1Cleanup.Objects...)
-	goldMut.Objects[1].SQL += " -- nudge"
-	if reflect.DeepEqual(&goldMut, derived) {
-		t.Fatal("parity cannot detect a cleanup-v1 golden-only change")
+	if !reflect.DeepEqual(derived.Objects, schemaGoldV2.Objects) {
+		t.Fatal("v2 golden drifted from the frozen v2 DDL")
+	}
+	if !reflect.DeepEqual(derived.Objects, schemaGoldV1Cleanup.Objects) {
+		t.Fatal("cleanup-token-v1 predecessor surface drifted from the frozen v2 DDL")
+	}
+	// A golden-only change to either predecessor must fail parity.
+	for _, g := range []*schemaManifest{schemaGoldV2, schemaGoldV1Cleanup} {
+		goldMut := *g
+		goldMut.Objects = append([]schemaObject(nil), g.Objects...)
+		goldMut.Objects[1].SQL += " -- nudge"
+		if reflect.DeepEqual(&goldMut, derived) {
+			t.Fatal("parity cannot detect a v2/cleanup golden-only change")
+		}
+	}
+	// A DDL-only change must fail parity.
+	ddlMut := deriveFromFrozenDDL(schemaGoldV2, frozen.VersionTable, frozen.Objects)
+	ddlMut.Objects[1].SQL += " -- nudge"
+	if reflect.DeepEqual(ddlMut.Objects, schemaGoldV2.Objects) {
+		t.Fatal("parity cannot detect a v2 DDL-only change")
+	}
+}
+
+func TestSchemaGoldenParityV3AgainstProductionDDL(t *testing.T) {
+	// The current v3 golden, when derived from the production v3 DDL, must be
+	// byte-identical. Both fresh creation and migration verify against it, so
+	// a unilateral change to either the golden or the DDL breaks parity. This
+	// is the mirror of TestSchemaGoldenParityDDL at the object level.
+	derived := deriveFromDDL()
+	if derived == nil {
+		t.Fatal("cannot derive a manifest from the v3 production DDL")
+	}
+	if !reflect.DeepEqual(derived.Objects, schemaGold.Objects) {
+		t.Fatal("v3 golden drifted from the v3 production DDL object surface")
+	}
+	// The v3 surface must DIFFER from the v2 surface (the deleting-tombstone
+	// provenance change), so the two are never confused.
+	if reflect.DeepEqual(derived.Objects, schemaGoldV2.Objects) {
+		t.Fatal("v3 production DDL must differ from the frozen v2 surface")
 	}
 }

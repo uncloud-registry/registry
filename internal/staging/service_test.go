@@ -1873,8 +1873,17 @@ func TestServiceCreateFaultsLeaveNoResidue(t *testing.T) {
 			if err != nil {
 				t.Fatalf("readdir spool: %v", err)
 			}
-			if len(entries) != 0 {
-				t.Fatalf("faulted create left spool entries: %v", entries)
+			// A dir-sync fault correctly RETAINS an already-quarantined leaf (the
+			// rename's durability could not be confirmed, so it is never unlinked),
+			// which is exactly the fail-closed contract. The only acceptable
+			// residue is a deterministic `q-` quarantine name; no managed canonical
+			// or token file may remain. The restart below converges any retained
+			// quarantine.
+			for _, en := range entries {
+				if strings.HasPrefix(en.Name(), "q-") {
+					continue
+				}
+				t.Fatalf("faulted create left a non-quarantine spool entry: %s", en.Name())
 			}
 			if state.Valid && State(state.String) != StateDeleting {
 				t.Fatalf("faulted create left non-tombstone row in state %q", state.String)

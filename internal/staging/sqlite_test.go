@@ -1001,8 +1001,8 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			return d
 		}, false, false, nil, "cleanup trigger body changed"},
 		{"trigger_cleanup_set_outside_activation", func(d []string) []string {
-			d[10] = strings.Replace(d[10], "and not (old.state = 'creating' and new.state = 'active' and old.create_token is not null and old.create_token = new.cleanup_token and new.create_token is null)",
-				"and not (new.cleanup_token = old.cleanup_token)", 1)
+			d[10] = strings.Replace(d[10], "when new.cleanup_token is not null and old.cleanup_token is null and new.state = 'active' and not (old.state = 'creating' and old.create_token is not null and old.create_token = new.cleanup_token and new.create_token is null)",
+				"when new.cleanup_token is not null and not (new.cleanup_token = old.cleanup_token)", 1)
 			return d
 		}, false, false, nil, "cleanup token settable outside activation"},
 		{"trigger_cleanup_cleared_from_creating", func(d []string) []string {
