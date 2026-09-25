@@ -32,6 +32,7 @@ type memorySession struct {
 	beeRef          string
 	mediaType       string
 	size            int64
+	finalizeToken   string
 	createdAt       time.Time
 	expiresAt       time.Time
 }
@@ -150,7 +151,7 @@ func (m *MemoryStore) Open(ctx context.Context, id, repo, actor string) (io.Read
 	if !s.expiresAt.After(time.Now()) {
 		return nil, Session{}, ErrExpired
 	}
-	if s.state != StateActive && s.state != StateFinalized {
+	if s.state != StateActive && s.state != StateFinalizing && s.state != StateFinalized {
 		return nil, Session{}, ErrInvalidState
 	}
 	data := make([]byte, len(s.data))
@@ -158,7 +159,52 @@ func (m *MemoryStore) Open(ctx context.Context, id, repo, actor string) (io.Read
 	return nopCloser{bytes.NewReader(data)}, m.toSession(s), nil
 }
 
-func (m *MemoryStore) MarkFinalized(_ context.Context, id, repo, actor, digest, beeRef, mediaType string, size int64) error {
+func (m *MemoryStore) ClaimFinalize(_ context.Context, id, repo, actor string, size int64) (Session, error) {
+	if err := validateID(id); err != nil {
+		return Session{}, err
+	}
+	if err := validateRepo(repo); err != nil {
+		return Session{}, err
+	}
+	if err := validateActor(actor); err != nil {
+		return Session{}, err
+	}
+	if size < 0 {
+		return Session{}, ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.lookupUnlocked(id, repo, actor)
+	if !ok {
+		return Session{}, ErrNotFound
+	}
+	if !s.expiresAt.After(time.Now()) {
+		return Session{}, ErrExpired
+	}
+	switch s.state {
+	case StateActive:
+		if size != s.offset {
+			return Session{}, ErrOffsetMismatch
+		}
+		token, err := genToken()
+		if err != nil {
+			return Session{}, typed(ErrDependency, err)
+		}
+		s.state = StateFinalizing
+		s.finalizeToken = token
+		sess := m.toSession(s)
+		sess.Token = token
+		return sess, nil
+	case StateFinalizing:
+		return Session{}, ErrInvalidState
+	case StateFinalized:
+		return Session{}, ErrFinalizeConflict
+	default:
+		return Session{}, ErrInvalidState
+	}
+}
+
+func (m *MemoryStore) ReleaseClaim(_ context.Context, id, repo, actor, token string) error {
 	if err := validateID(id); err != nil {
 		return err
 	}
@@ -167,6 +213,42 @@ func (m *MemoryStore) MarkFinalized(_ context.Context, id, repo, actor, digest, 
 	}
 	if err := validateActor(actor); err != nil {
 		return err
+	}
+	if err := validateHex(token, 64); err != nil {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.lookupUnlocked(id, repo, actor)
+	if !ok {
+		return ErrNotFound
+	}
+	if !s.expiresAt.After(time.Now()) {
+		return ErrExpired
+	}
+	if s.state != StateFinalizing {
+		return ErrInvalidState
+	}
+	if s.finalizeToken != token {
+		return ErrInvalidState
+	}
+	s.state = StateActive
+	s.finalizeToken = ""
+	return nil
+}
+
+func (m *MemoryStore) MarkFinalized(_ context.Context, id, repo, actor, token, digest, beeRef, mediaType string, size int64) error {
+	if err := validateID(id); err != nil {
+		return err
+	}
+	if err := validateRepo(repo); err != nil {
+		return err
+	}
+	if err := validateActor(actor); err != nil {
+		return err
+	}
+	if err := validateHex(token, 64); err != nil {
+		return ErrInvalidInput
 	}
 	if err := validateDigest(digest); err != nil {
 		return err
@@ -202,12 +284,16 @@ func (m *MemoryStore) MarkFinalized(_ context.Context, id, repo, actor, digest, 
 			return nil // idempotent for byte-identical metadata
 		}
 		return ErrFinalizeConflict
-	case StateActive:
+	case StateActive, StateFinalizing:
+		if s.state == StateFinalizing && s.finalizeToken != token {
+			return ErrInvalidState
+		}
 		if size != s.offset {
 			return ErrInvalidInput
 		}
 		s.digest, s.beeRef, s.mediaType, s.size = digest, beeRef, mediaType, size
 		s.state = StateFinalized
+		s.finalizeToken = ""
 		return nil
 	default:
 		return ErrInvalidState
@@ -223,6 +309,11 @@ func (m *MemoryStore) Delete(_ context.Context, id, repo, actor string) error {
 	}
 	if s.repo != repo || s.actor != actor {
 		return nil // confidential
+	}
+	if s.state == StateFinalizing {
+		// A session mid-external finalization may not be deleted fail-closed;
+		// its bytes may have reached the object store with no recorded receipt.
+		return ErrInvalidState
 	}
 	delete(m.sessions, id)
 	return nil

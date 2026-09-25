@@ -137,21 +137,25 @@ func TestSchemaGoldenParityV1CleanupAndV2ShareFrozenV2Surface(t *testing.T) {
 	}
 }
 
-func TestSchemaGoldenParityV3AgainstProductionDDL(t *testing.T) {
-	// The current v3 golden, when derived from the production v3 DDL, must be
+func TestSchemaGoldenParityV4AgainstProductionDDL(t *testing.T) {
+	// The current v4 golden, when derived from the production v4 DDL, must be
 	// byte-identical. Both fresh creation and migration verify against it, so
 	// a unilateral change to either the golden or the DDL breaks parity. This
 	// is the mirror of TestSchemaGoldenParityDDL at the object level.
 	derived := deriveFromDDL()
 	if derived == nil {
-		t.Fatal("cannot derive a manifest from the v3 production DDL")
+		t.Fatal("cannot derive a manifest from the v4 production DDL")
 	}
 	if !reflect.DeepEqual(derived.Objects, schemaGold.Objects) {
-		t.Fatal("v3 golden drifted from the v3 production DDL object surface")
+		t.Fatal("v4 golden drifted from the v4 production DDL object surface")
 	}
-	// The v3 surface must DIFFER from the v2 surface (the deleting-tombstone
-	// provenance change), so the two are never confused.
+	// The v4 surface must DIFFER from the frozen v3 predecessor (the
+	// finalizing claim state) and from the frozen v2 surface, so the current
+	// and every predecessor shape are never confused.
+	if reflect.DeepEqual(derived.Objects, schemaGoldV3.Objects) {
+		t.Fatal("v4 production DDL must differ from the frozen v3 surface")
+	}
 	if reflect.DeepEqual(derived.Objects, schemaGoldV2.Objects) {
-		t.Fatal("v3 production DDL must differ from the frozen v2 surface")
+		t.Fatal("v4 production DDL must differ from the frozen v2 surface")
 	}
 }

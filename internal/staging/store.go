@@ -32,6 +32,18 @@ const (
 	// otherwise) and is never visible to callers. Only startup
 	// reconciliation and Create itself transition out of it.
 	StateCreating State = "creating"
+	// StateFinalizing is the durable finalization CLAIM: committed by the
+	// single upload winner (ClaimFinalize) BEFORE any external object-store
+	// write, atomically freezing the exact staged snapshot (state == active,
+	// size == offset, bytes immutable thereafter). Appends are rejected while
+	// finalizing; delete/expire fail closed; publication never lists it. Only
+	// the claim winner streams to the object store and then either completes
+	// to StateFinalized (MarkFinalized) or — on a CONCLUSIVELY pre-side-effect
+	// uploader failure — returns to StateActive (ReleaseClaim). A session left
+	// in finalizing after an AMBIGUOUS uploader failure or a process crash is
+	// retained fail-closed: every retry makes ZERO object-store writes and
+	// receives a fixed response until an explicit reconciliation path exists.
+	StateFinalizing State = "finalizing"
 	// StateFinalized carries complete validated blob metadata; appends are
 	// rejected and the file bytes are frozen.
 	StateFinalized State = "finalized"
@@ -52,7 +64,34 @@ type RegistryStore interface {
 	Status(ctx context.Context, id, repo, actor string) (Session, error)
 	Append(ctx context.Context, id, repo, actor string, expectedOffset int64, src io.Reader, maxBytes int64) (Session, error)
 	Open(ctx context.Context, id, repo, actor string) (io.ReadCloser, Session, error)
-	MarkFinalized(ctx context.Context, id, repo, actor, digest, beeRef, mediaType string, size int64) error
+	// ClaimFinalize durably reserves THIS session for external finalization
+	// BEFORE any object-store write. It atomically authenticates repo+actor,
+	// requires an active + unexpired session, compares the exact frozen
+	// staged snapshot (the current durable offset MUST equal size, the byte
+	// count the caller just hashed), and transitions active -> finalizing.
+	// Exactly one concurrent caller wins per session; a loser sees the change
+	// reflected (finalizing / finalized) and performs ZERO object-store
+	// writes. While finalizing the bytes are immutable and delete/expire fail
+	// closed. It returns ErrOffsetMismatch when a concurrent append advanced
+	// the offset after the caller's hash, so no Bee write ever occurs on
+	// stale bytes.
+	ClaimFinalize(ctx context.Context, id, repo, actor string, size int64) (Session, error)
+	// ReleaseClaim returns a finalizing session to active. It is legal ONLY
+	// for a CONCLUSIVELY pre-side-effect uploader failure (no external bytes
+	// were ever sent); it is never used to paper over ambiguous failures or
+	// metadata-receipt faults, which must retain the claim fail-closed. Only
+	// the claim winner — the sole holder of the session's unforgeable claim
+	// token (the Token returned by ClaimFinalize) — may release; a foreign
+	// instance without the token gets the same ownership-indistinguishable
+	// result and can never reset a foreign claim to active (no duplicate or
+	// orphaned write is therefore possible across processes).
+	ReleaseClaim(ctx context.Context, id, repo, actor, token string) error
+	// MarkFinalized completes a session with exact finalize metadata (the
+	// digest/Bee ref/media type the winner already wrote). From finalizing it
+	// requires the winning claim token; from active (plain service-level
+	// finalize) no token is required. An already-finalized byte-identical
+	// retry is idempotently nil; differing metadata is ErrFinalizeConflict.
+	MarkFinalized(ctx context.Context, id, repo, actor, token, digest, beeRef, mediaType string, size int64) error
 	Delete(ctx context.Context, id, repo, actor string) error
 	ListStagedBlobs(ctx context.Context, repo, actor string) ([]spec.StagedBlob, error)
 	ClearStagedBlobsByDigest(ctx context.Context, repo, actor string, digests []string) error
@@ -96,6 +135,11 @@ type Session struct {
 	Digest    string
 	BeeRef    string
 	MediaType string
+	// The unforgeable claim identity handed ONLY to the single finalization
+	// winner (see Token). Only the winner may ReleaseClaim or complete
+	// (MarkFinalized) its claim; it is never surfaced by any read path and
+	// never appears in any error surface.
+	Token     string
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }

@@ -195,6 +195,18 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 		return
 	}
 
+	// A session in the durable finalization claim state is mid-external-write
+	// (a concurrent instance won the claim and is streaming to the object
+	// store) OR stuck uncertain after an ambiguous uploader failure / crash.
+	// In BOTH cases this request makes ZERO object-store calls and ZERO
+	// staging mutations and receives a fixed deterministic conflict. The bytes
+	// are frozen; the session is never auto-released or auto-completed, so an
+	// automatic retry can never produce a duplicate external write.
+	if session.State == staging.StateFinalizing {
+		writeError(w, http.StatusConflict, "BLOB_UPLOAD_INVALID", messageFinalizing)
+		return
+	}
+
 	// A finalized session is immutable. A retry that replays the SAME
 	// canonical digest with NO body and NO Content-Range is answered
 	// idempotently as 201 with the exact stored digest/location and ZERO
@@ -312,8 +324,36 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 		return
 	}
 
-	// Reopen and stream to the object uploader with an exact size and the
-	// explicit postage batch id.
+	// Durable claim BEFORE any external write: exactly one concurrent caller
+	// becomes the finalization winner; a loser (the session is already
+	// finalizing or finalized) makes ZERO object-store calls and gets a fixed
+	// response. The claim atomically freezes this exact staged snapshot; if a
+	// concurrent PATCH advanced the durable offset after this request's hash,
+	// it fails with a stale-offset so no Bee write ever happens on bytes that
+	// differ from what was hashed.
+	claimed, err := h.Staging.ClaimFinalize(r.Context(), uploadID, repo, actor, n)
+	if err != nil {
+		switch {
+		case errors.Is(err, staging.ErrOffsetMismatch):
+			h.respondRangeNotSatisfiable(w, r.Context(), repo, uploadID, actor)
+			return
+		case errors.Is(err, staging.ErrFinalizeConflict):
+			// A concurrent instance durably finished this session first.
+			writeError(w, http.StatusConflict, "BLOB_UPLOAD_INVALID", messageAlreadyFinalized)
+			return
+		case errors.Is(err, staging.ErrInvalidState):
+			// A concurrent instance claimed it first (now finalizing), or the
+			// state forbids the claim: deterministic conflict, zero writes.
+			writeError(w, http.StatusConflict, "BLOB_UPLOAD_INVALID", messageFinalizing)
+			return
+		}
+		status, code, message := classifyUploadError(err)
+		writeError(w, status, code, message)
+		return
+	}
+
+	// Only the claim winner reaches PutStream, streaming the staged bytes with
+	// the exact frozen size and the explicit postage batch id.
 	rc2, _, err := h.Staging.Open(r.Context(), uploadID, repo, actor)
 	if err != nil {
 		status, code, message := classifyUploadError(err)
@@ -323,8 +363,26 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 	ref, err := h.Uploader.PutStream(r.Context(), rc2, n, batchID)
 	rc2.Close()
 	if err != nil {
-		status, code, message := classifyUploadError(err)
-		writeError(w, status, code, message)
+		if errors.Is(err, ErrUploaderPreSideEffect) {
+			// CONCLUSIVELY no external write occurred (the request was never
+			// sent): safe to RELEASE the durable claim back to active so a
+			// corrected finalize flows through a fresh claim. The release is
+			// best-effort — a dependency failure here merely keeps the session
+			// finalizing, which is still safe (zero duplicate writes).
+			_ = h.Staging.ReleaseClaim(r.Context(), uploadID, repo, actor, claimed.Token)
+			writeError(w, http.StatusBadGateway, "BLOB_UPLOAD_INVALID", messageBlobUploadFailed)
+			return
+		}
+		// AMBIGUOUS: the object store may or may not have stored the bytes,
+		// and the returned reference is unavailable if this process died
+		// between the response and the receipt persistence. RETAIN the durable
+		// claim (the session stays finalizing); every automatic retry makes
+		// ZERO object-store calls and returns this fixed retryable response
+		// until an explicit reconciliation path has authoritative receipt
+		// information. Exactly-once side effects plus automatic liveness are
+		// impossible in this window, and bounded fail-closed uncertainty is
+		// preferred over a duplicate external write.
+		writeError(w, http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable)
 		return
 	}
 
@@ -337,9 +395,15 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 		// rejects malformed stored media with a 400 that never echoes it.
 		mediaType = "application/octet-stream"
 	}
-	if err := h.Staging.MarkFinalized(r.Context(), uploadID, repo, actor, digest, ref, mediaType, n); err != nil {
-		status, code, message := classifyUploadError(err)
-		writeError(w, status, code, message)
+	// The write is CONFIRMED successful: durably complete using the claim
+	// identity and the exact Bee ref. A metadata-receipt failure AFTER a
+	// successful external write is AMBIGUOUS (the bytes are in the store, the
+	// reference lost). The session is LEFT finalizing — never reset to active,
+	// never blindly re-written — so every automatic retry makes ZERO
+	// object-store calls and returns the fixed retryable response until an
+	// explicit reconciliation path supplies the receipt.
+	if err := h.Staging.MarkFinalized(r.Context(), uploadID, repo, actor, claimed.Token, digest, ref, mediaType, n); err != nil {
+		writeError(w, http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable)
 		return
 	}
 	w.Header().Set("Docker-Content-Digest", digest)
@@ -610,4 +674,5 @@ const (
 	messageUploadTooLarge   = "the upload exceeds the configured size limit"
 	messageUploadInvalid    = "the upload request is invalid"
 	messageAlreadyFinalized = "the upload is already finalized and cannot be modified"
+	messageFinalizing       = "the upload is already being finalized by another request; retry only after reconciliation"
 )

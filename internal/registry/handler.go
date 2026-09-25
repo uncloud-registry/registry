@@ -31,6 +31,18 @@ type ObjectUploader interface {
 	PutStream(ctx context.Context, src io.Reader, size int64, batchID string) (string, error)
 }
 
+// ErrUploaderPreSideEffect marks an object-uploader failure that is
+// CONCLUSIVELY PRE-SIDE-EFFECT: the object store never received (and never
+// could have received) any of the blob's bytes, so finalization may safely
+// RELEASE its durable claim and return the session to active with ZERO risk
+// of a duplicate or orphaned external write. It is the ONLY classification
+// that authorizes release. Every generic transport/HTTP/parse failure — the
+// object store may or may not have stored the bytes and the returned
+// reference is lost if the process dies before the receipt is persisted — is
+// AMBIGUOUS and must RETAIN the claim fail-closed. The data-free text carries
+// no operation token, reference, batch id, or raw cause.
+var ErrUploaderPreSideEffect = errors.New("object upload failed before any external write")
+
 type PullAuthorizer interface {
 	Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, principal auth.Principal) (bool, error)
 }

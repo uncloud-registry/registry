@@ -55,7 +55,9 @@ type Service interface {
 	Status(ctx context.Context, id, repo, actor string) (Session, error)
 	Append(ctx context.Context, id, repo, actor string, expectedOffset int64, src io.Reader, maxBytes int64) (Session, error)
 	Open(ctx context.Context, id, repo, actor string) (io.ReadCloser, Session, error)
-	MarkFinalized(ctx context.Context, id, repo, actor, digest, beeRef, mediaType string, size int64) error
+	ClaimFinalize(ctx context.Context, id, repo, actor string, size int64) (Session, error)
+	ReleaseClaim(ctx context.Context, id, repo, actor, token string) error
+	MarkFinalized(ctx context.Context, id, repo, actor, token, digest, beeRef, mediaType string, size int64) error
 	ListFinalized(ctx context.Context, repo, actor string) ([]spec.StagedBlob, error)
 	Delete(ctx context.Context, id, repo, actor string) error
 	Expire(ctx context.Context, now time.Time, limit int) (int, error)
@@ -451,9 +453,10 @@ type sessionRow struct {
 	size                   sql.NullInt64
 	createToken            sql.NullString
 	cleanupToken           sql.NullString
+	finalizeToken          sql.NullString
 }
 
-const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size, create_token, cleanup_token`
+const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size, create_token, cleanup_token, finalize_token`
 
 func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool, error) {
 	var row sessionRow
@@ -461,7 +464,7 @@ func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool,
 		`select `+sessionColumns+` from upload_sessions where id = ?`, id).
 		Scan(&row.id, &row.repo, &row.actor, &row.state, &row.offset,
 			&row.createdNanos, &row.expiresNanos, &row.digest, &row.beeRef,
-			&row.mediaType, &row.size, &row.createToken, &row.cleanupToken)
+			&row.mediaType, &row.size, &row.createToken, &row.cleanupToken, &row.finalizeToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -1348,7 +1351,7 @@ func (s *service) maxGrowth(ctx context.Context, conn *sql.Conn, repo string, cu
 // an astronomically large usage can never pass any positive quota). A genuine
 // query failure is returned for the caller to wrap as a dependency error.
 func usageSum(ctx context.Context, conn *sql.Conn, repo *string) (int64, error) {
-	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalized','deleting')`
+	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalizing','finalized','deleting')`
 	args := []any{}
 	if repo != nil {
 		query += ` and repo = ?`
@@ -1567,7 +1570,7 @@ func (s *service) Open(ctx context.Context, id, repo, actor string) (io.ReadClos
 		if s.expiredNanos(row.expiresNanos) {
 			return ErrExpired
 		}
-		if row.state != string(StateActive) && row.state != string(StateFinalized) {
+		if row.state != string(StateActive) && row.state != string(StateFinalizing) && row.state != string(StateFinalized) {
 			return ErrInvalidState
 		}
 		f, err := s.spool.openForRead(id, row.offset)
@@ -1590,10 +1593,126 @@ func (s *service) Open(ctx context.Context, id, repo, actor string) (io.ReadClos
 }
 
 // ---------------------------------------------------------------------------
-// MarkFinalized
+// ClaimFinalize / ReleaseClaim
 // ---------------------------------------------------------------------------
 
-func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, digest, beeRef, mediaType string, size int64) error {
+// ClaimFinalize durably reserves THIS session for external finalization
+// BEFORE any object-store write — the per-upload durable claim that makes a
+// concurrent or retried finalize impossible to duplicate. It runs entirely in
+// one BEGIN IMMEDIATE transaction: it authenticates repo+actor confidentiality
+// (foreign/absent ids surface the same ErrNotFound), requires an active +
+// unexpired session, atomically COMPARES the frozen snapshot (the current
+// durable offset MUST equal the caller's size — the exact byte count it just
+// hashed) and, only on a match, transitions active -> finalizing. After the
+// commit the bytes are immutable (Append rejects a finalizing session) and a
+// concurrent contender always loses with ZERO object-store writes. A stale
+// hash (a concurrent PATCH advanced the offset after the caller's hash) is
+// ErrOffsetMismatch so no Bee write ever happens on bytes that differ from
+// what was hashed.
+// genToken returns a 64-char lowercase-hex unforgeable token (32 crypto/rand
+// bytes), the same canonical shape as ID/create/cleanup tokens. It is the
+// claim identity handed only to the single finalization winner.
+func genToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+
+func (s *service) ClaimFinalize(ctx context.Context, id, repo, actor string, size int64) (Session, error) {
+	if err := validateID(id); err != nil {
+		return Session{}, err
+	}
+	if err := validateRepo(repo); err != nil {
+		return Session{}, err
+	}
+	if err := validateActor(actor); err != nil {
+		return Session{}, err
+	}
+	if size < 0 {
+		return Session{}, ErrInvalidInput
+	}
+	var sess Session
+	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		row, found, err := fetchSession(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotFound
+		}
+		if !ownsSession(row, repo, actor) {
+			return ErrNotFound
+		}
+		if row.state == string(StateCreating) {
+			return ErrNotFound
+		}
+		if s.expiredNanos(row.expiresNanos) {
+			return ErrExpired
+		}
+		switch row.state {
+		case string(StateFinalized):
+			// Another instance already completed the finalize durably.
+			return ErrFinalizeConflict
+		case string(StateFinalizing):
+			// Another instance already claimed this session; this contender
+			// loses with zero object-store writes.
+			return ErrInvalidState
+		case string(StateDeleting):
+			return ErrInvalidState
+		case string(StateActive):
+			if size != row.offset {
+				// A concurrent append advanced the durable offset after the
+				// caller's hash: the hashed snapshot is stale — no Bee write.
+				return ErrOffsetMismatch
+			}
+			token, err := genToken()
+			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				return typed(ErrDependency, err)
+			}
+			if err := s.spool.align(id, row.offset); err != nil {
+				return typed(ErrDependency, err)
+			}
+			res, err := conn.ExecContext(ctx,
+				`update upload_sessions set state = 'finalizing', finalize_token = ? where id = ? and state = 'active'`, token, id)
+			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				return typed(ErrDependency, err)
+			}
+			if affected, err := res.RowsAffected(); err != nil || affected != 1 {
+				return typed(ErrDependency, errors.New("staging claim update affected no row"))
+			}
+			sess = buildSession(row)
+			sess.State = StateFinalizing
+			sess.Token = token
+			return nil
+		default:
+			return ErrInvalidState
+		}
+	})
+	if err != nil {
+		return Session{}, err
+	}
+	return sess, nil
+}
+
+// ReleaseClaim returns a finalizing session to active, un-freezing its bytes
+// so a corrected finalize (or more appends) can proceed. It is legal ONLY for
+// a CONCLUSIVELY pre-side-effect uploader failure — the object store never
+// received any bytes, so no duplicate or orphaned write is possible — and is
+// authenticated and serialized like every other transition. An ambiguous
+// uploader failure or a metadata-receipt fault must NEVER release the claim
+// (it retains finalizing fail-closed); only an explicit reconciliation path
+// may ever settle that state. Because only the winner could have transitioned
+// the session to finalizing, the release cannot race another contender's
+// legitimate write.
+func (s *service) ReleaseClaim(ctx context.Context, id, repo, actor, token string) error {
 	if err := validateID(id); err != nil {
 		return err
 	}
@@ -1601,6 +1720,69 @@ func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, digest, be
 		return err
 	}
 	if err := validateActor(actor); err != nil {
+		return err
+	}
+	// The claim identity is validated against the same bounded canonical
+	// grammar as every token; a malformed value is uniformly ErrInvalidInput
+	// (data-free) and never reveals whether any session exists.
+	if err := validateHex(token, 64); err != nil {
+		return err
+	}
+	return s.withTx(ctx, func(conn *sql.Conn) error {
+		row, found, err := fetchSession(ctx, conn, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotFound
+		}
+		if !ownsSession(row, repo, actor) {
+			return ErrNotFound
+		}
+		if row.state == string(StateCreating) {
+			return ErrNotFound
+		}
+		if s.expiredNanos(row.expiresNanos) {
+			return ErrExpired
+		}
+		if row.state != string(StateFinalizing) {
+			// Not claimed, already completed, or tombstoned: nothing to release.
+			return ErrInvalidState
+		}
+		if !row.finalizeToken.Valid || row.finalizeToken.String != token {
+			// Ownership-indistinguishable: only the single winner holds the
+			// unforgeable claim identity, so a foreign instance can neither
+			// release nor observe that its candidate token is wrong.
+			return ErrInvalidState
+		}
+		res, err := conn.ExecContext(ctx,
+			`update upload_sessions set state = 'active', finalize_token = null where id = ? and state = 'finalizing' and finalize_token = ?`, id, token)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return typed(ErrDependency, err)
+		}
+		if affected, err := res.RowsAffected(); err != nil || affected != 1 {
+			return typed(ErrDependency, errors.New("staging claim release affected no row"))
+		}
+		return nil
+	})
+}
+
+func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, token, digest, beeRef, mediaType string, size int64) error {
+	if err := validateID(id); err != nil {
+		return err
+	}
+	if err := validateRepo(repo); err != nil {
+		return err
+	}
+	if err := validateActor(actor); err != nil {
+		return err
+	}
+	// The claim identity is validated against the same bounded canonical
+	// grammar as every token; a malformed value is uniformly ErrInvalidInput.
+	if err := validateHex(token, 64); err != nil {
 		return err
 	}
 	if err := validateDigest(digest); err != nil {
@@ -1644,7 +1826,20 @@ func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, digest, be
 				return nil
 			}
 			return ErrFinalizeConflict
-		case string(StateActive):
+		case string(StateActive), string(StateFinalizing):
+			// A session may be completed directly from active (a plain
+			// service-level finalize) OR from finalizing (the durable claim
+			// the handler placed BEFORE the external object-store write). In
+			// both cases the completion is claim-identity bound by the exact
+			// committed snapshot: size == offset and the file aligned.
+			if row.state == string(StateFinalizing) {
+				// Only the winner — the sole holder of the unforgeable claim
+				// identity — may complete an in-flight claim; a foreign
+				// instance fails ownership-indistinguishably.
+				if !row.finalizeToken.Valid || row.finalizeToken.String != token {
+					return ErrInvalidState
+				}
+			}
 			// Exact committed size.
 			if size != row.offset {
 				return ErrInvalidInput
@@ -1664,7 +1859,7 @@ func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, digest, be
 				return typed(ErrDependency, err)
 			}
 			if _, err := conn.ExecContext(ctx,
-				`update upload_sessions set state = 'finalized', digest = ?, bee_ref = ?, media_type = ?, size = ? where id = ?`,
+				`update upload_sessions set state = 'finalized', digest = ?, bee_ref = ?, media_type = ?, size = ?, finalize_token = null where id = ?`,
 				digest, beeRef, mediaType, size, id); err != nil {
 				if cerr := ctx.Err(); cerr != nil {
 					return cerr
@@ -1770,6 +1965,15 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 			// absent id — the foreign row is NEVER touched and the result is
 			// identically nil.
 			return nil
+		}
+		if row.state == string(StateFinalizing) {
+			// A session mid-external finalization (or stuck uncertain after
+			// an ambiguous failure / crash) may NOT be deleted: its bytes may
+			// have reached the object store and its receipt was never
+			// recorded. Deleting would destroy the only path to reconciliation
+			// and is never automatic; fail closed and force an explicit
+			// reconciliation path.
+			return ErrInvalidState
 		}
 		proceed = true
 		if row.state != string(StateDeleting) {
@@ -1917,6 +2121,14 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 			return err
 		}
 		if !found {
+			return nil
+		}
+		if row.state == string(StateFinalizing) {
+			// A session mid-external finalization (or stuck uncertain) is
+			// never expired: its bytes may have reached the object store with
+			// no recorded receipt. Expiry (automatic deletion) would destroy
+			// the only reconciliation path; fail closed and skip it. Its
+			// bytes still count toward quota, bounding the uncertainty.
 			return nil
 		}
 		proceed = true
@@ -2083,7 +2295,7 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 			if err := s.reconcileCreatingRow(ctx, ri); err != nil {
 				return err
 			}
-		case StateActive, StateFinalized:
+		case StateActive, StateFinalizing, StateFinalized:
 			if err := s.spool.align(ri.id, ri.offset); err != nil {
 				return typed(ErrDependency, err)
 			}
@@ -2095,6 +2307,11 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 					return err
 				}
 			}
+			// A finalizing row is left finalizing: its external write may or
+			// may not have reached the object store and no receipt was
+			// recorded. Startup NEVER completes or releases it automatically
+			// — it retains the fail-closed uncertainty for an explicit
+			// reconciliation path, and its bytes remain frozen and quota-billed.
 		default:
 			return typed(ErrDependency, errors.New("unknown session state"))
 		}

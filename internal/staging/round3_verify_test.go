@@ -197,7 +197,7 @@ func TestRound3EveryRetainedHandleBindsToOriginalVerifiedDB(t *testing.T) {
 		t.Fatalf("append through retained handles after path removal: %v", err)
 	}
 	digest, ref, media, size := finalizeArgs(s)
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, digest, ref, media, size); err != nil {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, digest, ref, media, size); err != nil {
 		t.Fatalf("finalize through retained handles after path removal: %v", err)
 	}
 	// The committed metadata is served by the RETAINED handles — the only

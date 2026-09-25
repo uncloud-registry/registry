@@ -166,7 +166,7 @@ func TestConsumeFinalizedReferencedOnly(t *testing.T) {
 			t.Fatalf("append: %v", err)
 		}
 		digest := "sha256:" + digestHex(data)
-		if err := svc.MarkFinalized(ctx, s.ID, repo, actor, digest, digestHex(data), "application/octet-stream", int64(len(data))); err != nil {
+		if err := svc.MarkFinalized(ctx, s.ID, repo, actor, testTok, digest, digestHex(data), "application/octet-stream", int64(len(data))); err != nil {
 			t.Fatalf("finalize: %v", err)
 		}
 		return s, digest

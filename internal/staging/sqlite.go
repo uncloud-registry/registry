@@ -25,12 +25,15 @@ import (
 // ONLY by its exact frozen object surface plus version, never guessed at. A
 // pre-existing database that matches none of them is rejected, never adopted.
 //
-// v3 is the current schema. It carries one forward change over v2: a deleting
-// tombstone may retain the authenticated sidecar cleanup token (exact 64-hex
-// lowercase) as durable provenance, so a crash between the tombstone commit
-// and the filesystem cleanup leaves a restart able to authenticate the
-// quarantined `.tok` sidecar. v2 never persisted that token on a deleting row.
-const latestSchemaVersion = 3
+// v4 is the current schema. It carries one forward change over v3: the durable
+// finalization claim state `finalizing`, which an upload winner commits BEFORE
+// any external object-store write so concurrent or retried finalizes serialize
+// to a single Bee write. A finalizing row freezes its exact staged snapshot
+// (offset == the hashed size), rejects appends, fails delete/expire closed,
+// and is never listed for publication; it is retained fail-closed across
+// restarts until an explicit reconciliation path settles it. v3 never had such
+// a frozen pre-write claim, so two concurrent PUTs could both reach Bee.
+const latestSchemaVersion = 4
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -91,6 +94,7 @@ var schemaDDL = []string{
 		expires_at not null,
 		create_token text,
 		cleanup_token text,
+		finalize_token text,
 		digest     text,
 		bee_ref    text,
 		media_type text,
@@ -98,15 +102,20 @@ var schemaDDL = []string{
 		check (typeof(id) = 'text' and length(hex(id)) = 128 and id = lower(id) and id not glob '*[^0-9a-f]*' and instr(hex(id), '00') = 0),
 		check (typeof(repo) = 'text' and length(hex(repo)) between 2 and 400 and instr(hex(repo), '00') = 0 and repo = lower(repo) and repo not glob '*[^a-z0-9._/-]*' and repo not glob '/**' and repo not glob '*/' and repo not glob '*//*' and repo not glob '*..*' and ('/' || repo) not glob '*[/][._-]*'),
 		check (typeof(actor) = 'text' and length(hex(actor)) between 2 and 400 and instr(hex(actor), '00') = 0 and actor not glob '*[^a-zA-Z0-9:_@.-]*' and actor not glob '[+._:@-]*'),
-		check (state in ('active','creating','finalized','deleting')),
+		check (state in ('active','creating','finalizing','finalized','deleting')),
 		check (typeof(offset) = 'integer' and offset >= 0),
 		check (typeof(created_at) = 'integer' and typeof(expires_at) = 'integer' and expires_at > created_at),
 		check (cleanup_token is null or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128 and cleanup_token = lower(cleanup_token) and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)),
+		check (finalize_token is null or (typeof(finalize_token) = 'text' and length(hex(finalize_token)) = 128 and finalize_token = lower(finalize_token) and finalize_token not glob '*[^0-9a-f]*' and instr(hex(finalize_token), '00') = 0)),
 		check (
-			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null)
+			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null and finalize_token is null)
+			or (state = 'finalizing' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null
+				and typeof(finalize_token) = 'text' and length(hex(finalize_token)) = 128
+				and finalize_token = lower(finalize_token)
+				and finalize_token not glob '*[^0-9a-f]*' and instr(hex(finalize_token), '00') = 0)
 			or (state = 'creating' and digest is null and bee_ref is null and media_type is null and size is null and offset = 0
 				and typeof(create_token) = 'text' and length(hex(create_token)) = 128 and create_token = lower(create_token)
-				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0 and cleanup_token is null)
+				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0 and cleanup_token is null and finalize_token is null)
 			or (state = 'finalized' and digest is not null and bee_ref is not null and media_type is not null
 				and size is not null and typeof(size) = 'integer' and size = offset
 				and typeof(digest) = 'text' and length(hex(digest)) = 142 and instr(hex(digest), '00') = 0
@@ -115,8 +124,8 @@ var schemaDDL = []string{
 				and bee_ref = lower(bee_ref) and bee_ref not glob '*[^0-9a-f]*'
 				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
-				and create_token is null)
-			or (state = 'deleting' and create_token is null
+				and create_token is null and finalize_token is null)
+			or (state = 'deleting' and create_token is null and finalize_token is null
 				and (cleanup_token is null
 					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
 						and cleanup_token = lower(cleanup_token)
@@ -152,10 +161,10 @@ var schemaDDL = []string{
 		select case when not (
 			(new.state = 'active' and new.offset = 0
 				and new.digest is null and new.bee_ref is null and new.media_type is null and new.size is null
-				and new.cleanup_token is null)
+				and new.cleanup_token is null and new.finalize_token is null)
 			or (new.state = 'creating' and new.offset = 0
 				and new.digest is null and new.bee_ref is null and new.media_type is null and new.size is null
-				and new.cleanup_token is null))
+				and new.cleanup_token is null and new.finalize_token is null))
 			then raise(abort, 'session insert must be active or creating') end;
 	end`,
 	// State transitions: active may only be ENTERED from creating; nothing
@@ -164,8 +173,9 @@ var schemaDDL = []string{
 	// is terminal.
 	`create trigger trg_session_state before update of state on upload_sessions begin
 		select case
-			when new.state = 'active' and old.state <> 'creating' and new.state <> old.state then raise(abort, 'cannot return to active')
+			when new.state = 'active' and new.state <> old.state and old.state not in ('creating','finalizing') then raise(abort, 'cannot return to active')
 			when new.state = 'creating' and new.state <> old.state then raise(abort, 'cannot enter creating')
+			when new.state = 'finalizing' and new.state <> old.state and old.state <> 'active' then raise(abort, 'finalizing requires active')
 			when new.state = 'finalized' and not (
 				select exists(select 1 from staged_blobs b where b.upload_id = new.id
 					and b.repo = new.repo and b.actor = new.actor and b.created_at = new.created_at
@@ -210,6 +220,20 @@ var schemaDDL = []string{
 			when old.create_token is not null and new.create_token is null and old.state <> 'creating' then raise(abort, 'create token cannot be cleared outside creating')
 			else null end;
 	end`,
+	// The finalize token is the unforgeable claim identity handed ONLY to the
+	// single upload winner at ClaimFinalize. It may be SET exactly once, and
+	// only as part of the active -> finalizing claim transition; it may be
+	// CLEARED only by the owner from finalizing: on completion (-> finalized,
+	// presented as the win identity) or on a CONCLUSIVELY pre-side-effect
+	// release (-> active). It is never surfaced by any read path (Status/Open/
+	// list), so a foreign instance cannot use or release a claim it never won.
+	`create trigger trg_session_finalize before update of finalize_token on upload_sessions begin
+		select case
+			when old.finalize_token is not null and new.finalize_token is not null and old.finalize_token <> new.finalize_token then raise(abort, 'finalize token immutable')
+			when new.finalize_token is not null and old.finalize_token is null and not (old.state = 'active' and new.state = 'finalizing') then raise(abort, 'finalize token may only be set at the claim')
+			when old.finalize_token is not null and new.finalize_token is null and old.state not in ('finalizing','finalized') then raise(abort, 'finalize token may only be cleared from finalizing')
+			else null end;
+	end`,
 	// The cleanup token is the durable sidecar provenance. It may be SET at
 	// activation (the creating row's create token atomically becomes the
 	// cleanup token) or at the deleting transition (an interrupted create's
@@ -242,7 +266,7 @@ var schemaDDL = []string{
 	// timing exactly; one blob per session (PK).
 	`create trigger trg_blob_insert before insert on staged_blobs begin
 		select case when not (
-			(select state from upload_sessions where id = new.upload_id) = 'active'
+			(select state from upload_sessions where id = new.upload_id) in ('active','finalizing')
 			and (select repo from upload_sessions where id = new.upload_id) = new.repo
 			and (select actor from upload_sessions where id = new.upload_id) = new.actor
 			and (select created_at from upload_sessions where id = new.upload_id) = new.created_at
@@ -330,8 +354,16 @@ var schemaGoldenV2JSON []byte
 //go:embed schema_golden_v3.json
 var schemaGoldenV3JSON []byte
 
-// schemaGold is the current (v3) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV3JSON)
+//go:embed schema_golden_v4.json
+var schemaGoldenV4JSON []byte
+
+// schemaGold is the current (v4) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV4JSON)
+
+// schemaGoldV3 is the exact frozen v3 predecessor manifest (the previously
+// committed "current" shape before v4), retained for migration detection and
+// parity. It is never renamed or called v4.
+var schemaGoldV3 = mustLoadSchemaGolden(schemaGoldenV3JSON)
 
 // schemaGoldV2 is the exact frozen v2 predecessor manifest (the previously
 // committed "current" shape before v3), retained for migration detection and
@@ -629,7 +661,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1382,6 +1414,7 @@ const (
 	schemaMigrateV1Pre
 	schemaMigrateV1Cleanup
 	schemaMigrateV2
+	schemaMigrateV3
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1433,6 +1466,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 3:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV3, 3); err == nil {
+			return schemaMigrateV3, nil
 		}
 	case 2:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV2, 2); err == nil {
@@ -1654,8 +1691,19 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		if err := verifyAgainst(ctx, conn, schemaGoldV2, 2); err != nil {
 			return depErr(err, ctx)
 		}
-		// Exact v2 -> v3: rebuild upload_sessions carrying every row/field
+		// Exact v2 -> v4: rebuild upload_sessions carrying every row/field
 		// across, including any cleanup_token (NULL deleting rows stay NULL).
+		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV3:
+		if err := verifyAgainst(ctx, conn, schemaGoldV3, 3); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v3 -> v4: the finalizing claim state. Rebuild upload_sessions
+		// carrying every row/field across exactly (no active/finalized row can
+		// be born finalizing; the CHECK and state trigger enforce it), so no
+		// existing row is ever altered or re-derived.
 		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
 			return depErr(err, ctx)
 		}
@@ -1754,15 +1802,17 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 	if err := exec(`drop table upload_sessions_copy`); err != nil {
 		return err
 	}
-	// Recreate the two session indexes (schemaDDL[3], schemaDDL[4]).
+	// Recreate the two session indexes (schemaDDL[3], schemaDDL[4]), then
+	// every remaining session and staged-blob trigger (schemaDDL[5..end]) so
+	// the rebuilt table carries the ENTIRE current trigger set — including the
+	// finalizing-claim trigger (trg_session_finalize) that the v1/v2/v3
+	// predecessors never had.
 	for _, idx := range []int{3, 4} {
 		if err := exec(schemaDDL[idx]); err != nil {
 			return err
 		}
 	}
-	// Recreate the seven v3 session triggers (schemaDDL[5..11]) and the three
-	// staged-blob triggers (schemaDDL[12..14]).
-	for i := 5; i <= 14; i++ {
+	for i := 5; i < len(schemaDDL); i++ {
 		if err := exec(schemaDDL[i]); err != nil {
 			return err
 		}

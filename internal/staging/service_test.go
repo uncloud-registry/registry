@@ -922,7 +922,7 @@ func TestServiceMarkFinalizedLifecycle(t *testing.T) {
 	s = mustAppend(t, svc, s, "blob-bytes")
 	digest, ref, media, size := finalizeArgs(s)
 
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, digest, ref, media, size); err != nil {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, digest, ref, media, size); err != nil {
 		t.Fatalf("MarkFinalized: %v", err)
 	}
 
@@ -940,11 +940,11 @@ func TestServiceMarkFinalizedLifecycle(t *testing.T) {
 	}
 
 	// Idempotent for identical metadata.
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, digest, ref, media, size); err != nil {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, digest, ref, media, size); err != nil {
 		t.Fatalf("identical re-finalize: %v", err)
 	}
 	// Conflicting second finalization is an error.
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, "sha256:"+strings.Repeat("e", 64), ref, media, size); !errors.Is(err, ErrFinalizeConflict) {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, "sha256:"+strings.Repeat("e", 64), ref, media, size); !errors.Is(err, ErrFinalizeConflict) {
 		t.Fatalf("conflicting re-finalize: %v, want ErrFinalizeConflict", err)
 	}
 	// Appends after finalization are rejected.
@@ -985,7 +985,7 @@ func TestServiceMarkFinalizedValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, tc.digest, tc.ref, tc.media, tc.size); !errors.Is(err, ErrInvalidInput) {
+			if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, tc.digest, tc.ref, tc.media, tc.size); !errors.Is(err, ErrInvalidInput) {
 				t.Fatalf("err = %v, want ErrInvalidInput", err)
 			}
 		})
@@ -1006,10 +1006,10 @@ func TestServiceMarkFinalizedOwnershipAndExpiry(t *testing.T) {
 	s = mustAppend(t, svc, s, "abcd")
 	digest, ref, media, size := finalizeArgs(s)
 
-	if err := svc.MarkFinalized(ctx, s.ID, "backend/api", "user:eve", digest, ref, media, size); !errors.Is(err, ErrNotFound) {
+	if err := svc.MarkFinalized(ctx, s.ID, "backend/api", "user:eve", testTok, digest, ref, media, size); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-owner finalize: %v, want ErrNotFound family", err)
 	}
-	if err := svc.MarkFinalized(ctx, s.ID, "other/app", s.Actor, digest, ref, media, size); !errors.Is(err, ErrNotFound) {
+	if err := svc.MarkFinalized(ctx, s.ID, "other/app", s.Actor, testTok, digest, ref, media, size); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-repo finalize: %v, want ErrNotFound family", err)
 	}
 	if st, _ := svc.Status(ctx, s.ID, s.Repo, s.Actor); st.State != StateActive {
@@ -1017,7 +1017,7 @@ func TestServiceMarkFinalizedOwnershipAndExpiry(t *testing.T) {
 	}
 
 	fixedClock(svc, now.Add(time.Hour))
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, digest, ref, media, size); !errors.Is(err, ErrExpired) {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, digest, ref, media, size); !errors.Is(err, ErrExpired) {
 		t.Fatalf("expired finalize: %v, want ErrExpired", err)
 	}
 }
@@ -1028,7 +1028,7 @@ func TestServiceMarkFinalizedSurvivesRestart(t *testing.T) {
 	s := mustCreate(t, svc, "backend/api", "user:alice")
 	s = mustAppend(t, svc, s, "durable")
 	digest, ref, media, size := finalizeArgs(s)
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, digest, ref, media, size); err != nil {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, digest, ref, media, size); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 	svc.Close()
@@ -1071,7 +1071,7 @@ func TestServiceListFinalizedScopedAndDeterministic(t *testing.T) {
 	otherRepo := mustCreate(t, svc, "other/app", "user:alice")
 	otherRepo = mustAppend(t, svc, otherRepo, "ccc")
 
-	if err := svc.MarkFinalized(ctx, alice.ID, alice.Repo, alice.Actor, digestA, refA, mediaA, sizeA); err != nil {
+	if err := svc.MarkFinalized(ctx, alice.ID, alice.Repo, alice.Actor, testTok, digestA, refA, mediaA, sizeA); err != nil {
 		t.Fatalf("finalize alice: %v", err)
 	}
 	// bob and otherRepo stay active.
@@ -1094,7 +1094,7 @@ func TestServiceListFinalizedScopedAndDeterministic(t *testing.T) {
 	second := mustCreate(t, svc, "backend/api", "user:alice")
 	second = mustAppend(t, svc, second, "2")
 	digest2, ref2, media2, size2 := finalizeArgs(second)
-	if err := svc.MarkFinalized(ctx, second.ID, second.Repo, second.Actor, digest2, ref2, media2, size2); err != nil {
+	if err := svc.MarkFinalized(ctx, second.ID, second.Repo, second.Actor, testTok, digest2, ref2, media2, size2); err != nil {
 		t.Fatalf("finalize second: %v", err)
 	}
 	list, err = svc.ListFinalized(ctx, "backend/api", "user:alice")
@@ -1353,7 +1353,7 @@ func TestServiceExpireFinalizedRowsIncluded(t *testing.T) {
 	s := mustCreate(t, svc, "backend/api", "user:alice")
 	s = mustAppend(t, svc, s, "final")
 	digest, ref, media, size := finalizeArgs(s)
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, digest, ref, media, size); err != nil {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, digest, ref, media, size); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 
@@ -1401,7 +1401,7 @@ func TestServiceRestartFullLifecycle(t *testing.T) {
 		t.Fatalf("offset after resume: %d", st.Offset)
 	}
 	digest, ref, media, size := finalizeArgs(st)
-	if err := svc2.MarkFinalized(ctx, st.ID, st.Repo, st.Actor, digest, ref, media, size); err != nil {
+	if err := svc2.MarkFinalized(ctx, st.ID, st.Repo, st.Actor, testTok, digest, ref, media, size); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 	svc2.Close()
@@ -2283,7 +2283,7 @@ func TestServiceErrorsAreDataFree(t *testing.T) {
 	if _, err := svc.Append(ctx, s.ID, s.Repo, s.Actor, size, strings.NewReader("x"), 0); err != nil {
 		errs = append(errs, err)
 	}
-	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, "sha512:"+strings.Repeat("8", 64), strings.Repeat("7", 64), "application/octet-stream", size); err != nil {
+	if err := svc.MarkFinalized(ctx, s.ID, s.Repo, s.Actor, testTok, "sha512:"+strings.Repeat("8", 64), strings.Repeat("7", 64), "application/octet-stream", size); err != nil {
 		errs = append(errs, err)
 	}
 	if err := svc.Delete(ctx, strings.Repeat("9", 64), "other/app", "user:else"); err != nil {
@@ -2428,10 +2428,10 @@ func TestServiceOwnerMismatchIdentityEqualsNotFound(t *testing.T) {
 		{
 			name: "MarkFinalized",
 			missing: func() error {
-				return svc.MarkFinalized(ctx, missingID, "backend/api", "user:alice", digest, ref, media, size)
+				return svc.MarkFinalized(ctx, missingID, "backend/api", "user:alice", testTok, digest, ref, media, size)
 			},
 			foreign: func() error {
-				return svc.MarkFinalized(ctx, s.ID, "other/app", "user:alice", digest, ref, media, size)
+				return svc.MarkFinalized(ctx, s.ID, "other/app", "user:alice", testTok, digest, ref, media, size)
 			},
 		},
 	}
@@ -2514,7 +2514,9 @@ func TestServiceCreatingInvisible(t *testing.T) {
 			return err
 		}},
 		{"Open", func() error { _, _, err := svc.Open(ctx, id, "backend/api", "user:alice"); return err }},
-		{"MarkFinalized", func() error { return svc.MarkFinalized(ctx, id, "backend/api", "user:alice", digest, ref, media, size) }},
+		{"MarkFinalized", func() error {
+			return svc.MarkFinalized(ctx, id, "backend/api", "user:alice", testTok, digest, ref, media, size)
+		}},
 	}
 	for _, p := range pairs {
 		if err := p.call(); !errors.Is(err, ErrNotFound) {

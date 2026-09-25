@@ -329,7 +329,7 @@ func TestRound2ContextCancellationMatrix(t *testing.T) {
 			return err
 		}},
 		{"MarkFinalized", func(c context.Context) error {
-			return svc.MarkFinalized(c, s.ID, s.Repo, s.Actor, dig, ref, "application/octet-stream", s.Offset)
+			return svc.MarkFinalized(c, s.ID, s.Repo, s.Actor, testTok, dig, ref, "application/octet-stream", s.Offset)
 		}},
 		{"Open", func(c context.Context) error {
 			rc, _, err := svc.Open(c, s.ID, s.Repo, s.Actor)
@@ -488,7 +488,8 @@ func TestSchemaGoldenManifestIsFrozen(t *testing.T) {
 	}
 	for _, want := range []string{"upload_sessions", "staged_blobs", versionTable,
 		"trg_session_insert", "trg_session_state", "trg_session_metadata", "trg_session_identity",
-		"trg_session_token", "trg_session_delete", "trg_blob_insert", "trg_blob_update", "trg_blob_delete"} {
+		"trg_session_token", "trg_session_finalize", "trg_session_cleanup", "trg_session_delete",
+		"trg_blob_insert", "trg_blob_update", "trg_blob_delete"} {
 		found := false
 		for _, o := range schemaGold.Objects {
 			if o.Name == want {

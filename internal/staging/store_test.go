@@ -114,7 +114,7 @@ func TestMemoryStoreFinalizeListAndClearByDigest(t *testing.T) {
 		if _, err := store.Append(ctx, s.ID, repo, actor, 0, bytes.NewReader(data), 100); err != nil {
 			t.Fatalf("append: %v", err)
 		}
-		if err := store.MarkFinalized(ctx, s.ID, repo, actor, dig(v), ref(v), "application/octet-stream", int64(len(data))); err != nil {
+		if err := store.MarkFinalized(ctx, s.ID, repo, actor, testTok, dig(v), ref(v), "application/octet-stream", int64(len(data))); err != nil {
 			t.Fatalf("finalize: %v", err)
 		}
 		final, err := store.Status(ctx, s.ID, repo, actor)

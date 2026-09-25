@@ -39,7 +39,7 @@ func mustLoadTestManifest(t *testing.T, data []byte) *schemaManifest {
 	if err := json.Unmarshal(data, &m); err != nil {
 		t.Fatalf("test golden not parseable: %v", err)
 	}
-	if m.Version < 1 || m.Version > 2 || len(m.Objects) == 0 {
+	if m.Version < 1 || m.Version > latestSchemaVersion || len(m.Objects) == 0 {
 		t.Fatalf("test golden has an unexpected version/object set: %d/%d", m.Version, len(m.Objects))
 	}
 	return &m
