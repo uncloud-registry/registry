@@ -149,7 +149,17 @@ func (h *Handler) uploadPatch(w http.ResponseWriter, r *http.Request, repo, uplo
 		body = exact
 	}
 
-	updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, body, maxBytes)
+	// A declared Content-Range span is the EXACT number of bytes this request
+	// will write, so the durable append may preflight-reject it when the span
+	// exceeds the available quota allowance BEFORE reading any payload (zero
+	// bytes consumed, no spool write) — while an implicit stream is instead
+	// bounded at the allowance and probed.
+	appendCtx := r.Context()
+	if present {
+		appendCtx = staging.WithDeclaredSpan(appendCtx)
+	}
+
+	updated, err := h.Staging.Append(appendCtx, uploadID, repo, actor, expected, body, maxBytes)
 	if err != nil {
 		if exact != nil && (exact.short || exact.long) {
 			// The chunked body did NOT fill the declared span exactly —
@@ -242,7 +252,13 @@ func (h *Handler) uploadPut(w http.ResponseWriter, r *http.Request, repo, upload
 			exact = newExactSpanReader(r.Body, maxBytes)
 			body = exact
 		}
-		updated, err := h.Staging.Append(r.Context(), uploadID, repo, actor, expected, body, maxBytes)
+		// Declared span => eligible for quota preflight rejection before any
+		// payload read (see uploadPatch).
+		appendCtx := r.Context()
+		if present {
+			appendCtx = staging.WithDeclaredSpan(appendCtx)
+		}
+		updated, err := h.Staging.Append(appendCtx, uploadID, repo, actor, expected, body, maxBytes)
 		if err != nil {
 			if exact != nil && (exact.short || exact.long) {
 				writeError(w, http.StatusBadRequest, "BLOB_UPLOAD_INVALID", messageRangeInvalid)

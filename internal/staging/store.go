@@ -62,18 +62,23 @@ type RegistryStore interface {
 // Append BEGIN IMMEDIATE transaction (never handler-side status checks), so
 // independent service processes admit only valid winners at every boundary
 // and a rejected append performs zero file/offset/state change. Zero means
-// that kind of quota is unbounded. Active and finalized session bytes are
-// both counted toward per-repository and total-staging usage (the documented
-// policy: a finalized blob awaiting a manifest still occupies staging, so a
-// restart or retry can never bypass a quota by "finishing"); creating rows
-// carry offset 0 and deleting rows are tombstoned, so neither is counted.
+// that kind of quota is unbounded. Usage counts every byte-bearing row whose
+// physical bytes may still occupy the spool: active and finalized sessions
+// (including already-expired ones — expiry alone never removes bytes) AND
+// deleting tombstones whose durable unlink has not yet been completed (the
+// documented policy: the row is removed only after the file is durably gone,
+// so a restart or a failed cleanup can never bypass a quota by releasing bytes
+// that still occupy the disk); creating rows carry offset 0. A rejected append
+// is decided BEFORE the spool file is opened or any source byte is read, so an
+// attacker with tiny remaining quota cannot stream payload bytes into the
+// spool first.
 type Limits struct {
 	// MaxUploadBytes bounds a single session's cumulative durable offset.
 	MaxUploadBytes int64
-	// MaxRepositoryBytes bounds the sum of active+finalized offsets for one
+	// MaxRepositoryBytes bounds the sum of byte-bearing offsets for one
 	// repository across concurrent and restarted processes.
 	MaxRepositoryBytes int64
-	// MaxTotalStagingBytes bounds the sum of active+finalized offsets across
+	// MaxTotalStagingBytes bounds the sum of byte-bearing offsets across
 	// every repository.
 	MaxTotalStagingBytes int64
 }

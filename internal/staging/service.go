@@ -63,6 +63,30 @@ type Service interface {
 
 var _ Service = (*service)(nil)
 
+// appendDeclaredCtxKey marks an Append whose maxBytes argument is an EXACT
+// declared Content-Range span (as opposed to a loose caller bound on an
+// implicit contiguous stream). For an exact declared span the append
+// preflight-rejects when the span exceeds the available quota allowance
+// BEFORE opening the spool file or reading the source, so a declared
+// over-quota request consumes ZERO payload bytes and performs no spool write.
+type appendDeclaredCtxKey struct{}
+
+// WithDeclaredSpan returns a context marked so the durable service treats the
+// Append maxBytes argument as an exact declared span eligible for quota
+// preflight rejection without reading the source. The registry handler sets
+// it for requests carrying a Content-Range header, where maxBytes is the
+// exact, pre-validated span.
+func WithDeclaredSpan(ctx context.Context) context.Context {
+	return context.WithValue(ctx, appendDeclaredCtxKey{}, true)
+}
+
+// appendDeclared reports whether ctx marks its Append maxBytes as an exact
+// declared span.
+func appendDeclared(ctx context.Context) bool {
+	v, _ := ctx.Value(appendDeclaredCtxKey{}).(bool)
+	return v
+}
+
 // SetLimits installs the atomic durable staging quotas enforced inside every
 // Append BEGIN IMMEDIATE transaction. It must be called before serving and
 // never concurrently with Appends. Zero calls leave all quotas unbounded.
@@ -1178,17 +1202,49 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 		}
 		oldOffset = row.offset
 
+		// Quota admission runs BEFORE opening the spool file or reading a single
+		// source byte. The maximum admissible growth is computed from EVERY
+		// configured limit (per-upload, per-repository, total-staging) inside
+		// this BEGIN IMMEDIATE transaction, so concurrent independent service
+		// processes admit only valid winners and an attacker with only tiny
+		// quota remaining can never stream arbitrary payload bytes into the
+		// spool before the rejection.
+		allowance, aerr := s.maxGrowth(ctx, conn, repo, oldOffset)
+		if aerr != nil {
+			return depErr(aerr, ctx)
+		}
+		// Copy bound selection. A DECLARED Content-Range span (WithDeclaredSpan)
+		// is the EXACT number of bytes the request WILL write: when the span
+		// exceeds the available allowance it is preflight-rejected with ZERO
+		// payload consumed and no spool write. An IMPLICIT stream's maxBytes is
+		// only a loose caller bound (the actual body may be far smaller), so its
+		// copy is bounded at the allowance instead; a body that actually exceeds
+		// the allowance then trips the bounded one-byte probe, yielding
+		// ErrTooLarge with zero durable mutation and consuming at most
+		// allowance+1 payload bytes.
+		bound := maxBytes
+		if bound > allowance {
+			if appendDeclared(ctx) {
+				return ErrTooLarge
+			}
+			bound = allowance
+		}
+
 		f, err := s.spool.openForAppend(id, oldOffset)
 		if err != nil {
 			return typed(ErrDependency, err)
 		}
 		fd = f
 
-		n, overflowing, err := copyBounded(f, src, maxBytes, s.copyBuf)
+		n, overflowing, err := copyBounded(f, src, bound, s.copyBuf)
 		if err != nil {
 			return typed(ErrSourceRead, err)
 		}
 		if overflowing {
+			// The stream exceeded the admissible allowance (or the caller's cap
+			// when it is the tighter bound): restoreTail truncates the
+			// uncommitted tail back to oldOffset on this non-committed exit,
+			// leaving zero durable mutation.
 			return ErrTooLarge
 		}
 		if err := s.syncFile(f); err != nil {
@@ -1199,16 +1255,10 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 				return typed(ErrDependency, err)
 			}
 		}
+		// The copy was bounded at the allowance computed under this transaction,
+		// so newOffset = oldOffset + n is guaranteed within every configured
+		// quota (n <= allowance). Commit the durable offset.
 		newOffset := oldOffset + n
-		// Atomic quota gate: per-upload, per-repository, and total-staging
-		// usage are all evaluated inside this same BEGIN IMMEDIATE write
-		// transaction against the OTHER processes' committed rows, so
-		// concurrent independent service processes admit only valid winners
-		// and a rejected append returns before any durable change (the tail
-		// is truncated back by restoreTail on this non-committed exit).
-		if err := s.checkQuota(ctx, conn, repo, oldOffset, newOffset); err != nil {
-			return err
-		}
 		res, err := conn.ExecContext(ctx,
 			`update upload_sessions set offset = ? where id = ?`, newOffset, id)
 		if err != nil {
@@ -1239,56 +1289,66 @@ func (s *service) Append(ctx context.Context, id, repo, actor string, expectedOf
 	return result, nil
 }
 
-// checkQuota evaluates the per-upload, per-repository, and total-staging
-// quotas atomically against durable committed usage INSIDE the caller's
-// BEGIN IMMEDIATE append transaction. Zero limit fields are skipped.
-// Usage counts active+finalized session offsets (creating rows are offset 0
-// and deleting rows are tombstoned). newOffset must be the session offset
-// AFTER this append and oldOffset the offset before it; delta = newOffset -
-// oldOffset. Overflow fails closed: an irrecoverable usage SUM collapses to
-// an unbounded sentinel so the append is rejected rather than admitted.
-func (s *service) checkQuota(ctx context.Context, conn *sql.Conn, repo string, oldOffset, newOffset int64) error {
+// maxGrowth returns the maximum number of bytes this append may add to the
+// session: the minimum remaining headroom across EVERY configured quota
+// (per-upload, per-repository, total-staging), given currentOffset. It is
+// computed inside the caller's BEGIN IMMEDIATE transaction so the result
+// reflects the OTHER processes' committed rows at the serialization point.
+// Zero limit fields are unbounded. Every allowance is overflow-safe: a usage
+// SUM that collapses fail-closed to math.MaxInt64 (an astronomical value) or
+// an already-exhausted limit drives the allowance to 0 so ANY growth is
+// rejected rather than admitted. The returned allowance is always >= 0.
+func (s *service) maxGrowth(ctx context.Context, conn *sql.Conn, repo string, currentOffset int64) (int64, error) {
 	l := s.limits
-	if l.MaxUploadBytes > 0 && newOffset > l.MaxUploadBytes {
-		return ErrTooLarge
+	allowance := int64(math.MaxInt64)
+	// clamp narrows the allowance toward the minimum headroom, flooring at 0
+	// so an already-exhausted (or unrepresentably large usage) quota rejects
+	// growth; it never raises a previously-computed headroom.
+	clamp := func(headroom int64) {
+		if headroom < allowance {
+			allowance = headroom
+		}
+		if allowance < 0 {
+			allowance = 0
+		}
 	}
-	if newOffset == oldOffset {
-		return nil // no growth: repo/total usage is unchanged
+	if l.MaxUploadBytes > 0 {
+		// newOffset = currentOffset + growth must be <= MaxUploadBytes.
+		clamp(l.MaxUploadBytes - currentOffset)
 	}
-	delta := newOffset - oldOffset
 	if l.MaxRepositoryBytes > 0 {
 		usage, err := usageSum(ctx, conn, &repo)
 		if err != nil {
-			return depErr(err, ctx)
+			return 0, err
 		}
-		// usage already includes this session's oldOffset (it is active);
-		// after commit the repo total becomes usage + delta.
-		if usage > l.MaxRepositoryBytes-delta {
-			return ErrTooLarge
-		}
+		// usage already includes this session's currentOffset (it is active);
+		// a growth of g makes the repository total usage + g.
+		clamp(l.MaxRepositoryBytes - usage)
 	}
 	if l.MaxTotalStagingBytes > 0 {
 		usage, err := usageSum(ctx, conn, nil)
 		if err != nil {
-			return depErr(err, ctx)
+			return 0, err
 		}
-		if usage > l.MaxTotalStagingBytes-delta {
-			return ErrTooLarge
-		}
+		clamp(l.MaxTotalStagingBytes - usage)
 	}
-	return nil
+	return allowance, nil
 }
 
-// usageSum returns the total active+finalized staged offset, optionally
-// scoped to one repository. The bounded SQL runs on the caller's connection
-// (inside the shared transaction), so the result reflects the OTHER
-// processes' committed rows at the serialization point. A SUM that overflows
-// signed int64 is returned by SQLite as a float: that non-integral result
-// fails the int64 scan and is collapsed to math.MaxInt64 (fail closed — an
-// astronomically large usage can never pass any positive quota). A genuine
+// usageSum returns the total byte-bearing staged offset, optionally scoped to
+// one repository, counting every row whose physical bytes may still occupy
+// the spool: active and finalized sessions (including already-expired ones —
+// expiry alone never removes bytes), AND deleting tombstones whose durable
+// unlink has not yet been completed (the row is removed only after the file is
+// durably gone). Creating rows carry offset 0. The bounded SQL runs on the
+// caller's connection (inside the shared transaction), so the result reflects
+// the OTHER processes' committed rows at the serialization point. A SUM that
+// overflows signed int64 is returned by SQLite as a float: that non-integral
+// result fails the int64 scan and is collapsed to math.MaxInt64 (fail closed —
+// an astronomically large usage can never pass any positive quota). A genuine
 // query failure is returned for the caller to wrap as a dependency error.
 func usageSum(ctx context.Context, conn *sql.Conn, repo *string) (int64, error) {
-	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalized')`
+	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalized','deleting')`
 	args := []any{}
 	if repo != nil {
 		query += ` and repo = ?`
