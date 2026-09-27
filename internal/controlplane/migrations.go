@@ -420,6 +420,21 @@ var migrations = []migration{
 		Version: 16,
 		Apply:   installPublicationStateStore,
 	},
+	// Version 17 closes the writer-fence gap round 6B / Important 2 found:
+	// migration 16 validates pre-v16 history once, at upgrade time, but never
+	// fenced feed_signer_operations itself, so an already-running process built
+	// against the pre-migration-16 code (or any direct-SQL writer) could hold
+	// an open handle to the SAME physical database and insert/claim/complete a
+	// fresh feed_signer_operations row with zero publication_states
+	// involvement — recreating the untracked-terminal-success gap migration 16
+	// exists to close, for a newly written attempt rather than pre-v16
+	// history. See publication_execution_fence.go for the exact predecessor
+	// validation, the fail-closed upgrade-history check, and the two narrow
+	// INSERT/claim-authority triggers this migration installs.
+	{
+		Version: 17,
+		Apply:   installFeedSignerPublicationFence,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

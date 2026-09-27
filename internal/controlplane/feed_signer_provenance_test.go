@@ -571,6 +571,7 @@ func TestFeedSignerDoneRecoveryAuthenticatesProvenance(t *testing.T) {
 		fx.blobDescs)
 	w.serveArtifact(fx)
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}
@@ -617,6 +618,7 @@ func TestFeedSignerDoneRecoveryForgedProvenanceRejected(t *testing.T) {
 		fx.blobDescs)
 	w.serveArtifact(fx)
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}
@@ -651,6 +653,7 @@ func TestFeedSignerDoneRecoveryLegacyDocFailsClosed(t *testing.T) {
 	w.docs.Documents[refHex('a')] = provenanceRepoDoc(t, testRepo, 1,
 		map[string]string{tag: digestRef('a')}, nil)
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}

@@ -615,6 +615,7 @@ func TestFeedSignerUncertainResponseRecovery(t *testing.T) {
 
 	// Pre-reserve a pending operation the way a crashed first attempt left it.
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}
@@ -884,6 +885,7 @@ func TestFeedSignerStoredResultStrictDecodeFailClosed(t *testing.T) {
 	w.fillTopic(&req)
 	ctx := context.Background()
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(ctx, req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -1174,6 +1176,7 @@ func TestFeedSignerExpiredLeaseCrashRecovery(t *testing.T) {
 	ctx := context.Background()
 
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(ctx, req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}

@@ -821,8 +821,8 @@ func TestInviteDigestMigrationFromEverySupportedSchema(t *testing.T) {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
 			got, err := CurrentSchemaVersion(ctx, db)
-			if err != nil || got != 16 {
-				t.Fatalf("expected schema version 16, got %d (err %v)", got, err)
+			if err != nil || got != 17 {
+				t.Fatalf("expected schema version 17, got %d (err %v)", got, err)
 			}
 			assertInviteDigestSchema(t, db)
 
@@ -1119,8 +1119,8 @@ func TestInviteDigestMigrationRejectsCorruptRows(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("invite recipient normalization collision must not fail the migration: %v", err)
 		}
-		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 16 {
-			t.Fatalf("expected version 16, got %d (err %v)", got, err)
+		if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 17 {
+			t.Fatalf("expected version 17, got %d (err %v)", got, err)
 		}
 		var emailA, emailB string
 		if err := db.QueryRowContext(ctx, `select email from registry_invites where id = 1`).Scan(&emailA); err != nil {
@@ -1273,8 +1273,8 @@ func TestInviteDigestMigrationNormalizesLegacyEmailsEveryVersion(t *testing.T) {
 			if err := ApplyMigrations(ctx, db); err != nil {
 				t.Fatalf("apply migrations from v%d: %v", version, err)
 			}
-			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 16 {
-				t.Fatalf("expected schema version 16, got %d (err %v)", got, err)
+			if got, err := CurrentSchemaVersion(ctx, db); err != nil || got != 17 {
+				t.Fatalf("expected schema version 17, got %d (err %v)", got, err)
 			}
 
 			// Users normalized to the canonical form.
@@ -1873,15 +1873,15 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schema version: %v", err)
 	}
-	if version != 16 {
-		t.Fatalf("expected schema version 16 after repair, got %d", version)
+	if version != 17 {
+		t.Fatalf("expected schema version 17 after repair, got %d", version)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 13 {
-		t.Fatalf("expected exactly 13 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7 + forward 8 + forward 9 + forward 10 + forward 11 + forward 12 + forward 13 + forward 14 + forward 15 + forward 16), got %d", migCount)
+	if migCount != 14 {
+		t.Fatalf("expected exactly 14 recorded migrations (fixture's v4 + forward 5 + forward 6 + forward 7 + forward 8 + forward 9 + forward 10 + forward 11 + forward 12 + forward 13 + forward 14 + forward 15 + forward 16 + forward 17), got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 
@@ -2001,7 +2001,7 @@ func TestInviteLegacyAttributionPrefixV4RepairedByMigrationV5(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("re-apply migrations after repair: %v", err)
 	}
-	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 16 {
+	if version, err := CurrentSchemaVersion(ctx, db); err != nil || version != 17 {
 		t.Fatalf("version must stay 15 on re-apply, got %d (err %v)", version, err)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
@@ -2037,15 +2037,15 @@ func TestInviteMigrationV5FromCleanV4Schema(t *testing.T) {
 		t.Fatalf("apply migrations from clean v4: %v", err)
 	}
 	version, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || version != 16 {
-		t.Fatalf("expected schema version 16 from clean v4, got %d (err %v)", version, err)
+	if err != nil || version != 17 {
+		t.Fatalf("expected schema version 17 from clean v4, got %d (err %v)", version, err)
 	}
 	var migCount int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migCount); err != nil {
 		t.Fatal(err)
 	}
-	if migCount != 16 {
-		t.Fatalf("expected 15 migration rows, got %d", migCount)
+	if migCount != 17 {
+		t.Fatalf("expected 16 migration rows, got %d", migCount)
 	}
 	assertLegacyAttributionImmutableTrigger(t, db)
 	// Still protected after the reinstall, row unchanged.

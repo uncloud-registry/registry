@@ -779,6 +779,7 @@ func TestFeedSignerDonePathVerifiesOperatedArtifact(t *testing.T) {
 		fx.blobDescs)
 	w.serveArtifact(simpleArtifact(t, '1', '6', '7', 300, 300)) // WRONG bytes at the ref
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}
@@ -1203,6 +1204,7 @@ func TestFeedSignerDoneRecoveryGeneratedReservesBinding(t *testing.T) {
 		fx.blobDescs)
 	w.serveArtifact(fx)
 	hash := NormalizeFeedCommitHash(req)
+	registerPublicationFence(t, w.store, req.OperationID, w.registry.ID)
 	if _, err := w.store.ReserveFeedSignerOperation(context.Background(), req.OperationID, w.registry.ID, w.repoTopic, hash); err != nil {
 		t.Fatalf("pre-reserve: %v", err)
 	}

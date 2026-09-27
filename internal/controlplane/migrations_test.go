@@ -41,8 +41,8 @@ func TestApplyMigrationsCreatesConstrainedSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version: %v", err)
 	}
-	if version != 16 {
-		t.Fatalf("expected schema version 16, got %d", version)
+	if version != 17 {
+		t.Fatalf("expected schema version 17, got %d", version)
 	}
 
 	// A fresh database must carry the full physical foreign-key graph, not just
@@ -79,8 +79,8 @@ func TestApplyMigrationsIsIdempotent(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&rows); err != nil {
 		t.Fatalf("count schema_migrations: %v", err)
 	}
-	if rows != 16 {
-		t.Fatalf("expected 15 migration rows, got %d", rows)
+	if rows != 17 {
+		t.Fatalf("expected 16 migration rows, got %d", rows)
 	}
 }
 
@@ -143,8 +143,8 @@ func TestUpgradeCurrentSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current schema version after upgrade: %v", err)
 	}
-	if version != 16 {
-		t.Fatalf("expected schema version 16 after upgrade, got %d", version)
+	if version != 17 {
+		t.Fatalf("expected schema version 17 after upgrade, got %d", version)
 	}
 
 	// Reapplying must be safe and not duplicate the migration row.
@@ -1138,8 +1138,8 @@ func TestFeedKeyEnvelopeMigrationAcceptsStructurallyValidRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 16 {
-		t.Fatalf("expected version 16, got %d", version)
+	if version != 17 {
+		t.Fatalf("expected version 17, got %d", version)
 	}
 	assertFeedKeyEnvelopeTriggers(t, db)
 	assertInviteDigestSchema(t, db)
@@ -1157,8 +1157,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(context.Background(), db)
-		if version != 16 {
-			t.Fatalf("expected version 16, got %d", version)
+		if version != 17 {
+			t.Fatalf("expected version 17, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		assertInviteDigestSchema(t, db)
@@ -1172,8 +1172,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 16 {
-			t.Fatalf("expected version 16, got %d", version)
+		if version != 17 {
+			t.Fatalf("expected version 17, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 		// Legacy plaintext untouched by the schema migration (opt-in only).
@@ -1215,8 +1215,8 @@ func TestFeedKeyEnvelopeMigrationWorksFromEverySupportedSchema(t *testing.T) {
 			t.Fatalf("apply migrations from v2: %v", err)
 		}
 		version, _ := CurrentSchemaVersion(ctx, db)
-		if version != 16 {
-			t.Fatalf("expected version 16, got %d", version)
+		if version != 17 {
+			t.Fatalf("expected version 17, got %d", version)
 		}
 		assertFeedKeyEnvelopeTriggers(t, db)
 	})
@@ -1307,6 +1307,7 @@ func TestFeedSignerResultIntegrityTriggers(t *testing.T) {
 	}
 	canonical := `{"operationID":"ok","feed":"` + topic + `","reference":"` + ref + `"}`
 	upd := `update feed_signer_operations set result_json=? , state=?, claim_token=null, lease_until=null where operation_id=?`
+	registerPublicationFence(t, &Store{DB: db}, "ok", int64(regID))
 
 	reject := func(name, resultJSON string, isUpdate bool) {
 		t.Run(name, func(t *testing.T) {
@@ -1370,7 +1371,11 @@ func TestFeedSignerResultIntegrityTriggers(t *testing.T) {
 func TestMigration13OperationIDGrammarTriggers(t *testing.T) {
 	db := openRawTestDB(t)
 	ctx := context.Background()
-	if err := ApplyMigrations(ctx, db); err != nil {
+	// Applied through exactly its named migration boundary (not the full
+	// chain) so migration 17's writer-fence triggers are absent: this test
+	// exercises migration 13's identity triggers in isolation, not the
+	// publication_states coordination migrations 16/17 layer on top.
+	if err := applyMigrationsThrough(ctx, db, 13); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
@@ -1675,11 +1680,15 @@ func TestMigration13AcceptsValidV12OperationIDRowsUpgrade(t *testing.T) {
 func TestMigration14OperationIDGrammarTriggers(t *testing.T) {
 	db := openRawTestDB(t)
 	ctx := context.Background()
-	if err := ApplyMigrations(ctx, db); err != nil {
+	// Applied through exactly its named migration boundary (not the full
+	// chain) so migration 17's writer-fence triggers are absent: this test
+	// exercises migration 14's byte-exact identity triggers in isolation, not
+	// the publication_states coordination migrations 16/17 layer on top.
+	if err := applyMigrationsThrough(ctx, db, 14); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 16 {
-		t.Fatalf("expected schema version 16, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 14 {
+		t.Fatalf("expected schema version 14, got %d (err %v)", v, err)
 	}
 	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
 		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {

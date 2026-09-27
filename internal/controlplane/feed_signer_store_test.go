@@ -108,6 +108,18 @@ func seedFeedSignerRegistry(t *testing.T, store *Store) (Registry, string) {
 	return reg, topic
 }
 
+// registerPublicationFence self-registers a trivial self-mapped
+// publication_states row (attempt_id = operationID) satisfying migration 17's
+// writer fence on feed_signer_operations, so these Store-level lifecycle
+// tests can keep exercising Reserve/Claim/Release/Complete/Adopt directly, in
+// isolation, exactly as they did before the fence existed.
+func registerPublicationFence(t *testing.T, store *Store, operationID string, registryID int64) {
+	t.Helper()
+	if _, err := store.ReservePublicationExecution(context.Background(), operationID, registryID, operationID); err != nil {
+		t.Fatalf("register publication fence for %s: %v", operationID, err)
+	}
+}
+
 // TestMigration10ConstrainHardenedSchemaOnFresh proves a fresh database reaches
 // version 10 with the hardened feed_signer_operations columns, the partial
 // unique index, and the FK reference to registries.
@@ -118,8 +130,8 @@ func TestMigration10ConstrainHardenedSchemaOnFresh(t *testing.T) {
 		t.Fatalf("apply migrations: %v", err)
 	}
 	v, err := CurrentSchemaVersion(ctx, db)
-	if err != nil || v != 16 {
-		t.Fatalf("expected schema version 16, got %d (err %v)", v, err)
+	if err != nil || v != 17 {
+		t.Fatalf("expected schema version 17, got %d (err %v)", v, err)
 	}
 	cols := tableColumnsOf(t, db, "feed_signer_operations")
 	for _, want := range []string{"operation_id", "registry_id", "topic", "request_hash", "state", "result_json", "claim_token", "lease_until", "attempts", "created_at", "updated_at"} {
@@ -350,6 +362,7 @@ func TestFeedSignerOperationReserveClaimCompleteLifecycle(t *testing.T) {
 	ctx := context.Background()
 	reqHash := feedSignerTestHash("lifecycle")
 
+	registerPublicationFence(t, store, "op-lifecycle", reg.ID)
 	op, err := store.ReserveFeedSignerOperation(ctx, "op-lifecycle", reg.ID, topic, reqHash)
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
@@ -391,6 +404,7 @@ func TestFeedSignerOperationReleaseRequiresToken(t *testing.T) {
 	reg, topic := seedFeedSignerRegistry(t, store)
 	ctx := context.Background()
 	reqHash := feedSignerTestHash("release")
+	registerPublicationFence(t, store, "op-release", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-release", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
@@ -424,6 +438,7 @@ func TestFeedSignerOperationExpiredLeaseTakeover(t *testing.T) {
 	reg, topic := seedFeedSignerRegistry(t, store)
 	ctx := context.Background()
 	reqHash := feedSignerTestHash("takeover")
+	registerPublicationFence(t, store, "op-takeover", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-takeover", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
@@ -469,6 +484,8 @@ func TestFeedSignerOperationDistinctOpsShareActiveRepoClaimGate(t *testing.T) {
 	ctx := context.Background()
 	hashA := feedSignerTestHash("A")
 	hashB := feedSignerTestHash("B")
+	registerPublicationFence(t, store, "op-A", reg.ID)
+	registerPublicationFence(t, store, "op-B", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-A", reg.ID, topic, hashA); err != nil {
 		t.Fatal(err)
 	}
@@ -508,6 +525,7 @@ func TestFeedSignerOperationCompleteIdempotentOnConcurrentSuccess(t *testing.T) 
 	reg, topic := seedFeedSignerRegistry(t, store)
 	ctx := context.Background()
 	reqHash := feedSignerTestHash("idem")
+	registerPublicationFence(t, store, "op-idem", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-idem", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
@@ -591,8 +609,12 @@ func TestFeedSignerOperationAdversarialCoherence(t *testing.T) {
 	// A well-formed direct-SQL succeeded row is accepted, proving the coherence
 	// is EXACT, not over-restrictive. The contract requires operationID to equal
 	// the row's operation_id, so the good fixture is built for the exact row id.
+	// This is the ONLY row in this test seeded with a matching publication_states
+	// fence: every malformed case above deliberately stays unfenced so its
+	// rejection continues to prove the CHECK-constraint boundary, not the fence.
 	goodHash := feedSignerTestHash("good")
 	goodResult := `{"operationID":"op-adv-good","feed":"` + topic + `","reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	registerPublicationFence(t, store, "op-adv-good", reg.ID)
 	if _, err := store.DB.ExecContext(ctx, sqlPrefix+
 		`('op-adv-good', ?, ?, ?, 'succeeded', '`+goodResult+`', null, null, 0, ?, ?)`,
 		reg.ID, topic, goodHash[:], nowNs, nowNs); err != nil {
@@ -616,6 +638,8 @@ func TestFeedSignerOperationStarvationExpiredDistinctRowCleared(t *testing.T) {
 	ctx := context.Background()
 	hashA := feedSignerTestHash("starve-A")
 	hashB := feedSignerTestHash("starve-B")
+	registerPublicationFence(t, store, "op-A", reg.ID)
+	registerPublicationFence(t, store, "op-B", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-A", reg.ID, topic, hashA); err != nil {
 		t.Fatal(err)
 	}
@@ -654,6 +678,8 @@ func TestFeedSignerOperationStarvationKeepsLiveDistinctLease(t *testing.T) {
 	ctx := context.Background()
 	hashA := feedSignerTestHash("live-A")
 	hashB := feedSignerTestHash("live-B")
+	registerPublicationFence(t, store, "op-A", reg.ID)
+	registerPublicationFence(t, store, "op-B", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-A", reg.ID, topic, hashA); err != nil {
 		t.Fatal(err)
 	}
@@ -683,6 +709,7 @@ func TestFeedSignerLeaseExtensionRejectsStaleToken(t *testing.T) {
 	reg, topic := seedFeedSignerRegistry(t, store)
 	ctx := context.Background()
 	reqHash := feedSignerTestHash("lease-stale")
+	registerPublicationFence(t, store, "op-lease", reg.ID)
 	if _, err := store.ReserveFeedSignerOperation(ctx, "op-lease", reg.ID, topic, reqHash); err != nil {
 		t.Fatal(err)
 	}
@@ -774,6 +801,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 
 	// 1. PENDING CURRENT identity -> active pending under current ID + reqHash.
 	seed("current-pending", "pending", "", reqHash)
+	registerPublicationFence(t, store, "current-pending", reg.ID)
 	topicOther := spec.RepoStateFeedRef(testFeedOwner, "otherrepo")
 	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "current-pending", reg.ID, topicOther, ref, reqHash, nil); err != nil || !adopted {
 		t.Fatalf("current pending adoption: adopted=%v err=%v", adopted, err)
@@ -788,6 +816,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	// 2. PENDING HISTORICAL identity (keyed by histID, m9 hash) -> active
 	//    pending under CURRENT ID; quarantine deleted.
 	seed(histID, "pending", "", histHash)
+	registerPublicationFence(t, store, req.OperationID, reg.ID)
 	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req.OperationID, reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{{OperationID: histID, RequestHash: histHash}}); err != nil || !adopted {
 		t.Fatalf("historical pending adoption: adopted=%v err=%v", adopted, err)
 	}
@@ -802,6 +831,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	// 3. SUCCEEDED CURRENT identity -> adopted with current result.
 	goodCurrent := `{"operationID":"suc-current","feed":"` + topic + `","reference":"` + ref + `"}`
 	seed("suc-current", "succeeded", goodCurrent, reqHash)
+	registerPublicationFence(t, store, "suc-current", reg.ID)
 	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "suc-current", reg.ID, topic, ref, reqHash, nil); err != nil || !adopted {
 		t.Fatalf("current succeeded adoption: adopted=%v err=%v", adopted, err)
 	}
@@ -824,6 +854,7 @@ func TestAdoptLegacyFeedSignerOperation(t *testing.T) {
 	histHash2 := legacyFeedCommitHashFor(histID2, req2)
 	histResult := `{"operationID":"` + histID2 + `","feed":"` + topic + `","reference":"` + ref + `"}`
 	seed(histID2, "succeeded", histResult, histHash2)
+	registerPublicationFence(t, store, req2.OperationID, reg.ID)
 	if adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, req2.OperationID, reg.ID, topic, ref, req2Hash, []LegacyOperationCandidate{{OperationID: histID2, RequestHash: histHash2}}); err != nil || !adopted {
 		t.Fatalf("historical succeeded adoption: adopted=%v err=%v", adopted, err)
 	}
@@ -971,6 +1002,7 @@ func TestAdoptLegacyFeedSignerOperationMultiTagCandidates(t *testing.T) {
 	t.Run("two-candidates-one-pending-row-adopts", func(t *testing.T) {
 		c1, c2 := hist("latest", digA), hist("v2", digB)
 		seed(c1.OperationID, "pending", "", c1.RequestHash)
+		registerPublicationFence(t, store, "multi-pending", reg.ID)
 		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "multi-pending", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2})
 		if err != nil || !adopted {
 			t.Fatalf("multi-tag pending adoption: adopted=%v err=%v", adopted, err)
@@ -990,6 +1022,7 @@ func TestAdoptLegacyFeedSignerOperationMultiTagCandidates(t *testing.T) {
 		c1, c2 := hist("latest", digA), hist("v2", digB)
 		result := `{"operationID":"` + c1.OperationID + `","feed":"` + topic + `","reference":"` + ref + `"}`
 		seed(c1.OperationID, "succeeded", result, c1.RequestHash)
+		registerPublicationFence(t, store, "multi-succeeded", reg.ID)
 		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "multi-succeeded", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{c1, c2})
 		if err != nil || !adopted {
 			t.Fatalf("multi-tag succeeded adoption: adopted=%v err=%v", adopted, err)
@@ -1014,6 +1047,7 @@ func TestAdoptLegacyFeedSignerOperationMultiTagCandidates(t *testing.T) {
 			t.Fatal("test requires distinct historical IDs for distinct tags")
 		}
 		seed(cA.OperationID, "pending", "", cA.RequestHash)
+		registerPublicationFence(t, store, "same-digest", reg.ID)
 		adopted, err := store.AdoptLegacyFeedSignerOperation(ctx, "same-digest", reg.ID, topic, ref, reqHash, []LegacyOperationCandidate{cA, cB})
 		if err != nil || !adopted {
 			t.Fatalf("same-digest multi-tag adoption: adopted=%v err=%v", adopted, err)
@@ -1151,6 +1185,7 @@ func TestAdoptLegacyFeedSignerOperationTwoStoresRace(t *testing.T) {
 		values (?, ?, 'pending', null, ?, ?)`, histID, histHash[:], nowNs, nowNs); err != nil {
 		t.Fatalf("seed quarantine row: %v", err)
 	}
+	registerPublicationFence(t, storeA, "race-op", reg.ID)
 
 	const n = 2
 	start := make(chan struct{})
@@ -1233,6 +1268,7 @@ func TestFeedSignerResultCanonicalByteExactTriggers(t *testing.T) {
 
 	canonical := `{"operationID":"ok-canon","feed":"` + topic + `","reference":"` + ref + `"}`
 	ch := feedSignerTestHash("ok-canon")
+	registerPublicationFence(t, store, "ok-canon", reg.ID)
 	if _, err := db.ExecContext(ctx, `insert into feed_signer_operations
 		(operation_id, registry_id, topic, request_hash, state, result_json,
 		 claim_token, lease_until, attempts, created_at, updated_at)

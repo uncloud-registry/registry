@@ -448,8 +448,20 @@ func TestCompleteFeedSignerOperationAndTerminatePublicationRollsBackOnMissingRow
 	ctx := context.Background()
 
 	const attemptID = "attempt-orphan"
+	const pubID = "pub-exec-orphan"
 	reqHash := feedSignerTestHash("orphan-attempt")
 	feed := "feed://" + testFeedOwner + "/" + refHex('c')
+
+	// Reserve an active publication_states row under attemptID so the
+	// migration-17 writer fence admits the reservation/claim below (both the
+	// INSERT and claim-authority triggers require a matching active row for
+	// the same registry_id+attempt_id). The test then deletes this EXACT row
+	// before the combined completion, so the row is genuinely missing at the
+	// point CompleteFeedSignerOperationAndTerminatePublication looks it up —
+	// proving the missing-row rollback, not merely a fence bypass.
+	if _, err := store.ReservePublicationExecution(ctx, pubID, reg.ID, attemptID); err != nil {
+		t.Fatalf("register publication fence: %v", err)
+	}
 	if _, err := store.ReserveFeedSignerOperation(ctx, attemptID, reg.ID, feed, reqHash); err != nil {
 		t.Fatal(err)
 	}
@@ -460,8 +472,12 @@ func TestCompleteFeedSignerOperationAndTerminatePublicationRollsBackOnMissingRow
 	}
 	result := []byte(`{"operationID":"` + attemptID + `","feed":"` + feed + `","reference":"` + refHex('a') + `"}`)
 
-	// No publication_states row was ever reserved for "pub-exec-orphan".
-	if err := store.CompleteFeedSignerOperationAndTerminatePublication(ctx, attemptID, reqHash, token, result, "pub-exec-orphan", reg.ID, attemptID); err == nil {
+	if _, err := store.DB.ExecContext(ctx, `delete from publication_states where operation_id = ?`, pubID); err != nil {
+		t.Fatalf("remove setup publication execution row: %v", err)
+	}
+
+	// No publication_states row exists for "pub-exec-orphan" at this point.
+	if err := store.CompleteFeedSignerOperationAndTerminatePublication(ctx, attemptID, reqHash, token, result, pubID, reg.ID, attemptID); err == nil {
 		t.Fatal("a missing publication execution row must fail the combined completion")
 	}
 
@@ -472,7 +488,7 @@ func TestCompleteFeedSignerOperationAndTerminatePublicationRollsBackOnMissingRow
 	if op.State != FeedSignerOpProcessing {
 		t.Fatalf("the attempt row must be ROLLED BACK to processing (unchanged), got %q", op.State)
 	}
-	if _, err := store.GetPublicationExecution(ctx, "pub-exec-orphan"); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.GetPublicationExecution(ctx, pubID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("no publication execution row must have been created, got %v", err)
 	}
 }
@@ -634,8 +650,8 @@ func TestMigration16FreshUpgradeAndRollback(t *testing.T) {
 	if err := ApplyMigrations(ctx, fresh); err != nil {
 		t.Fatalf("fresh apply: %v", err)
 	}
-	if v, _ := CurrentSchemaVersion(ctx, fresh); v != 16 {
-		t.Fatalf("fresh db must reach version 16, got %d", v)
+	if v, _ := CurrentSchemaVersion(ctx, fresh); v != 17 {
+		t.Fatalf("fresh db must reach version 17, got %d", v)
 	}
 	if sqliteObjectCount(t, fresh, "table", "publication_states") != 1 {
 		t.Fatal("migration 16 must create publication_states on a fresh database")
@@ -658,8 +674,8 @@ func TestMigration16FreshUpgradeAndRollback(t *testing.T) {
 	if err := ApplyMigrations(ctx, upg); err != nil {
 		t.Fatalf("upgrade to 16: %v", err)
 	}
-	if v, _ := CurrentSchemaVersion(ctx, upg); v != 16 {
-		t.Fatalf("upgraded db must reach version 16, got %d", v)
+	if v, _ := CurrentSchemaVersion(ctx, upg); v != 17 {
+		t.Fatalf("upgraded db must reach version 17, got %d", v)
 	}
 	if sqliteObjectCount(t, upg, "table", "publication_states") != 1 {
 		t.Fatal("migration 16 must create publication_states on upgrade")
@@ -886,8 +902,8 @@ func TestMigration16AllowsSafePreV16History(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("empty-history upgrade must succeed: %v", err)
 		}
-		if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
-			t.Fatalf("expected version 16, got %d", v)
+		if v, _ := CurrentSchemaVersion(ctx, db); v != 17 {
+			t.Fatalf("expected version 17, got %d", v)
 		}
 	})
 
@@ -907,8 +923,8 @@ func TestMigration16AllowsSafePreV16History(t *testing.T) {
 		if err := ApplyMigrations(ctx, db); err != nil {
 			t.Fatalf("bound-only upgrade must succeed: %v", err)
 		}
-		if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
-			t.Fatalf("expected version 16, got %d", v)
+		if v, _ := CurrentSchemaVersion(ctx, db); v != 17 {
+			t.Fatalf("expected version 17, got %d", v)
 		}
 		if sqliteObjectCount(t, db, "table", "publication_states") != 1 {
 			t.Fatal("safe upgrade must still create publication_states")
@@ -928,8 +944,8 @@ func TestMigration16RepeatedApplyIsIdempotent(t *testing.T) {
 	if err := ApplyMigrations(ctx, db); err != nil {
 		t.Fatalf("repeated apply must be a no-op, got: %v", err)
 	}
-	if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
-		t.Fatalf("expected version 16, got %d", v)
+	if v, _ := CurrentSchemaVersion(ctx, db); v != 17 {
+		t.Fatalf("expected version 17, got %d", v)
 	}
 	var rows int
 	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations where version = 16`).Scan(&rows); err != nil {

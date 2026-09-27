@@ -162,9 +162,12 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	// authorizePublicationExecution, called from signCommit strictly AFTER
 	// this exact attempt's payload has been authenticated (see round 4 /
 	// Finding 2 below). A request with PublicationID empty (unreachable from
-	// any wire path; see above) never touches publication_states at all,
-	// since its OperationID already IS its own generation-bound stable
-	// identity.
+	// any wire path; see above) never runs this fast path or the replacement
+	// machinery, since its OperationID already IS its own generation-bound
+	// stable identity — but it now DOES self-register a trivial self-mapped
+	// publication_states row (round 6B / Important 2) purely so migration
+	// 17's DB-level fence on feed_signer_operations sees a matching
+	// authorization; see the self-registration immediately below.
 	if req.PublicationID != "" {
 		if err := s.precheckPublicationExecution(ctx, req); err != nil {
 			return publish.FeedCommitResult{}, err
@@ -183,12 +186,26 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	// The legacy (PublicationID-empty) protocol: unreachable from any wire
 	// path (see the PublicationID doc above), retained solely for the
 	// internal migration-9 quarantine-adoption test surface. Its OperationID
-	// IS its own stable identity with no separate publication_states
-	// involvement at all, so it is structurally immune to the round-5
-	// attempt-id poisoning class (there is no attempt-id/PublicationID
-	// indirection to poison) and keeps its original, extensively-tested
+	// IS its own stable identity with no separate PublicationID/attempt-id
+	// indirection to poison, so it keeps its original, extensively-tested
 	// control flow unchanged: signCommitLegacy performs every check inline
 	// under the SAME feed_signer_operations claim reserved below.
+	//
+	// Round 6B / Important 2: migration 17 fences EVERY feed_signer_operations
+	// insert/claim at the SQLite boundary behind a matching "active"
+	// publication_states row — the only way to distinguish a legitimate
+	// writer from an already-running pre-migration-16 process (or any other
+	// direct-SQL writer) that never learned publication_states exists is to
+	// require every writer, including this internal-only legacy protocol, to
+	// prove it went through the reservation step. This self-registration is a
+	// trivial self-mapped row (PublicationID := OperationID, attempt :=
+	// OperationID) — insert-or-ignore, so a retried identical OperationID is a
+	// harmless no-op — that exists PURELY to satisfy the fence; this protocol
+	// still has no PublicationID-indirection, no replacement CAS, and no
+	// terminal-success gate of its own.
+	if _, err := s.Store.ReservePublicationExecution(ctx, req.OperationID, req.RegistryID, req.OperationID); err != nil {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: publication execution self-registration: %v", errFeedSignerBackend, err)
+	}
 	return s.reserveAndRunClaim(ctx, req, reqHash, canonicalTopic, func(ctx context.Context, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
 		return s.signCommitLegacy(ctx, req, claimToken)
 	})
