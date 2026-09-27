@@ -433,30 +433,36 @@ func (s *Store) ReplacePublicationExecutionAttempt(ctx context.Context, publicat
 	return won, row, nil
 }
 
-// ReconcilePublicationExecutionSucceeded atomically marks an active or
-// replaceable publication_states row terminally succeeded for the EXACT
-// registry and attempt that a caller has ALREADY independently proven reached
-// a genuine succeeded feed_signer_operations result (round 17 closure review —
-// see FeedSigner.resolveSucceededOperation). It proves nothing new itself: the
+// ReconcilePublicationExecutionSucceeded atomically marks an active
+// publication_states row terminally succeeded for the EXACT registry and
+// attempt that a caller has ALREADY independently proven reached a genuine
+// succeeded feed_signer_operations result (round 17 closure review — see
+// FeedSigner.resolveSucceededOperation). It proves nothing new itself: the
 // caller must have already verified the stored result is hash/coherence-
 // checked for this exact request and that this row already agrees on
 // registry_id + attempt_id, merely not yet terminal. The update is scoped to
-// exactly that (registry_id, attempt_id) pair — never a different attempt,
-// never a different registry, never inventing a fresh result — so it only
-// ever marks an already-authorized attempt terminal.
+// exactly that (registry_id, attempt_id) pair AND state = 'active' — never a
+// different attempt, never a different registry, never a 'replaceable' row
+// (the authoritative generation-conflict marker, which a DIFFERENT fresh
+// attempt must remain free to CAS back to active; promoting it to
+// 'succeeded' here would permanently poison the publication against that
+// legitimate replacement — see task 17 closure review, test D) — never
+// inventing a fresh result — so it only ever marks an already-authorized
+// attempt terminal.
 //
 // applied=true covers both this call's own flip AND an idempotent concurrent
 // reconciler that already left the row succeeded under the SAME registry and
 // attempt (mirroring the tolerance CompleteFeedSignerOperation and
 // CompleteFeedSignerOperationAndTerminatePublication apply to their own
 // concurrent completions). applied=false means the row no longer matches
-// (succeeded under a DIFFERENT attempt, or a different registry) — the caller
-// must treat that as "not durably applied", never silently succeed.
+// (succeeded under a DIFFERENT attempt, a different registry, or is not
+// 'active' — e.g. 'replaceable') — the caller must treat that as "not
+// durably applied", never silently succeed.
 func (s *Store) ReconcilePublicationExecutionSucceeded(ctx context.Context, publicationID string, registryID int64, attemptID string) (applied bool, err error) {
 	nowNanos := timeToNanos(time.Now().UTC())
 	res, err := s.DB.ExecContext(ctx, `update publication_states
 		set state = 'succeeded', updated_at = ?
-		where operation_id = ? and registry_id = ? and attempt_id = ? and state in ('active','replaceable')`,
+		where operation_id = ? and registry_id = ? and attempt_id = ? and state = 'active'`,
 		nowNanos, publicationID, registryID, attemptID)
 	if err != nil {
 		return false, err

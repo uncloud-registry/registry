@@ -135,6 +135,267 @@ func TestFeedSignerSucceededOperationReconcilesActivePublicationOnReplay(t *test
 	}
 }
 
+// --- Test D: replaceable publication is never promoted, only active is ----
+
+// TestFeedSignerSucceededOperationNeverReconcilesReplaceablePublicationOnReplay
+// is task 17's FINAL closure fix (targeted review). Test A above correctly
+// reconciles an ACTIVE-but-nonterminal publication row back to succeeded on
+// an exact retry. But "replaceable" is NOT a harmless nonterminal variant of
+// "active": it is the authoritative generation-conflict marker — this exact
+// attempt already had its external update DEFINITELY refused with zero write
+// (see authorizePublicationExecution / MarkPublicationExecutionReplaceable),
+// and a DIFFERENT fresh attempt may legitimately CAS it back to active at any
+// time. If a succeeded feed_signer_operations row for this SAME attempt ever
+// coexists with a replaceable publication row (a split reconciliation must
+// never paper over, whatever bug or race produced it), promoting
+// "replaceable" to "succeeded" would permanently poison the publication
+// against the very replacement its own state exists to authorize — even
+// though this attempt's generation-conflict path performed NO external
+// write. The fix restricts reconciliation to a coherent "active" row only;
+// "replaceable" (or any other non-active, non-succeeded state) under the
+// same registry/publication/attempt must fail closed, data-free, and
+// retryable, with ZERO mutation to either ledger — while a genuinely fresh
+// attempt id must remain free to replace the row exactly as before.
+//
+// NOTE: through the real Commit path exercised here, this exact retry
+// actually fails one layer BEFORE ever reaching resolveSucceededOperation:
+// reserveAndRunClaim's insert-or-ignore of the (already-succeeded)
+// feed_signer_operations row still fires migration 17's BEFORE INSERT fence
+// trigger, which aborts because publication_states is "replaceable", not
+// "active", for this attempt. That is a real, independently-load-bearing
+// guard, but it means this test alone does not prove
+// resolveSucceededOperation/ReconcilePublicationExecutionSucceeded refuse to
+// promote a replaceable row — see
+// TestResolveSucceededOperationNeverReconcilesReplaceablePublicationDirectly
+// below for a direct exercise of that path, bypassing the fence trigger
+// entirely via a self-mapped operation row.
+func TestFeedSignerSucceededOperationNeverReconcilesReplaceablePublicationOnReplay(t *testing.T) {
+	ctx := context.Background()
+	w := newRound6AWorld(t, "replaceablesplit")
+	const publicationID = "pub-round17-replaceable-P"
+
+	fxA := simpleArtifact(t, 'a', 'b', 'c', 64, 64)
+	w.bytesReader.serve(fxA.manifest.SwarmRef, fxA.body)
+	referenceA := refHex('a')
+	w.docs.Documents[referenceA] = transitionDoc(t, testRepo, 1,
+		map[string]string{"latest": fxA.digest},
+		map[string]spec.TagPublication{"latest": {OperationID: publicationID, Generation: 1, Digest: fxA.digest}},
+		map[string]spec.ManifestDescriptor{fxA.digest: fxA.manifest},
+		fxA.blobDescs)
+	hash := NormalizePublicationBindingHash(w.reg.ID, w.ownerHex0x, testRepo, "latest", fxA.digest)
+	if _, err := w.store1.ReservePublicationBinding(ctx, publicationID, w.reg.ID, hash); err != nil {
+		t.Fatalf("preflight-bind P: %v", err)
+	}
+
+	attemptID := publish.ComputeCommitAttemptID(publicationID, w.reg.ID, w.ownerHex0x, w.repoTopic, referenceA, 0)
+	req := publish.FeedCommitRequest{
+		PublicationID:      publicationID,
+		OperationID:        attemptID,
+		RegistryID:         w.reg.ID,
+		Owner:              w.ownerHex0x,
+		Topic:              w.repoTopic,
+		Reference:          referenceA,
+		BatchID:            "batch-1",
+		ExpectedGeneration: 0,
+	}
+
+	signer1 := w.signer(w.store1)
+	first, err := signer1.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("original commit must succeed: %v", err)
+	}
+	if n := w.updater.count(); n != 1 {
+		t.Fatalf("expected exactly one external update after the original commit, got %d", n)
+	}
+
+	// Simulate the split directly (file-backed, bypassing every
+	// application-level guard): feed_signer_operations is genuinely succeeded
+	// and left UNTOUCHED; publication_states alone is forced to "replaceable"
+	// under the SAME attempt id — the authoritative generation-conflict shape,
+	// never a harmless nonterminal variant of "active".
+	if _, err := w.store1.DB.ExecContext(ctx, `update publication_states set state = 'replaceable' where operation_id = ?`, publicationID); err != nil {
+		t.Fatalf("simulate replaceable split state: %v", err)
+	}
+	before, err := w.store1.GetPublicationExecution(ctx, publicationID)
+	if err != nil || before.State != PublicationExecutionReplaceable || before.AttemptID != attemptID {
+		t.Fatalf("split-state fixture malformed: %+v err %v", before, err)
+	}
+
+	// The exact retry, through an INDEPENDENT second Store handle over the
+	// SAME database file, using the real FeedSigner/current-v2 Commit path.
+	signer2 := w.signer(w.store2)
+	_, err = signer2.Commit(ctx, req)
+	if err == nil {
+		t.Fatal("exact retry against a replaceable-disagreeing publication must not silently succeed")
+	}
+	if errors.Is(err, errFeedSignerConflict) {
+		t.Fatalf("must not be classified as a permanent conflict (replaceable is retryable, not permanent): %v", err)
+	}
+	if !errors.Is(err, errFeedSignerBackend) {
+		t.Fatalf("expected a data-free, fail-closed/retryable backend error, got %v", err)
+	}
+
+	after, err := w.store1.GetPublicationExecution(ctx, publicationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.AttemptID != before.AttemptID ||
+		after.RegistryID != before.RegistryID || after.PublicationID != before.PublicationID ||
+		!after.CreatedAt.Equal(before.CreatedAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("publication row must remain byte-for-byte unchanged, before=%+v after=%+v", before, after)
+	}
+	op, err := w.store1.GetFeedSignerOperation(ctx, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.State != FeedSignerOpSucceeded {
+		t.Fatalf("operation must remain succeeded, got %q", op.State)
+	}
+	if !bytesEqual(op.ResultJSON, publish.CanonicalFeedCommitResultJSON(first)) {
+		t.Fatalf("stored operation result must remain unchanged, got %s", op.ResultJSON)
+	}
+	if n := w.updater.count(); n != 1 {
+		t.Fatalf("a fail-closed replay must cause ZERO additional external updates, got %d total", n)
+	}
+
+	// A legitimate replacement attempt must still be permitted by the
+	// existing state machine: a DIFFERENT fresh attempt id may atomically CAS
+	// the still-replaceable row back to active.
+	won, replaced, err := w.store1.ReplacePublicationExecutionAttempt(ctx, publicationID, w.reg.ID, attemptID, "attempt-B-legit-replacement")
+	if err != nil {
+		t.Fatalf("legitimate replacement CAS: %v", err)
+	}
+	if !won || replaced.State != PublicationExecutionActive || replaced.AttemptID != "attempt-B-legit-replacement" {
+		t.Fatalf("a fresh attempt must still be able to replace the replaceable row, got won=%v row=%+v", won, replaced)
+	}
+}
+
+// TestResolveSucceededOperationNeverReconcilesReplaceablePublicationDirectly
+// is the direct exercise TestFeedSignerSucceededOperationNeverReconcilesReplaceablePublicationOnReplay's
+// own doc comment above describes: it calls
+// FeedSigner.resolveSucceededOperation and
+// Store.ReconcilePublicationExecutionSucceeded DIRECTLY against a replaceable
+// publication row, bypassing migration 17's insert-fence trigger entirely
+// (that test alone only proves the fence trigger refuses the retry one layer
+// above; it never reaches resolveSucceededOperation at all). This proves the
+// two functions themselves — not just the fence trigger — refuse to promote
+// a replaceable row to succeeded.
+func TestResolveSucceededOperationNeverReconcilesReplaceablePublicationDirectly(t *testing.T) {
+	ctx := context.Background()
+	w := newRound6AWorld(t, "replaceabledirect")
+	const publicationID = "pub-round17-replaceable-direct-P"
+
+	fxA := simpleArtifact(t, 'a', 'b', 'c', 64, 64)
+	w.bytesReader.serve(fxA.manifest.SwarmRef, fxA.body)
+	referenceA := refHex('a')
+	w.docs.Documents[referenceA] = transitionDoc(t, testRepo, 1,
+		map[string]string{"latest": fxA.digest},
+		map[string]spec.TagPublication{"latest": {OperationID: publicationID, Generation: 1, Digest: fxA.digest}},
+		map[string]spec.ManifestDescriptor{fxA.digest: fxA.manifest},
+		fxA.blobDescs)
+	hash := NormalizePublicationBindingHash(w.reg.ID, w.ownerHex0x, testRepo, "latest", fxA.digest)
+	if _, err := w.store1.ReservePublicationBinding(ctx, publicationID, w.reg.ID, hash); err != nil {
+		t.Fatalf("preflight-bind P: %v", err)
+	}
+
+	attemptID := publish.ComputeCommitAttemptID(publicationID, w.reg.ID, w.ownerHex0x, w.repoTopic, referenceA, 0)
+	req := publish.FeedCommitRequest{
+		PublicationID:      publicationID,
+		OperationID:        attemptID,
+		RegistryID:         w.reg.ID,
+		Owner:              w.ownerHex0x,
+		Topic:              w.repoTopic,
+		Reference:          referenceA,
+		BatchID:            "batch-1",
+		ExpectedGeneration: 0,
+	}
+
+	signer := w.signer(w.store1)
+	first, err := signer.Commit(ctx, req)
+	if err != nil {
+		t.Fatalf("original commit must succeed: %v", err)
+	}
+	if n := w.updater.count(); n != 1 {
+		t.Fatalf("expected exactly one external update after the original commit, got %d", n)
+	}
+
+	// Simulate the split directly, exactly like Test D: feed_signer_operations
+	// stays genuinely succeeded; publication_states alone is forced to
+	// "replaceable" under the SAME attempt id.
+	if _, err := w.store1.DB.ExecContext(ctx, `update publication_states set state = 'replaceable' where operation_id = ?`, publicationID); err != nil {
+		t.Fatalf("simulate replaceable split state: %v", err)
+	}
+	before, err := w.store1.GetPublicationExecution(ctx, publicationID)
+	if err != nil || before.State != PublicationExecutionReplaceable || before.AttemptID != attemptID {
+		t.Fatalf("split-state fixture malformed: %+v err %v", before, err)
+	}
+	op, err := w.store1.GetFeedSignerOperation(ctx, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.State != FeedSignerOpSucceeded {
+		t.Fatalf("operation fixture must be succeeded, got %q", op.State)
+	}
+
+	// The direct call, bypassing reserveAndRunClaim and the fence trigger
+	// entirely.
+	result, err := signer.resolveSucceededOperation(ctx, op, req)
+	if err == nil {
+		t.Fatalf("direct call against a replaceable-disagreeing publication must not silently succeed, got result %+v", result)
+	}
+	if errors.Is(err, errFeedSignerConflict) {
+		t.Fatalf("must not be classified as a permanent conflict (replaceable is retryable, not permanent): %v", err)
+	}
+	if !errors.Is(err, errFeedSignerBackend) {
+		t.Fatalf("expected a data-free, fail-closed/retryable backend error, got %v", err)
+	}
+	if result != (publish.FeedCommitResult{}) {
+		t.Fatalf("must return no result, got %+v", result)
+	}
+
+	after, err := w.store1.GetPublicationExecution(ctx, publicationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.AttemptID != before.AttemptID ||
+		after.RegistryID != before.RegistryID || after.PublicationID != before.PublicationID ||
+		!after.CreatedAt.Equal(before.CreatedAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("publication row must remain byte-for-byte unchanged, before=%+v after=%+v", before, after)
+	}
+	opAfter, err := w.store1.GetFeedSignerOperation(ctx, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opAfter.State != FeedSignerOpSucceeded {
+		t.Fatalf("operation must remain succeeded, got %q", opAfter.State)
+	}
+	if !bytesEqual(opAfter.ResultJSON, publish.CanonicalFeedCommitResultJSON(first)) {
+		t.Fatalf("stored operation result must remain unchanged, got %s", opAfter.ResultJSON)
+	}
+	if n := w.updater.count(); n != 1 {
+		t.Fatalf("a direct fail-closed call must cause ZERO external updates, got %d total", n)
+	}
+
+	// Store.ReconcilePublicationExecutionSucceeded, called directly, must
+	// likewise refuse to apply against the replaceable row.
+	applied, err := w.store1.ReconcilePublicationExecutionSucceeded(ctx, publicationID, w.reg.ID, attemptID)
+	if err != nil {
+		t.Fatalf("ReconcilePublicationExecutionSucceeded: %v", err)
+	}
+	if applied {
+		t.Fatalf("must not report applied against a replaceable row")
+	}
+	finalExec, err := w.store1.GetPublicationExecution(ctx, publicationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalExec.State != before.State || finalExec.AttemptID != before.AttemptID ||
+		finalExec.RegistryID != before.RegistryID || finalExec.PublicationID != before.PublicationID ||
+		!finalExec.CreatedAt.Equal(before.CreatedAt) || !finalExec.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("publication row must remain byte-for-byte unchanged after ReconcilePublicationExecutionSucceeded, before=%+v after=%+v", before, finalExec)
+	}
+}
+
 // --- Test B: standalone CompleteFeedSignerOperation must never split ------
 
 // TestCompleteFeedSignerOperationRejectsSplitFromActivePublication is RED

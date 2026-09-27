@@ -453,9 +453,14 @@ func (s *FeedSigner) terminalReplayResult(ctx context.Context, req publish.FeedC
 //     absent.
 //   - agree=false, mismatch=false: either no row exists at all, or a row
 //     exists for the SAME registry/attempt but has not yet reached
-//     'succeeded' (active/replaceable) — the exact split-ledger condition a
-//     caller with independent proof of a genuine succeeded operation may be
-//     able to safely reconcile (see resolveSucceededOperation).
+//     'succeeded'. Of these, only 'active' is the harmless nonterminal
+//     variant a caller with independent proof of a genuine succeeded
+//     operation may safely reconcile (see resolveSucceededOperation).
+//     'replaceable' is NOT harmless: it is the authoritative
+//     generation-conflict marker (this exact attempt's external update was
+//     already definitively refused with zero write, and a DIFFERENT fresh
+//     attempt may legitimately CAS it back to active at any time) — a caller
+//     must inspect exec.State itself and never reconcile a replaceable row.
 func (s *FeedSigner) publicationExecutionAgreement(ctx context.Context, req publish.FeedCommitRequest) (exec PublicationExecution, agree bool, mismatch bool, err error) {
 	exec, err = s.Store.GetPublicationExecution(ctx, req.PublicationID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -486,12 +491,17 @@ func (s *FeedSigner) publicationExecutionAgreement(ctx context.Context, req publ
 //
 // A registry/attempt mismatch is a PERMANENT conflict, never silently
 // accepted. A matching but nonterminal row is atomically reconciled to
-// succeeded: every invariant (operation succeeded, result hash/coherence-
-// verified against THIS request via storedResult, SAME registry+attempt
-// already on record) is proven BEFORE the reconciliation ever runs, so it
-// never invents a result or provenance — it only marks an already-authorized
-// attempt terminal. A publication_states row missing entirely for this
-// PublicationID has nothing to reconcile against and fails closed, data-free.
+// succeeded ONLY when it is coherently 'active': every invariant (operation
+// succeeded, result hash/coherence-verified against THIS request via
+// storedResult, SAME registry+attempt already on record, row state 'active')
+// is proven BEFORE the reconciliation ever runs, so it never invents a
+// result or provenance — it only marks an already-authorized attempt
+// terminal. A 'replaceable' row is the authoritative generation-conflict
+// marker, never a harmless nonterminal variant of 'active': it fails closed,
+// data-free, leaving both ledgers untouched, so a fresh attempt remains free
+// to replace it exactly as before. A publication_states row missing entirely
+// for this PublicationID has nothing to reconcile against and fails closed,
+// data-free.
 func (s *FeedSigner) resolveSucceededOperation(ctx context.Context, op FeedSignerOperation, req publish.FeedCommitRequest) (publish.FeedCommitResult, error) {
 	if req.PublicationID == "" {
 		return s.storedResult(op, req)
@@ -512,6 +522,9 @@ func (s *FeedSigner) resolveSucceededOperation(ctx context.Context, op FeedSigne
 	}
 	if exec.PublicationID == "" {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: publication execution missing for succeeded operation", errFeedSignerBackend)
+	}
+	if exec.State != PublicationExecutionActive {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: publication execution is not coherently active for a succeeded operation", errFeedSignerBackend)
 	}
 	applied, err := s.Store.ReconcilePublicationExecutionSucceeded(ctx, req.PublicationID, req.RegistryID, req.OperationID)
 	if err != nil {
