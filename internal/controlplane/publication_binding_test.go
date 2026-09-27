@@ -266,9 +266,11 @@ func TestPublicationBindingTableConstraints(t *testing.T) {
 func TestMigration15FreshUpgradeAndRollback(t *testing.T) {
 	ctx := context.Background()
 
-	// Fresh database converges to 15 with table + triggers.
+	// Fresh database converges to 15 with table + triggers. Bounded at 15 (not
+	// the open-ended ApplyMigrations) so this migration-15-specific test stays
+	// pinned to migration 15's own effects regardless of later migrations.
 	fresh := openRawNamedTestDB(t, "migration15_fresh")
-	if err := ApplyMigrations(ctx, fresh); err != nil {
+	if err := applyMigrationsThrough(ctx, fresh, 15); err != nil {
 		t.Fatalf("fresh apply: %v", err)
 	}
 	if v, _ := CurrentSchemaVersion(ctx, fresh); v != 15 {
@@ -298,7 +300,7 @@ func TestMigration15FreshUpgradeAndRollback(t *testing.T) {
 		reg.ID, sh[:], now, now); err != nil {
 		t.Fatalf("seed pre-15 operation: %v", err)
 	}
-	if err := ApplyMigrations(ctx, upg); err != nil {
+	if err := applyMigrationsThrough(ctx, upg, 15); err != nil {
 		t.Fatalf("upgrade to 15: %v", err)
 	}
 	if v, _ := CurrentSchemaVersion(ctx, upg); v != 15 {
@@ -321,7 +323,7 @@ func TestMigration15FreshUpgradeAndRollback(t *testing.T) {
 	if _, err := rb.ExecContext(ctx, `create table publication_bindings (operation_id text primary key, unrelated_col integer)`); err != nil {
 		t.Fatalf("seed wrong-schema table: %v", err)
 	}
-	if err := ApplyMigrations(ctx, rb); err == nil {
+	if err := applyMigrationsThrough(ctx, rb, 15); err == nil {
 		t.Fatal("migration 15 must fail against a wrong-schema pre-existing table")
 	}
 	if v, _ := CurrentSchemaVersion(ctx, rb); v != 14 {

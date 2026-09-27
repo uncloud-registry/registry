@@ -382,6 +382,31 @@ var migrations = []migration{
 		Version: 15,
 		Apply:   installPublicationBindingStore,
 	},
+	// Version 16 creates the durable logical-publication EXECUTION state
+	// machine (publication_states): one row per stable PublicationID,
+	// tracking which single per-attempt FeedSigner identity is currently
+	// authorized ("active"), when that attempt has been proven dead by an
+	// authoritative generation conflict ("replaceable" — the ONLY transition
+	// that ever authorizes a fresh replacement attempt), and permanent
+	// terminal success ("succeeded"). This closes the round-2 gap where a
+	// stable PublicationID that already reached a terminal success could be
+	// "retried" after an unrelated later publication overwrote the same tag:
+	// the retry would compute a fresh per-attempt identity that authenticates
+	// cleanly against the (unrelated) preflight binding and the CURRENT
+	// generation, advancing the feed a second time under the SAME logical
+	// publication id. The table is pure forward DDL over a NEW table
+	// alongside the migration 9-15 feed-signer/binding stores — it never
+	// reads, mutates, or drops any migration 1-15 state — and installs its
+	// own byte-exact operation-ID identity triggers (the shared migration-14
+	// predicate, generalized to apply to BOTH its operation_id and
+	// attempt_id columns, with distinct trigger names since SQLite triggers
+	// are database-global). Any statement failure aborts the migration
+	// transaction atomically: version stays 15 and no schema object is
+	// installed.
+	{
+		Version: 16,
+		Apply:   installPublicationStateStore,
+	},
 }
 
 // enableForeignKeys is intentionally NOT emitted inside migrations. SQLite only

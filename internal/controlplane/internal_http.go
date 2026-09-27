@@ -58,10 +58,18 @@ func (s *InternalFeedServer) logger() *slog.Logger {
 
 // ServeHTTP handles the two allowed routes. Any other path or method is a
 // generic 404; a non-POST method on a route is 405.
+//
+// publish.InternalFeedUpdatePath (the retired legacy v1 feed-update path) is
+// DELIBERATELY absent from both switches below: it is not a recognized route
+// at all, so a request to it — with any method, any credential, any body —
+// falls straight through to the generic 404, exactly like any other unknown
+// path. This is the round-3 / Finding 2 explicit retirement: there is no
+// second active identity mode to isolate or namespace, because the legacy
+// route simply no longer exists on this server.
 func (s *InternalFeedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		switch r.URL.Path {
-		case publish.InternalFeedUpdatePath, publish.InternalOperationBindingPath:
+		case publish.InternalFeedUpdatePathV2, publish.InternalOperationBindingPath:
 			w.Header().Set("Allow", "POST")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
@@ -70,7 +78,7 @@ func (s *InternalFeedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.URL.Path {
-	case publish.InternalFeedUpdatePath:
+	case publish.InternalFeedUpdatePathV2:
 		s.handleFeedUpdate(w, r)
 	case publish.InternalOperationBindingPath:
 		s.handleOperationBinding(w, r)
@@ -106,10 +114,14 @@ func (s *InternalFeedServer) checkCredential(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), s.Secret) == 1
 }
 
-// handleFeedUpdate serves POST /internal/v1/feed-updates.
+// handleFeedUpdate serves POST /internal/v2/feed-updates, the ONLY current
+// feed-commit route. It requires a non-empty PublicationID BEFORE the
+// request ever reaches the signer: the current protocol never infers a
+// legacy identity mode from a missing field, so an omitted PublicationID is
+// rejected malformed here, before any durable mutation (round 3 / Finding 2).
 func (s *InternalFeedServer) handleFeedUpdate(w http.ResponseWriter, r *http.Request) {
 	if !s.checkCredential(r) {
-		s.logger().Warn("internal credential rejected", "component", "controlplane-internal", "path", publish.InternalFeedUpdatePath)
+		s.logger().Warn("internal credential rejected", "component", "controlplane-internal", "path", publish.InternalFeedUpdatePathV2)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
@@ -121,6 +133,10 @@ func (s *InternalFeedServer) handleFeedUpdate(w http.ResponseWriter, r *http.Req
 
 	var req publish.FeedCommitRequest
 	if err := decodeStrictJSON(data, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+	if req.PublicationID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
 		return
 	}

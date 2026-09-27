@@ -20,11 +20,40 @@ import (
 	"github.com/uncloud-registry/registry/internal/spec"
 )
 
-// InternalFeedUpdatePath is the exact internal feed-update endpoint path. The
-// internal feed-signing server accepts ONLY this path on POST; nothing else is
-// served, so a caller cannot discover or reach unrelated control-plane routes
-// through the internal credential.
+// InternalFeedUpdatePath is the RETIRED legacy (pre-round-3) internal
+// feed-update endpoint path. It is EXPLICITLY DISABLED on the internal
+// server (a request to it is an ordinary unrecognized-route 404, exactly
+// like any other unknown path — see InternalFeedServer.ServeHTTP): the
+// PublicationID/attempt-identity split (round 2) and the durable
+// publication_states terminal-success gate (round 3 / Finding 1) are both
+// meaningless without a stable PublicationID, and this repository has no
+// production caller that ever omits one (the registry data plane's handler
+// always supplies a non-empty stable identity — see
+// registry.Handler.handleManifestPut). Rather than maintain a second active
+// identity mode whose durable rows could be mistaken for — or used to
+// bypass — the current protocol's, the legacy shape is retired outright.
+// This constant is retained ONLY so tests can positively assert the route is
+// gone (never 200, never routed to the signer).
 const InternalFeedUpdatePath = "/internal/v1/feed-updates"
+
+// InternalFeedUpdatePathV2 is the CURRENT internal feed-update endpoint path
+// and the ONLY one ControlPlaneCommitter (the production data-plane client)
+// ever sends to. Every request accepted here MUST carry a non-empty
+// PublicationID (the stable logical-publication identity) and an OperationID
+// that is exactly ComputeCommitAttemptID(PublicationID, ...) — the current
+// protocol never falls back to treating OperationID as its own stable
+// identity, and never infers a "legacy mode" from a missing field. This is
+// the explicit, bounded protocol-version marker Task 17 round 3 requires:
+// a new registry binary and an old (pre-round-3) control plane can never
+// silently miscommunicate, because the old control plane simply does not
+// serve this path (it 404s) and the new registry never speaks the old one.
+// Deployment ordering: this repository ships in lockstep, but a rolling
+// upgrade MUST still bring the control plane up on the version that serves
+// this path BEFORE any registry process using it is started; a registry
+// pointed at a not-yet-upgraded control plane fails every commit closed
+// (ErrCommitBackend, from the 404) rather than silently degrading to a
+// weaker identity contract.
+const InternalFeedUpdatePathV2 = "/internal/v2/feed-updates"
 
 // InternalAuthHeader is the dedicated credential header the registry data
 // plane sends on every internal feed-commit request. It is distinct from the
@@ -54,10 +83,11 @@ const InternalAuthHeader = "X-Uncloud-Internal-Auth"
 //     OperationID, so its durable reservation can never collide with the
 //     conflicted attempt's permanently-fixed request hash.
 //
-// PublicationID is OPTIONAL on the wire for backward compatibility: a request
-// that leaves it empty is treated exactly as before this identity split — its
-// OperationID is its own stable logical identity, with no separate per-attempt
-// derivation enforced. Every NEW publisher-driven request sets both.
+// On the current versioned wire route PublicationID is REQUIRED. The v2
+// client rejects an empty value before network I/O, and the v2 server rejects
+// omission before invoking the signer. The omitempty tag exists only because
+// this typed value is also used by isolated Go-level legacy migration tests;
+// it does not make omission a supported wire mode.
 type FeedCommitRequest struct {
 	OperationID        string `json:"operationID"`
 	PublicationID      string `json:"publicationID,omitempty"`
@@ -176,6 +206,14 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 	if err := validateCommitRequestShape(req); err != nil {
 		return FeedCommitResult{}, ErrCommitMalformed
 	}
+	// The CURRENT protocol (round 3 / Finding 2) mandates the stable/attempt
+	// identity split unconditionally: this production client never sends the
+	// legacy (PublicationID-omitted) shape, and never silently infers one
+	// from a missing field. A caller that leaves PublicationID empty fails
+	// closed here, before any network attempt.
+	if req.PublicationID == "" {
+		return FeedCommitResult{}, ErrCommitMalformed
+	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -197,7 +235,7 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 		defer cancel()
 	}
 
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+InternalFeedUpdatePath, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, baseURL+InternalFeedUpdatePathV2, bytes.NewReader(body))
 	if err != nil {
 		return FeedCommitResult{}, ErrCommitMalformed
 	}
@@ -311,8 +349,8 @@ func ParseControlPlaneOrigin(raw string) (ControlPlaneOrigin, error) {
 }
 
 // parseCommitBaseURL is the request-time wrapper over the shared origin
-// validator, returning the canonical origin string for the OLD commit path that
-// stores it. Both it and cmd/registry's startup builder call
+// validator, returning the canonical origin string used by the current commit
+// client. Both it and cmd/registry's startup builder call
 // ParseControlPlaneOrigin, so the policies are structurally identical.
 func parseCommitBaseURL(raw string) (string, error) {
 	o, err := ParseControlPlaneOrigin(raw)

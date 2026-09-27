@@ -12,9 +12,9 @@ import (
 
 // InternalOperationBindingPath is the exact internal endpoint path for
 // preflight operation-key binding. The internal server accepts ONLY this and
-// InternalFeedUpdatePath on POST; nothing else is served, so a caller cannot
-// discover or reach unrelated control-plane routes through the internal
-// credential.
+// InternalFeedUpdatePathV2 on POST; the retired v1 feed-update path is not a
+// route. Nothing else is served, so a caller cannot discover or reach
+// unrelated control-plane routes through the internal credential.
 const InternalOperationBindingPath = "/internal/v1/operation-bindings"
 
 // BindingRequestMaxBody bounds the internal operation-binding request body.

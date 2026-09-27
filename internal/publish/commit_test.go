@@ -29,18 +29,21 @@ func commitServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *Co
 
 func validCommit() FeedCommitRequest {
 	return FeedCommitRequest{
-		OperationID: "op-abc", RegistryID: 7,
+		OperationID: "op-abc", PublicationID: "op-abc-pub", RegistryID: 7,
 		Owner: "0xabcDEF", Topic: "feed://abababababababababababababababababababab/cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
 		Reference: strings.Repeat("a", 64), BatchID: "batch-1", ExpectedGeneration: 0,
 	}
 }
 
 // echoServer is the fake control plane: it asserts the credential header,
-// method, and path, then returns a canned status with the body.
+// method, and path, then returns a canned status with the body. The path
+// assertion is the CURRENT (v2) protocol endpoint: ControlPlaneCommitter is
+// the production client and posts ONLY there (see
+// TestControlPlaneCommitterPostsToCurrentV2Endpoint).
 func echoServer(t *testing.T, status int, respBody string, checkResults bool) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != InternalFeedUpdatePath {
+		if r.Method != http.MethodPost || r.URL.Path != InternalFeedUpdatePathV2 {
 			w.WriteHeader(500)
 			return
 		}
@@ -107,6 +110,48 @@ func TestControlPlaneCommitterFailsBeforeNetworkOnBadConfig(t *testing.T) {
 	c = &ControlPlaneCommitter{BaseURL: "http://127.0.0.1:1", Secret: nil, HTTPClient: http.DefaultClient}
 	if _, err := c.Commit(context.Background(), validCommit()); !errors.Is(err, ErrCommitBackend) {
 		t.Fatalf("empty secret: got %v want backend", err)
+	}
+}
+
+// TestControlPlaneCommitterRequiresNonEmptyPublicationID proves the CURRENT
+// production committer (round 3 / Finding 2) fails a request with an empty
+// PublicationID BEFORE any network attempt: the current protocol mandates the
+// stable/attempt identity split unconditionally, never falling back to
+// treating OperationID as its own stable identity (that legacy shape is only
+// ever accepted on the isolated legacy endpoint, never through this client).
+func TestControlPlaneCommitterRequiresNonEmptyPublicationID(t *testing.T) {
+	req := validCommit()
+	req.PublicationID = ""
+	c := &ControlPlaneCommitter{BaseURL: "http://127.0.0.1:1", Secret: []byte(commitSecret), HTTPClient: http.DefaultClient}
+	if _, err := c.Commit(context.Background(), req); !errors.Is(err, ErrCommitMalformed) {
+		t.Fatalf("empty publicationID: got %v want malformed", err)
+	}
+}
+
+// TestControlPlaneCommitterPostsToCurrentV2Endpoint proves the production
+// committer sends every request to the CURRENT versioned endpoint
+// (InternalFeedUpdatePathV2), never the legacy InternalFeedUpdatePath —
+// closing the round-3 "silent missing-field mode" gap where an old strict
+// control plane could otherwise be accidentally sent a current-shaped
+// request on the legacy path.
+func TestControlPlaneCommitterPostsToCurrentV2Endpoint(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := json.Marshal(FeedCommitResult{OperationID: "op-abc", Feed: validCommit().Topic, Reference: strings.Repeat("a", 64)})
+		w.WriteHeader(200)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	c := &ControlPlaneCommitter{BaseURL: srv.URL, Secret: []byte(commitSecret), HTTPClient: srv.Client()}
+	if _, err := c.Commit(context.Background(), validCommit()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if gotPath != InternalFeedUpdatePathV2 {
+		t.Fatalf("got path %q want the current versioned endpoint %q", gotPath, InternalFeedUpdatePathV2)
+	}
+	if gotPath == InternalFeedUpdatePath {
+		t.Fatal("the production committer must never post to the legacy path")
 	}
 }
 

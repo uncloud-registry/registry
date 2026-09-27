@@ -96,15 +96,26 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	if err := publish.ValidateCommitRequest(req); err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: %v", errFeedSignerMalformed, err)
 	}
-	// When the request carries an explicit stable PublicationID (the current
-	// data-plane contract), its OperationID MUST be exactly the deterministic
-	// per-ATTEMPT identity derived from that stable id plus THIS attempt's own
-	// ExpectedGeneration/Reference (see publish.ComputeCommitAttemptID) — never
-	// an arbitrary or reused value. This is checked BEFORE any hashing,
+	// The CURRENT wire protocol (publish.InternalFeedUpdatePathV2, the ONLY
+	// route InternalFeedServer.ServeHTTP forwards to this method — the legacy
+	// publish.InternalFeedUpdatePath is retired outright, not merely
+	// deprecated: it is not a recognized route at all) REQUIRES a non-empty
+	// PublicationID; the HTTP handler rejects an empty one with 400 before
+	// Commit is ever invoked (round 3 / Finding 2). Commit itself stays
+	// protocol-agnostic and accepts an empty PublicationID too, but ONLY a
+	// direct internal Go-level caller can ever supply one — no wire path
+	// reaches this method that way. When PublicationID IS supplied, its
+	// OperationID MUST be exactly the deterministic per-ATTEMPT identity
+	// derived from that stable id plus THIS attempt's own
+	// ExpectedGeneration/Reference (see publish.ComputeCommitAttemptID) —
+	// never an arbitrary or reused value. This is checked BEFORE any hashing,
 	// reservation, or registry lookup. A request that leaves PublicationID
-	// empty is the backward-compatible legacy shape: its OperationID IS its
-	// own stable identity, with no separate per-attempt derivation enforced
-	// (see publicationIdentity).
+	// empty is the pre-round-2 shape retained solely for the internal
+	// migration-9 quarantine-adoption test surface: its OperationID IS its
+	// own stable identity, with no separate per-attempt derivation enforced,
+	// and — critically — it NEVER passes through the round-3 execution gate
+	// below, so it can neither benefit from nor corrupt a current
+	// PublicationID's durable terminal state (see publicationIdentity).
 	if req.PublicationID != "" {
 		wantAttemptID := publish.ComputeCommitAttemptID(req.PublicationID, req.RegistryID, req.Owner, req.Topic, req.Reference, req.ExpectedGeneration)
 		if req.OperationID != wantAttemptID {
@@ -123,6 +134,23 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 			return publish.FeedCommitResult{}, errFeedSignerRegistryNotFound
 		}
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
+	}
+
+	// The durable logical-publication EXECUTION gate (round 3 / Finding 1):
+	// ONLY for the current (PublicationID-bearing) protocol — a request with
+	// PublicationID empty (unreachable from any wire path; see above) never
+	// touches publication_states, since its OperationID already IS its own
+	// generation-bound stable identity and cannot be replayed against a LATER
+	// generation the way a stable PublicationID otherwise could (see
+	// authorizePublicationExecution). This runs BEFORE any legacy adoption,
+	// durable attempt reservation, or claim,
+	// so a permanently-conflicted or currently-owned-by-another-attempt
+	// publication is rejected with ZERO durable feed_signer_operations rows
+	// and ZERO document reads.
+	if req.PublicationID != "" {
+		if err := s.authorizePublicationExecution(ctx, req); err != nil {
+			return publish.FeedCommitResult{}, err
+		}
 	}
 
 	// Adopt any quarantined migration-9 row for this operation on this FIRST
@@ -239,6 +267,100 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	}
 }
 
+// publicationExecutionMaxCASAttempts bounds authorizePublicationExecution's
+// re-evaluation loop after a lost replacement CAS: each iteration performs
+// real work (a fresh CAS attempt) and only re-loops when the row is STILL
+// replaceable under yet another distinct attempt id, which requires an
+// entire additional signCommit invocation to have happened between our read
+// and our CAS — a bound far beyond any realistic contention is a pure
+// defensive backstop against an unforeseen bug looping forever.
+const publicationExecutionMaxCASAttempts = 1000
+
+// authorizePublicationExecution is the durable logical-publication EXECUTION
+// gate (round 3 / Finding 1). It runs BEFORE any legacy adoption, durable
+// attempt reservation, or claim, and decides — atomically, never on a stale
+// read — whether req.OperationID (THIS attempt) may proceed for
+// req.PublicationID (the STABLE logical publication):
+//
+//   - no row yet: this is the FIRST-EVER attempt. ReservePublicationExecution
+//     atomically wins (or, if a concurrent distinct attempt already reserved
+//     it first, reads back the ACTUAL winner) — never two distinct attempts
+//     both pass this gate for a fresh publication id.
+//   - state active, SAME attempt id: this is a concurrent/retried instance of
+//     the currently-authorized attempt — proceed (the existing
+//     feed_signer_operations claim/lease machinery, unchanged, governs it
+//     from here).
+//   - state active, DIFFERENT attempt id: the recorded attempt has not been
+//     proven dead by an authoritative generation conflict. A fresh attempt
+//     must NEVER silently replace a still-active one — this is a retryable
+//     backend condition, never a fabricated success or a permanent conflict.
+//   - state replaceable: the recorded attempt DEFINITIVELY conflicted on
+//     generation with zero external write. A DIFFERENT attempt id may
+//     atomically CAS the row back to active (exactly one winner under
+//     concurrent replacement bids — see ReplacePublicationExecutionAttempt);
+//     the loser re-evaluates the row it observes after losing.
+//   - state succeeded: TERMINAL. The SAME attempt id that succeeded may
+//     proceed (a lost-response retry, answered by the existing
+//     feed_signer_operations succeeded-row lookup); any OTHER attempt id is a
+//     PERMANENT conflict — the feed must never advance again for this
+//     publication, even after an entirely different later publication
+//     overwrites the same tag.
+//
+// A registry mismatch on an existing row (a defensive, cryptographically
+// improbable case since PublicationID hashes bind the registry) is also a
+// permanent conflict, never silently accepted.
+func (s *FeedSigner) authorizePublicationExecution(ctx context.Context, req publish.FeedCommitRequest) error {
+	pubID := req.PublicationID
+	exec, err := s.Store.GetPublicationExecution(ctx, pubID)
+	if errors.Is(err, sql.ErrNoRows) {
+		exec, err = s.Store.ReservePublicationExecution(ctx, pubID, req.RegistryID, req.OperationID)
+		if err != nil {
+			return fmt.Errorf("%w: publication execution: %v", errFeedSignerBackend, err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("%w: publication execution: %v", errFeedSignerBackend, err)
+	}
+
+	for attempt := 0; ; attempt++ {
+		if attempt >= publicationExecutionMaxCASAttempts {
+			return fmt.Errorf("%w: publication execution: replacement contention exceeded the bound", errFeedSignerBackend)
+		}
+		if exec.RegistryID != req.RegistryID {
+			return fmt.Errorf("%w: publication identity is bound to another registry", errFeedSignerConflict)
+		}
+		switch exec.State {
+		case PublicationExecutionSucceeded:
+			if exec.AttemptID == req.OperationID {
+				return nil
+			}
+			return errFeedSignerConflict
+		case PublicationExecutionActive:
+			if exec.AttemptID == req.OperationID {
+				return nil
+			}
+			return fmt.Errorf("%w: another attempt owns this publication", errFeedSignerBackend)
+		case PublicationExecutionReplaceable:
+			if exec.AttemptID == req.OperationID {
+				// Not expected (a fresh attempt id always differs from the
+				// one that just conflicted), but if it recurs, treat it as
+				// reactivating the same attempt.
+				return nil
+			}
+			won, row, rerr := s.Store.ReplacePublicationExecutionAttempt(ctx, pubID, req.RegistryID, exec.AttemptID, req.OperationID)
+			if rerr != nil {
+				return fmt.Errorf("%w: publication execution replace: %v", errFeedSignerBackend, rerr)
+			}
+			if won {
+				return nil
+			}
+			exec = row
+			continue
+		default:
+			return fmt.Errorf("%w: publication execution: unrecognized state", errFeedSignerBackend)
+		}
+	}
+}
+
 // runSignedCommit performs the guarded signing under a won claim and then
 // durably completes it (or conditionally releases on a definite pre-update
 // failure). An uncertain update failure keeps the lease until recovery.
@@ -293,6 +415,37 @@ func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommit
 			// Definite pre-update failure (malformed/not-ready/owner/topic/
 			// generation/batch): release the claim so a retry may re-claim.
 			_ = s.Store.ReleaseFeedSignerOperation(ctx, req.OperationID, claimToken)
+			// The publication-execution row is flipped to "replaceable" ONLY
+			// for the exact authoritative generation-conflict class — never
+			// for malformed/not-ready/owner/batch/provenance failures, which
+			// must never silently authorize a fresh attempt to replace this
+			// one (round 3 / Finding 1).
+			//
+			// This transition must be DURABLY CONFIRMED before we report the
+			// generation conflict to the caller: PublishCommitWithConflictRebuild
+			// treats that error class as "safe to rebuild" and will construct a
+			// fresh attempt immediately. If the mark silently failed to apply
+			// (a DB error, or the row no longer matched this attempt — e.g. a
+			// concurrent observer already moved it), that fresh attempt could
+			// never be authorized by authorizePublicationExecution (the row
+			// would stay "active" under this same attempt forever, or under
+			// whatever a concurrent actor left it as), permanently wedging the
+			// publication. So a mark failure or a non-applied mark degrades
+			// THIS response to a retryable backend error instead of the
+			// generation conflict — never a silent "safe to rebuild" that
+			// cannot actually be honored. A later retry of this SAME attempt
+			// re-detects the identical generation conflict and retries the
+			// mark; only once it durably applies is the caller ever told it
+			// may rebuild.
+			if req.PublicationID != "" && errors.Is(err, errFeedSignerGenerationConflict) {
+				applied, merr := s.Store.MarkPublicationExecutionReplaceable(ctx, req.PublicationID, req.OperationID)
+				if merr != nil {
+					return publish.FeedCommitResult{}, fmt.Errorf("%w: mark publication replaceable: %v", errFeedSignerBackend, merr)
+				}
+				if !applied {
+					return publish.FeedCommitResult{}, fmt.Errorf("%w: publication replaceable transition did not durably apply", errFeedSignerBackend)
+				}
+			}
 		}
 		// Uncertain update failure is NOT released: the lease is kept until a
 		// later identical request reclaims it (after expiry) and resolves the
@@ -311,6 +464,15 @@ func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommit
 		// the JSON-safe contract and we fail closed rather than persist a
 		// non-canonical result.
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: result is not byte-canonical", errFeedSignerBackend)
+	}
+	if req.PublicationID != "" {
+		// The atomic combined completion: the per-attempt feed_signer_operations
+		// row and the logical publication_states terminal marking commit in
+		// ONE transaction, so the two can never split (round 3 / Finding 1).
+		if err := s.Store.CompleteFeedSignerOperationAndTerminatePublication(ctx, req.OperationID, reqHash, claimToken, resultJSON, req.PublicationID, req.RegistryID, req.OperationID); err != nil {
+			return publish.FeedCommitResult{}, fmt.Errorf("%w: persist result: %v", errFeedSignerBackend, err)
+		}
+		return result, nil
 	}
 	if err := s.Store.CompleteFeedSignerOperation(ctx, req.OperationID, reqHash, claimToken, resultJSON); err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: persist result: %v", errFeedSignerBackend, err)
@@ -812,14 +974,16 @@ func (s *FeedSigner) validateArtifactBlobTransition(ctx context.Context, cur, ta
 }
 
 // publicationIdentity returns the request's STABLE logical publication
-// identity: req.PublicationID when the caller supplied one, or req.OperationID
-// for a backward-compatible legacy request that carries no separate attempt
-// identity (its OperationID IS its own stable identity — Commit's
-// attempt-identity check never runs for such a request). This is the ONLY
-// identity ever compared against durable publication_bindings rows or
-// recorded/expected in a repo-state document's TagPublications — the
-// per-attempt req.OperationID (see publish.ComputeCommitAttemptID) never
-// crosses that boundary.
+// identity: req.PublicationID when the caller supplied one (the ONLY shape
+// reachable from any wire path — the current v2 endpoint requires it, and
+// the legacy v1 endpoint no longer exists), or req.OperationID for the
+// pre-round-2 shape that carries no separate attempt identity (its
+// OperationID IS its own stable identity — Commit's attempt-identity check
+// never runs for such a request, and it never passes through the round-3
+// execution gate). This is the ONLY identity ever compared against durable
+// publication_bindings rows or recorded/expected in a repo-state document's
+// TagPublications — the per-attempt req.OperationID (see
+// publish.ComputeCommitAttemptID) never crosses that boundary.
 func publicationIdentity(req publish.FeedCommitRequest) string {
 	if req.PublicationID != "" {
 		return req.PublicationID

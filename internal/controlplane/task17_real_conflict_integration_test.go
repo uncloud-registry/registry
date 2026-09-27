@@ -270,7 +270,7 @@ func newRealConflictWorld(t *testing.T) *realConflictWorld {
 
 	gate := make(chan struct{})
 	blocked := make(chan struct{})
-	gatedTransport := &gatingTransport{inner: http.DefaultTransport, path: publish.InternalFeedUpdatePath, gate: gate, blocked: blocked}
+	gatedTransport := &gatingTransport{inner: http.DefaultTransport, path: publish.InternalFeedUpdatePathV2, gate: gate, blocked: blocked}
 
 	buildHandler := func(commitClient *http.Client) *registry.Handler {
 		resolver := resolve.RegistryResolver{
