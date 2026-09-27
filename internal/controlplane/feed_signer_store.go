@@ -1178,6 +1178,43 @@ func (s *Store) ReleaseFeedSignerOperation(ctx context.Context, operationID stri
 	return nil
 }
 
+// AbandonFeedSignerOperationForRetry DELETES a processing operation's durable
+// row entirely — rather than resetting it to pending like
+// ReleaseFeedSignerOperation — but ONLY when the exact claim token still owns
+// it (conditional on operation_id + claim_token + state='processing',
+// identical ownership precondition to ReleaseFeedSignerOperation).
+//
+// It exists for round 6A / Important 1: when a fresh, authoritative
+// reconciliation performed under the won claim (see FeedSigner.finishBoundCommit
+// / reconcileStampPolicy) discovers that mutable state (the stamp policy)
+// observed during earlier, unlocked preparation has since changed, the
+// reserved row's request hash is PERMANENTLY bound to that STALE request.
+// ReleaseFeedSignerOperation's reset-to-pending would leave the stale hash in
+// place, which would permanently conflict with a corrected retry under the
+// SAME deterministic attempt id (BatchID is deliberately excluded from
+// publish.ComputeCommitAttemptID, so a corrected retry recomputes an
+// IDENTICAL operation id with a DIFFERENT request hash). Deleting the row
+// instead lets a subsequent ReserveFeedSignerOperation for the SAME operation
+// id insert a fresh pending row carrying the corrected hash.
+//
+// This never touches publication_states: the caller is responsible for
+// leaving the logical publication's execution row exactly as it was (still
+// "active" under this SAME attempt id) — only an authoritative generation
+// conflict may ever authorize a DIFFERENT attempt id to replace it. Because
+// the delete is scoped to operation_id + the exact claim token, only the
+// legitimate current owner of THIS attempt's claim can ever abandon its own
+// row; no other attempt id's row or claim is ever affected, so this can
+// never be used to seize or vacate a DIFFERENT attempt's reservation. A stale
+// or already-taken-over token is a harmless no-op (zero rows match).
+func (s *Store) AbandonFeedSignerOperationForRetry(ctx context.Context, operationID string, claimToken string) error {
+	if _, err := s.DB.ExecContext(ctx, `delete from feed_signer_operations
+		where operation_id = ? and claim_token = ? and state = 'processing'`,
+		operationID, claimToken); err != nil {
+		return err
+	}
+	return nil
+}
+
 // newClaimToken returns an unpredictable 128-hex claim token from the
 // cryptorandom source. An entropy failure is a DATA-FREE backend error (never
 // a panic): a signer whose RNG is broken must fail its claim closed, returning

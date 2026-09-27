@@ -42,6 +42,20 @@ var (
 	errFeedSignerConflict = errors.New("feed commit operation conflict")
 	// errFeedSignerBackend: 503 (dependency/Bee/datastore failure).
 	errFeedSignerBackend = errors.New("feed signing service backend failure")
+	// errFeedSignerStampPolicyStale: retryable (falls through to the generic
+	// 503 backend mapping in mapFeedSignerError). Round 6A / Important 1: a
+	// fresh, authoritative reconciliation of the stamp policy — performed
+	// under the won durable claim, immediately before any external update —
+	// disagrees with the mutable policy prepareBoundCommit observed during
+	// its earlier, unlocked read. Zero external update ever happens for this
+	// condition. This is deliberately its own sentinel: never
+	// errFeedSignerGenerationConflict (the retry needed is a corrected batch
+	// selection under the SAME attempt id, not a repository-generation
+	// rebuild — see runSignedCommit and Store.AbandonFeedSignerOperationForRetry),
+	// and never errFeedSignerMalformed (the original request was not
+	// malformed at the time it was prepared; only external mutable state
+	// changed after preparation).
+	errFeedSignerStampPolicyStale = errors.New("feed commit stamp policy authority changed since preparation")
 )
 
 // FeedSigner cleanly separates the two feed-signing sides: the data plane
@@ -328,6 +342,19 @@ func (s *FeedSigner) reserveAndRunClaim(ctx context.Context, req publish.FeedCom
 // finishBoundCommit for the argument that this single fresh reconciliation
 // is sufficient without redoing the non-generation checks).
 func (s *FeedSigner) commitBoundPublication(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, canonicalTopic string) (publish.FeedCommitResult, error) {
+	// Round 6A / Important 1: a data-free, hash-checked terminal-replay fast
+	// path runs BEFORE any mutable preparation. prepareBoundCommit's
+	// verifyBatch reads the LIVE, mutable stamp-policy document; an exact
+	// lost-response retry of an attempt that already reached durable
+	// terminal success must return the stored result WITHOUT ever
+	// re-validating a policy that may have rotated since the original
+	// success (failure class A). See terminalReplayResult.
+	if result, ok, err := s.terminalReplayResult(ctx, req, reqHash); err != nil {
+		return publish.FeedCommitResult{}, err
+	} else if ok {
+		return result, nil
+	}
+
 	prep, err := s.prepareBoundCommit(ctx, req)
 	if err != nil {
 		return publish.FeedCommitResult{}, err
@@ -344,6 +371,54 @@ func (s *FeedSigner) commitBoundPublication(ctx context.Context, req publish.Fee
 	return s.reserveAndRunClaim(ctx, req, reqHash, canonicalTopic, func(ctx context.Context, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
 		return s.finishBoundCommit(ctx, req, prep, claimToken)
 	})
+}
+
+// terminalReplayResult is round 6A's data-free, hash-checked terminal-replay
+// fast path (Important 1). It runs BEFORE prepareBoundCommit's mutable
+// stamp-policy read, so an exact lost-response retry of an attempt that
+// already reached durable terminal success returns the stored result without
+// ever re-validating mutable policy state that may have rotated since the
+// original success. ok=true is returned ONLY when BOTH:
+//
+//   - the feed_signer_operations row for req.OperationID exists, is
+//     succeeded, and its stored request hash equals the EXACT current
+//     request hash (a differently-shaped retry — e.g. a corrected batch —
+//     must fall through to full re-validation, never short-circuit here);
+//     AND
+//   - the publication_states row for req.PublicationID is terminal
+//     (succeeded) for the SAME registry and under the SAME attempt id.
+//
+// Either condition failing (absent row, mismatched hash, nonterminal or
+// mismatched-attempt/registry publication state) returns ok=false and
+// mutates nothing: the caller proceeds to full preparation, exactly as
+// before this fast path existed. All errors are the fixed, data-free
+// backend sentinel (no request/document content ever appears).
+func (s *FeedSigner) terminalReplayResult(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte) (publish.FeedCommitResult, bool, error) {
+	op, err := s.Store.GetFeedSignerOperation(ctx, req.OperationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return publish.FeedCommitResult{}, false, nil
+	}
+	if err != nil {
+		return publish.FeedCommitResult{}, false, fmt.Errorf("%w: lookup: %v", errFeedSignerBackend, err)
+	}
+	if op.State != FeedSignerOpSucceeded || op.RequestHash != reqHash {
+		return publish.FeedCommitResult{}, false, nil
+	}
+	exec, err := s.Store.GetPublicationExecution(ctx, req.PublicationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return publish.FeedCommitResult{}, false, nil
+	}
+	if err != nil {
+		return publish.FeedCommitResult{}, false, fmt.Errorf("%w: publication execution: %v", errFeedSignerBackend, err)
+	}
+	if exec.RegistryID != req.RegistryID || exec.State != PublicationExecutionSucceeded || exec.AttemptID != req.OperationID {
+		return publish.FeedCommitResult{}, false, nil
+	}
+	result, err := s.storedResult(op, req)
+	if err != nil {
+		return publish.FeedCommitResult{}, false, err
+	}
+	return result, true, nil
 }
 
 // publicationExecutionMaxCASAttempts bounds authorizePublicationExecution's
@@ -549,6 +624,29 @@ func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommit
 
 	if err != nil {
 		if !uncertain {
+			if req.PublicationID != "" && errors.Is(err, errFeedSignerStampPolicyStale) {
+				// Round 6A / Important 1: the reserved feed_signer_operations
+				// row's request hash is PERMANENTLY bound to the STALE
+				// request (BatchID is deliberately excluded from the
+				// deterministic attempt-id derivation — see
+				// publish.ComputeCommitAttemptID — so a corrected retry
+				// recomputes the IDENTICAL attempt id with a DIFFERENT
+				// request hash). ReleaseFeedSignerOperation's reset-to-pending
+				// would leave that stale hash in place, permanently
+				// conflicting with the corrected retry's ReserveFeedSignerOperation
+				// call. Delete the row instead so a fresh reserve can bind
+				// the corrected hash. Critically, publication_states is left
+				// COMPLETELY untouched — still "active" under this SAME
+				// attempt id — because only an authoritative generation
+				// conflict may ever authorize a DIFFERENT attempt to replace
+				// it (see authorizePublicationExecution); a stamp-policy
+				// staleness must never make the publication replaceable by
+				// another attempt.
+				if derr := s.Store.AbandonFeedSignerOperationForRetry(ctx, req.OperationID, claimToken); derr != nil {
+					return publish.FeedCommitResult{}, fmt.Errorf("%w: abandon stale reservation: %v", errFeedSignerBackend, derr)
+				}
+				return publish.FeedCommitResult{}, err
+			}
 			// Definite pre-update failure (malformed/not-ready/owner/topic/
 			// generation/batch): release the claim so a retry may re-claim.
 			_ = s.Store.ReleaseFeedSignerOperation(ctx, req.OperationID, claimToken)
@@ -704,7 +802,7 @@ func (s *FeedSigner) signCommitLegacy(ctx context.Context, req publish.FeedCommi
 	}
 
 	// Stamp policy / batch proof (definite pre-update).
-	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
+	if _, err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
@@ -755,6 +853,16 @@ type commitPreparation struct {
 	targetRepo string
 	targetDoc  spec.RepoStateDocument
 	operated   string
+	// stampPolicyRef is the stamp-policy feed's resolved reference observed
+	// by verifyBatch during preparation (round 6A / Important 1). It is
+	// empty whenever preparation skipped stamp-policy validation (the
+	// recovery path, done==true — see prepareBoundCommit), which is exactly
+	// the case finishBoundCommit's own done check short-circuits before ever
+	// consulting this field. finishBoundCommit compares a FRESH resolution
+	// against this observed reference, immediately before any external
+	// update, so a stamp policy that rotated between preparation and the won
+	// claim is never silently trusted.
+	stampPolicyRef string
 }
 
 // prepareBoundCommit is round 5's non-mutating preparation phase for the
@@ -865,11 +973,31 @@ func (s *FeedSigner) prepareBoundCommit(ctx context.Context, req publish.FeedCom
 	// retry, since BatchID is excluded from ComputeCommitAttemptID — can
 	// never bind the durable request-hash row that retry would need (see
 	// TestFeedSignerBadBatchPoisoningZeroReservation).
-	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
-		return commitPreparation{}, err
+	//
+	// Round 6A / Important 1: this mutable-policy read is skipped ONLY on
+	// the RECOVERY path (done==true — the current feed already resolves to
+	// the target reference): a prior write already consumed whatever batch
+	// was authorized at THAT time, and re-validating it against a policy
+	// that may have since rotated would wrongly turn a legitimate
+	// crash-recovery retry into a permanent malformed failure (failure class
+	// C). Feed generations only ever advance, so done==true here guarantees
+	// a fresh finishBoundCommit read observes done again and returns before
+	// ever reaching the stamp-policy reconciliation step — no observed
+	// reference is needed on that path. done==false (including the
+	// currentGenConflict case, exactly as before this change) still runs
+	// verifyBatch unconditionally, preserving the round-5 precedent that a
+	// non-generation failure always wins over a generation-conflict
+	// classification.
+	var stampPolicyRef string
+	if !done {
+		ref, err := s.verifyBatch(ctx, req, reg, targetRepo)
+		if err != nil {
+			return commitPreparation{}, err
+		}
+		stampPolicyRef = ref
 	}
 
-	return commitPreparation{reg: reg, targetRepo: targetRepo, targetDoc: targetDoc, operated: operated}, nil
+	return commitPreparation{reg: reg, targetRepo: targetRepo, targetDoc: targetDoc, operated: operated, stampPolicyRef: stampPolicyRef}, nil
 }
 
 // finishBoundCommit is round 5's mutating/authoritative phase for the
@@ -920,6 +1048,17 @@ func (s *FeedSigner) finishBoundCommit(ctx context.Context, req publish.FeedComm
 	// must be caught here.
 	if err := s.Store.EnsureFeedSignerLeaseOwned(ctx, req.OperationID, claimToken); err != nil {
 		return result, false, false, fmt.Errorf("%w: lost ownership before feed update: %v", errFeedSignerBackend, err)
+	}
+	// Round 6A / Important 1: freshly reconcile stamp-policy authority under
+	// the won claim, immediately before any external update — never trusted
+	// from prepareBoundCommit's earlier, unlocked read (see
+	// commitPreparation.stampPolicyRef and reconcileStampPolicy). This is
+	// reached ONLY when this attempt is about to perform a genuine NEW write
+	// (done==false above, and the fresh generation checks just passed), so
+	// prep.stampPolicyRef was always populated by prepareBoundCommit at this
+	// point.
+	if err := s.reconcileStampPolicy(ctx, prep.reg, prep.stampPolicyRef); err != nil {
+		return result, false, false, err
 	}
 	// The key is now decryptable and the feed is signed. THIS is the only
 	// point a network update happens. The request's BatchID — already proven
@@ -1057,27 +1196,58 @@ func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCom
 // verifyBatch resolves the registry's deterministic stamp-policy feed, decodes
 // and validates the current policy, selects the exact repo override (or the
 // default), and requires the caller-supplied BatchID to equal it exactly. The
-// caller-selected batch is never trusted.
-func (s *FeedSigner) verifyBatch(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) error {
+// caller-selected batch is never trusted. It returns the RESOLVED stamp-policy
+// feed reference (round 6A / Important 1) so a bound-protocol caller
+// (prepareBoundCommit) can bind its non-mutating preparation to the exact
+// mutable state it observed and freshly reconcile it later, under the won
+// claim, before any external update (see reconcileStampPolicy).
+func (s *FeedSigner) verifyBatch(ctx context.Context, req publish.FeedCommitRequest, reg Registry, targetRepo string) (string, error) {
 	stampFeed := spec.StampPolicyFeedRef(reg.FeedOwnerAddress)
 	ref, err := s.ResolveFeeds.ResolveFeed(ctx, stampFeed)
 	if err != nil {
-		return fmt.Errorf("%w: stamp policy feed: %v", errFeedSignerBackend, err)
+		return "", fmt.Errorf("%w: stamp policy feed: %v", errFeedSignerBackend, err)
 	}
 	data, err := s.Docs.Read(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("%w: stamp policy document: %v", errFeedSignerBackend, err)
+		return "", fmt.Errorf("%w: stamp policy document: %v", errFeedSignerBackend, err)
 	}
 	doc, err := spec.DecodeStampPolicyDocument(data)
 	if err != nil {
-		return fmt.Errorf("%w: stamp policy document: %v", errFeedSignerBackend, err)
+		return "", fmt.Errorf("%w: stamp policy document: %v", errFeedSignerBackend, err)
 	}
 	selected := doc.DefaultPolicy
 	if repoPolicy, ok := doc.Repos[targetRepo]; ok {
 		selected = repoPolicy
 	}
 	if req.BatchID != selected.BatchID {
-		return fmt.Errorf("%w: batch is not permitted by the current stamp policy", errFeedSignerMalformed)
+		return "", fmt.Errorf("%w: batch is not permitted by the current stamp policy", errFeedSignerMalformed)
+	}
+	return ref, nil
+}
+
+// reconcileStampPolicy is round 6A's fresh, authoritative stamp-policy
+// reconciliation (Important 1), run by finishBoundCommit under the won
+// durable claim, immediately before any external update. It re-resolves the
+// SAME stamp-policy feed prepareBoundCommit's verifyBatch resolved and
+// compares the CANONICAL current reference against observedRef (the
+// reference prepareBoundCommit observed during its earlier, unlocked read).
+// Equal references prove the policy document is UNCHANGED since preparation
+// (content-addressed: same reference implies same bytes, so re-reading and
+// re-decoding the document would be redundant) and this attempt's
+// already-proven batch selection remains authorized. A different reference
+// means the policy rotated between preparation and this instant: this
+// attempt must never trust its stale batch selection, so it fails with
+// errFeedSignerStampPolicyStale (never errFeedSignerGenerationConflict —
+// this is not a repository-generation conflict — and never
+// errFeedSignerMalformed — the request was not malformed when prepared).
+func (s *FeedSigner) reconcileStampPolicy(ctx context.Context, reg Registry, observedRef string) error {
+	stampFeed := spec.StampPolicyFeedRef(reg.FeedOwnerAddress)
+	ref, err := s.ResolveFeeds.ResolveFeed(ctx, stampFeed)
+	if err != nil {
+		return fmt.Errorf("%w: stamp policy feed: %v", errFeedSignerBackend, err)
+	}
+	if swarm.CanonicalObjectRef(ref) != swarm.CanonicalObjectRef(observedRef) {
+		return errFeedSignerStampPolicyStale
 	}
 	return nil
 }
