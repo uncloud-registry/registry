@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -1626,11 +1627,17 @@ func TestMigration13AcceptsValidV12OperationIDRowsUpgrade(t *testing.T) {
 		t.Fatalf("seed succeeded %q: %v", sucOp, err)
 	}
 
-	if err := ApplyMigrations(ctx, db); err != nil {
-		t.Fatalf("valid v12 rows must upgrade to 13: %v", err)
+	// Migration 13 (and the untouched 14/15) apply normally over these valid
+	// v12 rows, but migration 16 (round 4 / Finding 1) then fails closed
+	// atomically: sucOp is a genuine pre-v16 'succeeded' row with no
+	// publication_states equivalent, exactly the unsafe history migration 16
+	// cannot reconstruct — so the full chain must refuse there, leaving
+	// version 15 current and migration 13's identity triggers fully applied.
+	if err := ApplyMigrations(ctx, db); err == nil || !errors.Is(err, errPublicationStateHistoryUnsafe) {
+		t.Fatalf("migration 16 must refuse pre-v16 succeeded history seeded for the migration-13 upgrade proof, got %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 16 {
-		t.Fatalf("expected version 16, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 15 {
+		t.Fatalf("expected version 15 (migration 16 refused), got %d (err %v)", v, err)
 	}
 	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
 		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {
@@ -2047,11 +2054,18 @@ func TestMigration14AcceptsValidV13OperationIDRowsUpgrade(t *testing.T) {
 		t.Fatalf("seed succeeded %q: %v", sucOp, err)
 	}
 
-	if err := ApplyMigrations(ctx, db); err != nil {
-		t.Fatalf("valid v13 rows must upgrade to 14: %v", err)
+	// Migration 14 (and the untouched 15) apply normally over these valid v13
+	// rows, but migration 16 (round 4 / Finding 1) then fails closed
+	// atomically: sucOp is a genuine pre-v16 'succeeded' row with no
+	// publication_states equivalent, exactly the unsafe history migration 16
+	// cannot reconstruct — so the full chain must refuse there, leaving
+	// version 15 current and migration 14's byte-exact identity triggers
+	// fully applied.
+	if err := ApplyMigrations(ctx, db); err == nil || !errors.Is(err, errPublicationStateHistoryUnsafe) {
+		t.Fatalf("migration 16 must refuse pre-v16 succeeded history seeded for the migration-14 upgrade proof, got %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 16 {
-		t.Fatalf("expected version 16, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 15 {
+		t.Fatalf("expected version 15 (migration 16 refused), got %d (err %v)", v, err)
 	}
 	if sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_ins") != 1 ||
 		sqliteObjectCount(t, db, "trigger", "feed_signer_operation_id_upd") != 1 {

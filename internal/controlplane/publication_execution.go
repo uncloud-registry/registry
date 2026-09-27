@@ -77,6 +77,54 @@ const publicationStateTableSQL = `CREATE TABLE publication_states (
 // creates any object.
 var errPublicationStatePredecessorMalformed = errors.New("controlplane: migration 16 prerequisite failed: publication binding schema is not the genuine version-15 schema")
 
+// errPublicationStateHistoryUnsafe is migration 16's fail-closed refusal for
+// pre-v16 publication history that safe state reconstruction cannot cover
+// (round 4 / Finding 1). See validatePublicationStateHistorySafe.
+var errPublicationStateHistoryUnsafe = errors.New("controlplane: migration 16 refused: pre-v16 succeeded publication history cannot be safely reconstructed")
+
+// validatePublicationStateHistorySafe is migration 16's mandatory upgrade
+// production policy: refuse atomically whenever the pre-v16 database holds
+// ANY completed publication history that publication_states cannot account
+// for. A v15 (or earlier-lineage) database has NO record of the STABLE
+// PublicationID a completed feed_signer_operations row belonged to —
+// operation_id there is the per-ATTEMPT identity (a one-way domain-separated
+// hash of registry/owner/repo/tag/digest/generation, or of PublicationID plus
+// the attempt's own generation/reference), never the stable id itself, and
+// publication_bindings (migration 15) carries only a bound HASH with no
+// success/failure state, so neither table can be inverted back to "which
+// PublicationID, if any, already reached a terminal success". Backfilling
+// publication_states from either table would therefore have to GUESS, and a
+// wrong guess is exactly the round-3 gap this migration exists to close: a
+// stable PublicationID whose pre-v16 success is left unrecorded can be
+// "retried" after an unrelated later publication overwrites the same tag,
+// re-authenticating cleanly against the CURRENT generation and advancing the
+// feed a second time.
+//
+// A pre-v16 feed_signer_operations row in ANY other state (pending,
+// processing) never advanced the feed — its logical publication, if it has
+// one at all, never became terminal, so a future attempt for it correctly
+// takes the ordinary "absent -> first-ever reservation" path in
+// publication_states with nothing to protect. Likewise, a publication_bindings
+// row alone (bound, but never completed) proves nothing about a completed
+// feed write. Only a SUCCEEDED feed_signer_operations row is unsafe: it is
+// the sole durable proof that a real external feed advancement happened under
+// a protocol that had no terminal-success ledger, so its mere existence,
+// regardless of which registry or topic it names, refuses the migration
+// atomically before any DDL or version write. Fresh databases and databases
+// whose feed_signer_operations table has never recorded a completed
+// publication upgrade exactly as before.
+func validatePublicationStateHistorySafe(ctx context.Context, tx *sql.Tx) error {
+	var succeeded int
+	if err := tx.QueryRowContext(ctx,
+		`select count(*) from feed_signer_operations where state = 'succeeded'`).Scan(&succeeded); err != nil {
+		return errors.New("migration 16: validate pre-v16 publication history")
+	}
+	if succeeded != 0 {
+		return errPublicationStateHistoryUnsafe
+	}
+	return nil
+}
+
 // byteExactIdentityGrammarCond returns the migration-14 byte-exact
 // operation-ID grammar predicate (see feedSignerOperationIDGrammarCondV14),
 // generalized to an arbitrary NEW column so it can be applied to BOTH
@@ -129,6 +177,9 @@ func publicationStateIdentityTriggerSQL() []string {
 // atomically (version stays 15, no schema object installed).
 func installPublicationStateStore(ctx context.Context, tx *sql.Tx) error {
 	if err := validatePublicationStatePredecessor(ctx, tx); err != nil {
+		return err
+	}
+	if err := validatePublicationStateHistorySafe(ctx, tx); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, publicationStateTableSQL); err != nil {

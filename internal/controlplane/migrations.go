@@ -403,6 +403,19 @@ var migrations = []migration{
 	// are database-global). Any statement failure aborts the migration
 	// transaction atomically: version stays 15 and no schema object is
 	// installed.
+	//
+	// Round 4 / Finding 1: an empty publication_states table is only a SAFE
+	// starting point when the pre-v16 database has no history an empty table
+	// could fail to protect. validatePublicationStateHistorySafe (called
+	// before any DDL, alongside the predecessor-schema check) refuses the
+	// migration atomically whenever ANY feed_signer_operations row is already
+	// 'succeeded': under v15 that table's operation_id is the per-ATTEMPT
+	// identity, never the stable PublicationID, and publication_bindings
+	// carries no success/failure state either, so there is no way to
+	// recover which (if any) PublicationID such a row belongs to and
+	// backfill it as terminal. Serving v16 over such a database unprotected
+	// would leave a real pre-v16 success invisible to the new gate, exactly
+	// the round-3 gap this table exists to close.
 	{
 		Version: 16,
 		Apply:   installPublicationStateStore,

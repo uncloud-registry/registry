@@ -136,19 +136,23 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
 	}
 
-	// The durable logical-publication EXECUTION gate (round 3 / Finding 1):
-	// ONLY for the current (PublicationID-bearing) protocol — a request with
-	// PublicationID empty (unreachable from any wire path; see above) never
-	// touches publication_states, since its OperationID already IS its own
-	// generation-bound stable identity and cannot be replayed against a LATER
-	// generation the way a stable PublicationID otherwise could (see
-	// authorizePublicationExecution). This runs BEFORE any legacy adoption,
-	// durable attempt reservation, or claim,
-	// so a permanently-conflicted or currently-owned-by-another-attempt
-	// publication is rejected with ZERO durable feed_signer_operations rows
-	// and ZERO document reads.
+	// The durable logical-publication EXECUTION gate's cheap, READ-ONLY
+	// fast path (round 3 / Finding 1, narrowed by round 4 / Finding 2): ONLY
+	// for the current (PublicationID-bearing) protocol. This can reject a
+	// request that is ALREADY known-doomed from whatever publication_states
+	// row exists TODAY — a permanent conflict against a terminal success
+	// under a different attempt, or a live different active attempt — with
+	// ZERO durable feed_signer_operations row ever created and ZERO document
+	// reads for the rejected attempt. It NEVER reserves an absent row and
+	// NEVER performs the replacement CAS: those mutations happen ONLY in
+	// authorizePublicationExecution, called from signCommit strictly AFTER
+	// this exact attempt's payload has been authenticated (see round 4 /
+	// Finding 2 below). A request with PublicationID empty (unreachable from
+	// any wire path; see above) never touches publication_states at all,
+	// since its OperationID already IS its own generation-bound stable
+	// identity.
 	if req.PublicationID != "" {
-		if err := s.authorizePublicationExecution(ctx, req); err != nil {
+		if err := s.precheckPublicationExecution(ctx, req); err != nil {
 			return publish.FeedCommitResult{}, err
 		}
 	}
@@ -276,11 +280,69 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 // defensive backstop against an unforeseen bug looping forever.
 const publicationExecutionMaxCASAttempts = 1000
 
+// precheckPublicationExecution is the cheap, READ-ONLY companion to
+// authorizePublicationExecution (round 4 / Finding 2). It fetches today's
+// publication_states row for req.PublicationID and rejects the request when
+// that EXISTING row already, unambiguously forbids it — a terminal success
+// under a different attempt (permanent conflict) or a live different active
+// attempt (retryable) — but it NEVER creates, reserves, or CASes anything:
+// an absent row or a replaceable row both return nil ("proceed"), deferring
+// the actual authorization decision — including any reservation or
+// replacement — to authorizePublicationExecution, which runs only after this
+// exact attempt's payload has been authenticated. This is what closes round 4
+// / Finding 2: an unauthenticated attempt can never seize an absent or
+// replaceable execution slot merely by presenting a self-consistently
+// derived attempt id for an arbitrary (possibly forged) payload, because the
+// only two states this function would need to MUTATE to admit such an
+// attempt are exactly the two states it leaves untouched. It still preserves
+// the round-3 guarantee that a request already known-doomed by EXISTING
+// durable state is rejected before wasting a durable feed_signer_operations
+// row or any proof-of-work.
+func (s *FeedSigner) precheckPublicationExecution(ctx context.Context, req publish.FeedCommitRequest) error {
+	exec, err := s.Store.GetPublicationExecution(ctx, req.PublicationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: publication execution: %v", errFeedSignerBackend, err)
+	}
+	if exec.RegistryID != req.RegistryID {
+		return fmt.Errorf("%w: publication identity is bound to another registry", errFeedSignerConflict)
+	}
+	switch exec.State {
+	case PublicationExecutionSucceeded:
+		if exec.AttemptID == req.OperationID {
+			return nil
+		}
+		return errFeedSignerConflict
+	case PublicationExecutionActive:
+		if exec.AttemptID == req.OperationID {
+			return nil
+		}
+		return fmt.Errorf("%w: another attempt owns this publication", errFeedSignerBackend)
+	case PublicationExecutionReplaceable:
+		// Deferred: only authorizePublicationExecution may CAS a replaceable
+		// row, and only after authentication.
+		return nil
+	default:
+		return fmt.Errorf("%w: publication execution: unrecognized state", errFeedSignerBackend)
+	}
+}
+
 // authorizePublicationExecution is the durable logical-publication EXECUTION
-// gate (round 3 / Finding 1). It runs BEFORE any legacy adoption, durable
-// attempt reservation, or claim, and decides — atomically, never on a stale
-// read — whether req.OperationID (THIS attempt) may proceed for
-// req.PublicationID (the STABLE logical publication):
+// gate's AUTHORITATIVE, mutating half (round 3 / Finding 1; relocated by
+// round 4 / Finding 2). It is called from signCommit strictly AFTER
+// authenticatePublicationProvenance has verified this exact attempt's target
+// document and operation-identity binding, and strictly BEFORE any external
+// feed update — never earlier: reserving an absent row, or CASing a
+// replaceable one, for an attempt whose payload has not yet been proven
+// legitimate is exactly how round 4 / Finding 2's poisoning happened (an
+// internal-credential caller could seize the publication's execution slot
+// with a wrong payload's self-consistently-derived attempt id, and every
+// non-generation-conflict failure class left that seizure permanent). It
+// decides — atomically, never on a stale read — whether req.OperationID
+// (THIS authenticated attempt) may proceed for req.PublicationID (the STABLE
+// logical publication):
 //
 //   - no row yet: this is the FIRST-EVER attempt. ReservePublicationExecution
 //     atomically wins (or, if a concurrent distinct attempt already reserved
@@ -509,6 +571,22 @@ func (s *FeedSigner) storedResult(op FeedSignerOperation, req publish.FeedCommit
 // result without a second advancement. uncertain=true reports that the failure
 // occurred DURING the network feed update (the update may have partially/fully
 // applied), so the caller keeps the lease.
+//
+// The validation order is deliberate (round 4 / Finding 2): for the current
+// (PublicationID-bearing) protocol, the exact PublicationID binding and
+// immutable payload provenance are authenticated against the target document
+// ALONE — before any live current-feed read and before the publication's
+// execution row is ever reserved or CASed — so that NEITHER of the two
+// authoritative generation-conflict checks below (target generation, then
+// live current-feed generation) can ever mutate publication_states for an
+// attempt whose payload has not already been authenticated. Only once
+// authentication and reservation have both succeeded do the generation
+// checks run; either may still, entirely legitimately, report an
+// authoritative conflict against the now-authenticated row, which
+// runSignedCommit then marks replaceable. For the legacy PublicationID-empty
+// protocol (unreachable from any wire path), publication_states is never
+// touched at all, so authentication instead keeps its original historical
+// position after both generation checks.
 func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitRequest, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
 	reg, err := s.Store.FindRegistryByID(ctx, req.RegistryID)
 	if err != nil {
@@ -526,35 +604,95 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 		return publish.FeedCommitResult{}, false, false, errFeedSignerRegistryNotFound
 	}
 
-	// Topic proof + canonical target document + generation (definite pre-update).
-	targetRepo, targetDoc, err := s.verifyTopicFromReference(ctx, req, reg)
+	// Read the immutable target document and prove the topic derivation
+	// (definite pre-update, generation-independent).
+	targetRepo, targetDoc, err := s.readTargetDocument(ctx, req, reg)
 	if err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Current feed + repo identity + generation (definite pre-update).
-	// create=true means the repo feed is CONCLUSIVELY absent and this is a
-	// generation-zero creation: the updater receives the explicit creation
-	// intent (Task 13), so a racing creator that wins the CONCURRENT create
-	// surfaces as ErrFeedAlreadyExists instead of an overwrite or a success.
+	// Round 4 / Finding 2: authenticate the exact PublicationID binding and
+	// the immutable payload provenance recorded in the target document ALONE
+	// — entirely independent of live current-feed state. authenticate is
+	// called EXACTLY once below, at a position that depends on the protocol:
+	//
+	//   - PublicationID != "" (the current protocol): authentication runs
+	//     HERE, strictly BEFORE authorizePublicationExecution ever reserves
+	//     or CASes a publication_states row for this attempt. A forged,
+	//     absent, or mismatched provenance entry, or an operation identity
+	//     bound to a DIFFERENT tag/digest, therefore creates ZERO
+	//     publication_states mutations — even when it is deliberately shaped
+	//     to also trip one of the generation checks below. This is what
+	//     closes the round 4 / Finding 2 gap.
+	//   - PublicationID == "" (the legacy protocol, unreachable from any wire
+	//     path): publication_states is NEVER touched for such a request (the
+	//     reservation call below is itself gated on PublicationID != ""), so
+	//     there is no mutation-ordering hazard to close; authentication runs
+	//     at its ORIGINAL historical position, after both generation checks,
+	//     exactly as before this fix.
+	var operated string
+	authenticate := func() error {
+		var aerr error
+		operated, aerr = s.authenticatePublicationBinding(ctx, req, targetRepo, targetDoc)
+		return aerr
+	}
+
+	if req.PublicationID != "" {
+		if err := authenticate(); err != nil {
+			return publish.FeedCommitResult{}, false, false, err
+		}
+		// The durable logical-publication EXECUTION gate's AUTHORITATIVE,
+		// mutating half (round 3 / Finding 1; reordered by round 4 / Finding
+		// 2): runs strictly AFTER the authentication above and strictly
+		// BEFORE either generation check, so an authoritative generation
+		// conflict discovered by either check below always finds an
+		// ALREADY-AUTHENTICATED row to flip to replaceable — never a row
+		// reserved for an unauthenticated attempt.
+		if err := s.authorizePublicationExecution(ctx, req); err != nil {
+			return publish.FeedCommitResult{}, false, false, err
+		}
+	}
+
+	// Target generation must be exactly ExpectedGeneration+1 (definite
+	// pre-update): the first of the two authoritative generation-conflict
+	// classes.
+	if err := verifyTargetGeneration(req, targetDoc); err != nil {
+		return publish.FeedCommitResult{}, false, false, err
+	}
+
+	// Current feed + repo identity + generation (definite pre-update): the
+	// second authoritative generation-conflict class. create=true means the
+	// repo feed is CONCLUSIVELY absent and this is a generation-zero
+	// creation: the updater receives the explicit creation intent (Task 13),
+	// so a racing creator that wins the CONCURRENT create surfaces as
+	// ErrFeedAlreadyExists instead of an overwrite or a success.
 	done, create, curDoc, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
 	if err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Stamp policy / batch proof (definite pre-update).
-	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
+	if req.PublicationID == "" {
+		if err := authenticate(); err != nil {
+			return publish.FeedCommitResult{}, false, false, err
+		}
+	}
+
+	// Current-tag-consistency (definite pre-update): the transition from the
+	// resolved current document to the target must be exactly the
+	// authenticated operation's own tag, with no unrelated tag mapping,
+	// provenance entry, manifest descriptor, or blob record mutated
+	// alongside it.
+	if err := s.authenticateCurrentTagConsistency(ctx, targetDoc, curDoc, done, operated); err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Operation provenance authentication (definite pre-update): the request
-	// is authenticated against the EXACT tag-publication transition the
-	// immutable documents record — NOT against feed-reference readback, which
-	// can only prove bytes, never op provenance — and the operation identity
-	// is proven generated or durably bound. A forged, stale, zero, multiple,
-	// or unbound provenance fails closed HERE, before any external feed
-	// update, so the retry handler can never trust an attacker-overlaid entry.
-	if err := s.authenticatePublicationProvenance(ctx, req, targetRepo, targetDoc, curDoc, done); err != nil {
+	// Stamp policy / batch proof (definite pre-update). Runs AFTER
+	// authorization and both generation checks: an otherwise-authentic
+	// attempt with an impermissible batch id must still durably own its
+	// publication's execution slot (a non-generation failure never
+	// authorizes a replacement — see authorizePublicationExecution), never
+	// leave zero trace of it.
+	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
@@ -595,14 +733,20 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 	return result, false, false, nil
 }
 
-// verifyTopicFromReference decodes and validates the immutable target document
-// and proves the requested Topic is the FULL deterministic repo-state feed ref
-// of the document's own canonical Repo under the registry's normalized owner. It
+// readTargetDocument decodes and validates the immutable target document and
+// proves the requested Topic is the FULL deterministic repo-state feed ref of
+// the document's own canonical Repo under the registry's normalized owner. It
 // returns the canonical repo name AND the decoded target document (the exact
 // immutable bytes this operation would publish). An arbitrary,
 // non-deterministic, auth-policy, or stamp-policy topic is rejected BEFORE the
 // key is touched or any feed is written.
-func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.FeedCommitRequest, reg Registry) (string, spec.RepoStateDocument, error) {
+//
+// Target-generation coherence is deliberately NOT checked here (round 4 /
+// Finding 2 — see verifyTargetGeneration): reading and topic-checking the
+// document is itself generation-independent, but a Generation mismatch is
+// exactly the authoritative generation-conflict class that must never mutate
+// publication_states before this attempt's payload has been authenticated.
+func (s *FeedSigner) readTargetDocument(ctx context.Context, req publish.FeedCommitRequest, reg Registry) (string, spec.RepoStateDocument, error) {
 	data, err := s.Docs.Read(ctx, req.Reference)
 	if err != nil {
 		return "", spec.RepoStateDocument{}, fmt.Errorf("%w: target reference: %v", errFeedSignerBackend, err)
@@ -615,14 +759,25 @@ func (s *FeedSigner) verifyTopicFromReference(ctx context.Context, req publish.F
 	if derived != req.Topic {
 		return "", spec.RepoStateDocument{}, fmt.Errorf("%w: topic is not the deterministic reference for the repository in the target document", errFeedSignerMalformed)
 	}
-	// Target generation must be exactly ExpectedGeneration+1, overflow-safe.
+	return doc.Repo, doc, nil
+}
+
+// verifyTargetGeneration proves the target document's own Generation is
+// exactly ExpectedGeneration+1 (overflow-safe) — the first of the two
+// authoritative generation-conflict classes (round 4 / Finding 2). It runs
+// strictly AFTER authenticatePublicationBinding and authorizePublicationExecution
+// in signCommit, so a mismatch here — however trivially an internal caller can
+// construct one by choosing an arbitrary target document — can never mutate
+// publication_states for an attempt whose payload has not already been
+// authenticated.
+func verifyTargetGeneration(req publish.FeedCommitRequest, doc spec.RepoStateDocument) error {
 	if req.ExpectedGeneration == math.MaxInt64 {
-		return "", spec.RepoStateDocument{}, errFeedSignerGenerationConflict
+		return errFeedSignerGenerationConflict
 	}
 	if doc.Generation != req.ExpectedGeneration+1 {
-		return "", spec.RepoStateDocument{}, errFeedSignerGenerationConflict
+		return errFeedSignerGenerationConflict
 	}
-	return doc.Repo, doc, nil
+	return nil
 }
 
 // resolveCurrentFeed re-reads the current repo feed via the resolver and the
@@ -713,69 +868,100 @@ func (s *FeedSigner) verifyBatch(ctx context.Context, req publish.FeedCommitRequ
 	return nil
 }
 
-// authenticatePublicationProvenance is the signer's AUTHORITATIVE
-// authentication of the operated tag publication. It compares the current and
-// next immutable repo-state documents to identify EXACTLY ONE
-// tag-publication transition for this operation — across the SYMMETRIC union
-// of both documents' Tag and TagPublications keys (so an unrelated tag
-// mapping or provenance entry deleted from the current state, or added to the
-// target, is as much a change as an edited value) and across the Manifests
-// and Blobs maps (existing entries preserved exactly; the operated manifest
-// descriptor added/updated only at the operated digest; new blob records
-// permitted) — and requires that transition's
-// provenance entry to record the request's operation ID at the NEXT
-// generation with the resulting tag digest — rejecting zero-mutation,
-// multi-mutation, forged, stale, or copied entries as malformed BEFORE any
-// external feed update. On the already-advanced recovery path (done=true,
-// current == target) the single provenance entry recording this exact
-// operation at the document's own generation is identified instead; a legacy
-// document with no provenance record fails closed. It then binds the
-// semantic request identity (authenticateOperationIdentity): in no case can an
-// arbitrary internal request pair a forged document ID with a chosen request
-// ID. All errors are data-free sentinel-wrapped failures.
-func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req publish.FeedCommitRequest, targetRepo string, targetDoc spec.RepoStateDocument, curDoc *spec.RepoStateDocument, done bool) error {
+// authenticatePublicationBinding is the PRE-GENERATION, PRE-MUTATION half of
+// the signer's operation-provenance authentication (round 4 / Finding 2). It
+// identifies the operated tag and authenticates the request's STABLE
+// publication identity using ONLY the immutable target document and the
+// request's own fields — never the live current feed, never a
+// publication_states row. The operated tag is the SINGLE entry in the target
+// document's TagPublications that records EXACTLY this operation's STABLE
+// publication identity (publicationIdentity(req)) at the document's own
+// generation, mapping to its recorded digest — the provenance entry NEVER
+// carries the per-attempt FeedSigner identity (req.OperationID), only the
+// stable publication identity that survives a conflict rebuild. A duplicate,
+// zero, or multi-match attribution fails closed as malformed. It then binds
+// the semantic request identity (authenticateOperationIdentity): in no case
+// can an arbitrary internal request pair a forged document ID with a chosen
+// request ID.
+//
+// This runs strictly BEFORE authorizePublicationExecution ever reserves or
+// CASes a publication_states row for this attempt: a payload that fails here
+// — a forged, absent, or mismatched provenance entry, or an operation
+// identity bound to a DIFFERENT tag/digest — creates ZERO publication_states
+// mutations, regardless of what generation-conflict class the later
+// (generation-dependent) checks would otherwise have produced. This closes
+// the round 4 / Finding 2 gap: an internal-credential caller can no longer
+// seize an absent or replaceable execution slot for a PublicationID by
+// presenting a self-consistently-derived attempt id over an arbitrary
+// (possibly forged) payload, because reaching a generation-conflict class
+// error can never again bypass this authentication.
+//
+// It returns the identified operated tag; the LATER current-tag-consistency
+// phase (authenticateCurrentTagConsistency) independently proves that tag is
+// also the ONLY tag the transition from the live current document touches,
+// and that the manifest/blob state carries no unrelated mutation alongside
+// it. All errors are data-free sentinel-wrapped failures.
+func (s *FeedSigner) authenticatePublicationBinding(ctx context.Context, req publish.FeedCommitRequest, targetRepo string, targetDoc spec.RepoStateDocument) (string, error) {
 	if hasDuplicateOperationAttribution(targetDoc.TagPublications) {
 		// One operation identity recorded by TWO tags is never produced by a
-		// legitimate publication sequence and defeats every single-entry
-		// identification below.
-		return fmt.Errorf("%w: duplicate operation attribution in target document", errFeedSignerMalformed)
+		// legitimate publication sequence and defeats single-entry
+		// identification.
+		return "", fmt.Errorf("%w: duplicate operation attribution in target document", errFeedSignerMalformed)
 	}
 
 	pubID := publicationIdentity(req)
+	var operated string
+	for tag, entry := range targetDoc.TagPublications {
+		if entry.OperationID != pubID {
+			continue
+		}
+		if entry.Generation != targetDoc.Generation {
+			continue
+		}
+		if targetDoc.Tags[tag] != entry.Digest {
+			continue
+		}
+		if operated != "" {
+			return "", fmt.Errorf("%w: multiple provenance entries record this operation", errFeedSignerMalformed)
+		}
+		operated = tag
+	}
+	if operated == "" {
+		return "", fmt.Errorf("%w: no provenance entry records this operation at the target generation", errFeedSignerMalformed)
+	}
+	if err := s.authenticateOperationIdentity(ctx, req, targetRepo, operated, targetDoc.TagPublications[operated].Digest); err != nil {
+		return "", err
+	}
+	return operated, nil
+}
 
+// authenticateCurrentTagConsistency is the CURRENT-FEED-DEPENDENT half of the
+// signer's operation-provenance authentication (round 4 / Finding 2), run
+// AFTER authenticatePublicationBinding has already authenticated this
+// attempt's PublicationID binding and AFTER the publication's execution row
+// has been reserved/CASed for it. Using the resolved current document, it
+// proves the transition cur → target touches EXACTLY the tag
+// authenticatePublicationBinding already identified — never an unrelated tag
+// mapping, provenance entry, manifest descriptor, or blob record hidden
+// alongside it.
+//
+// The comparison is the SYMMETRIC union of both documents' Tag and
+// TagPublications keys (so an unrelated tag mapping or provenance entry
+// deleted from the current state, or added to the target, is as much a
+// change as an edited value) and across the Manifests and Blobs maps
+// (existing entries preserved exactly; the operated manifest descriptor
+// added/updated only at the operated digest; new blob records permitted). A
+// changed-tag count other than one, or a changed tag that disagrees with the
+// already-authenticated operated tag, fails closed as malformed.
+//
+// On the already-advanced recovery path (done=true, current == target) no
+// cur-diff is needed — current==target trivially satisfies it, and
+// authenticatePublicationBinding already fully authenticated the operated
+// tag against the target document alone — so only the independent
+// artifact/blob byte-level proof runs.
+func (s *FeedSigner) authenticateCurrentTagConsistency(ctx context.Context, targetDoc spec.RepoStateDocument, curDoc *spec.RepoStateDocument, done bool, operated string) error {
 	if done {
-		// current == target: identify the operated tag as the SINGLE
-		// provenance entry recording EXACTLY this operation's STABLE
-		// publication identity at the document's own generation and mapping
-		// to its recorded digest. The provenance entry NEVER carries the
-		// per-attempt FeedSigner identity (req.OperationID) — only the stable
-		// publication identity that survives a conflict rebuild.
-		var operated string
-		for tag, entry := range targetDoc.TagPublications {
-			if entry.OperationID != pubID {
-				continue
-			}
-			if entry.Generation != targetDoc.Generation {
-				continue
-			}
-			if targetDoc.Tags[tag] != entry.Digest {
-				continue
-			}
-			if operated != "" {
-				return fmt.Errorf("%w: multiple provenance entries record this operation", errFeedSignerMalformed)
-			}
-			operated = tag
-		}
-		if operated == "" {
-			return fmt.Errorf("%w: no provenance entry records this operation at the target generation", errFeedSignerMalformed)
-		}
-		// The already-advanced document is ALSO subject to the independent
-		// artifact proof (current == target here: no blob additions are possible,
-		// so the reference/coherence side applies).
-		if err := s.validateArtifactBlobTransition(ctx, targetDoc.Blobs, targetDoc.Blobs, targetDoc, operated); err != nil {
-			return err
-		}
-		return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, targetDoc.TagPublications[operated].Digest)
+		return s.validateArtifactBlobTransition(ctx, targetDoc.Blobs, targetDoc.Blobs, targetDoc, operated)
 	}
 
 	var cur spec.RepoStateDocument
@@ -783,36 +969,19 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 		cur = *curDoc
 	}
 	// The transition cur → target must touch EXACTLY ONE tag — in its mapping,
-	// its provenance entry, or both. The comparison is the SYMMETRIC union of
-	// BOTH documents' keys (presence-sensitive: a tag present on only one side
-	// is a change even when the other side would render the zero value), so a
-	// target that deletes an unrelated CURRENT tag mapping, deletes an
-	// unrelated CURRENT provenance entry, or adds a wholly new tag while
-	// operating another can never hide alongside the operated transition: a
-	// current-only delete or a target-only add is exactly as much a change as
-	// an edited value, and any count other than one fails closed. Two tags
-	// changing means two publications packed into one document; none changing
-	// means this operation has no record at all. Either is malformed.
+	// its provenance entry, or both. Two tags changing means two publications
+	// packed into one document; none changing means this operation has no
+	// record at all. Either is malformed.
 	changing := changedTransitionTags(cur, targetDoc)
 	if len(changing) != 1 {
 		return fmt.Errorf("%w: target document mutates %d tags, expected exactly one", errFeedSignerMalformed, len(changing))
 	}
-	var operated string
+	var changedTag string
 	for tag := range changing {
-		operated = tag
+		changedTag = tag
 	}
-	entry, ok := targetDoc.TagPublications[operated]
-	if !ok {
-		return fmt.Errorf("%w: operated tag has no provenance record", errFeedSignerMalformed)
-	}
-	if entry.OperationID != pubID {
-		return fmt.Errorf("%w: provenance operation does not match the request's stable publication identity", errFeedSignerMalformed)
-	}
-	if entry.Generation != targetDoc.Generation {
-		return fmt.Errorf("%w: provenance generation does not match the target generation", errFeedSignerMalformed)
-	}
-	if entry.Digest != targetDoc.Tags[operated] {
-		return fmt.Errorf("%w: provenance digest does not match the operated tag mapping", errFeedSignerMalformed)
+	if changedTag != operated {
+		return fmt.Errorf("%w: the changed tag does not match the authenticated operation's tag", errFeedSignerMalformed)
 	}
 	// The SAME root class extends to the other state maps: the transition must
 	// be exactly the operation's own, with NO unrelated semantic change
@@ -825,10 +994,7 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 	if err := validateManifestTransition(cur.Manifests, targetDoc.Manifests, targetDoc.Tags[operated]); err != nil {
 		return err
 	}
-	if err := s.validateArtifactBlobTransition(ctx, cur.Blobs, targetDoc.Blobs, targetDoc, operated); err != nil {
-		return err
-	}
-	return s.authenticateOperationIdentity(ctx, req, targetRepo, operated, entry.Digest)
+	return s.validateArtifactBlobTransition(ctx, cur.Blobs, targetDoc.Blobs, targetDoc, operated)
 }
 
 // changedTransitionTags computes the set of tag names whose TAG MAPPING or

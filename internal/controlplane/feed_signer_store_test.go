@@ -255,12 +255,18 @@ func TestMigration11HardensOldV10ActiveRows(t *testing.T) {
 	}
 
 	// Apply migrations: 11 (harden old-v10) and 12 (correct canonical triggers)
-	// both run (already at 10). Both must succeed for a valid row.
-	if err := ApplyMigrations(ctx, db); err != nil {
-		t.Fatalf("migration 11 hardening old-v10 must succeed for valid rows: %v", err)
+	// both run (already at 10) and must succeed for a valid row. Migration 16
+	// (round 4 / Finding 1) then fails closed atomically: this seeded row is a
+	// genuine pre-v16 'succeeded' feed_signer_operations row with no
+	// publication_states equivalent, exactly the unsafe history that
+	// migration cannot reconstruct — so the full chain must refuse there,
+	// leaving version 15 current and the migration-11/12 hardening (below)
+	// fully applied and preserved.
+	if err := ApplyMigrations(ctx, db); err == nil || !errors.Is(err, errPublicationStateHistoryUnsafe) {
+		t.Fatalf("migration 16 must refuse pre-v16 succeeded history seeded for the migration-11/12 hardening proof, got %v", err)
 	}
-	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 16 {
-		t.Fatalf("expected version 16, got %d (err %v)", v, err)
+	if v, err := CurrentSchemaVersion(ctx, db); err != nil || v != 15 {
+		t.Fatalf("expected version 15 (migration 16 refused), got %d (err %v)", v, err)
 	}
 	// Quarantine table re-created, triggers installed, valid row preserved.
 	if sqliteObjectCount(t, db, "table", "feed_signer_operations_legacy") != 1 {

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/uncloud-registry/registry/internal/publish"
 )
 
 // Round 3: the durable logical-publication execution state machine
@@ -755,5 +757,194 @@ func TestGetPublicationExecutionNoRows(t *testing.T) {
 	store := newFileBackedProvisioningStore(t)
 	if _, err := store.GetPublicationExecution(context.Background(), "pub-exec-never"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows, got %v", err)
+	}
+}
+
+// Round 4 / Finding 1: migration 16 must not silently create an empty
+// publication_states table over a v15 database that already carries
+// unprotectable completed-publication history. These tests build the exact
+// predecessor via the SAME migration helpers used everywhere else
+// (applyMigrationsThrough executes real migrations 1-15; nothing here is a
+// hand-authored lookalike row), then drive a REAL feed_signer_operations row
+// through the SAME store methods the pre-round-3 signer used
+// (ReserveFeedSignerOperation / ClaimFeedSignerOperation /
+// CompleteFeedSignerOperation), so the "succeeded" row is a genuine
+// persisted equivalent of a pre-v16 completed publication, not an imagined
+// one.
+
+// TestMigration16RefusesPreV16SucceededPublicationHistory is the round-4 /
+// Finding 1 acceptance proof. Neither feed_signer_operations (keyed by the
+// per-ATTEMPT identity, a one-way hash) nor publication_bindings (which
+// carries a bound hash but no success/failure state) can be inverted back to
+// "which stable PublicationID, if any, already reached a terminal success" —
+// so an empty publication_states table would silently leave a real pre-v16
+// success unprotected: exactly the round-3 gap where a retried P
+// (recomputing a fresh per-attempt identity against a generation an
+// unrelated later Q advanced) authenticates cleanly and advances the feed a
+// second time. Migration 16 must instead refuse atomically: version stays
+// 15, publication_states is never created, and the pre-existing succeeded
+// row is byte-for-byte untouched.
+func TestMigration16RefusesPreV16SucceededPublicationHistory(t *testing.T) {
+	ctx := context.Background()
+	db := openRawFileTestDB(t)
+	if err := applyMigrationsThrough(ctx, db, 15); err != nil {
+		t.Fatalf("apply exact predecessor: %v", err)
+	}
+	store := &Store{DB: db}
+	reg, topic := seedFeedSignerRegistry(t, store)
+
+	// P: a real publish attempt driven to a genuine 'succeeded' row through
+	// the pre-round-3 store machinery (unaffected by migrations 15/16).
+	const opP = "op-p-pre-v16-succeeded"
+	reqP := publish.FeedCommitRequest{
+		OperationID: opP, RegistryID: reg.ID, Owner: "0x" + testFeedOwner,
+		Topic: topic, Reference: refHex('a'), BatchID: "batch-1", ExpectedGeneration: 0,
+	}
+	hashP := NormalizeFeedCommitHash(reqP)
+	if _, err := store.ReserveFeedSignerOperation(ctx, opP, reg.ID, topic, hashP); err != nil {
+		t.Fatalf("reserve P: %v", err)
+	}
+	const tokenP = "claim-token-pre-v16-000000000001"
+	won, err := store.ClaimFeedSignerOperation(ctx, opP, hashP, tokenP, time.Now().UTC().Add(time.Minute))
+	if err != nil || !won {
+		t.Fatalf("claim P: won=%v err=%v", won, err)
+	}
+	resultP := publish.FeedCommitResult{OperationID: opP, Feed: publish.CanonicalTopic(topic), Reference: publish.CanonicalReference(refHex('a'))}
+	if err := store.CompleteFeedSignerOperation(ctx, opP, hashP, tokenP, publish.CanonicalFeedCommitResultJSON(resultP)); err != nil {
+		t.Fatalf("complete P: %v", err)
+	}
+	before, err := store.GetFeedSignerOperation(ctx, opP)
+	if err != nil || before.State != FeedSignerOpSucceeded {
+		t.Fatalf("P must be a genuine succeeded row before migrating, got %+v err %v", before, err)
+	}
+
+	// Q: an unrelated later publication that would overwrite the same tag —
+	// modeled here as a second real succeeded row, proving the refusal is not
+	// an artifact of there being only one completed operation.
+	const opQ = "op-q-pre-v16-succeeded"
+	reqQ := publish.FeedCommitRequest{
+		OperationID: opQ, RegistryID: reg.ID, Owner: "0x" + testFeedOwner,
+		Topic: topic, Reference: refHex('f'), BatchID: "batch-1", ExpectedGeneration: 1,
+	}
+	hashQ := NormalizeFeedCommitHash(reqQ)
+	if _, err := store.ReserveFeedSignerOperation(ctx, opQ, reg.ID, topic, hashQ); err != nil {
+		t.Fatalf("reserve Q: %v", err)
+	}
+	const tokenQ = "claim-token-pre-v16-000000000002"
+	won, err = store.ClaimFeedSignerOperation(ctx, opQ, hashQ, tokenQ, time.Now().UTC().Add(time.Minute))
+	if err != nil || !won {
+		t.Fatalf("claim Q: won=%v err=%v", won, err)
+	}
+	resultQ := publish.FeedCommitResult{OperationID: opQ, Feed: publish.CanonicalTopic(topic), Reference: publish.CanonicalReference(refHex('f'))}
+	if err := store.CompleteFeedSignerOperation(ctx, opQ, hashQ, tokenQ, publish.CanonicalFeedCommitResultJSON(resultQ)); err != nil {
+		t.Fatalf("complete Q: %v", err)
+	}
+
+	if err := ApplyMigrations(ctx, db); err == nil || !errors.Is(err, errPublicationStateHistoryUnsafe) {
+		t.Fatalf("migration 16 must refuse pre-v16 succeeded publication history, got %v", err)
+	}
+	if v, verr := CurrentSchemaVersion(ctx, db); verr != nil || v != 15 {
+		t.Fatalf("refused migration must leave version 15 current, got %d (err %v)", v, verr)
+	}
+	if sqliteObjectCount(t, db, "table", "publication_states") != 0 {
+		t.Fatal("refused migration must not create publication_states")
+	}
+	var migRows int
+	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations`).Scan(&migRows); err != nil {
+		t.Fatal(err)
+	}
+	if migRows != 15 {
+		t.Fatalf("refused migration must not record a migration row, got %d", migRows)
+	}
+	afterP, err := store.GetFeedSignerOperation(ctx, opP)
+	if err != nil || afterP.State != FeedSignerOpSucceeded || !bytesEqual(afterP.ResultJSON, publish.CanonicalFeedCommitResultJSON(resultP)) {
+		t.Fatalf("P's pre-existing succeeded row must be byte-for-byte untouched, got %+v err %v", afterP, err)
+	}
+	afterQ, err := store.GetFeedSignerOperation(ctx, opQ)
+	if err != nil || afterQ.State != FeedSignerOpSucceeded {
+		t.Fatalf("Q's pre-existing succeeded row must be untouched, got %+v err %v", afterQ, err)
+	}
+}
+
+// TestMigration16AllowsSafePreV16History proves the fail-closed rule targets
+// EXACTLY completed (succeeded) history: a completely empty pre-v16
+// database, and a v15 database carrying ONLY non-terminal history (a durable
+// preflight binding with no completed write, and a feed_signer_operations
+// row still pending) both upgrade to 16 normally.
+func TestMigration16AllowsSafePreV16History(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty history", func(t *testing.T) {
+		db := openRawFileTestDB(t)
+		if err := applyMigrationsThrough(ctx, db, 15); err != nil {
+			t.Fatalf("apply through 15: %v", err)
+		}
+		if err := ApplyMigrations(ctx, db); err != nil {
+			t.Fatalf("empty-history upgrade must succeed: %v", err)
+		}
+		if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
+			t.Fatalf("expected version 16, got %d", v)
+		}
+	})
+
+	t.Run("merely bound and pending history", func(t *testing.T) {
+		db := openRawFileTestDB(t)
+		if err := applyMigrationsThrough(ctx, db, 15); err != nil {
+			t.Fatalf("apply through 15: %v", err)
+		}
+		store := &Store{DB: db}
+		reg, topic := seedFeedSignerRegistry(t, store)
+
+		hash := NormalizePublicationBindingHash(reg.ID, "0x"+testFeedOwner, "myrepo", "latest", "sha256:"+refHex('d'))
+		if _, err := store.ReservePublicationBinding(ctx, "op-bound-only", reg.ID, hash); err != nil {
+			t.Fatalf("seed binding: %v", err)
+		}
+
+		req := publish.FeedCommitRequest{
+			OperationID: "op-pending-only", RegistryID: reg.ID, Owner: "0x" + testFeedOwner,
+			Topic: topic, Reference: refHex('a'), BatchID: "batch-1", ExpectedGeneration: 0,
+		}
+		reqHash := NormalizeFeedCommitHash(req)
+		if _, err := store.ReserveFeedSignerOperation(ctx, req.OperationID, reg.ID, topic, reqHash); err != nil {
+			t.Fatalf("seed pending operation: %v", err)
+		}
+		pendingRow, err := store.GetFeedSignerOperation(ctx, req.OperationID)
+		if err != nil || pendingRow.State != FeedSignerOpPending {
+			t.Fatalf("sanity: row must be pending before migrating, got %+v err %v", pendingRow, err)
+		}
+
+		if err := ApplyMigrations(ctx, db); err != nil {
+			t.Fatalf("merely-bound/pending upgrade must succeed: %v", err)
+		}
+		if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
+			t.Fatalf("expected version 16, got %d", v)
+		}
+		if sqliteObjectCount(t, db, "table", "publication_states") != 1 {
+			t.Fatal("safe upgrade must still create publication_states")
+		}
+	})
+}
+
+// TestMigration16RepeatedApplyIsIdempotent proves ApplyMigrations run twice
+// over the same already-migrated database never re-applies migration 16 (or
+// records a duplicate row).
+func TestMigration16RepeatedApplyIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	db := openRawFileTestDB(t)
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if err := ApplyMigrations(ctx, db); err != nil {
+		t.Fatalf("repeated apply must be a no-op, got: %v", err)
+	}
+	if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
+		t.Fatalf("expected version 16, got %d", v)
+	}
+	var rows int
+	if err := db.QueryRowContext(ctx, `select count(*) from schema_migrations where version = 16`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("migration 16 must be recorded exactly once, got %d", rows)
 	}
 }
