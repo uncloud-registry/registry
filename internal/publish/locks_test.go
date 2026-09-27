@@ -4,11 +4,40 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// waitForQueuedWaiter blocks until the entry for key has at least n waiters
+// parked in its FIFO queue, by polling the real internal state under l.mu.
+// This proves a waiter has actually enqueued itself in the entry — not merely
+// that its goroutine has started — before a caller races a release against a
+// cancellation targeting it. The deadline is a failure guard only; it never
+// establishes the ordering being tested.
+func waitForQueuedWaiter(t *testing.T, l *RepositoryLocker, key lockKey, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		l.mu.Lock()
+		ent := l.locks[key]
+		got := 0
+		if ent != nil {
+			got = len(ent.waiters)
+		}
+		l.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d queued waiter(s), got %d", n, got)
+		}
+		runtime.Gosched()
+	}
+}
 
 // TestRepositoryLockerSameKeySerializes proves that two WithLock calls for the
 // SAME canonical owner/repository key never run their callbacks concurrently:
@@ -243,6 +272,226 @@ func TestRepositoryLockerEntryReclamation(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("canceled-waiter scenario left %d live lock entries", n)
 	}
+}
+
+// TestRepositoryLockerGrantCancelOverlap forces the release of a held lock and
+// the cancellation of the exact waiter next in line to happen at (as close as
+// the runtime allows to) the same instant, repeatedly, under -race. It proves
+// the grant-vs-cancel race has exactly one authoritative outcome per
+// iteration: either the waiter is granted (runs its callback, and the lock is
+// later reusable) or it is canceled (never runs its callback, and the lock is
+// still reusable) — never both, never neither, and never a second concurrent
+// holder. No sleep is used to establish ordering: waitForQueuedWaiter polls
+// the entry's real FIFO queue (guarded by l.mu) until the waiter has actually
+// enqueued itself, a barrier then releases both racing goroutines together,
+// and a bounded follow-up acquisition is the leak detector (a leaked lock
+// would hang it, not just run "eventually"). Bounded deadlines throughout are
+// failure guards only, never the source of ordering.
+func TestRepositoryLockerGrantCancelOverlap(t *testing.T) {
+	const iterations = 2000
+	key := canonicalLockKey("0xaliceowner", "repo")
+
+	for i := 0; i < iterations; i++ {
+		l := NewRepositoryLocker()
+
+		holderInside := make(chan struct{})
+		releaseHolder := make(chan struct{})
+		holderDone := make(chan struct{})
+		go func() {
+			err := l.WithLock(context.Background(), "0xaliceowner", "repo", func(_ context.Context) error {
+				close(holderInside)
+				<-releaseHolder
+				return nil
+			})
+			if err != nil {
+				t.Errorf("iteration %d: holder: unexpected error %v", i, err)
+			}
+			close(holderDone)
+		}()
+		<-holderInside
+
+		waitCtx, cancel := context.WithCancel(context.Background())
+		var ran atomic.Bool
+		waitErr := make(chan error, 1)
+		go func() {
+			waitErr <- l.WithLock(waitCtx, "0xaliceowner", "repo", func(_ context.Context) error {
+				ran.Store(true)
+				return nil
+			})
+		}()
+
+		// Prove the waiter has actually enqueued itself in the entry's FIFO
+		// queue — real internal state, not just "the goroutine started" —
+		// before racing a release against a cancellation targeting it.
+		waitForQueuedWaiter(t, l, key, 1)
+
+		// Release the holder and cancel the waiter from a synchronized start,
+		// maximizing the chance the two race an actual overlap against the
+		// now-confirmed-queued waiter across many iterations rather than one
+		// always winning first.
+		start := make(chan struct{})
+		var fire sync.WaitGroup
+		fire.Add(2)
+		go func() { defer fire.Done(); <-start; close(releaseHolder) }()
+		go func() { defer fire.Done(); <-start; cancel() }()
+		close(start)
+		fire.Wait()
+
+		<-holderDone
+		err := <-waitErr
+		switch {
+		case err == nil:
+			if !ran.Load() {
+				t.Fatalf("iteration %d: waiter returned nil error but its callback never ran", i)
+			}
+		case errors.Is(err, context.Canceled):
+			if ran.Load() {
+				t.Fatalf("iteration %d: waiter returned context.Canceled but its callback ran (leaked authority)", i)
+			}
+		default:
+			t.Fatalf("iteration %d: unexpected error %v", i, err)
+		}
+
+		// Leak / concurrent-entry detector: the key must be immediately
+		// re-acquirable, and exactly one holder may run at a time. If the
+		// canceled waiter actually kept the lock (never releasing), this
+		// follow-up acquisition hangs.
+		var concurrent atomic.Int32
+		followUp := make(chan struct{})
+		go func() {
+			_ = l.WithLock(context.Background(), "0xaliceowner", "repo", func(_ context.Context) error {
+				if concurrent.Add(1) != 1 {
+					t.Errorf("iteration %d: concurrent holder observed", i)
+				}
+				defer concurrent.Add(-1)
+				return nil
+			})
+			close(followUp)
+		}()
+		select {
+		case <-followUp:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: lock leaked, follow-up acquisition hung", i)
+		}
+	}
+}
+
+// TestRepositoryLockerLongKeysDoNotAlias proves, for owner/repository pairs
+// constructed to share a prefix past the two length boundaries a previous,
+// now-removed truncating canonicalization used (64 bytes of the normalized
+// owner, 4096 bytes of the repository), that: (1) canonicalLockKey itself
+// produces exact, unequal keys for each such pair — the direct proof, not an
+// inference from behavior; and (2) that inequality is what the locker
+// actually acts on, since the two repository pairs run concurrently and the
+// identical long key still serializes against itself. This does not claim
+// aliasing is impossible for every conceivable length; it demonstrates it for
+// the specific boundary this package used to truncate at.
+func TestRepositoryLockerLongKeysDoNotAlias(t *testing.T) {
+	l := NewRepositoryLocker()
+
+	longOwner := "0x" + strings.Repeat("a", 200)
+	// Two repository names sharing a common prefix well past the previous
+	// 4096-byte truncation boundary, differing only in their final byte.
+	base := strings.Repeat("r", 5000)
+	repoA := base + "-A"
+	repoB := base + "-B"
+
+	// Two owners sharing the first 64 bytes of their normalized form (the
+	// previous owner-truncation boundary), differing only right after it.
+	ownerPrefix := strings.Repeat("a", 64)
+	ownerA := "0x" + ownerPrefix + "b" + strings.Repeat("c", 20)
+	ownerB := "0x" + ownerPrefix + "d" + strings.Repeat("c", 20)
+
+	// Direct proof: canonicalLockKey itself, not just observed behavior,
+	// treats these as distinct identities.
+	if canonicalLockKey(ownerA, "repo") == canonicalLockKey(ownerB, "repo") {
+		t.Fatal("owners sharing the old 64-byte truncation prefix produced the same exact key")
+	}
+	if canonicalLockKey(longOwner, repoA) == canonicalLockKey(longOwner, repoB) {
+		t.Fatal("repos sharing the old 4096-byte truncation prefix produced the same exact key")
+	}
+
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	errs := make(chan error, 2)
+
+	run := func(repo string) {
+		errs <- l.WithLock(context.Background(), longOwner, repo, func(_ context.Context) error {
+			entered <- repo
+			<-release
+			return nil
+		})
+	}
+	go run(repoA)
+	go run(repoB)
+
+	// Both must be able to enter concurrently: if the keys aliased, the
+	// second would block behind the first and this would deadlock here.
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-entered:
+			got[r] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("distinct long keys aliased: only %d/2 entered concurrently", i)
+		}
+	}
+	if !got[repoA] || !got[repoB] {
+		t.Fatalf("expected both long repo keys to enter, got %v", got)
+	}
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	// The identical long key must still serialize against itself.
+	insideFirst := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan struct{})
+	go func() {
+		err := l.WithLock(context.Background(), longOwner, repoA, func(_ context.Context) error {
+			close(insideFirst)
+			<-releaseFirst
+			return nil
+		})
+		if err != nil {
+			t.Errorf("first holder: unexpected error %v", err)
+		}
+		close(firstDone)
+	}()
+	<-insideFirst
+
+	var overlapped atomic.Bool
+	secondDone := make(chan struct{})
+	go func() {
+		err := l.WithLock(context.Background(), longOwner, repoA, func(_ context.Context) error {
+			select {
+			case <-releaseFirst:
+				overlapped.Store(true)
+			default:
+			}
+			return nil
+		})
+		if err != nil {
+			t.Errorf("second holder: unexpected error %v", err)
+		}
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("second holder of the identical long key ran before the first released")
+	case <-time.After(30 * time.Millisecond):
+	}
+	if overlapped.Load() {
+		t.Fatal("identical long key allowed overlapping holders")
+	}
+
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
 }
 
 // TestRepositoryLockerPanicCleanup proves a panicking callback does not leak the
