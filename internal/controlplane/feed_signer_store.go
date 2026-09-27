@@ -1120,6 +1120,28 @@ func (s *Store) EnsureFeedSignerLeaseOwned(ctx context.Context, operationID, cla
 	return nil
 }
 
+// errFeedSignerOperationPublicationSplit is returned when standalone
+// completion is attempted against an attempt id a GENUINELY PublicationID-
+// indirected publication_states row (operation_id != attempt_id — never a
+// round-6B self-mapped row, where operation_id == attempt_id) still claims
+// nonterminally (active or replaceable). Completing the feed_signer_operations
+// row here, without terminating that publication_states row in the SAME
+// transaction, is exactly the split-ledger hazard the round-17 closure review
+// found: a later shared succeeded-operation lookup would otherwise be able to
+// observe a succeeded operation whose logical publication never terminates.
+// The current (PublicationID-bearing) protocol must always complete through
+// CompleteFeedSignerOperationAndTerminatePublication instead, which keeps both
+// rows in lockstep inside one transaction.
+var errFeedSignerOperationPublicationSplit = errors.New("complete feed signer operation: a publication execution record is still active for this attempt; use the combined completion")
+
+// isNoSuchTable reports whether err is SQLite's "no such table" failure —
+// tolerated by CompleteFeedSignerOperation's split-state guard so a
+// pre-migration-16 database (publication_states does not exist yet) behaves
+// exactly as it did before this guard existed.
+func isNoSuchTable(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such table")
+}
+
 // CompleteFeedSignerOperation transitions a processing operation to the
 // terminal succeeded state, storing the bounded canonical result JSON. It is
 // conditional on the claim token matching, so a stale or stolen token can
@@ -1127,38 +1149,63 @@ func (s *Store) EnsureFeedSignerLeaseOwned(ctx context.Context, operationID, cla
 // race completion, the first wins the update and the second finds the row
 // already succeeded with the SAME hash and the SAME canonical result, which is
 // an idempotent no-op returning nil.
+//
+// Round 17 closure review: before ever touching the row, this atomically
+// refuses (leaving BOTH ledgers completely untouched) whenever a genuinely
+// PublicationID-indirected publication_states row for this exact attempt id
+// is still active or replaceable — see errFeedSignerOperationPublicationSplit.
+// A self-mapped round-6B legacy-fence row (operation_id == attempt_id) is NOT
+// a match: the legacy protocol has no separate publication identity to
+// terminate, so its existing completion path is unchanged. A pre-migration-16
+// database (publication_states does not exist yet) has no row to check
+// against and is likewise unaffected.
 func (s *Store) CompleteFeedSignerOperation(ctx context.Context, operationID string, reqHash [32]byte, claimToken string, resultJSON []byte) error {
-	nowNanos := timeToNanos(time.Now().UTC())
-	res, err := s.DB.ExecContext(ctx, `update feed_signer_operations
-		set state = 'succeeded', result_json = ?, claim_token = null, lease_until = null, updated_at = ?
-		where operation_id = ? and request_hash = ? and claim_token = ? and state = 'processing'`,
-		string(resultJSON), nowNanos, operationID, reqHash[:], claimToken)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 1 {
+	return s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		var blockingState string
+		guardErr := c.QueryRowContext(ctx, `select state from publication_states
+			where attempt_id = ? and operation_id != ? and state != 'succeeded' limit 1`,
+			operationID, operationID).Scan(&blockingState)
+		if guardErr == nil {
+			return errFeedSignerOperationPublicationSplit
+		}
+		if !errors.Is(guardErr, sql.ErrNoRows) && !isNoSuchTable(guardErr) {
+			return guardErr
+		}
+
+		nowNanos := timeToNanos(time.Now().UTC())
+		res, err := c.ExecContext(ctx, `update feed_signer_operations
+			set state = 'succeeded', result_json = ?, claim_token = null, lease_until = null, updated_at = ?
+			where operation_id = ? and request_hash = ? and claim_token = ? and state = 'processing'`,
+			string(resultJSON), nowNanos, operationID, reqHash[:], claimToken)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 1 {
+			return nil
+		}
+		// Zero rows: either we hold a stale token (a takeover happened) or a
+		// concurrent identical request already completed the same operation.
+		// Only the latter is acceptable: the stored result must be
+		// byte-canonically identical to what we are about to persist (not
+		// merely same-hash), so two completers never disagree about the
+		// persisted feed/reference.
+		var existing FeedSignerOperation
+		if err := scanFeedSignerOperation(c.QueryRowContext(ctx,
+			`select `+feedSignerOperationColumns+` from feed_signer_operations where operation_id = ?`, operationID), &existing); err != nil {
+			return err
+		}
+		if existing.State != FeedSignerOpSucceeded || existing.RequestHash != reqHash {
+			return errors.New("complete feed signer operation: operation is not owned by this claim or the request hash did not match")
+		}
+		if !bytesEqual(existing.ResultJSON, resultJSON) {
+			return errors.New("complete feed signer operation: concurrent completed result does not match this canonical result")
+		}
 		return nil
-	}
-	// Zero rows: either we hold a stale token (a takeover happened) or a
-	// concurrent identical request already completed the same operation. Only
-	// the latter is acceptable: the stored result must be byte-canonically
-	// identical to what we are about to persist (not merely same-hash), so two
-	// completers never disagree about the persisted feed/reference.
-	existing, err := s.GetFeedSignerOperation(ctx, operationID)
-	if err != nil {
-		return err
-	}
-	if existing.State != FeedSignerOpSucceeded || existing.RequestHash != reqHash {
-		return errors.New("complete feed signer operation: operation is not owned by this claim or the request hash did not match")
-	}
-	if !bytesEqual(existing.ResultJSON, resultJSON) {
-		return errors.New("complete feed signer operation: concurrent completed result does not match this canonical result")
-	}
-	return nil
+	})
 }
 
 // ReleaseFeedSignerOperation returns a processing operation to pending,

@@ -433,6 +433,49 @@ func (s *Store) ReplacePublicationExecutionAttempt(ctx context.Context, publicat
 	return won, row, nil
 }
 
+// ReconcilePublicationExecutionSucceeded atomically marks an active or
+// replaceable publication_states row terminally succeeded for the EXACT
+// registry and attempt that a caller has ALREADY independently proven reached
+// a genuine succeeded feed_signer_operations result (round 17 closure review —
+// see FeedSigner.resolveSucceededOperation). It proves nothing new itself: the
+// caller must have already verified the stored result is hash/coherence-
+// checked for this exact request and that this row already agrees on
+// registry_id + attempt_id, merely not yet terminal. The update is scoped to
+// exactly that (registry_id, attempt_id) pair — never a different attempt,
+// never a different registry, never inventing a fresh result — so it only
+// ever marks an already-authorized attempt terminal.
+//
+// applied=true covers both this call's own flip AND an idempotent concurrent
+// reconciler that already left the row succeeded under the SAME registry and
+// attempt (mirroring the tolerance CompleteFeedSignerOperation and
+// CompleteFeedSignerOperationAndTerminatePublication apply to their own
+// concurrent completions). applied=false means the row no longer matches
+// (succeeded under a DIFFERENT attempt, or a different registry) — the caller
+// must treat that as "not durably applied", never silently succeed.
+func (s *Store) ReconcilePublicationExecutionSucceeded(ctx context.Context, publicationID string, registryID int64, attemptID string) (applied bool, err error) {
+	nowNanos := timeToNanos(time.Now().UTC())
+	res, err := s.DB.ExecContext(ctx, `update publication_states
+		set state = 'succeeded', updated_at = ?
+		where operation_id = ? and registry_id = ? and attempt_id = ? and state in ('active','replaceable')`,
+		nowNanos, publicationID, registryID, attemptID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 1 {
+		return true, nil
+	}
+	var exec PublicationExecution
+	if err := scanPublicationExecution(s.DB.QueryRowContext(ctx,
+		`select `+publicationExecutionColumns+` from publication_states where operation_id = ?`, publicationID), &exec); err != nil {
+		return false, err
+	}
+	return exec.State == PublicationExecutionSucceeded && exec.RegistryID == registryID && exec.AttemptID == attemptID, nil
+}
+
 // CompleteFeedSignerOperationAndTerminatePublication atomically applies BOTH
 // the per-attempt feed_signer_operations completion (identical semantics to
 // CompleteFeedSignerOperation) AND the logical publication_states terminal

@@ -285,7 +285,7 @@ func (s *FeedSigner) reserveAndRunClaim(ctx context.Context, req publish.FeedCom
 		}
 		switch op.State {
 		case FeedSignerOpSucceeded:
-			return s.storedResult(op, req)
+			return s.resolveSucceededOperation(ctx, op, req)
 		case FeedSignerOpPending:
 			token, terr := newClaimToken()
 			if terr != nil {
@@ -421,14 +421,11 @@ func (s *FeedSigner) terminalReplayResult(ctx context.Context, req publish.FeedC
 	if op.State != FeedSignerOpSucceeded || op.RequestHash != reqHash {
 		return publish.FeedCommitResult{}, false, nil
 	}
-	exec, err := s.Store.GetPublicationExecution(ctx, req.PublicationID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return publish.FeedCommitResult{}, false, nil
-	}
+	_, agree, _, err := s.publicationExecutionAgreement(ctx, req)
 	if err != nil {
-		return publish.FeedCommitResult{}, false, fmt.Errorf("%w: publication execution: %v", errFeedSignerBackend, err)
+		return publish.FeedCommitResult{}, false, err
 	}
-	if exec.RegistryID != req.RegistryID || exec.State != PublicationExecutionSucceeded || exec.AttemptID != req.OperationID {
+	if !agree {
 		return publish.FeedCommitResult{}, false, nil
 	}
 	result, err := s.storedResult(op, req)
@@ -436,6 +433,94 @@ func (s *FeedSigner) terminalReplayResult(ctx context.Context, req publish.FeedC
 		return publish.FeedCommitResult{}, false, err
 	}
 	return result, true, nil
+}
+
+// publicationExecutionAgreement is the SINGLE authoritative comparison
+// between a PublicationID-bearing request's identity and its publication_states
+// row, reused by every path that must decide whether a succeeded
+// feed_signer_operations row may be treated as a genuine terminal success
+// (round 17 closure review — the single-authoritative-helper fix for the gap
+// where terminalReplayResult and reserveAndRunClaim's succeeded case each
+// independently decided this, and the latter did not check publication
+// agreement AT ALL). It never mutates anything.
+//
+//   - agree=true: the row exists, is terminal ('succeeded'), and is bound to
+//     the EXACT same registry and attempt id as req — the only condition
+//     under which a stored succeeded result may be returned as-is.
+//   - mismatch=true: a row exists but disagrees on registry or attempt id — a
+//     PERMANENT conflict (a different attempt or registry already owns or
+//     terminated this publication); never reconciled, never treated as
+//     absent.
+//   - agree=false, mismatch=false: either no row exists at all, or a row
+//     exists for the SAME registry/attempt but has not yet reached
+//     'succeeded' (active/replaceable) — the exact split-ledger condition a
+//     caller with independent proof of a genuine succeeded operation may be
+//     able to safely reconcile (see resolveSucceededOperation).
+func (s *FeedSigner) publicationExecutionAgreement(ctx context.Context, req publish.FeedCommitRequest) (exec PublicationExecution, agree bool, mismatch bool, err error) {
+	exec, err = s.Store.GetPublicationExecution(ctx, req.PublicationID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublicationExecution{}, false, false, nil
+	}
+	if err != nil {
+		return PublicationExecution{}, false, false, fmt.Errorf("%w: publication execution: %v", errFeedSignerBackend, err)
+	}
+	if exec.RegistryID != req.RegistryID || exec.AttemptID != req.OperationID {
+		return exec, false, true, nil
+	}
+	return exec, exec.State == PublicationExecutionSucceeded, false, nil
+}
+
+// resolveSucceededOperation is the single authoritative path for returning a
+// succeeded feed_signer_operations row's result, reached from
+// reserveAndRunClaim's FeedSignerOpSucceeded case for BOTH protocols. For the
+// legacy (PublicationID-empty) protocol it is exactly the prior unconditional
+// storedResult lookup. For the current (PublicationID-bearing) protocol it
+// additionally REQUIRES publication_states to agree this exact attempt
+// reached the SAME terminal success (round 17 closure review / Important:
+// this call site alone — unlike terminalReplayResult and
+// authorizePublicationExecution — used to return a stored succeeded result
+// unconditionally, even while publication_states was still nonterminal, e.g.
+// after some path left the two ledgers split; see
+// Store.CompleteFeedSignerOperation's own hardening against creating that
+// split via standalone completion).
+//
+// A registry/attempt mismatch is a PERMANENT conflict, never silently
+// accepted. A matching but nonterminal row is atomically reconciled to
+// succeeded: every invariant (operation succeeded, result hash/coherence-
+// verified against THIS request via storedResult, SAME registry+attempt
+// already on record) is proven BEFORE the reconciliation ever runs, so it
+// never invents a result or provenance — it only marks an already-authorized
+// attempt terminal. A publication_states row missing entirely for this
+// PublicationID has nothing to reconcile against and fails closed, data-free.
+func (s *FeedSigner) resolveSucceededOperation(ctx context.Context, op FeedSignerOperation, req publish.FeedCommitRequest) (publish.FeedCommitResult, error) {
+	if req.PublicationID == "" {
+		return s.storedResult(op, req)
+	}
+	result, err := s.storedResult(op, req)
+	if err != nil {
+		return publish.FeedCommitResult{}, err
+	}
+	exec, agree, mismatch, err := s.publicationExecutionAgreement(ctx, req)
+	if err != nil {
+		return publish.FeedCommitResult{}, err
+	}
+	if agree {
+		return result, nil
+	}
+	if mismatch {
+		return publish.FeedCommitResult{}, errFeedSignerConflict
+	}
+	if exec.PublicationID == "" {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: publication execution missing for succeeded operation", errFeedSignerBackend)
+	}
+	applied, err := s.Store.ReconcilePublicationExecutionSucceeded(ctx, req.PublicationID, req.RegistryID, req.OperationID)
+	if err != nil {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: reconcile publication execution: %v", errFeedSignerBackend, err)
+	}
+	if !applied {
+		return publish.FeedCommitResult{}, fmt.Errorf("%w: publication execution reconciliation did not durably apply", errFeedSignerBackend)
+	}
+	return result, nil
 }
 
 // publicationExecutionMaxCASAttempts bounds authorizePublicationExecution's
