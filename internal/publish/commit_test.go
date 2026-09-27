@@ -86,6 +86,7 @@ func TestControlPlaneCommitterStatusMapping(t *testing.T) {
 		400: ErrCommitMalformed,
 		404: ErrCommitUnknownRegistry,
 		409: ErrCommitConflict,
+		412: ErrCommitGenerationConflict,
 		503: ErrCommitBackend,
 	}
 	for status, want := range cases {

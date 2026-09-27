@@ -74,11 +74,15 @@ func (g *generationCommitter) Commit(_ context.Context, req publish.FeedCommitRe
 	g.mu.Lock()
 	g.commits++
 	// Authoritative generation comparison: the feed must be EXACTLY at the
-	// expected generation, never ahead or behind the caller's read.
+	// expected generation, never ahead or behind the caller's read. This is
+	// the RECOVERABLE conflict class — the real signer's 412
+	// errFeedSignerGenerationConflict — never the permanent operation/binding
+	// conflict, so IsGenerationConflict recognizes it and the publisher's
+	// one-time rebuild triggers.
 	if req.ExpectedGeneration != curGen {
 		g.conflicts++
 		g.mu.Unlock()
-		return publish.FeedCommitResult{}, publish.ErrCommitConflict
+		return publish.FeedCommitResult{}, publish.ErrCommitGenerationConflict
 	}
 	g.mu.Unlock()
 

@@ -189,8 +189,12 @@ func TestNewExplicitKeyOnPublishedTargetBecomesFreshOperation(t *testing.T) {
 	if got := second.Header.Get(OperationIDHeader); got == opA {
 		t.Fatal("the distinct key must never be echoed as A's prior operation")
 	}
-	if binder.calls != 1 || binder.conflicts != 0 {
-		t.Fatalf("distinct key must be durably bound exactly once through the preflight: calls=%d conflicts=%d", binder.calls, binder.conflicts)
+	// Round-2: EVERY logical publication identity is durably preflight-bound,
+	// not just explicit caller keys — push A's (generated) identity is bound
+	// once, and push B's (explicit) identity is bound once, for exactly two
+	// total calls and zero conflicts (each identity's own payload is fresh).
+	if binder.calls != 2 || binder.conflicts != 0 {
+		t.Fatalf("both the generated and the distinct explicit identity must be durably bound exactly once each through the preflight: calls=%d conflicts=%d", binder.calls, binder.conflicts)
 	}
 	if committer.calls != 2 {
 		t.Fatalf("distinct-key request must be a second publication: commits=%d", committer.calls)

@@ -433,6 +433,12 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		// operation ID (and its durable binding is validated below, before any
 		// answer). A DISTINCT explicit key never fast-paths. A document WITHOUT
 		// provenance (legacy valid state) falls through to a fresh publication.
+		// boundOperationID tracks the identity (if any) the fast-path retry
+		// recognition below has ALREADY durably preflight-bound in THIS
+		// request, so the universal preflight bind further down never repeats
+		// an identical bind call for the same identity/payload it just made.
+		boundOperationID := ""
+
 		if found && current.Generation >= 1 {
 			if mappedDigest, mapped := current.Tags[reference]; mapped && mappedDigest == manifestDigest {
 				if pub, hasProvenance := current.TagPublications[reference]; hasProvenance && pub.OperationID != "" && pub.Digest == manifestDigest {
@@ -451,6 +457,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 							}); err != nil {
 								return err
 							}
+							boundOperationID = clientOperationID
 						}
 						verr := VerifyPublishedRetryState(ctx, h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
 						if verr == nil {
@@ -473,14 +480,39 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			}
 		}
 
-		// Explicit-key PREFLIGHT binding BEFORE any immutable object write. The
-		// control plane durably reserves this operation key for exactly this
-		// logical payload, so a reused key with a DIFFERENT payload is a hard
-		// 409 here — before any object upload, feed write, or staging
-		// consumption — and the durable binding survives process restarts.
-		if clientOperationID != "" && h.Preflight != nil {
+		// The STABLE logical publication identity is derived from the CURRENT
+		// (lock-resolved) generation when the caller supplied no explicit key:
+		// two concurrent publications to the same owner+repo get distinct
+		// deterministic identities matching their actual resulting
+		// generations, while a lost-response retry of one logical publication
+		// recomputes the identical identity and timestamp. This identity is
+		// what is recorded as durable per-tag provenance, returned to the
+		// caller, and durably bound below — it is NEVER the per-attempt
+		// FeedSigner identity a conflict rebuild derives internally (see
+		// Publisher.PublishCommitWithConflictRebuild), so it stays fixed
+		// across a one-time rebuild.
+		operationID := clientOperationID
+		if operationID == "" {
+			operationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation)
+		}
+
+		// PREFLIGHT binding BEFORE any immutable object write, for EVERY
+		// logical publication identity — generated or explicit. The control
+		// plane durably reserves this identity for exactly this logical
+		// payload: a reused key with a DIFFERENT payload is a hard 409 here
+		// (before any object upload, feed write, or staging consumption), and
+		// the durable binding survives process restarts. Binding a GENERATED
+		// identity too (not just an explicit client key) is what lets a later
+		// one-time conflict rebuild still authenticate at the control plane:
+		// the rebuild's recomputed generated-form check no longer matches (it
+		// targets a fresh generation), so it depends on THIS binding, reserved
+		// before the conflicted first attempt, surviving the conflict. Skipped
+		// when the fast-path retry recognition above ALREADY durably bound
+		// this EXACT identity for this exact payload moments ago — never a
+		// second identical bind call for the same request.
+		if h.Preflight != nil && operationID != boundOperationID {
 			if err := h.Preflight.Bind(ctx, publish.OperationBindingRequest{
-				OperationID:    clientOperationID,
+				OperationID:    operationID,
 				RegistryID:     registryIdentity.RegistryID,
 				Owner:          registryIdentity.Owner,
 				Repo:           repo,
@@ -509,27 +541,21 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			}
 		}
 
-		// The operation identity is derived from the CURRENT (lock-resolved)
-		// generation: two concurrent publications to the same owner+repo get
-		// distinct deterministic operation IDs matching their actual resulting
-		// generations, while a lost-response retry of one logical publication
-		// recomputes the identical ID and timestamp.
-		operationID := clientOperationID
-		if operationID == "" {
-			operationID = publish.ComputeOperationID(registryIdentity.RegistryID, registryIdentity.Owner, repo, reference, manifestDigest, current.Generation)
-		}
 		input.StagedBlobs = blobMap
 		// Byte-stable state rebuilds across retries and conflict rebuilds: the
-		// state timestamp is derived deterministically from the operation
-		// identity, never the clock.
+		// state timestamp is derived deterministically from the STABLE
+		// publication identity, never the clock, and never the per-attempt
+		// FeedSigner identity.
 		input.UpdatedAt = publish.DeterministicUpdatedAt(operationID)
 
 		// Publish through the conflict-safe commit path. On an AUTHORITATIVE
 		// generation conflict (feed advanced elsewhere) it re-resolves the
-		// newest state and rebuilds ONCE with the same operation id/timestamp,
-		// so concurrent publications and crash-point retries advance the feed
-		// at most once per resolved operation. Distinct operations never
-		// inherit another operation's success.
+		// newest state and rebuilds ONCE, keeping the same stable publication
+		// identity/timestamp but deriving a FRESH per-attempt FeedSigner
+		// identity for the rebuilt attempt (see ComputeCommitAttemptID), so
+		// concurrent publications and crash-point retries advance the feed at
+		// most once per resolved logical publication. Distinct logical
+		// publications never inherit another's success.
 		receipt, err := h.Publisher.PublishCommitWithConflictRebuild(ctx, stateFeed, current, input, batchID, registryIdentity.RegistryID, registryIdentity.Owner, operationID, func(cctx context.Context) (spec.RepoStateDocument, bool, error) {
 			return h.Resolver.ResolveRepoStateOptional(cctx, registryIdentity, repo)
 		})

@@ -96,6 +96,21 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 	if err := publish.ValidateCommitRequest(req); err != nil {
 		return publish.FeedCommitResult{}, fmt.Errorf("%w: %v", errFeedSignerMalformed, err)
 	}
+	// When the request carries an explicit stable PublicationID (the current
+	// data-plane contract), its OperationID MUST be exactly the deterministic
+	// per-ATTEMPT identity derived from that stable id plus THIS attempt's own
+	// ExpectedGeneration/Reference (see publish.ComputeCommitAttemptID) — never
+	// an arbitrary or reused value. This is checked BEFORE any hashing,
+	// reservation, or registry lookup. A request that leaves PublicationID
+	// empty is the backward-compatible legacy shape: its OperationID IS its
+	// own stable identity, with no separate per-attempt derivation enforced
+	// (see publicationIdentity).
+	if req.PublicationID != "" {
+		wantAttemptID := publish.ComputeCommitAttemptID(req.PublicationID, req.RegistryID, req.Owner, req.Topic, req.Reference, req.ExpectedGeneration)
+		if req.OperationID != wantAttemptID {
+			return publish.FeedCommitResult{}, fmt.Errorf("%w: operationID is not the deterministic attempt identity for this publicationID", errFeedSignerMalformed)
+		}
+	}
 	reqHash := NormalizeFeedCommitHash(req)
 	canonicalTopic := publish.CanonicalTopic(req.Topic)
 
@@ -564,13 +579,18 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 		return fmt.Errorf("%w: duplicate operation attribution in target document", errFeedSignerMalformed)
 	}
 
+	pubID := publicationIdentity(req)
+
 	if done {
 		// current == target: identify the operated tag as the SINGLE
-		// provenance entry recording EXACTLY this operation at the document's
-		// own generation and mapping to its recorded digest.
+		// provenance entry recording EXACTLY this operation's STABLE
+		// publication identity at the document's own generation and mapping
+		// to its recorded digest. The provenance entry NEVER carries the
+		// per-attempt FeedSigner identity (req.OperationID) — only the stable
+		// publication identity that survives a conflict rebuild.
 		var operated string
 		for tag, entry := range targetDoc.TagPublications {
-			if entry.OperationID != req.OperationID {
+			if entry.OperationID != pubID {
 				continue
 			}
 			if entry.Generation != targetDoc.Generation {
@@ -623,8 +643,8 @@ func (s *FeedSigner) authenticatePublicationProvenance(ctx context.Context, req 
 	if !ok {
 		return fmt.Errorf("%w: operated tag has no provenance record", errFeedSignerMalformed)
 	}
-	if entry.OperationID != req.OperationID {
-		return fmt.Errorf("%w: provenance operation does not match the request operation", errFeedSignerMalformed)
+	if entry.OperationID != pubID {
+		return fmt.Errorf("%w: provenance operation does not match the request's stable publication identity", errFeedSignerMalformed)
 	}
 	if entry.Generation != targetDoc.Generation {
 		return fmt.Errorf("%w: provenance generation does not match the target generation", errFeedSignerMalformed)
@@ -791,39 +811,64 @@ func (s *FeedSigner) validateArtifactBlobTransition(ctx context.Context, cur, ta
 	return nil
 }
 
-// authenticateOperationIdentity proves the request's operation identity is NOT
-// attacker-selected and decides it ATOMICALLY — never on a stale absence.
+// publicationIdentity returns the request's STABLE logical publication
+// identity: req.PublicationID when the caller supplied one, or req.OperationID
+// for a backward-compatible legacy request that carries no separate attempt
+// identity (its OperationID IS its own stable identity — Commit's
+// attempt-identity check never runs for such a request). This is the ONLY
+// identity ever compared against durable publication_bindings rows or
+// recorded/expected in a repo-state document's TagPublications — the
+// per-attempt req.OperationID (see publish.ComputeCommitAttemptID) never
+// crosses that boundary.
+func publicationIdentity(req publish.FeedCommitRequest) string {
+	if req.PublicationID != "" {
+		return req.PublicationID
+	}
+	return req.OperationID
+}
+
+// authenticateOperationIdentity proves the request's STABLE publication
+// identity is NOT attacker-selected and decides it ATOMICALLY — never on a
+// stale absence.
 //
-// When the request's operation ID is EXACTLY the deterministic recomputation
-// of ComputeOperationID over (registry ID, owner, repo, operated tag, digest,
-// expected generation), the identity IS that generated publication: the
-// signer ATOMICALLY RESERVES a permanent binding row for it (Reserve
-// PublicationBinding — insert-or-read), which serializes with any concurrent
-// explicit preflight at the data plane: there is exactly ONE permanent
-// binding winner per operation identity, and the returned row must match the
-// request registry and the exact binding hash. A pre-existing conflicting row
-// (a preflight bound the generated-looking key to a different payload) is a
-// hard conflict BEFORE the updater; the stale-absence decision is eliminated
-// because the row is created by the reserve itself, never assumed absent.
+// When the publication identity (publicationIdentity(req)) is EXACTLY the
+// deterministic recomputation of ComputeOperationID over (registry ID, owner,
+// repo, operated tag, digest, expected generation), the identity IS that
+// generated publication AT ITS ORIGINAL EXPECTED GENERATION: the signer
+// ATOMICALLY RESERVES a permanent binding row for it (ReservePublicationBinding
+// — insert-or-read), which serializes with any concurrent explicit preflight
+// at the data plane: there is exactly ONE permanent binding winner per
+// publication identity, and the returned row must match the request registry
+// and the exact binding hash. A pre-existing conflicting row (a preflight
+// bound the generated-looking key to a different payload) is a hard conflict
+// BEFORE the updater; the stale-absence decision is eliminated because the
+// row is created by the reserve itself, never assumed absent. This is also
+// the compatibility fallback for direct/legacy callers with no preflight
+// wiring: the FIRST attempt of a generated publication self-reserves its own
+// binding.
 //
-// For any NON-generated (explicit) caller key the durable preflight row MUST
-// already exist: the signer reads it (never auto-reserves arbitrary explicit
-// IDs — preflight-before-object-write is the data plane's contract), requires
-// the exact registry and hash, and a missing row is malformed. An explicit
-// caller that chose the exact generated ID semantically IS that generated
-// identity, so it takes the atomic-reserve path above and conflicts with any
-// pre-existing different binding.
+// For any OTHER publication identity — an explicit caller key, OR a generated
+// identity being REBUILT at a generation different from the one it encodes
+// (its recomputation no longer matches) — the durable preflight row MUST
+// already exist: the signer reads it (never auto-reserves), requires the
+// exact registry and hash, and a missing row is malformed. This is exactly
+// why the data plane preflight-binds EVERY logical publication (generated and
+// explicit) before its first immutable write: a rebuilt generated publication
+// depends on that binding surviving the conflict, since its own recomputation
+// check will fail on the second (fresh-generation) attempt.
 //
 // A DB/query/reserve failure is a backend/uncertain condition and NEVER falls
 // back to accepting without a binding. All errors are data-free (fixed
 // sentinel + fixed message; the DB failure keeps its cause server-side only).
 func (s *FeedSigner) authenticateOperationIdentity(ctx context.Context, req publish.FeedCommitRequest, targetRepo, operatedTag, digest string) error {
+	pubID := publicationIdentity(req)
 	bindingHash := NormalizePublicationBindingHash(req.RegistryID, req.Owner, targetRepo, operatedTag, digest)
-	if req.OperationID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
-		// Generated identity: ATOMIC insert-or-read. This single statement
-		// serializes with any concurrent explicit preflight for the same key —
-		// one permanent winner per identity, never a stale-absence decision.
-		binding, err := s.Store.ReservePublicationBinding(ctx, req.OperationID, req.RegistryID, bindingHash)
+	if pubID == publish.ComputeOperationID(req.RegistryID, req.Owner, targetRepo, operatedTag, digest, req.ExpectedGeneration) {
+		// Generated identity at its own expected generation: ATOMIC
+		// insert-or-read. This single statement serializes with any
+		// concurrent explicit preflight for the same key — one permanent
+		// winner per identity, never a stale-absence decision.
+		binding, err := s.Store.ReservePublicationBinding(ctx, pubID, req.RegistryID, bindingHash)
 		if err != nil {
 			return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
 		}
@@ -835,9 +880,10 @@ func (s *FeedSigner) authenticateOperationIdentity(ctx context.Context, req publ
 		}
 		return nil
 	}
-	// Explicit caller key: require the data plane's pre-existing preflight
-	// row; the signer NEVER auto-reserves arbitrary explicit IDs.
-	binding, err := s.Store.GetPublicationBinding(ctx, req.OperationID)
+	// Explicit caller key, or a generated identity being rebuilt at a
+	// different generation than it encodes: require the data plane's
+	// pre-existing preflight row; the signer NEVER auto-reserves it here.
+	binding, err := s.Store.GetPublicationBinding(ctx, pubID)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: publication binding: %v", errFeedSignerBackend, err)
@@ -890,6 +936,7 @@ func NormalizeFeedCommitHash(req publish.FeedCommitRequest) [32]byte {
 	writeHashInt(h, req.ExpectedGeneration)
 	writeHashInt(h, req.RegistryID)
 	writeHashBytes(h, req.OperationID)
+	writeHashBytes(h, req.PublicationID)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out

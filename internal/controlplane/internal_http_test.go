@@ -167,12 +167,13 @@ func TestInternalFeedServerErrorMapping(t *testing.T) {
 		t.Fatalf("unknown registry: got %d want 404", rec.Code)
 	}
 
-	// Generation conflict → 409.
+	// Generation conflict → 412 (the RECOVERABLE class, distinct from the
+	// PERMANENT operation/binding conflict's 409 — see mapFeedSignerError).
 	conflict := req
 	conflict.ExpectedGeneration = 99
 	body, _ = json.Marshal(conflict)
-	if rec := postFeedUpdate(t, srv, publish.InternalFeedUpdatePath, testInternalSecret, string(body)); rec.Code != http.StatusConflict {
-		t.Fatalf("generation conflict: got %d want 409", rec.Code)
+	if rec := postFeedUpdate(t, srv, publish.InternalFeedUpdatePath, testInternalSecret, string(body)); rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("generation conflict: got %d want 412", rec.Code)
 	}
 
 	// Unconfigured signer backend → 503.

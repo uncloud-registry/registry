@@ -127,8 +127,8 @@ func (p Publisher) Publish(ctx context.Context, stateFeed string, current spec.R
 // falls back to the local Feeds updater (in-memory mode). It returns the exact
 // PublicationReceipt — captured BEFORE the commit boundary — so the caller can
 // run the read-after-write verification and answer retries.
-func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, operationID string) (PublicationReceipt, error) {
-	_, receipt, err := p.publish(ctx, stateFeed, current, input, batchID, true, registryID, owner, operationID)
+func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, publicationID string) (PublicationReceipt, error) {
+	_, receipt, err := p.publish(ctx, stateFeed, current, input, batchID, true, registryID, owner, publicationID)
 	return receipt, err
 }
 
@@ -136,9 +136,10 @@ func (p Publisher) PublishCommit(ctx context.Context, stateFeed string, current 
 // control-plane generation-conflict sentinel — the repository-generation
 // comparison at the feed signer found the expected generation stale because
 // the feed advanced elsewhere. Only this conflict class is safe to recover by
-// a rebuild; a binding conflict (same operation ID, different logical payload)
-// is a hard 409 to the caller and must NEVER be retried or rebuilt.
-func IsGenerationConflict(err error) bool { return errors.Is(err, ErrCommitConflict) }
+// a rebuild; a permanent operation/binding conflict (ErrCommitConflict — the
+// same operation or publication identity reused with a different logical
+// payload) is a hard 409 to the caller and must NEVER be retried or rebuilt.
+func IsGenerationConflict(err error) bool { return errors.Is(err, ErrCommitGenerationConflict) }
 
 // RebuildResolver re-resolves the current repository state (its generation and
 // content) inside the caller's held publication lock. found=false reports a
@@ -149,19 +150,26 @@ type RebuildResolver func(ctx context.Context) (current spec.RepoStateDocument, 
 // point. It commits the immutable state reference exactly like PublishCommit,
 // but when the control plane reports an AUTHORITATIVE generation conflict (the
 // repository feed advanced elsewhere) it re-resolves the newest state through
-// reResolve and rebuilds ONCE, reusing the exact stable operation ID and its
-// deterministic timestamp (input.UpdatedAt derives from operationID) so a
-// lost-response retry of this same logical publication stays byte-stable. The
-// rebuild re-runs the strict input validation (via PublishCommit) against the
-// fresh state, so it proceeds only while the original staged inputs remain
-// valid and coherent — otherwise it fails typed with zero feed writes. Retries
-// are bounded to this single rebuild: if the fresh state did not actually
-// advance, re-resolving failed, or the rebuild itself conflicts again, the
-// ORIGINAL conflict (mapped to 409 by the caller) is returned. Different
-// operations never inherit another operation's success: the operation ID is
-// unchanged, and only a feed that never recorded it is re-advanced.
-func (p Publisher) PublishCommitWithConflictRebuild(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, operationID string, reResolve RebuildResolver) (PublicationReceipt, error) {
-	receipt, err := p.PublishCommit(ctx, stateFeed, current, input, batchID, registryID, owner, operationID)
+// reResolve and rebuilds ONCE, reusing the exact stable publicationID and its
+// deterministic timestamp (input.UpdatedAt derives from publicationID) so a
+// lost-response retry of this same logical publication stays byte-stable.
+// publicationID is NEVER mutated across the rebuild — it is the identity
+// recorded in TagPublications, returned to the caller, and durably bound by
+// preflight; only the fresh immutable state bytes/reference (Generation
+// advances) and, internally, the derived per-attempt FeedSigner identity
+// change (see ComputeCommitAttemptID) — which is exactly what lets the
+// rebuilt attempt avoid colliding with the conflicted attempt's permanently
+// reserved durable operation row. The rebuild re-runs the strict input
+// validation (via PublishCommit) against the fresh state, so it proceeds only
+// while the original staged inputs remain valid and coherent — otherwise it
+// fails typed with zero feed writes. Retries are bounded to this single
+// rebuild: if the fresh state did not actually advance, re-resolving failed,
+// or the rebuild itself conflicts again, the ORIGINAL conflict (mapped to 409
+// by the caller) is returned. Different logical publications never inherit
+// another's success: publicationID is unchanged, and only a feed that never
+// recorded it is re-advanced.
+func (p Publisher) PublishCommitWithConflictRebuild(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, publicationID string, reResolve RebuildResolver) (PublicationReceipt, error) {
+	receipt, err := p.PublishCommit(ctx, stateFeed, current, input, batchID, registryID, owner, publicationID)
 	if err == nil || !IsGenerationConflict(err) {
 		return receipt, err
 	}
@@ -172,10 +180,10 @@ func (p Publisher) PublishCommitWithConflictRebuild(ctx context.Context, stateFe
 		// becoming authoritative.
 		return PublicationReceipt{}, err
 	}
-	return p.PublishCommit(ctx, stateFeed, fresh, input, batchID, registryID, owner, operationID)
+	return p.PublishCommit(ctx, stateFeed, fresh, input, batchID, registryID, owner, publicationID)
 }
 
-func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, operationID string) (spec.RepoStateDocument, PublicationReceipt, error) {
+func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, useCommits bool, registryID int64, owner string, publicationID string) (spec.RepoStateDocument, PublicationReceipt, error) {
 	// Strict pre-upload validation: parse the artifact, verify the
 	// handler-provided digest/size/media against the actual body, and confirm
 	// every referenced descriptor's size and media type agree with its stored
@@ -193,11 +201,14 @@ func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.R
 	}
 
 	input.Manifest.SwarmRef = manifestRef
-	// The committed operation identity IS the durable publication provenance
-	// recorded in the repo-state document (spec.TagPublication). The legacy
-	// Publish path passes an empty identity and its documents carry no
-	// provenance; PublishCommit always records the exact operation it commits.
-	input.OperationID = operationID
+	// The committed STABLE publication identity IS the durable publication
+	// provenance recorded in the repo-state document (spec.TagPublication).
+	// The legacy Publish path passes an empty identity and its documents carry
+	// no provenance; PublishCommit always records the exact publication it
+	// commits. This identity is deliberately NEVER the per-attempt FeedSigner
+	// identity (see below) — it stays stable across a one-time conflict
+	// rebuild.
+	input.OperationID = publicationID
 	next, err := p.Builder.BuildNext(current, input)
 	if err != nil {
 		return spec.RepoStateDocument{}, PublicationReceipt{}, err
@@ -218,7 +229,7 @@ func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.R
 	// the production feed/document path without trusting this process's
 	// memory.
 	receipt := PublicationReceipt{
-		OperationID:        operationID,
+		OperationID:        publicationID,
 		StateFeed:          stateFeed,
 		StateRef:           stateRef,
 		ManifestRef:        manifestRef,
@@ -233,9 +244,17 @@ func (p Publisher) publish(ctx context.Context, stateFeed string, current spec.R
 	if useCommits && p.Commits != nil {
 		// Bee mode: route the immutable state reference through the control
 		// plane. The control plane alone holds and uses the feed-owner signing
-		// key; the registry process never receives it.
+		// key; the registry process never receives it. The ATTEMPT identity
+		// sent as OperationID is deterministically derived from the stable
+		// publicationID plus THIS attempt's own expected generation/reference —
+		// never reused unchanged across a rebuild — so the durable FeedSigner
+		// operation row it reserves can never collide with a different
+		// attempt's permanently-fixed request hash (see
+		// ComputeCommitAttemptID).
+		attemptID := ComputeCommitAttemptID(publicationID, registryID, owner, stateFeed, stateRef, current.Generation)
 		if _, err := p.Commits.Commit(ctx, FeedCommitRequest{
-			OperationID:        operationID,
+			OperationID:        attemptID,
+			PublicationID:      publicationID,
 			RegistryID:         registryID,
 			Owner:              owner,
 			Topic:              stateFeed,

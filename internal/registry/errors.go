@@ -136,7 +136,12 @@ func classifyPublicationError(err error) (int, string, string) {
 		return http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable
 	case errors.As(err, new(*ConflictError)):
 		return http.StatusConflict, ErrorCodeManifestConflict, messageConflict
-	case errors.Is(err, publish.ErrCommitConflict):
+	case errors.Is(err, publish.ErrCommitConflict), errors.Is(err, publish.ErrCommitGenerationConflict):
+		// Both conflict classes are the same fixed public 409: the internal
+		// 412/409 discriminator (publish.ErrCommitGenerationConflict vs
+		// ErrCommitConflict) exists ONLY to gate the one-time internal rebuild
+		// (see Publisher.PublishCommitWithConflictRebuild / IsGenerationConflict)
+		// and is never exposed on the public surface.
 		return http.StatusConflict, ErrorCodeManifestConflict, messageConflict
 	case errors.As(err, new(*DependencyError)):
 		return http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable

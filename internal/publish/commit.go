@@ -37,8 +37,30 @@ const InternalAuthHeader = "X-Uncloud-Internal-Auth"
 // control-plane internal feed signer. Field/JSON names are the fixed contract
 // from the Task 10 interface. Topic is the FULL deterministic repository-state
 // feed reference (feed://<owner>/<topichex>).
+//
+// OperationID and PublicationID are DELIBERATELY DISTINCT identities:
+//
+//   - PublicationID is the STABLE logical publication identity — the exact
+//     identity recorded as durable per-tag provenance (spec.TagPublication),
+//     echoed to the caller, and durably bound by the preflight operation-key
+//     reservation. It NEVER changes across a one-time authoritative
+//     generation-conflict rebuild or a lost-response retry of the SAME
+//     logical publication.
+//   - OperationID is the identity of ONE COMMIT ATTEMPT: it is deterministically
+//     derived from PublicationID plus the attempt's own ExpectedGeneration and
+//     target Reference (see ComputeCommitAttemptID), so it is durably reserved
+//     and hashed at the control plane (feed_signer_operations) PER ATTEMPT. A
+//     rebuilt attempt (fresh generation/reference) always derives a FRESH
+//     OperationID, so its durable reservation can never collide with the
+//     conflicted attempt's permanently-fixed request hash.
+//
+// PublicationID is OPTIONAL on the wire for backward compatibility: a request
+// that leaves it empty is treated exactly as before this identity split — its
+// OperationID is its own stable logical identity, with no separate per-attempt
+// derivation enforced. Every NEW publisher-driven request sets both.
 type FeedCommitRequest struct {
 	OperationID        string `json:"operationID"`
+	PublicationID      string `json:"publicationID,omitempty"`
 	RegistryID         int64  `json:"registryID"`
 	Owner              string `json:"owner"`
 	Topic              string `json:"topic"`
@@ -69,9 +91,17 @@ var (
 	// ErrCommitUnknownRegistry is returned when the registry ID does not exist
 	// or the caller's owner does not belong to it (404).
 	ErrCommitUnknownRegistry = errors.New("registry is unknown to the feed signing service")
-	// ErrCommitConflict is returned when reusing an operation ID with different
-	// input, or when the repository generation advanced elsewhere (409).
+	// ErrCommitConflict is the PERMANENT conflict class: reusing an operation
+	// or publication identity with different input (409). It is NEVER safe to
+	// rebuild or retry — a distinct logical operation must never inherit
+	// another operation's outcome.
 	ErrCommitConflict = errors.New("feed commit operation conflict")
+	// ErrCommitGenerationConflict is the RECOVERABLE conflict class: the
+	// repository generation did not match (advanced elsewhere, or a
+	// concurrent creation raced) (412). It is the ONLY conflict class
+	// IsGenerationConflict recognizes as safe for the one-time authoritative
+	// re-resolution and rebuild.
+	ErrCommitGenerationConflict = errors.New("feed commit generation conflict")
 	// ErrCommitBackend is a retryable control-plane/Bee/dependency failure (503).
 	// It is also the class to which every raw network, dial, timeout, URL,
 	// TLS, decode, and validation-of-response failure collapses, so no host/
@@ -201,6 +231,8 @@ func (c ControlPlaneCommitter) Commit(ctx context.Context, req FeedCommitRequest
 		return FeedCommitResult{}, ErrCommitUnknownRegistry
 	case http.StatusConflict:
 		return FeedCommitResult{}, ErrCommitConflict
+	case http.StatusPreconditionFailed:
+		return FeedCommitResult{}, ErrCommitGenerationConflict
 	default:
 		// 503 and anything else on the backend side is retryable/dependency.
 		return FeedCommitResult{}, ErrCommitBackend
@@ -349,6 +381,11 @@ func decodeCommitResult(data []byte, req FeedCommitRequest) (FeedCommitResult, e
 func validateCommitRequestShape(req FeedCommitRequest) error {
 	if err := ValidateOperationID(req.OperationID); err != nil {
 		return fmt.Errorf("%w: operationID must be non-empty, bounded, and a JSON-safe printable-ASCII identifier", err)
+	}
+	if req.PublicationID != "" {
+		if err := ValidateOperationID(req.PublicationID); err != nil {
+			return fmt.Errorf("%w: publicationID must be bounded and a JSON-safe printable-ASCII identifier", err)
+		}
 	}
 	if req.RegistryID <= 0 {
 		return errors.New("registryID must be positive")
@@ -577,6 +614,29 @@ func DeterministicUpdatedAt(operationID string) string {
 	seconds := int64(binary.BigEndian.Uint64(sum[:8]))
 	offset := seconds % (366 * 24 * 3600)
 	return anchor.Add(time.Duration(offset) * time.Second).UTC().Format(time.RFC3339)
+}
+
+// ComputeCommitAttemptID derives the deterministic identity of ONE feed-commit
+// ATTEMPT from its stable logical publicationID plus the exact fields that
+// distinguish one attempt from another: the registry, owner, topic, the
+// immutable reference the attempt targets, and its expected generation. Two
+// attempts of the SAME logical publication (a conflict rebuild, or a crash
+// retry) derive the SAME attempt id iff they target the IDENTICAL
+// generation and reference; a rebuilt attempt at a fresh generation/reference
+// always derives a FRESH attempt id, so the durable FeedSigner operation row
+// it reserves can never collide with a prior attempt's permanently-fixed
+// request hash. Topic and Reference are canonicalized first so an equivalent
+// non-canonical spelling derives the identical attempt id.
+func ComputeCommitAttemptID(publicationID string, registryID int64, owner string, topic string, reference string, expectedGeneration int64) string {
+	h := sha256.New()
+	h.Write([]byte("uncloud-registry-feed-commit-attempt:v1\x00"))
+	writeStringField(h, publicationID)
+	writeInt64Field(h, registryID)
+	writeStringField(h, spec.NormalizeOwner(owner))
+	writeStringField(h, CanonicalTopic(topic))
+	writeStringField(h, CanonicalReference(reference))
+	writeInt64Field(h, expectedGeneration)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func writeStringField(h io.Writer, s string) {

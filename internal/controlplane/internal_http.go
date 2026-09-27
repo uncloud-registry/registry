@@ -208,14 +208,23 @@ func decodeStrictJSON(data []byte, dst any) error {
 }
 
 // mapFeedSignerError maps the signer's stable sentinels to the generic coarse
-// internal statuses.
+// internal statuses. The two conflict classes carry DISTINCT, fixed,
+// data-free statuses so the data-plane client can tell them apart WITHOUT any
+// response body content: errFeedSignerGenerationConflict (recoverable — the
+// repository generation advanced elsewhere) maps to 412, so
+// ControlPlaneCommitter.Commit can surface publish.ErrCommitGenerationConflict
+// and the publisher's one-time rebuild triggers; errFeedSignerConflict
+// (permanent — a reused operation/publication identity with different input)
+// stays 409 and must never be rebuilt.
 func mapFeedSignerError(err error) int {
 	switch {
 	case errors.Is(err, errFeedSignerMalformed):
 		return http.StatusBadRequest
 	case errors.Is(err, errFeedSignerRegistryNotFound), errors.Is(err, errFeedSignerNotReady):
 		return http.StatusNotFound
-	case errors.Is(err, errFeedSignerGenerationConflict), errors.Is(err, errFeedSignerConflict):
+	case errors.Is(err, errFeedSignerGenerationConflict):
+		return http.StatusPreconditionFailed
+	case errors.Is(err, errFeedSignerConflict):
 		return http.StatusConflict
 	default: // errFeedSignerBackend and anything unrecognized
 		return http.StatusServiceUnavailable
@@ -230,6 +239,8 @@ func genericFeedSignerErrorFor(status int) string {
 		return "invalid request"
 	case http.StatusNotFound:
 		return "registry not found"
+	case http.StatusPreconditionFailed:
+		return "generation conflict"
 	case http.StatusConflict:
 		return "operation conflict"
 	default:

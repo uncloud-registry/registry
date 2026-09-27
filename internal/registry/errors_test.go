@@ -511,6 +511,7 @@ func TestClassifyPublicationErrorMatrix(t *testing.T) {
 		{name: "dependency", err: newDependencyError(errors.New(marker)), wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
 		{name: "conflict typed", err: newConflictError(errors.New(marker)), wantStatus: http.StatusConflict, wantCode: ErrorCodeManifestConflict},
 		{name: "commit conflict sentinel", err: fmt.Errorf("commit: %w", publish.ErrCommitConflict), wantStatus: http.StatusConflict, wantCode: ErrorCodeManifestConflict},
+		{name: "commit generation conflict sentinel", err: fmt.Errorf("commit: %w", publish.ErrCommitGenerationConflict), wantStatus: http.StatusConflict, wantCode: ErrorCodeManifestConflict},
 		{name: "commit backend sentinel", err: fmt.Errorf("commit: %w", publish.ErrCommitBackend), wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
 		{name: "commit unauthorized sentinel", err: publish.ErrCommitUnauthorized, wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
 		{name: "commit unknown registry sentinel", err: publish.ErrCommitUnknownRegistry, wantStatus: http.StatusServiceUnavailable, wantCode: ErrorCodeDependencyUnavailable},
