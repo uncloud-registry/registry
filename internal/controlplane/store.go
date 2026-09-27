@@ -302,6 +302,7 @@ func OpenSQLite(path string) (*Store, error) {
 	}
 	store := &Store{DB: db}
 	if err := ApplyMigrations(context.Background(), db); err != nil {
+		db.Close()
 		return nil, err
 	}
 	return store, nil

@@ -272,7 +272,13 @@ func TestInternalFeedServerHappyPath(t *testing.T) {
 
 func TestInternalFeedServerErrorMapping(t *testing.T) {
 	req := validCommitReq(0, "batch-1")
-	fx := simpleArtifact(t, 'e', 'f', 'g', 100, 100)
+	// Round 5: the generation-conflict subtest below now also exercises
+	// prepareBoundCommit's full non-generation validation (including the
+	// independent artifact/blob proof) even though the request conflicts on
+	// generation — see prepareBoundCommit. The digest bytes must therefore be
+	// genuine lowercase hex (a stray 'g' is not valid hex and would fail
+	// artifact parsing once that check is actually reached).
+	fx := simpleArtifact(t, 'e', 'f', 'd', 100, 100)
 	w := newFeedTestWorld(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 		targetTags: map[string]string{"latest": "sha256:" + refHex('a')},

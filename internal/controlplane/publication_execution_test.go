@@ -866,11 +866,15 @@ func TestMigration16RefusesPreV16SucceededPublicationHistory(t *testing.T) {
 	}
 }
 
-// TestMigration16AllowsSafePreV16History proves the fail-closed rule targets
-// EXACTLY completed (succeeded) history: a completely empty pre-v16
-// database, and a v15 database carrying ONLY non-terminal history (a durable
-// preflight binding with no completed write, and a feed_signer_operations
-// row still pending) both upgrade to 16 normally.
+// TestMigration16AllowsSafePreV16History proves the fail-closed rule's safe
+// path: a completely empty pre-v16 database, and a v15 database carrying a
+// durable preflight publication_bindings row with NO matching
+// feed_signer_operations row at all, both upgrade to 16 normally.
+// publication_bindings alone proves nothing about a completed or in-flight
+// feed write (round 5 / Important 2: see TestMigration16RefusesAnyPreV16FeedSignerHistory
+// in migration16_history_test.go for the broader "any row, any state" refusal
+// this migration now enforces on feed_signer_operations and its legacy
+// quarantine table).
 func TestMigration16AllowsSafePreV16History(t *testing.T) {
 	ctx := context.Background()
 
@@ -887,34 +891,21 @@ func TestMigration16AllowsSafePreV16History(t *testing.T) {
 		}
 	})
 
-	t.Run("merely bound and pending history", func(t *testing.T) {
+	t.Run("bound only, no feed signer operations row", func(t *testing.T) {
 		db := openRawFileTestDB(t)
 		if err := applyMigrationsThrough(ctx, db, 15); err != nil {
 			t.Fatalf("apply through 15: %v", err)
 		}
 		store := &Store{DB: db}
-		reg, topic := seedFeedSignerRegistry(t, store)
+		reg, _ := seedFeedSignerRegistry(t, store)
 
 		hash := NormalizePublicationBindingHash(reg.ID, "0x"+testFeedOwner, "myrepo", "latest", "sha256:"+refHex('d'))
 		if _, err := store.ReservePublicationBinding(ctx, "op-bound-only", reg.ID, hash); err != nil {
 			t.Fatalf("seed binding: %v", err)
 		}
 
-		req := publish.FeedCommitRequest{
-			OperationID: "op-pending-only", RegistryID: reg.ID, Owner: "0x" + testFeedOwner,
-			Topic: topic, Reference: refHex('a'), BatchID: "batch-1", ExpectedGeneration: 0,
-		}
-		reqHash := NormalizeFeedCommitHash(req)
-		if _, err := store.ReserveFeedSignerOperation(ctx, req.OperationID, reg.ID, topic, reqHash); err != nil {
-			t.Fatalf("seed pending operation: %v", err)
-		}
-		pendingRow, err := store.GetFeedSignerOperation(ctx, req.OperationID)
-		if err != nil || pendingRow.State != FeedSignerOpPending {
-			t.Fatalf("sanity: row must be pending before migrating, got %+v err %v", pendingRow, err)
-		}
-
 		if err := ApplyMigrations(ctx, db); err != nil {
-			t.Fatalf("merely-bound/pending upgrade must succeed: %v", err)
+			t.Fatalf("bound-only upgrade must succeed: %v", err)
 		}
 		if v, _ := CurrentSchemaVersion(ctx, db); v != 16 {
 			t.Fatalf("expected version 16, got %d", v)

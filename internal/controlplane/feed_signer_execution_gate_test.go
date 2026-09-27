@@ -129,6 +129,21 @@ func TestFeedSignerGateSameAttemptRetryAfterSuccessIsIdempotent(t *testing.T) {
 // for the same PublicationID is blocked (a retryable backend condition, never
 // a silent authorization) even though the first attempt never advanced the
 // feed.
+// alwaysFailingFeedUpdater simulates a dependency/network failure on every
+// external feed update: a plain (non-ErrFeedAlreadyExists) error, which
+// finishBoundCommit's caller (runSignedCommit) classifies as UNCERTAIN — the
+// one non-generation failure class that can still occur strictly AFTER the
+// publication execution slot has already been durably reserved active, since
+// round 5 moved every OTHER non-generation check (binding/provenance,
+// current-transition integrity, batch/stamp authorization) into
+// prepareBoundCommit's zero-mutation phase, which runs strictly BEFORE
+// authorizePublicationExecution ever reserves anything.
+type alwaysFailingFeedUpdater struct{}
+
+func (alwaysFailingFeedUpdater) UpdateRegistryFeed(context.Context, Registry, string, string, string, bool) error {
+	return errors.New("simulated backend/network failure")
+}
+
 func TestFeedSignerGateNonGenerationFailureNeverAuthorizesReplacement(t *testing.T) {
 	req := validCommitReq(0, "batch-1")
 	fx := simpleArtifact(t, '7', '8', '9', 100, 100)
@@ -144,12 +159,21 @@ func TestFeedSignerGateNonGenerationFailureNeverAuthorizesReplacement(t *testing
 	attemptID1 := publish.ComputeCommitAttemptID(publicationID, req.RegistryID, req.Owner, req.Topic, req.Reference, req.ExpectedGeneration)
 	req.OperationID = attemptID1
 	req.PublicationID = publicationID
-	// An impermissible batch id: verifyBatch fails MALFORMED, a definite
-	// pre-update failure that is NOT a generation conflict.
-	req.BatchID = "not-the-permitted-batch"
 
-	if _, err := w.signer.Commit(context.Background(), req); !errors.Is(err, errFeedSignerMalformed) {
-		t.Fatalf("impermissible batch must fail malformed, got %v", err)
+	// An otherwise fully-authenticated attempt (round 5: every non-generation
+	// check already passed in the zero-mutation preparation phase, and the
+	// publication execution slot is durably reserved active) whose external
+	// update fails UNCERTAINLY. This is a definite NON-generation-conflict
+	// condition, so the row must stay active under attempt1 — NEVER released,
+	// NEVER marked replaceable.
+	w.signer.Feeds = alwaysFailingFeedUpdater{}
+
+	_, err := w.signer.Commit(context.Background(), req)
+	if !errors.Is(err, errFeedSignerBackend) {
+		t.Fatalf("an uncertain update failure must surface as a retryable backend condition, got %v", err)
+	}
+	if errors.Is(err, errFeedSignerGenerationConflict) {
+		t.Fatal("an uncertain update failure must never surface as a generation conflict")
 	}
 	if got := w.feedStore.Feeds[w.repoTopic]; got != refHex('b') {
 		t.Fatalf("the feed must be untouched, got %q", got)
@@ -159,7 +183,7 @@ func TestFeedSignerGateNonGenerationFailureNeverAuthorizesReplacement(t *testing
 		t.Fatal(err)
 	}
 	if exec.State != PublicationExecutionActive || exec.AttemptID != attemptID1 {
-		t.Fatalf("a non-generation failure must NEVER flip the row to replaceable, got %+v", exec)
+		t.Fatalf("a non-generation (uncertain update) failure must NEVER flip the row to replaceable, got %+v", exec)
 	}
 
 	// A DIFFERENT fresh attempt (even a well-formed, otherwise-valid one) for

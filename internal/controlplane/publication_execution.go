@@ -72,54 +72,78 @@ const publicationStateTableSQL = `CREATE TABLE publication_states (
 
 // errPublicationStatePredecessorMalformed is migration 16's single stable,
 // data-free prerequisite error. A database stamped at version 15 must carry
-// the exact publication_bindings table and both identity triggers installed by
-// migration 15; a missing or weakened lookalike fails before migration 16
-// creates any object.
-var errPublicationStatePredecessorMalformed = errors.New("controlplane: migration 16 prerequisite failed: publication binding schema is not the genuine version-15 schema")
+// the exact publication_bindings table and both identity triggers installed
+// by migration 15, AND (round 5 / Important 2) the exact hardened
+// feed_signer_operations table/index/triggers and feed_signer_operations_legacy
+// quarantine table migrations 9-14 install; a missing or weakened lookalike
+// of any of them fails before migration 16 creates any object.
+var errPublicationStatePredecessorMalformed = errors.New("controlplane: migration 16 prerequisite failed: publication binding or feed signer history schema is not the genuine version-15 schema")
 
 // errPublicationStateHistoryUnsafe is migration 16's fail-closed refusal for
 // pre-v16 publication history that safe state reconstruction cannot cover
-// (round 4 / Finding 1). See validatePublicationStateHistorySafe.
-var errPublicationStateHistoryUnsafe = errors.New("controlplane: migration 16 refused: pre-v16 succeeded publication history cannot be safely reconstructed")
+// (round 4 / Finding 1, broadened by round 5 / Important 2). See
+// validatePublicationStateHistorySafe.
+var errPublicationStateHistoryUnsafe = errors.New("controlplane: migration 16 refused: pre-v16 feed signer history cannot be safely reconstructed")
 
 // validatePublicationStateHistorySafe is migration 16's mandatory upgrade
 // production policy: refuse atomically whenever the pre-v16 database holds
-// ANY completed publication history that publication_states cannot account
-// for. A v15 (or earlier-lineage) database has NO record of the STABLE
-// PublicationID a completed feed_signer_operations row belonged to —
-// operation_id there is the per-ATTEMPT identity (a one-way domain-separated
-// hash of registry/owner/repo/tag/digest/generation, or of PublicationID plus
-// the attempt's own generation/reference), never the stable id itself, and
+// ANY feed-signer history that publication_states cannot account for.
+//
+// A v15 (or earlier-lineage) database has NO record of the STABLE
+// PublicationID a feed_signer_operations row belongs to — operation_id there
+// is the per-ATTEMPT identity (a one-way domain-separated hash of
+// registry/owner/repo/tag/digest/generation, or of PublicationID plus the
+// attempt's own generation/reference), never the stable id itself, and
 // publication_bindings (migration 15) carries only a bound HASH with no
 // success/failure state, so neither table can be inverted back to "which
-// PublicationID, if any, already reached a terminal success". Backfilling
-// publication_states from either table would therefore have to GUESS, and a
-// wrong guess is exactly the round-3 gap this migration exists to close: a
-// stable PublicationID whose pre-v16 success is left unrecorded can be
-// "retried" after an unrelated later publication overwrites the same tag,
-// re-authenticating cleanly against the CURRENT generation and advancing the
-// feed a second time.
+// PublicationID, if any, already reached a terminal success, is currently
+// mid-flight, or was adopted from migration-9 quarantine". Backfilling
+// publication_states from either table would therefore have to GUESS.
 //
-// A pre-v16 feed_signer_operations row in ANY other state (pending,
-// processing) never advanced the feed — its logical publication, if it has
-// one at all, never became terminal, so a future attempt for it correctly
-// takes the ordinary "absent -> first-ever reservation" path in
-// publication_states with nothing to protect. Likewise, a publication_bindings
-// row alone (bound, but never completed) proves nothing about a completed
-// feed write. Only a SUCCEEDED feed_signer_operations row is unsafe: it is
-// the sole durable proof that a real external feed advancement happened under
-// a protocol that had no terminal-success ledger, so its mere existence,
-// regardless of which registry or topic it names, refuses the migration
-// atomically before any DDL or version write. Fresh databases and databases
-// whose feed_signer_operations table has never recorded a completed
-// publication upgrade exactly as before.
+// Round 4 / Finding 1 fail-closed on SUCCEEDED rows alone: that closes the
+// gap where a stable PublicationID whose pre-v16 success is left unrecorded
+// gets "retried" after an unrelated later publication overwrites the same
+// tag, re-authenticating cleanly against the CURRENT generation and
+// advancing the feed a second time. But round 5 / Important 2 observed the
+// SAME hazard is not limited to 'succeeded' rows:
+//
+//   - a 'pending' or 'processing' row (including one an expired lease has
+//     just reset back to pending) is durable evidence that SOME caller
+//     already reserved this exact per-attempt identity for a real publish
+//     attempt. Serving v16 over it means a fresh publication_states row
+//     could be reserved and raced against that still-live pre-v16 attempt
+//     with no coordination between the two ledgers at all;
+//   - a migration-9 quarantine row in feed_signer_operations_legacy
+//     (pending OR succeeded) is exactly the same class of unrecorded history
+//     as an active row — AdoptLegacyFeedSignerOperation can promote it into
+//     an active row (succeeded or pending) at any time AFTER the upgrade,
+//     which publication_states would then have no memory of ever having
+//     existed before v16.
+//
+// So the fail-closed check is: EITHER table carrying so much as one row,
+// regardless of that row's state, refuses the migration atomically before
+// any DDL or version write. Only a database whose feed_signer_operations AND
+// feed_signer_operations_legacy are BOTH completely empty — nothing has ever
+// been reserved, claimed, completed, or quarantined — has nothing
+// publication_states could fail to protect, and upgrades normally. A
+// publication_bindings row alone (bound, but with no matching
+// feed_signer_operations row) is unaffected: it proves nothing about a
+// completed or in-flight feed write on its own.
 func validatePublicationStateHistorySafe(ctx context.Context, tx *sql.Tx) error {
-	var succeeded int
+	var activeRows int
 	if err := tx.QueryRowContext(ctx,
-		`select count(*) from feed_signer_operations where state = 'succeeded'`).Scan(&succeeded); err != nil {
-		return errors.New("migration 16: validate pre-v16 publication history")
+		`select count(*) from feed_signer_operations`).Scan(&activeRows); err != nil {
+		return errors.New("migration 16: validate pre-v16 feed signer operation history")
 	}
-	if succeeded != 0 {
+	if activeRows != 0 {
+		return errPublicationStateHistoryUnsafe
+	}
+	var legacyRows int
+	if err := tx.QueryRowContext(ctx,
+		`select count(*) from feed_signer_operations_legacy`).Scan(&legacyRows); err != nil {
+		return errors.New("migration 16: validate pre-v16 feed signer legacy quarantine history")
+	}
+	if legacyRows != 0 {
 		return errPublicationStateHistoryUnsafe
 	}
 	return nil
@@ -193,27 +217,91 @@ func installPublicationStateStore(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// validatePublicationStatePredecessor compares migration 15's table and
-// triggers against the same DDL constants migration 15 installs. Comparison
-// uses the existing quote-aware SQL fingerprinting rather than a permissive
-// column-presence check, so a hand-built lookalike cannot satisfy the gate.
+// validatePublicationStatePredecessor compares migration 15's publication-
+// binding objects AND every relevant migration 9-14 feed-signer history
+// object (round 5 / Important 2) against the same DDL constants those
+// migrations install. Comparison uses the existing quote-aware SQL
+// fingerprinting rather than a permissive column-presence check, so a
+// hand-built lookalike cannot satisfy the gate.
+//
+// validatePublicationStateHistorySafe only proves the ROW COUNT of
+// feed_signer_operations / feed_signer_operations_legacy is zero; that is a
+// meaningless guarantee unless the TABLES THEMSELVES (and the triggers that
+// constrain what can ever be written into them going forward) are proven to
+// be the genuine hardened schema those migrations install — a hand-rolled
+// empty lookalike table with weaker or absent CHECKs/triggers is not the
+// schema migration 16's own guarantees are built on top of. Both the active
+// feed_signer_operations table (schema, active-repo-claim index, operation-id
+// identity triggers, canonical-result triggers) and the
+// feed_signer_operations_legacy quarantine table are therefore validated
+// here, exactly like publication_bindings.
 func validatePublicationStatePredecessor(ctx context.Context, tx *sql.Tx) error {
-	triggerDDL := publicationBindingIdentityTriggerSQL()
+	bindingTriggerDDL := publicationBindingIdentityTriggerSQL()
 	// SQLite stores CREATE TRIGGER with that two-keyword prefix uppercased even
 	// when migration 15's executable DDL constant uses lowercase. This is a
 	// deterministic sqlite_schema serialization detail, not a relaxed
 	// comparison: every remaining byte is still fingerprinted exactly.
-	for i := range triggerDDL {
-		triggerDDL[i] = strings.Replace(triggerDDL[i], "create trigger", "CREATE TRIGGER", 1)
+	for i := range bindingTriggerDDL {
+		bindingTriggerDDL[i] = strings.Replace(bindingTriggerDDL[i], "create trigger", "CREATE TRIGGER", 1)
 	}
-	expected := []struct {
+
+	// Migration 14's operation-id identity triggers on feed_signer_operations
+	// use plain "create trigger" (no IF NOT EXISTS); the same prefix
+	// uppercasing applies.
+	feedSignerIdentityDDL := feedSignerOperationIDTriggerSQLV14()
+	for i := range feedSignerIdentityDDL {
+		feedSignerIdentityDDL[i] = strings.Replace(feedSignerIdentityDDL[i], "create trigger", "CREATE TRIGGER", 1)
+	}
+
+	// Migration 12/14's canonical-result triggers use "create trigger if not
+	// exists"; SQLite strips the IF NOT EXISTS clause entirely from the stored
+	// form in addition to uppercasing the prefix (verified empirically: the
+	// stored sqlite_master row for these triggers has no trace of "if not
+	// exists"), so both must be normalized away together.
+	feedSignerResultDDL := feedSignerResultCanonicalTriggerSQL()
+	for i := range feedSignerResultDDL {
+		feedSignerResultDDL[i] = strings.Replace(feedSignerResultDDL[i], "create trigger if not exists", "CREATE TRIGGER", 1)
+	}
+
+	// Migration 10/11's quarantine table constant likewise uses "create table
+	// if not exists"; SQLite stores it as a plain "CREATE TABLE".
+	feedSignerLegacyDDL := strings.Replace(feedSignerLegacyTableSQL, "create table if not exists", "CREATE TABLE", 1)
+
+	// The feed-signer objects carry literal `--` SQL comments inside their DDL
+	// constants (feedSignerOperationTableSQLV10's two state-coherence CHECK
+	// annotations). normalizeSQL deliberately REJECTS any `--`/`/* */` comment
+	// outside a literal — by design, for the invite-migration objects it was
+	// built for, which carry none — so it cannot fingerprint these constants.
+	// None of the feed-signer objects are ever installed via the rename-based
+	// rebuild pattern (they are created directly, never as a "_new" clone
+	// later renamed), so SQLite's stored sqlite_master text is byte-identical
+	// to the exact string this package executes (verified empirically): exact
+	// byte equality is sound here and strictly stricter than a fingerprint,
+	// not a looser or invented substitute.
+	byteExact := []struct{ typ, name, ddl string }{
+		{"table", "feed_signer_operations", feedSignerOperationTableSQLV10},
+		{"index", "feed_signer_active_repo_claim", feedSignerActiveRepoClaimIndexSQL},
+		{"trigger", "feed_signer_operation_id_ins", feedSignerIdentityDDL[0]},
+		{"trigger", "feed_signer_operation_id_upd", feedSignerIdentityDDL[1]},
+		{"trigger", "feed_signer_result_integrity_ins", feedSignerResultDDL[0]},
+		{"trigger", "feed_signer_result_integrity_upd", feedSignerResultDDL[1]},
+		{"table", "feed_signer_operations_legacy", feedSignerLegacyDDL},
+	}
+	for _, object := range byteExact {
+		stored, ok, err := storedObjectSQL(ctx, tx, object.typ, object.name)
+		if err != nil || !ok || stored != object.ddl {
+			return errPublicationStatePredecessorMalformed
+		}
+	}
+
+	fingerprinted := []struct {
 		typ, name, ddl string
 	}{
 		{"table", "publication_bindings", publicationBindingTableSQL},
-		{"trigger", "publication_binding_operation_id_ins", triggerDDL[0]},
-		{"trigger", "publication_binding_operation_id_upd", triggerDDL[1]},
+		{"trigger", "publication_binding_operation_id_ins", bindingTriggerDDL[0]},
+		{"trigger", "publication_binding_operation_id_upd", bindingTriggerDDL[1]},
 	}
-	for _, object := range expected {
+	for _, object := range fingerprinted {
 		stored, ok, err := storedObjectSQL(ctx, tx, object.typ, object.name)
 		if err != nil || !ok {
 			return errPublicationStatePredecessorMalformed

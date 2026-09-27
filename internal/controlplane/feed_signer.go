@@ -155,8 +155,39 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 		if err := s.precheckPublicationExecution(ctx, req); err != nil {
 			return publish.FeedCommitResult{}, err
 		}
+		// Round 5 / Important 1: the current (PublicationID-bearing) protocol
+		// takes a COMPLETELY SEPARATE path from this point on. Every
+		// non-generation check — target binding/provenance, current-
+		// transition integrity, batch/stamp authorization — is proven with
+		// ZERO durable mutation (prepareBoundCommit) BEFORE either durable
+		// reservation class (publication_states via authorizePublicationExecution,
+		// feed_signer_operations via ReserveFeedSignerOperation/Claim) ever
+		// runs. See commitBoundPublication.
+		return s.commitBoundPublication(ctx, req, reqHash, canonicalTopic)
 	}
 
+	// The legacy (PublicationID-empty) protocol: unreachable from any wire
+	// path (see the PublicationID doc above), retained solely for the
+	// internal migration-9 quarantine-adoption test surface. Its OperationID
+	// IS its own stable identity with no separate publication_states
+	// involvement at all, so it is structurally immune to the round-5
+	// attempt-id poisoning class (there is no attempt-id/PublicationID
+	// indirection to poison) and keeps its original, extensively-tested
+	// control flow unchanged: signCommitLegacy performs every check inline
+	// under the SAME feed_signer_operations claim reserved below.
+	return s.reserveAndRunClaim(ctx, req, reqHash, canonicalTopic, func(ctx context.Context, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
+		return s.signCommitLegacy(ctx, req, claimToken)
+	})
+}
+
+// reserveAndRunClaim is the shared durable feed_signer_operations
+// reservation-and-claim machinery used by BOTH the legacy protocol
+// (Commit, called immediately) and the current PublicationID-bearing
+// protocol (commitBoundPublication, called only AFTER prepareBoundCommit and
+// authorizePublicationExecution have already authenticated the attempt and
+// reserved its publication execution slot — see commitBoundPublication).
+// signFn is invoked exactly once, under the won claim, by runSignedCommit.
+func (s *FeedSigner) reserveAndRunClaim(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, canonicalTopic string, signFn func(ctx context.Context, claimToken string) (publish.FeedCommitResult, bool, bool, error)) (publish.FeedCommitResult, error) {
 	// Adopt any quarantined migration-9 row for this operation on this FIRST
 	// request (before reservation). A quarantined row is located atomically by
 	// the CURRENT operation ID OR ANY DERIVED HISTORICAL migration-9 operation
@@ -239,7 +270,7 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 				return publish.FeedCommitResult{}, fmt.Errorf("%w: claim: %v", errFeedSignerBackend, cerr)
 			}
 			if won {
-				return s.runSignedCommit(ctx, req, reqHash, token)
+				return s.runSignedCommit(ctx, req, reqHash, token, signFn)
 			}
 			// An identical request won the claim; reload and poll.
 		case FeedSignerOpProcessing:
@@ -264,11 +295,55 @@ func (s *FeedSigner) Commit(ctx context.Context, req publish.FeedCommitRequest) 
 				return publish.FeedCommitResult{}, fmt.Errorf("%w: reclaim: %v", errFeedSignerBackend, cerr)
 			}
 			if won {
-				return s.runSignedCommit(ctx, req, reqHash, token)
+				return s.runSignedCommit(ctx, req, reqHash, token, signFn)
 			}
 			// Claim raced; reload and poll.
 		}
 	}
+}
+
+// commitBoundPublication is the round-5 rebuilt control flow for the current
+// (PublicationID-bearing) protocol. It strictly separates non-mutating
+// preparation from durable reservation (Important 1): prepareBoundCommit
+// authenticates the ENTIRE attempt — target binding/provenance, current-
+// transition integrity, batch/stamp authorization — against the immutable
+// target document and a live (but unlocked) read of the current feed, with
+// ZERO durable mutation. Only an attempt that passes EVERY one of those
+// non-generation checks ever reaches authorizePublicationExecution (the
+// publication_states reservation/CAS) or reserveAndRunClaim (the
+// feed_signer_operations reservation/claim). A malformed, mismatched, or
+// impermissible attempt therefore creates NO publication_states row and NO
+// feed_signer_operations row at all — never reserved-then-released, never
+// left occupying another attempt's durable state — closing both the
+// same-bound-malformed-transition and the bad-batch attempt-id-collision
+// poisoning classes.
+//
+// The two authoritative generation-conflict checks (verifyTargetGeneration,
+// resolveCurrentFeed's current-generation comparison) are deliberately NOT
+// the authority here: prepareBoundCommit's current-feed read is not
+// protected by any exclusivity, so the live feed can advance between
+// preparation and the claim being won. finishBoundCommit re-derives both
+// checks FRESH, immediately before the external update, under the won claim
+// — the only point that is safe against a TOCTOU overwrite (see
+// finishBoundCommit for the argument that this single fresh reconciliation
+// is sufficient without redoing the non-generation checks).
+func (s *FeedSigner) commitBoundPublication(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, canonicalTopic string) (publish.FeedCommitResult, error) {
+	prep, err := s.prepareBoundCommit(ctx, req)
+	if err != nil {
+		return publish.FeedCommitResult{}, err
+	}
+
+	// The durable logical-publication EXECUTION gate's AUTHORITATIVE,
+	// mutating half (round 3 / Finding 1). Runs strictly AFTER prepareBoundCommit
+	// has authenticated this exact attempt's payload with zero mutation, so a
+	// row is only ever reserved or CASed for an ALREADY-AUTHENTICATED attempt.
+	if err := s.authorizePublicationExecution(ctx, req); err != nil {
+		return publish.FeedCommitResult{}, err
+	}
+
+	return s.reserveAndRunClaim(ctx, req, reqHash, canonicalTopic, func(ctx context.Context, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
+		return s.finishBoundCommit(ctx, req, prep, claimToken)
+	})
 }
 
 // publicationExecutionMaxCASAttempts bounds authorizePublicationExecution's
@@ -434,7 +509,7 @@ func (s *FeedSigner) authorizePublicationExecution(ctx context.Context, req publ
 // deadline. If the heartbeat fails to renew (a stale/defeated token, or a
 // takeover), the work context is cancelled immediately and completion is
 // prevented; the caller discovers the cancellation when the work loop returns.
-func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, claimToken string) (publish.FeedCommitResult, error) {
+func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommitRequest, reqHash [32]byte, claimToken string, signFn func(ctx context.Context, claimToken string) (publish.FeedCommitResult, bool, bool, error)) (publish.FeedCommitResult, error) {
 	workCtx, cancelWork := context.WithTimeout(ctx, feedSignerWorkTimeout)
 	defer cancelWork()
 
@@ -465,7 +540,7 @@ func (s *FeedSigner) runSignedCommit(ctx context.Context, req publish.FeedCommit
 		}
 	}()
 
-	result, _, uncertain, err := s.signCommit(workCtx, req, claimToken)
+	result, _, uncertain, err := signFn(workCtx, claimToken)
 	// Stop the heartbeat now that the work returned (the deferred cancelWork
 	// also fires on every return path, but an explicit cancel here guarantees
 	// the heartbeat goroutine exits before we wait on it).
@@ -561,33 +636,18 @@ func (s *FeedSigner) storedResult(op FeedSignerOperation, req publish.FeedCommit
 	return result, nil
 }
 
-// signCommit performs the tight validation sequence and, only once every check
-// passes and the caller still owns the claim, the signed feed update. All
-// validation precedes the key/network use. Ownership of the claim (exact token
-// + live lease) is re-verified immediately BEFORE the external update, so a
-// defeated owner whose lease was taken over discovers it lost the claim before
-// touching the updater. done=true reports that the feed already resolves to the
-// target reference (uncertain-response recovery), so the caller persists the
-// result without a second advancement. uncertain=true reports that the failure
-// occurred DURING the network feed update (the update may have partially/fully
-// applied), so the caller keeps the lease.
-//
-// The validation order is deliberate (round 4 / Finding 2): for the current
-// (PublicationID-bearing) protocol, the exact PublicationID binding and
-// immutable payload provenance are authenticated against the target document
-// ALONE — before any live current-feed read and before the publication's
-// execution row is ever reserved or CASed — so that NEITHER of the two
-// authoritative generation-conflict checks below (target generation, then
-// live current-feed generation) can ever mutate publication_states for an
-// attempt whose payload has not already been authenticated. Only once
-// authentication and reservation have both succeeded do the generation
-// checks run; either may still, entirely legitimately, report an
-// authoritative conflict against the now-authenticated row, which
-// runSignedCommit then marks replaceable. For the legacy PublicationID-empty
-// protocol (unreachable from any wire path), publication_states is never
-// touched at all, so authentication instead keeps its original historical
-// position after both generation checks.
-func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitRequest, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
+// signCommitLegacy performs the ORIGINAL, unmodified tight validation
+// sequence for the legacy PublicationID-empty protocol (unreachable from any
+// wire path; see the PublicationID doc on Commit). It is unchanged from the
+// pre-round-5 signCommit apart from dropping the now-dead PublicationID!=""
+// branches: publication_states is never touched by this protocol at all (its
+// OperationID IS its own stable identity, with no separate attempt-id
+// indirection to poison), so authentication keeps its ORIGINAL historical
+// position — after both generation checks — exactly as before round 5.
+// done=true reports that the feed already resolves to the target reference
+// (uncertain-response recovery); uncertain=true reports that the failure
+// occurred DURING the network feed update.
+func (s *FeedSigner) signCommitLegacy(ctx context.Context, req publish.FeedCommitRequest, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
 	reg, err := s.Store.FindRegistryByID(ctx, req.RegistryID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -611,48 +671,6 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Round 4 / Finding 2: authenticate the exact PublicationID binding and
-	// the immutable payload provenance recorded in the target document ALONE
-	// — entirely independent of live current-feed state. authenticate is
-	// called EXACTLY once below, at a position that depends on the protocol:
-	//
-	//   - PublicationID != "" (the current protocol): authentication runs
-	//     HERE, strictly BEFORE authorizePublicationExecution ever reserves
-	//     or CASes a publication_states row for this attempt. A forged,
-	//     absent, or mismatched provenance entry, or an operation identity
-	//     bound to a DIFFERENT tag/digest, therefore creates ZERO
-	//     publication_states mutations — even when it is deliberately shaped
-	//     to also trip one of the generation checks below. This is what
-	//     closes the round 4 / Finding 2 gap.
-	//   - PublicationID == "" (the legacy protocol, unreachable from any wire
-	//     path): publication_states is NEVER touched for such a request (the
-	//     reservation call below is itself gated on PublicationID != ""), so
-	//     there is no mutation-ordering hazard to close; authentication runs
-	//     at its ORIGINAL historical position, after both generation checks,
-	//     exactly as before this fix.
-	var operated string
-	authenticate := func() error {
-		var aerr error
-		operated, aerr = s.authenticatePublicationBinding(ctx, req, targetRepo, targetDoc)
-		return aerr
-	}
-
-	if req.PublicationID != "" {
-		if err := authenticate(); err != nil {
-			return publish.FeedCommitResult{}, false, false, err
-		}
-		// The durable logical-publication EXECUTION gate's AUTHORITATIVE,
-		// mutating half (round 3 / Finding 1; reordered by round 4 / Finding
-		// 2): runs strictly AFTER the authentication above and strictly
-		// BEFORE either generation check, so an authoritative generation
-		// conflict discovered by either check below always finds an
-		// ALREADY-AUTHENTICATED row to flip to replaceable — never a row
-		// reserved for an unauthenticated attempt.
-		if err := s.authorizePublicationExecution(ctx, req); err != nil {
-			return publish.FeedCommitResult{}, false, false, err
-		}
-	}
-
 	// Target generation must be exactly ExpectedGeneration+1 (definite
 	// pre-update): the first of the two authoritative generation-conflict
 	// classes.
@@ -671,10 +689,9 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	if req.PublicationID == "" {
-		if err := authenticate(); err != nil {
-			return publish.FeedCommitResult{}, false, false, err
-		}
+	operated, err := s.authenticatePublicationBinding(ctx, req, targetRepo, targetDoc)
+	if err != nil {
+		return publish.FeedCommitResult{}, false, false, err
 	}
 
 	// Current-tag-consistency (definite pre-update): the transition from the
@@ -686,12 +703,7 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 		return publish.FeedCommitResult{}, false, false, err
 	}
 
-	// Stamp policy / batch proof (definite pre-update). Runs AFTER
-	// authorization and both generation checks: an otherwise-authentic
-	// attempt with an impermissible batch id must still durably own its
-	// publication's execution slot (a non-generation failure never
-	// authorizes a replacement — see authorizePublicationExecution), never
-	// leave zero trace of it.
+	// Stamp policy / batch proof (definite pre-update).
 	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
 		return publish.FeedCommitResult{}, false, false, err
 	}
@@ -718,6 +730,202 @@ func (s *FeedSigner) signCommit(ctx context.Context, req publish.FeedCommitReque
 	// the stamp-policy-selected batch — is the exact postage batch propagated
 	// into the updater.
 	if err := s.Feeds.UpdateRegistryFeed(ctx, reg, req.Topic, req.Reference, req.BatchID, create); err != nil {
+		if errors.Is(err, swarm.ErrFeedAlreadyExists) {
+			// A create-only update observed an EXISTING feed: a racing creator
+			// won the creation race. This is a DEFINITE no-write by OUR
+			// operation — the feed at the topic is not ours, so it is a
+			// generation conflict, NEVER a success, NEVER the second
+			// advancement. The claim is released (there is nothing to retry on
+			// our side): a later retry re-resolves the REAL feed and conflicts
+			// against it again. No URL/body is ever leaked through the error.
+			return result, false, false, errFeedSignerGenerationConflict
+		}
+		return result, false, true, fmt.Errorf("%w: feed update: %v", errFeedSignerBackend, err)
+	}
+	return result, false, false, nil
+}
+
+// commitPreparation carries prepareBoundCommit's authenticated, read-only
+// results forward to authorizePublicationExecution and finishBoundCommit:
+// exactly what is needed to reserve the publication execution slot and to
+// re-derive the authoritative generation decision fresh, without repeating
+// any of the non-generation checks that already fully proved this attempt.
+type commitPreparation struct {
+	reg        Registry
+	targetRepo string
+	targetDoc  spec.RepoStateDocument
+	operated   string
+}
+
+// prepareBoundCommit is round 5's non-mutating preparation phase for the
+// current (PublicationID-bearing) protocol (Important 1). It proves EVERY
+// non-generation check — registry ready/owner, target topic derivation,
+// PublicationID binding/provenance, current-transition integrity (tag,
+// manifest, and independently-verified artifact/blob body), and batch/stamp
+// authorization — with ZERO durable mutation: no publication_states row and
+// no feed_signer_operations row is ever created by this function. Only a
+// caller that receives a nil error may proceed to authorizePublicationExecution
+// and reserveAndRunClaim.
+//
+// The two authoritative generation-conflict classes (verifyTargetGeneration,
+// resolveCurrentFeed's current-generation comparison) are deliberately NOT
+// treated as fatal here: a mismatch on EITHER is caught and swallowed (as
+// opposed to every other error resolveCurrentFeed/verifyTargetGeneration can
+// return, which IS fatal and returned immediately) so that
+// authenticateCurrentTagConsistency and verifyBatch still run and get the
+// chance to reject a payload that is ALSO malformed for a non-generation
+// reason — preserving the existing precedent (see
+// TestFeedSignerPublicationIDPoisoningRequiresAuthenticationBeforeExecutionGate)
+// that a non-generation failure always wins over a generation-conflict
+// classification. The generation outcome itself is intentionally NOT carried
+// forward: finishBoundCommit re-derives it FRESH under the won claim, which
+// is the only point safe against a live feed advancing between this
+// preparation and reservation (see finishBoundCommit).
+func (s *FeedSigner) prepareBoundCommit(ctx context.Context, req publish.FeedCommitRequest) (commitPreparation, error) {
+	reg, err := s.Store.FindRegistryByID(ctx, req.RegistryID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return commitPreparation{}, fmt.Errorf("%w: registry %d", errFeedSignerRegistryNotFound, req.RegistryID)
+		}
+		return commitPreparation{}, fmt.Errorf("%w: registry: %v", errFeedSignerBackend, err)
+	}
+	if reg.ProvisioningState != ProvisioningStateReady {
+		return commitPreparation{}, errFeedSignerNotReady
+	}
+	// Owner check BEFORE any key access or network update: normalized
+	// constant-time comparison against the stored feed-owner address.
+	if !constantEqual(spec.NormalizeOwner(req.Owner), spec.NormalizeOwner(reg.FeedOwnerAddress)) {
+		return commitPreparation{}, errFeedSignerRegistryNotFound
+	}
+
+	// Read the immutable target document and prove the topic derivation
+	// (definite pre-update, generation-independent).
+	targetRepo, targetDoc, err := s.readTargetDocument(ctx, req, reg)
+	if err != nil {
+		return commitPreparation{}, err
+	}
+
+	// Authenticate the exact PublicationID binding and the immutable payload
+	// provenance recorded in the target document ALONE — entirely
+	// independent of live current-feed state, and strictly BEFORE either
+	// durable reservation class. A forged, absent, or mismatched provenance
+	// entry, or an operation identity bound to a DIFFERENT tag/digest,
+	// therefore creates ZERO mutations of any kind (round 4 / Finding 2).
+	operated, err := s.authenticatePublicationBinding(ctx, req, targetRepo, targetDoc)
+	if err != nil {
+		return commitPreparation{}, err
+	}
+
+	// Current feed + repo identity (definite pre-update, non-generation) plus
+	// a PROVISIONAL current-generation read: a mismatch is caught below
+	// (currentGenConflict) rather than returned immediately.
+	done, _, curDoc, err := s.resolveCurrentFeed(ctx, req, reg, targetRepo)
+	currentGenConflict := false
+	if err != nil {
+		if !errors.Is(err, errFeedSignerGenerationConflict) {
+			return commitPreparation{}, err
+		}
+		currentGenConflict = true
+	}
+
+	// Current-tag-consistency (definite pre-update, round 5 / Important 1):
+	// the transition from the resolved current document to the target must
+	// be exactly the authenticated operation's own tag, with no unrelated
+	// tag mapping, provenance entry, manifest descriptor, or blob record
+	// mutated alongside it — proven here, BEFORE either reservation class,
+	// so an attempt shaped like B in
+	// TestFeedSignerSameBoundMalformedTransitionZeroReservation can never
+	// occupy P's execution slot or attempt-id row.
+	//
+	// This proof is only MEANINGFUL when curDoc is genuinely the document the
+	// target was built against — i.e. when the current-generation check just
+	// above actually agreed. When it did NOT (currentGenConflict), curDoc is
+	// a DIFFERENT, legitimately-diverged branch (a concurrent publication
+	// already advanced the feed past what this attempt expected — exactly
+	// the P/Q/P conflict-rebuild scenario): comparing the target against the
+	// WRONG predecessor would find spurious "unrelated" tag changes (the
+	// concurrent publication's own tags) and misreport a genuine, self-
+	// healing generation conflict as permanent malformed corruption — which
+	// would then never be marked replaceable (only the generation-conflict
+	// class is), permanently blocking the rebuild
+	// (TestRealFeedSignerCrossHandlerGenerationConflictSingleRebuild). So
+	// this proof is skipped here and the attempt instead proceeds to
+	// reservation, where finishBoundCommit's FRESH generation check
+	// authoritatively reclassifies it as the generation conflict it is.
+	if !currentGenConflict {
+		if err := s.authenticateCurrentTagConsistency(ctx, targetDoc, curDoc, done, operated); err != nil {
+			return commitPreparation{}, err
+		}
+	}
+
+	// Stamp policy / batch proof (definite pre-update, round 5 / Important
+	// 1): proven here, BEFORE either reservation class, so an
+	// otherwise-authentic attempt with an impermissible batch id — which
+	// shares its deterministic attempt id with a legitimate corrected-batch
+	// retry, since BatchID is excluded from ComputeCommitAttemptID — can
+	// never bind the durable request-hash row that retry would need (see
+	// TestFeedSignerBadBatchPoisoningZeroReservation).
+	if err := s.verifyBatch(ctx, req, reg, targetRepo); err != nil {
+		return commitPreparation{}, err
+	}
+
+	return commitPreparation{reg: reg, targetRepo: targetRepo, targetDoc: targetDoc, operated: operated}, nil
+}
+
+// finishBoundCommit is round 5's mutating/authoritative phase for the
+// current (PublicationID-bearing) protocol, invoked under the won
+// feed_signer_operations claim by runSignedCommit (via commitBoundPublication
+// / reserveAndRunClaim), strictly AFTER prepareBoundCommit and
+// authorizePublicationExecution have already authenticated this attempt and
+// reserved its publication execution slot.
+//
+// Both authoritative generation-conflict classes are re-derived FRESH here —
+// never trusted from prepareBoundCommit's earlier, unlocked read — because
+// the live feed can advance between preparation and this point (nothing
+// protects prepareBoundCommit's read). verifyTargetGeneration is a pure
+// function of the already-read, content-addressed immutable target document,
+// so recomputing it is cheap and unconditionally authoritative.
+// resolveCurrentFeed needs a genuinely fresh live read: since EVERY write to
+// this (registry, topic) feed is serialized through this exact claim
+// mechanism and strictly increments the document's embedded Generation, a
+// FRESH read reporting the SAME generation as before PROVES the feed is
+// unchanged since preparation — which is exactly why
+// authenticateCurrentTagConsistency and verifyBatch do not need to be redone
+// here: their prepareBoundCommit result remains valid whenever this fresh
+// check does not report a conflict. When it DOES report a conflict, that
+// result is authoritative and this attempt's row is marked replaceable by
+// runSignedCommit — never a stale, prepare-time conflict.
+func (s *FeedSigner) finishBoundCommit(ctx context.Context, req publish.FeedCommitRequest, prep commitPreparation, claimToken string) (publish.FeedCommitResult, bool, bool, error) {
+	if err := verifyTargetGeneration(req, prep.targetDoc); err != nil {
+		return publish.FeedCommitResult{}, false, false, err
+	}
+	done, create, _, err := s.resolveCurrentFeed(ctx, req, prep.reg, prep.targetRepo)
+	if err != nil {
+		return publish.FeedCommitResult{}, false, false, err
+	}
+
+	result := publish.FeedCommitResult{
+		OperationID: req.OperationID,
+		Feed:        publish.CanonicalTopic(req.Topic),
+		Reference:   publish.CanonicalReference(req.Reference),
+	}
+	if done {
+		// Already advanced to the target (recovery): no second advancement.
+		return result, true, false, nil
+	}
+
+	// Re-verify ownership at this instant so a defeated owner whose lease was
+	// taken over fails CLOSED before touching the key/network — after the
+	// updater starts, perfect cancellation is impossible, so a stale owner
+	// must be caught here.
+	if err := s.Store.EnsureFeedSignerLeaseOwned(ctx, req.OperationID, claimToken); err != nil {
+		return result, false, false, fmt.Errorf("%w: lost ownership before feed update: %v", errFeedSignerBackend, err)
+	}
+	// The key is now decryptable and the feed is signed. THIS is the only
+	// point a network update happens. The request's BatchID — already proven
+	// to equal the stamp-policy-selected batch — is the exact postage batch
+	// propagated into the updater.
+	if err := s.Feeds.UpdateRegistryFeed(ctx, prep.reg, req.Topic, req.Reference, req.BatchID, create); err != nil {
 		if errors.Is(err, swarm.ErrFeedAlreadyExists) {
 			// A create-only update observed an EXISTING feed: a racing creator
 			// won the creation race. This is a DEFINITE no-write by OUR
@@ -835,7 +1043,13 @@ func (s *FeedSigner) resolveCurrentFeed(ctx context.Context, req publish.FeedCom
 		return false, false, nil, fmt.Errorf("%w: current repo identity does not match the referenced repository", errFeedSignerMalformed)
 	}
 	if decodedCur.Generation != req.ExpectedGeneration {
-		return false, false, nil, errFeedSignerGenerationConflict
+		// The decoded document is still returned alongside the conflict: a
+		// non-mutating caller preparing an attempt (see prepareBoundCommit)
+		// needs it to prove the non-generation transition/batch checks even
+		// when this specific read also disagrees on generation — a callsite
+		// that only wants the fast-fail behavior already discards it on
+		// error, exactly as before.
+		return false, false, &decodedCur, errFeedSignerGenerationConflict
 	}
 	return false, false, &decodedCur, nil
 }
