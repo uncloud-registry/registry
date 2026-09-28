@@ -374,9 +374,13 @@ func TestIndexMalformedPlatformRejected(t *testing.T) {
 	}
 }
 
-// TestIndexDuplicatePlatformRejected rejects an index with TWO children under
-// the SAME platform as a 400 with zero writes.
-func TestIndexDuplicatePlatformRejected(t *testing.T) {
+// TestIndexDuplicatePlatformAccepted proves an index with TWO children under
+// the SAME platform is ACCEPTED (publishes 201). Neither the OCI image-index
+// spec nor the Docker manifest-list spec requires child platforms to be
+// unique — the OCI spec resolves a tie on a client/runtime as "the first
+// matching entry SHOULD be used" (descriptor order) — so a duplicate is never
+// rejected (the previous invented uniqueness rule is removed).
+func TestIndexDuplicatePlatformAccepted(t *testing.T) {
 	t.Parallel()
 	h, _, _, issuer := newIndexWorld(t)
 	counter := &countingObjectUploader{inner: h.Publisher.Objects}
@@ -389,13 +393,21 @@ func TestIndexDuplicatePlatformRejected(t *testing.T) {
 		indexChild{digest: publish.ComputeDigest(indexChildArm64), media: indexTestManMT, size: len(indexChildArm64), arch: "amd64", os: "linux"},
 	)
 	resp := putIndex(t, server.URL, issuer, "multi", indexTestMT, body)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("duplicate platform must be 400, got %d (body %s)", resp.StatusCode, b)
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("same-platform index must publish 201, got %d (body %s)", resp.StatusCode, b)
 	}
-	if counter.puts != 0 {
-		t.Fatalf("duplicate platform caused %d object writes, want 0", counter.puts)
+	if counter.puts == 0 {
+		t.Fatalf("same-platform index publish must write objects, got 0")
+	}
+	// The published index is serveable by digest: descriptor order preserved.
+	indexDigest := publish.ComputeDigest(body)
+	p := indexPullManifest(t, server.URL, issuer, indexDigest, indexTestMT)
+	defer p.Body.Close()
+	bb, _ := io.ReadAll(p.Body)
+	if p.StatusCode != http.StatusOK || !bytes.Equal(bb, body) {
+		t.Fatalf("published index must be pullable by digest, got %d", p.StatusCode)
 	}
 }
 

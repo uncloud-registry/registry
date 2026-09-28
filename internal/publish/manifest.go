@@ -81,12 +81,16 @@ type Descriptor struct {
 }
 
 // Platform is a validated index-child platform. architecture and os are
-// required; every string is bounded.
+// required; every string is bounded. os.features lists mandatory OS features
+// and features lists mandatory CPU features (per the Docker manifest-list and
+// OCI image-index platform objects); both are optional, bounded arrays of
+// strings.
 type Platform struct {
 	Architecture string   `json:"architecture"`
 	OS           string   `json:"os"`
 	OSVersion    string   `json:"os.version,omitempty"`
 	OSFeatures   []string `json:"os.features,omitempty"`
+	Features     []string `json:"features,omitempty"`
 	Variant      string   `json:"variant,omitempty"`
 }
 
@@ -236,6 +240,7 @@ var (
 		"os":           {},
 		"os.version":   {},
 		"os.features":  {},
+		"features":     {},
 		"variant":      {},
 	}
 )
@@ -607,33 +612,18 @@ func decodePlatform(raw json.RawMessage, field string) (*Platform, error) {
 		p.Variant = s
 	}
 	if fRaw, present := members["os.features"]; present {
-		if isNullRaw(fRaw) {
-			return nil, newValidationError(ErrKindWrongType, joinPath(field, "os.features"), "value must be a JSON array of strings, not null")
-		}
-		// Decode into RAW members and STRICTLY require each to be a non-null
-		// JSON string. Unmarshaling straight into []string would silently
-		// coerce a null array member to "" (encoding/json's string-target
-		// null behavior), hiding a null behind an accepted empty string.
-		var items []json.RawMessage
-		if err := json.Unmarshal(fRaw, &items); err != nil {
-			return nil, newValidationError(ErrKindWrongType, joinPath(field, "os.features"), "value must be a JSON array of strings")
-		}
-		if items == nil {
-			items = []json.RawMessage{}
-		}
-		if len(items) > maxPlatformFeatures {
-			return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "os.features"),
-				fmt.Sprintf("platform os.features exceeds %d entries", maxPlatformFeatures))
-		}
-		feats := make([]string, 0, len(items))
-		for i, item := range items {
-			s, err := decodeRequiredString(item, fmt.Sprintf("%s.os.features[%d]", field, i))
-			if err != nil {
-				return nil, err
-			}
-			feats = append(feats, s)
+		feats, err := decodePlatformFeatureArray(fRaw, joinPath(field, "os.features"))
+		if err != nil {
+			return nil, err
 		}
 		p.OSFeatures = feats
+	}
+	if fRaw, present := members["features"]; present {
+		feats, err := decodePlatformFeatureArray(fRaw, joinPath(field, "features"))
+		if err != nil {
+			return nil, err
+		}
+		p.Features = feats
 	}
 
 	for name, v := range map[string]string{
@@ -653,7 +643,46 @@ func decodePlatform(raw json.RawMessage, field string) (*Platform, error) {
 				fmt.Sprintf("platform os.features entry exceeds the %d-byte bound", maxPlatformStringLen))
 		}
 	}
+	for i, f := range p.Features {
+		if len(f) > maxPlatformStringLen {
+			return nil, newValidationError(ErrKindInvalidPlatform, fmt.Sprintf("%s.features[%d]", field, i),
+				fmt.Sprintf("platform features entry exceeds the %d-byte bound", maxPlatformStringLen))
+		}
+	}
 	return p, nil
+}
+
+// decodePlatformFeatureArray strictly decodes a bounded platform feature list
+// (os.features or features): a non-null array with at most maxPlatformFeatures
+// entries, each entry a non-null strict JSON string. Unmarshaling straight
+// into []string would silently coerce a null array member to "" (encoding/
+// json's string-target null behavior), hiding a null behind an accepted empty
+// string, so each member is decoded as a RAW token and required to be a
+// non-null string. Errors are data-free (never echo a feature value).
+func decodePlatformFeatureArray(raw json.RawMessage, field string) ([]string, error) {
+	if isNullRaw(raw) {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array of strings, not null")
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array of strings")
+	}
+	if items == nil {
+		items = []json.RawMessage{}
+	}
+	if len(items) > maxPlatformFeatures {
+		return nil, newValidationError(ErrKindInvalidPlatform, field,
+			fmt.Sprintf("platform feature list exceeds %d entries", maxPlatformFeatures))
+	}
+	feats := make([]string, 0, len(items))
+	for i, item := range items {
+		s, err := decodeRequiredString(item, fmt.Sprintf("%s[%d]", field, i))
+		if err != nil {
+			return nil, err
+		}
+		feats = append(feats, s)
+	}
+	return feats, nil
 }
 
 // rejectConflictingDescriptors fails the artifact when the same digest

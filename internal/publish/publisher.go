@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"mime"
-	"sort"
 	"strings"
 	"time"
 
@@ -479,7 +478,6 @@ func validateManifestReferences(current spec.RepoStateDocument, input BuildInput
 // error BEFORE any object or feed write, so the failed publication performs
 // zero puts and zero feed updates.
 func validateIndexReferences(current spec.RepoStateDocument, input BuildInput, artifact Artifact) error {
-	platforms := make(map[string]struct{}, len(artifact.Manifests))
 	for _, ref := range artifact.Manifests {
 		if !IsSupportedChildManifestMediaType(ref.MediaType) {
 			return newValidationError(ErrKindUnsupportedNestedMediaType, "",
@@ -498,42 +496,17 @@ func validateIndexReferences(current spec.RepoStateDocument, input BuildInput, a
 			return newValidationError(ErrKindMediaTypeMismatch, "",
 				"stored child manifest media type disagrees with the index descriptor")
 		}
-		// At most one child per resolved platform: both the OCI image-index and
-		// the Docker manifest-list specs require the platform to be unique so a
-		// client can disambiguate. A duplicated platform is rejected (never
-		// last-wins); children without a platform are not compared.
-		if key := resolvedPlatformKey(ref.Platform); key != "" {
-			if _, dup := platforms[key]; dup {
-				return newValidationError(ErrKindInvalidPlatform, "",
-					"an index must not contain more than one child for the same platform")
-			}
-			platforms[key] = struct{}{}
-		}
+		// Children are validated in DOCUMENT ORDER and no validity rule depends
+		// on platform uniqueness: both the OCI image-index and the Docker
+		// manifest-list specs place at most one child per (architecture, os,
+		// variant, feature) platform in practice, but neither REQUIRES
+		// uniqueness — the OCI spec explicitly resolves ties on a client or
+		// runtime by "the first matching entry SHOULD be used". A child with
+		// no platform is compared to no other. The parser preserves descriptor
+		// order (see Artifact.Manifests), so every valid order is accepted and
+		// no duplicate-platform detector is applied here (or anywhere).
 	}
 	return nil
-}
-
-// resolvedPlatformKey returns a stable, order-independent key for a child
-// platform, or "" for a nil (absent) platform. The platform parts are bounded
-// at parse time, so the key is bounded too. It is used only to reject
-// duplicate platforms within one index (never echoed in an error).
-func resolvedPlatformKey(p *Platform) string {
-	if p == nil {
-		return ""
-	}
-	var feats string
-	if len(p.OSFeatures) > 0 {
-		sorted := append([]string(nil), p.OSFeatures...)
-		sort.Strings(sorted)
-		// Canonical JSON framing is collision-free: ["a,b","c"] and ["a","b,c"]
-		// marshal to DISTINCT byte strings, so two platforms whose feature
-		// slices differ only by where a separator falls can never share a key.
-		// (A naive comma/byte join would conflate them into an identical key.)
-		if b, err := json.Marshal(sorted); err == nil {
-			feats = string(b)
-		}
-	}
-	return strings.Join([]string{p.OS, p.Architecture, p.OSVersion, p.Variant, feats}, "\x00")
 }
 
 // CheckBlobReferenceCoherence verifies ONE stored blob record against the

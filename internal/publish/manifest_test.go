@@ -102,6 +102,45 @@ func TestParseArtifact(t *testing.T) {
 			wantKind: ArtifactKindIndex,
 		},
 		{
+			name:      "docker manifest list with platform features (cpu)",
+			mediaType: dockerListMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":500,"digest":%q,"platform":{"architecture":"amd64","os":"linux","features":["sse4","aes"]}}]}`,
+				dockerListMT, dockerManMT, dig('e')),
+			wantKind: ArtifactKindIndex,
+			check: func(t *testing.T, a Artifact) {
+				if len(a.Manifests) != 1 || a.Manifests[0].Platform == nil {
+					t.Fatalf("expected one child with a platform: %+v", a.Manifests)
+				}
+				p := a.Manifests[0].Platform
+				if !reflect.DeepEqual(p.Features, []string{"sse4", "aes"}) {
+					t.Fatalf("features not parsed: %+v", p.Features)
+				}
+				// features and os.features are DISTINCT fields: parsing features
+				// must never leak into os.features or vice versa.
+				if p.OSFeatures != nil {
+					t.Fatalf("os.features must remain absent when only features is present: %+v", p.OSFeatures)
+				}
+			},
+		},
+		{
+			name: "index preserves descriptor order with duplicate platforms",
+			// Same-platform children are standards-valid and resolved client-side
+			// as the FIRST matching entry (descriptor order); the parser must
+			// preserve that order and never drop or reject the second child.
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux"}},{"mediaType":%q,"size":513,"digest":%q,"platform":{"architecture":"amd64","os":"linux"}}]}`,
+				ociIndexMT, ociManifestMT, dig('b'), ociManifestMT, dig('d')),
+			wantKind: ArtifactKindIndex,
+			check: func(t *testing.T, a Artifact) {
+				if len(a.Manifests) != 2 {
+					t.Fatalf("expected 2 children, got %+v", a.Manifests)
+				}
+				if a.Manifests[0].Digest != dig('b') || a.Manifests[1].Digest != dig('d') {
+					t.Fatalf("descriptor order must be preserved, got %s then %s", a.Manifests[0].Digest, a.Manifests[1].Digest)
+				}
+			},
+		},
+		{
 			name:      "duplicate identical layer digest allowed and deduplicated",
 			mediaType: ociManifestMT,
 			body: fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":1024,"digest":%q},{"mediaType":%q,"size":1024,"digest":%q}]}`,
@@ -428,6 +467,41 @@ func TestParseArtifact(t *testing.T) {
 				ociIndexMT, ociManifestMT, dig('b')),
 			wantErr:     true,
 			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "platform features null rejected",
+			mediaType:   ociIndexMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","features":null}}]}`, ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "platform features null member rejected",
+			mediaType:   ociIndexMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","features":["sse4",null]}}]}`, ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "platform features non-string member rejected",
+			mediaType:   ociIndexMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","features":["sse4",42]}}]}`, ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "platform features mixed null/number rejected",
+			mediaType:   ociIndexMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","features":[null,42,"avx"]}}]}`, ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:        "platform case-variant features key rejected",
+			mediaType:   ociIndexMT,
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","Features":["x"]}}]}`, ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindUnknownMember,
 		},
 
 		// schemaVersion.

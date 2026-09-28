@@ -222,7 +222,7 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 	// an explicitly unacceptable stored media type is a documented 404
 	// MANIFEST_UNKNOWN with a fixed data-free message, and returns WITHOUT
 	// touching the object store or any state.
-	if !acceptAccepts(r.Header.Get("Accept"), desc.MediaType) {
+	if !acceptAcceptsValues(r.Header.Values("Accept"), desc.MediaType) {
 		writeError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", messageManifestNotAcceptable)
 		return
 	}
@@ -814,6 +814,20 @@ const (
 	messageManifestNotAcceptable = "the stored manifest representation is not acceptable for the requested media types"
 )
 
+// acceptAcceptsValues reports whether the request's Accept header field
+// (ALL field lines, in order) permits serving the exact stored media type.
+// Multiple header lines that carry an Accept field name are combined before
+// the comma-list is parsed, per RFC 9110 §5.3 field-combining semantics, and
+// the ORDER of the field lines is preserved in that combine. The single
+// combined value is then evaluated by acceptAccepts. An absent Accept (no
+// field lines) accepts any representation.
+func acceptAcceptsValues(values []string, storedMediaType string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	return acceptAccepts(strings.Join(values, ","), storedMediaType)
+}
+
 // acceptAccepts reports whether the request's Accept header permits serving
 // the exact stored media type, per Distribution (RFC 7231 §5.3.2) semantics:
 //   - an absent or empty Accept accepts any representation;
@@ -827,10 +841,13 @@ const (
 //     representation, q>0 serves it. So an exact `type/subtype;q=0` overrides
 //     a positive `*/*`, and an exact positive overrides a global `q=0`.
 //   - matching is case-insensitive; parameters other than q are ignored; a
-//     malformed media range or a malformed/out-of-range q (not a number, or
-//     outside [0,1]) skips that item rather than poisoning the whole header;
+//     malformed media range or a malformed/out-of-range q (any string that
+//     does not match the RFC 9110 qvalue grammar, or a value outside [0,1])
+//     skips that item rather than poisoning the whole header;
 //   - if NO item matches, the representation is refused.
 //
+// Callers span multiple field lines via acceptAcceptsValues BEFORE the
+// comma-list is parsed, so descriptor order is preserved across lines.
 // This function is data-free — it never echoes any Accept value.
 func acceptAccepts(header, storedMediaType string) bool {
 	if strings.TrimSpace(header) == "" {
@@ -864,9 +881,11 @@ func acceptAccepts(header, storedMediaType string) bool {
 // parseAcceptItem splits one Accept item into its media-range base (the part
 // before the first ';') and its effective q value (default 1). ok=false means
 // the item is malformed and must be skipped: an empty media range, or a q
-// parameter that is not a number or is outside the valid [0,1] range. When
-// several q parameters appear, the LAST one governs. The returned base is
-// trimmed but not lowercased; callers lowercase it consistently.
+// parameter that is not a valid RFC 9110 qvalue or is not present. Because q
+// values are checked against the exact qvalue grammar in [0,1] (see
+// parseQvalue), a value that parses is always in range. When several q
+// parameters appear, the LAST one governs. The returned base is trimmed but
+// not lowercased; callers lowercase it consistently.
 func parseAcceptItem(item string) (base string, q float64, ok bool) {
 	parts := strings.Split(item, ";")
 	basePart := strings.TrimSpace(parts[0])
@@ -879,13 +898,68 @@ func parseAcceptItem(item string) (base string, q float64, ok bool) {
 		if len(kv) != 2 || strings.ToLower(strings.TrimSpace(kv[0])) != "q" {
 			continue
 		}
-		v, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
-		if err != nil || v < 0 || v > 1 {
+		v, valid := parseQvalue(kv[1])
+		if !valid {
 			return "", 0, false
 		}
 		q = v
 	}
 	return basePart, q, true
+}
+
+// parseQvalue parses ONE HTTP qvalue against the exact RFC 9110 §12.4.2 ABNF:
+//
+//	qvalue = ( "0" [ "." 0*3DIGIT ] ) / ( "1" [ "." 0*3("0") ] )
+//
+// So an integral digit of 0 or 1, optionally followed by "." and AT MOST three
+// fractional digits; after a "1." ONLY zeros are allowed (a weight never
+// exceeds 1). The whole token must match — NaN, ".5", "+0.5", "-1", "2",
+// "1e0", ".", a fourth fractional digit ("1.0000", "0.1234"), surplus
+// precision, trailing garbage, or an empty/malformed value are all rejected.
+// Leading/trailing whitespace is tolerated (the caller already trims the
+// q parameter value). The returned weight is always in [0,1].
+func parseQvalue(raw string) (float64, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, false
+	}
+	var weight float64
+	switch s[0] {
+	case '0':
+	case '1':
+		weight = 1
+	default:
+		// NaN, ".5", "+0.5", "-1", "2", "1e0", letters, symbols.
+		return 0, false
+	}
+	whole := s[0]
+	i := 1
+	if i < len(s) && s[i] == '.' {
+		i++
+		fraction := 0
+		place := 10.0
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			fraction++
+			if fraction > 3 {
+				return 0, false
+			}
+			if whole == '1' {
+				// After "1." only zeros keep the weight at exactly 1.
+				if s[i] != '0' {
+					return 0, false
+				}
+			} else {
+				weight += float64(s[i]-'0') / place
+				place *= 10
+			}
+			i++
+		}
+	}
+	if i != len(s) {
+		// Trailing garbage: exponent, extra '.', sign, whitespace inside, etc.
+		return 0, false
+	}
+	return weight, true
 }
 
 // mediaRangeMatchesSpec reports whether a lowercased Accept media range

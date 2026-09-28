@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/uncloud-registry/registry/internal/publish"
@@ -262,5 +263,100 @@ func TestFeedSignerRejectsIndexChildByteLengthMismatch(t *testing.T) {
 	}
 	if n := updater.count(); n != 0 {
 		t.Fatalf("child byte-length mismatch must cause ZERO external updates, got %d", n)
+	}
+}
+
+// TestFeedSignerAcceptsDockerManifestListChildFeatures proves the production
+// signer accepts a real Docker schema2 manifest list whose child platform
+// carries the standard `features` (CPU features) AND `os.features` (OS
+// features) fields end to end: the operated list body parses under its DECLARED
+// Docker media type with the platform objects accepted, every committed child
+// is verified, and exactly one feed update advances the repository.
+func TestFeedSignerAcceptsDockerManifestListChildFeatures(t *testing.T) {
+	const tag = "latest"
+	child := makeDockerChild(t)
+	fx := buildDockerListWithFeatures(t, child)
+	w, req := indexWorld(t, tag, 1, []indexChildFixture{child}, fx)
+
+	signer, updater := w.countingSigner()
+	result, err := signer.Commit(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Docker manifest list with platform features must be accepted by the signer: %v", err)
+	}
+	if result.Feed != w.repoTopic || result.Reference != refHex('a') {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if n := updater.count(); n != 1 {
+		t.Fatalf("expected exactly 1 external feed update, got %d", n)
+	}
+	if got := w.feedStore.Feeds[w.repoTopic]; got != refHex('a') {
+		t.Fatalf("feed must advance to the Docker manifest-list target, got %q", got)
+	}
+}
+
+// makeDockerChild builds a REAL Docker schema-2 single-platform manifest the
+// Docker manifest list references (the child media type and body parse as a
+// coherent manifest under the Docker schema-2 declaration).
+func makeDockerChild(t *testing.T) indexChildFixture {
+	t.Helper()
+	const dockerChildMT = "application/vnd.docker.distribution.manifest.v2+json"
+	const dockerConfigMT = "application/vnd.docker.container.image.v1+json"
+	child := map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     dockerChildMT,
+		"config": map[string]any{
+			"mediaType": dockerConfigMT,
+			"digest":    "sha256:" + strings.Repeat("c", 64),
+			"size":      100,
+		},
+		"layers": []map[string]any{},
+	}
+	body, err := json.Marshal(child)
+	if err != nil {
+		t.Fatalf("marshal docker child fixture: %v", err)
+	}
+	digest := publish.ComputeDigest(body)
+	return indexChildFixture{
+		body:     body,
+		digest:   digest,
+		manifest: spec.ManifestDescriptor{SwarmRef: refHex('8'), MediaType: dockerChildMT, Size: int64(len(body))},
+		ref:      publish.Descriptor{MediaType: dockerChildMT, Digest: digest, Size: int64(len(body))},
+	}
+}
+
+// buildDockerListWithFeatures assembles a REAL Docker schema2 manifest list
+// whose single child platform carries BOTH the standard CPU `features` and the
+// `os.features` fields, referencing the given committed child.
+func buildDockerListWithFeatures(t *testing.T, child indexChildFixture) indexFixture {
+	t.Helper()
+	childJSON := []map[string]any{
+		{
+			"mediaType": child.ref.MediaType,
+			"digest":    child.ref.Digest,
+			"size":      child.ref.Size,
+			"platform": map[string]any{
+				"architecture": "amd64",
+				"os":           "linux",
+				"features":     []string{"sse4", "aes"},
+				"os.features":  []string{"avx"},
+			},
+		},
+	}
+	idx := map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     publish.MediaTypeDockerManifestList,
+		"manifests":     childJSON,
+	}
+	body, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal docker manifest list fixture: %v", err)
+	}
+	return indexFixture{
+		body:   body,
+		digest: publish.ComputeDigest(body),
+		manifest: spec.ManifestDescriptor{
+			SwarmRef: refHex('9'), MediaType: publish.MediaTypeDockerManifestList, Size: int64(len(body)),
+		},
+		children: []indexChildFixture{child},
 	}
 }

@@ -245,12 +245,18 @@ func TestBuildNextEmptyIndexPublicationValid(t *testing.T) {
 	}
 }
 
-// TestBuildNextIndexDuplicatePlatformRejected proves an index with TWO
-// children carrying the SAME resolved platform (both amd64/linux) is rejected
-// as an invalid platform before any state is derived — both the OCI and Docker
-// specs require at most one child per platform.
-func TestBuildNextIndexDuplicatePlatformRejected(t *testing.T) {
+// TestBuildNextIndexDuplicatePlatformAccepted proves an index with TWO
+// children carrying the SAME resolved platform is ACCEPTED and published.
+// Neither the OCI image-index spec nor the Docker manifest-list spec requires
+// child platforms to be unique: the OCI spec resolves a tie on a client or
+// runtime as "the first matching entry SHOULD be used" (descriptor order),
+// so a duplicate is never rejected and the second child is never shadowed.
+// Both committed children are retained exactly. (Children without a platform
+// are likewise all valid and not compared to one another.)
+func TestBuildNextIndexDuplicatePlatformAccepted(t *testing.T) {
 	input, _ := indexInput(t)
+	// Both children declare the SAME platform (amd64/linux); they reference
+	// the two canonical committed children and must both be validated.
 	input.ManifestJSON = makeIndex(t, ociIndexMT,
 		childSpec{mediaType: ociManifestMT, digest: dig('b'), size: 512, arch: "amd64", os: "linux"},
 		childSpec{mediaType: ociManifestMT, digest: dig('d'), size: 513, arch: "amd64", os: "linux"},
@@ -258,20 +264,29 @@ func TestBuildNextIndexDuplicatePlatformRejected(t *testing.T) {
 	input.ManifestDigest = ComputeDigest(input.ManifestJSON)
 	input.Manifest.Size = int64(len(input.ManifestJSON))
 
-	_, err := (DefaultBuilder{}).BuildNext(currentWithChildren(), input)
-	var ve *ValidationError
-	if !errors.As(err, &ve) || ve.Kind != ErrKindInvalidPlatform {
-		t.Fatalf("duplicate platform: expected invalid_platform, got %v", err)
+	next, err := (DefaultBuilder{}).BuildNext(currentWithChildren(), input)
+	if err != nil {
+		t.Fatalf("same-platform children must publish: %v", err)
+	}
+	if next.Tags["multi"] != input.ManifestDigest {
+		t.Fatalf("tag did not map to the index: %+v", next.Tags)
+	}
+	// Both committed children are retained exactly (neither is shadowed).
+	if got := next.Manifests[dig('b')]; got.SwarmRef != "child-amd64-ref" || got.Size != 512 {
+		t.Fatalf("child b not retained: %+v", got)
+	}
+	if got := next.Manifests[dig('d')]; got.SwarmRef != "child-arm64-ref" || got.Size != 513 {
+		t.Fatalf("child d not retained: %+v", got)
 	}
 }
 
-// TestBuildNextIndexDistinctFeatureSetNotDuplicate proves two children whose
+// TestBuildNextIndexDistinctFeatureSetAccepted proves two children whose
 // platforms differ ONLY in where a comma falls inside their os.features
-// arrays are TWO distinct platforms — never conflated by a naive comma-join
-// key (["a,b","c"] must not equal ["a","b,c"]). Under the old framing these
-// collided into the same key and were falsely rejected as a duplicate
-// platform.
-func TestBuildNextIndexDistinctFeatureSetNotDuplicate(t *testing.T) {
+// arrays are two independent, accepted platforms (["a,b","c"] vs
+// ["a","b,c"]). With no duplicate-platform detector, both are trivially
+// accepted and the index publishes; this pins that a naive/lossy slicing
+// cannot conflate them into one rejected kid.
+func TestBuildNextIndexDistinctFeatureSetAccepted(t *testing.T) {
 	body := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[`+
 		`{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":["a,b","c"]}},`+
 		`{"mediaType":%q,"size":513,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":["a","b,c"]}}]}`,
