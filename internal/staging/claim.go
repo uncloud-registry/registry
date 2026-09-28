@@ -259,10 +259,17 @@ func (s *service) ClaimedDigests(ctx context.Context, repo, actor, operationID s
 }
 
 // ConsumeStagedForPublish removes (WITHOUT unpinning) ONLY the staged upload
-// rows claimed by operationID whose digests are in digests, after a verified
-// publication of that operation. Rows claimed by a different operation, rows
-// not in the claimed state, and rows whose digest is not referenced are never
-// touched.
+// rows owned by operationID whose digests are referenced by `digests`, after
+// a verified publication of that operation. It is durable and retryable
+// across the `claimed -> deleting` transition: an exact-operation retry
+// selects BOTH `claimed` rows AND publication-owned `deleting` tombstones
+// (the residue of a prior consume whose filesystem / quarantine cleanup
+// failed AFTER the transition committed) and durably removes each — so a
+// retry can never return success while any exact-operation consume tombstone
+// remains, and the quota charge is never stranded until a restart. Rows
+// claimed by a DIFFERENT operation, generic (unowned) deleting rows, and rows
+// whose digest is not referenced are never touched. It returns success only
+// after every exact matching referenced row it found is durably removed.
 //
 // The consume is scoped by the AUTHORITATIVE (global) operation identity —
 // repo + operationID + referenced digests — never by the calling actor. The
@@ -303,7 +310,8 @@ func (s *service) ConsumeStagedForPublish(ctx context.Context, repo, actor, oper
 	}
 	rows, err := conn.QueryContext(ctx,
 		`select u.id from staged_blobs b join upload_sessions u on u.id = b.upload_id
-		  where b.repo = ? and b.digest in (select value from json_each(?)) and u.state = 'claimed' and u.operation_id = ?`,
+		  where b.repo = ? and b.digest in (select value from json_each(?)) and u.operation_id = ?
+		    and u.state in ('claimed','deleting')`,
 		repo, digestJSON(wanted), operationID)
 	if err != nil {
 		s.pool.release(conn)
@@ -339,75 +347,118 @@ func (s *service) ConsumeStagedForPublish(ctx context.Context, repo, actor, oper
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		done, err := s.consumeClaimed(ctx, id, repo, operationID)
-		if err != nil {
+		if _, err := s.consumePublicationRow(ctx, id, repo, operationID); err != nil {
 			return err
-		}
-		if !done {
-			// The row was concurrently consumed or no longer owned by this
-			// operation (a foreign consume raced us): idempotent skip.
-			continue
 		}
 	}
 	return nil
 }
 
-// consumeClaimed tombstone + atomically quarantine-removes ONE claimed-by-op
-// staged upload row WITHOUT unpinning. It reports whether THIS call performed
-// the final metadata removal (so concurrent instances converge on count 1).
-func (s *service) consumeClaimed(ctx context.Context, id, repo, operationID string) (bool, error) {
+// consumePublicationRow durably retires ONE operation-owned staged upload row
+// (WITHOUT unpinning) and reports whether THIS call performed the final
+// metadata removal. It handles BOTH shapes an exact-operation consume can
+// meet:
+//
+//   - a `claimed` row owned by operationID: capture the authenticating
+//     cleanup/token provenance and transition claimed -> deleting RETAINING
+//     operation_id (v7 schema). A crash or filesystem failure after this
+//     transition leaves a publication-owned deleting tombstone, not an
+//     unowned one.
+//   - a publication-owned `deleting` tombstone (operation_id retained, the
+//     residue of a prior consume that faulted after the transition): resume
+//     the deletion idempotently.
+//
+// After the transition-or-resume it calls finishDeletion, which atomically
+// quarantines + authenticates + unlinks the committed file and any token
+// sidecar and only then removes the metadata row. If the filesystem cleanup
+// fails, finishDeletion returns an error (so the caller withholds 201 / any
+// success) while the publication-owned deleting tombstone is retained for an
+// exact-operation retry. Concurrent exact retries converge: exactly one
+// instance performs the final row removal, and a row a concurrent instance
+// already transitioned or removed is resumed/idempotently skipped rather than
+// double-processed or double-counted.
+func (s *service) consumePublicationRow(ctx context.Context, id, repo, operationID string) (bool, error) {
 	var a deleteAuth
 	proceed := false
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
+		capture := func(row *sessionRow) {
+			if row.cleanupToken.Valid {
+				a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
+				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
+			}
+			if fi, _, err := s.spool.nameInfo(id); err == nil {
+				a.canonical = fi
+			}
+		}
 		row, found, err := fetchSession(ctx, conn, id)
 		if err != nil {
 			return err
 		}
 		if !found || row.repo != repo {
-			return nil
-		}
-		if row.state != string(StateClaimed) {
-			// Not claimed (finalized/active/deleting/etc.): only claimed rows
-			// belonging to THIS operation may be consumed here.
+			// Absent (a concurrent exact consume removed it) or a foreign
+			// repo: nothing for us to remove.
 			return nil
 		}
 		if !row.operationID.Valid || row.operationID.String != operationID {
-			// A row claimed by a DIFFERENT operation is NEVER consumed by us
-			// (another operation's claim is never cleared).
+			// Owned by a DIFFERENT operation (or an unowned generic deleting
+			// tombstone): NEVER resumed or cleared by us.
 			return nil
 		}
-		// Capture the authenticating token (a claimed row may still carry the
-		// post-activation cleanup_token sidecar provenance) onto the deleting
-		// tombstone, then transition claimed -> deleting and clear the
-		// operation_id (the coherence CHECK requires operation_id null on a
-		// deleting row). A crash at any point leaves a deleting tombstone that
-		// startup/retry finishes idempotently.
-		if row.cleanupToken.Valid {
-			a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
-			a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
-		}
-		newCleanup := deletingTransitionToken(row)
-		res, err := conn.ExecContext(ctx,
-			`update upload_sessions set state = 'deleting', operation_id = null, create_token = null, cleanup_token = ?
-			  where id = ? and state = 'claimed' and operation_id = ?`,
-			newCleanup, id, operationID)
-		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
+		switch row.state {
+		case string(StateClaimed):
+			// Capture the transition-observed provenance BEFORE the tombstone
+			// clears create_token. The deleting tombstone RETAINS operation_id
+			// (publication-owned) so an exact-operation retry can always select
+			// it after a filesystem failure here.
+			if row.cleanupToken.Valid {
+				a.tokenBytes, _ = hex.DecodeString(row.cleanupToken.String)
+				a.tokenBytesKnown = a.tokenBytes != nil && len(a.tokenBytes) == creatingTokenLen
 			}
-			return typed(ErrDependency, err)
-		}
-		if n, _ := res.RowsAffected(); n != 1 {
-			// A concurrent consume or foreign claim cleared it first: skip.
+			newCleanup := deletingTransitionToken(row)
+			res, err := conn.ExecContext(ctx,
+				`update upload_sessions set state = 'deleting', create_token = null, cleanup_token = ?
+				  where id = ? and state = 'claimed' and operation_id = ?`,
+				newCleanup, id, operationID)
+			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
+				return typed(ErrDependency, err)
+			}
+			if n, _ := res.RowsAffected(); n == 1 {
+				// This call owns the transition: capture the canonical file
+				// observed at the transition and proceed to finish it.
+				capture(row)
+				proceed = true
+				return nil
+			}
+			// A concurrent exact instance transitioned it first (now a
+			// publication-owned deleting tombstone): resume it below instead
+			// of treating it as done — otherwise we might return success while
+			// the tombstone the concurrent instance transitioned is still
+			// present if its finishDeletion faults.
+			row, found, err = fetchSession(ctx, conn, id)
+			if err != nil {
+				return err
+			}
+			if !found || row.state != string(StateDeleting) ||
+				!row.operationID.Valid || row.operationID.String != operationID {
+				// Removed by a concurrent instance, or no longer owned: done.
+				return nil
+			}
+			capture(row)
+			proceed = true
+			return nil
+		case string(StateDeleting):
+			// An owned deleting tombstone surviving a prior faulted consume:
+			// resume the deletion idempotently.
+			capture(row)
+			proceed = true
+			return nil
+		default:
+			// Not a claimable/owned-deleting shape: never touched here.
 			return nil
 		}
-		if fi, _, err := s.spool.nameInfo(id); err != nil {
-			return typed(ErrDependency, err)
-		} else {
-			a.canonical = fi
-		}
-		proceed = true
-		return nil
 	})
 	if err != nil {
 		return false, err
@@ -439,4 +490,32 @@ func digestJSON(set map[string]struct{}) string {
 		out += k
 	}
 	return out + "]"
+}
+
+// FaultFinishDeletionForTest installs a deterministic finishDeletion fault on
+// the underlying durable service so a handler-level test can drive the
+// post-transition publication-consume retry. It faults the PRODUCTION
+// finishDeletion path (a directory/file-sync failure that occurs only AFTER
+// the claimed -> publication-owned-deleting transition has committed), never
+// a wrapper failure before the mutation. It is a no-op on a RegistryStore
+// that is not the durable *service. Test-only.
+func FaultFinishDeletionForTest(s RegistryStore) {
+	svc, ok := s.(*service)
+	if !ok {
+		return
+	}
+	svc.dirSyncHook = func() error { return typed(ErrDependency, errors.New("injected finishDeletion directory-sync fault")) }
+	svc.fsyncHook = func() error { return typed(ErrDependency, errors.New("injected finishDeletion file-sync fault")) }
+}
+
+// ClearFinishDeletionFaultForTest removes the fault installed by
+// FaultFinishDeletionForTest so an exact-operation retry can succeed.
+// Test-only.
+func ClearFinishDeletionFaultForTest(s RegistryStore) {
+	svc, ok := s.(*service)
+	if !ok {
+		return
+	}
+	svc.dirSyncHook = nil
+	svc.fsyncHook = nil
 }

@@ -25,29 +25,31 @@ import (
 // ONLY by its exact frozen object surface plus version, never guessed at. A
 // pre-existing database that matches none of them is rejected, never adopted.
 //
-// v6 is the current schema. It carries one forward change over v5: the
-// durable publication-claim fence that closes the cross-process
-// publication-versus-unpin TOCTOU. Publication AND cleanup operate on the
-// SAME SQLite staging database under serialized write transactions, so the
-// fence is enforced at the DB level. A finalized blob that a publication
-// claims transitions to the publication-owned `claimed` state and records its
-// stable operation_id. Cleanup's candidate query (`state in
-// ('active','finalized','expiring')`) and its expiring-transition rule
-// (`expiring only from active/finalized`) can therefore NEVER select, move to
-// expiring, or unpin a claimed row — and the claim itself atomically requires
-// a genuinely finalized, non-expired, repo/actor/digest-matching row, so it
-// can never latch onto a row cleanup already unpinned (expiring) or a generic
-// Delete stole (deleting). A publication that listed a blob and then had a
-// concurrent cleanup win the row fails its claim closed (zero external
-// writes); a publication whose claim won means cleanup provably does zero
-// unpins. v6 adds the `claimed` value to the state CHECK, the coherence
-// CHECK, the state-transition trigger, and the `operation_id` column (with a
-// bounded grammar CHECK) to upload_sessions; every other column/row is
-// carried across the migration exactly and no existing row is ever re-derived.
+// v7 is the current schema. It carries one forward change over v6: the
+// durable post-transition publication-consume retry. Under v6, a `claimed`
+// row's consume transition (`claimed -> deleting`) CLEARED operation_id
+// (the coherence CHECK required NULL on deleting). If the filesystem /
+// quarantine cleanup then failed, the row became an unowned `deleting`
+// tombstone that an exact-operation retry could not select: the retry saw
+// no `claimed` row, returned success, and the handler emitted 201 while the
+// quota-charged bytes stayed stranded until a restart. v7 RETAINS the exact
+// operation_id on publication-created deleting tombstones (a publication-
+// owned `deleting` row) while generic Delete/Expire tombstones remain
+// unowned (NULL operation_id). The coherence CHECK's deleting branch now
+// admits either shape, and a new `trg_session_operation` trigger makes
+// operation_id immutable once set, settable only at the finalized -> claimed
+// transition, and NEVER clearable - so ownership can never be injected,
+// mutated, reused, or stripped, and a distinct operation can never
+// resume/clear another operation's deleting tombstone. An exact-operation
+// consume retry selects BOTH claimed rows and owned deleting tombstones and
+// durably removes them (without unpinning); startup reconciliation safely
+// finishes an owned deleting tombstone but never converts it back to
+// publishable state.
 //
-// v5 is the prior committed schema (the cleanup-owned `expiring` state value).
-// It is retained for migration detection and parity.
-const latestSchemaVersion = 6
+// v6 is the prior committed schema (the durable publication-claim fence with
+// `claimed` + operation_id, whose deleting tombstones were forced NULL). It
+// is retained for migration detection and parity.
+const latestSchemaVersion = 7
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -151,7 +153,9 @@ var schemaDDL = []string{
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
 				and create_token is null and finalize_token is null
 				and typeof(operation_id) = 'text' and length(operation_id) between 1 and 256)
-			or (state = 'deleting' and create_token is null and finalize_token is null and operation_id is null
+			or (state = 'deleting' and create_token is null and finalize_token is null
+				and (operation_id is null
+					or (typeof(operation_id) = 'text' and length(operation_id) between 1 and 256))
 				and (cleanup_token is null
 					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
 						and cleanup_token = lower(cleanup_token)
@@ -272,6 +276,23 @@ var schemaDDL = []string{
 			when old.finalize_token is not null and new.finalize_token is null and old.state not in ('finalizing','finalized') then raise(abort, 'finalize token may only be cleared from finalizing')
 			else null end;
 	end`,
+	// The publication operation_id is the durable claim ownership. It is set
+	// EXACTLY once at the finalized -> claimed transition (the publication
+	// claim) and is thereafter immutable and NEVER cleared: a claimed row may
+	// only become a publication-OWNED deleting tombstone (retaining its
+	// operation_id, so the exact-operation retry can always select and finish
+	// it after a filesystem / quarantine failure), and a generic deleting /
+	// expiring / other row can never be injected with, mutate, reuse, or have
+	// stripped a foreign operation's ownership. A distinct operation can
+	// therefore never resume or clear another operation's tombstone.
+	`create trigger trg_session_operation before update of operation_id on upload_sessions begin
+		select case
+			when old.operation_id is not null and new.operation_id is not null and old.operation_id <> new.operation_id then raise(abort, 'operation id immutable once set')
+			when new.operation_id is not null and old.operation_id is null and not (old.state = 'finalized' and new.state = 'claimed') then raise(abort, 'operation id may only be set at the claim')
+			when old.operation_id is not null and new.operation_id is null then raise(abort, 'publication operation id must never be cleared')
+			else null end;
+	end`,
+
 	// The cleanup token is the durable sidecar provenance. It may be SET at
 	// activation (the creating row's create token atomically becomes the
 	// cleanup token) or at the deleting transition (an interrupted create's
@@ -401,8 +422,16 @@ var schemaGoldenV5JSON []byte
 //go:embed schema_golden_v6.json
 var schemaGoldenV6JSON []byte
 
-// schemaGold is the current (v6) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV6JSON)
+//go:embed schema_golden_v7.json
+var schemaGoldenV7JSON []byte
+
+// schemaGold is the current (v7) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV7JSON)
+
+// schemaGoldV6 is the exact frozen v6 predecessor manifest (the previously
+// committed "current" shape before v7), retained for migration detection and
+// parity. It is never renamed or called v7.
+var schemaGoldV6 = mustLoadSchemaGolden(schemaGoldenV6JSON)
 
 // schemaGoldV5 is the exact frozen v5 predecessor manifest (the previously
 // committed "current" shape before v6), retained for migration detection and
@@ -715,7 +744,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1471,6 +1500,7 @@ const (
 	schemaMigrateV3
 	schemaMigrateV4
 	schemaMigrateV5
+	schemaMigrateV6
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1522,6 +1552,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 6:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV6, 6); err == nil {
+			return schemaMigrateV6, nil
 		}
 	case 5:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV5, 5); err == nil {
@@ -1738,7 +1772,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		}
 		// v1-pre copies the reconstructed cleanup_token and finalize_token as
 		// NULL everywhere (neither column ever existed in this predecessor).
-		if err := rebuildUploadSessions(ctx, conn, exec, false, false); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, false, false, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV1Cleanup:
@@ -1750,7 +1784,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// also rebuilds upload_sessions to v3, carrying rows and any
 		// cleanup_token exactly across. finalize_token is synthesized NULL (the
 		// column does not exist in this predecessor).
-		if err := rebuildUploadSessions(ctx, conn, exec, true, false); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, true, false, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV2:
@@ -1761,7 +1795,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// across, including any cleanup_token (NULL deleting rows stay NULL).
 		// finalize_token is synthesized NULL (a v2 row never had a finalizing
 		// claim).
-		if err := rebuildUploadSessions(ctx, conn, exec, true, false); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, true, false, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV3:
@@ -1773,7 +1807,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// be born finalizing; the CHECK and state trigger enforce it), so no
 		// existing row is ever altered or re-derived. finalize_token is
 		// synthesized NULL (a v3 row never carried a finalizing claim).
-		if err := rebuildUploadSessions(ctx, conn, exec, true, false); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, true, false, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV4:
@@ -1785,7 +1819,22 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// can be born expiring; the CHECK and state trigger enforce it), so no
 		// existing row is ever altered or re-derived and a generic deleting
 		// tombstone is never re-interpreted as cleanup-owned.
-		if err := rebuildUploadSessions(ctx, conn, exec, true, true); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true, false); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV6:
+		if err := verifyAgainst(ctx, conn, schemaGoldV6, 6); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v6 -> v7: the durable post-transition publication-consume retry.
+		// Rebuild upload_sessions carrying every row/field across exactly
+		// (operation_id is carried verbatim: a published-consuming deleting
+		// tombstone from an in-flight v7 runtime retains its ownership). No
+		// v6 row can carry a non-null operation_id on a deleting tombstone (the
+		// v6 coherence CHECK forced NULL), and no row's ownership is ever
+		// invented, so the new deleting-ownership CHECK and the
+		// trg_session_operation trigger take effect without altering a row.
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true, true); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV5:
@@ -1802,7 +1851,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// effect without altering a single existing row. The v4/v5 finalize_token
 		// is preserved exactly: a valid finalizing row carries a non-null claim
 		// token the v6 coherence CHECK requires, so it must survive verbatim.
-		if err := rebuildUploadSessions(ctx, conn, exec, true, true); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true, false); err != nil {
 			return depErr(err, ctx)
 		}
 	default:
@@ -1846,7 +1895,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 // (v1-pre/v1-cleanup/v2/v3, which predate the column). The full current
 // indexes/triggers are recreated. The scratch copy table is dropped before
 // verification so the live object set is exactly the current one.
-func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error, preserveCleanup, preserveFinalize bool) error {
+func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error, preserveCleanup, preserveFinalize, preserveOperation bool) error {
 	cleanupExpr := "NULL"
 	if preserveCleanup {
 		cleanupExpr = "cleanup_token"
@@ -1855,13 +1904,17 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 	if preserveFinalize {
 		finalizeExpr = "finalize_token"
 	}
+	operationExpr := "NULL"
+	if preserveOperation {
+		operationExpr = "operation_id"
+	}
 	copyDDL := strings.Replace(schemaDDL[0], "upload_sessions", "upload_sessions_copy", 1)
 	if err := exec(copyDDL); err != nil {
 		return err
 	}
 	if err := exec(`insert into upload_sessions_copy
-		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, finalize_token, digest, bee_ref, media_type, size )
-		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `, ` + finalizeExpr + `,
+		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, finalize_token, operation_id, digest, bee_ref, media_type, size )
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `, ` + finalizeExpr + `, ` + operationExpr + `,
 		       digest, bee_ref, media_type, size from upload_sessions`); err != nil {
 		return err
 	}
@@ -1900,8 +1953,8 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 		return err
 	}
 	if err := exec(`insert into upload_sessions
-		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, finalize_token, digest, bee_ref, media_type, size )
-		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `, ` + finalizeExpr + `,
+		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, finalize_token, operation_id, digest, bee_ref, media_type, size )
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `, ` + finalizeExpr + `, ` + operationExpr + `,
 		       digest, bee_ref, media_type, size from upload_sessions_copy`); err != nil {
 		return err
 	}

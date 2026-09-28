@@ -1009,17 +1009,39 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			d[10] = strings.Replace(d[10], "old.state not in ('finalizing','finalized')", "old.state not in ('active')", 1)
 			return d
 		}, false, false, nil, "finalize token clearable from creating/deleting"},
+		{"trigger_operation_softened", func(d []string) []string {
+			d[11] = strings.Replace(d[11], "'operation id immutable once set'", "'x'", 1)
+			return d
+		}, false, false, nil, "operation id trigger body changed"},
+		{"trigger_operation_copyable", func(d []string) []string {
+			d[11] = strings.Replace(d[11], "when old.operation_id is not null and new.operation_id is not null and old.operation_id <> new.operation_id then raise(abort, 'operation id immutable once set')",
+				"when old.operation_id is not null and new.operation_id is not null then raise(abort, 'x')", 1)
+			return d
+		}, false, false, nil, "operation id mutable across an owned claim"},
+		{"trigger_operation_set_outside_claim", func(d []string) []string {
+			d[11] = strings.Replace(d[11], "and not (old.state = 'finalized' and new.state = 'claimed')", "and 0", 1)
+			return d
+		}, false, false, nil, "operation id settable outside the claim"},
+		{"trigger_operation_clearable", func(d []string) []string {
+			d[11] = strings.Replace(d[11], "when old.operation_id is not null and new.operation_id is null then raise(abort, 'publication operation id must never be cleared')",
+				"when 1 = 1 then raise(abort, 'x')", 1)
+			return d
+		}, false, false, nil, "operation id clearable from a claimed/deleting row"},
+		{"sessions_deleting_op_grammar", func(d []string) []string {
+			d[0] = strings.Replace(d[0], "(operation_id is null or (typeof(operation_id) = 'text' and length(operation_id) between 1 and 256))", "(operation_id is null or 1)", 1)
+			return d
+		}, false, false, nil, "deleting-row operation ownership untyped"},
 		{"trigger_cleanup_softened", func(d []string) []string {
-			d[11] = strings.Replace(d[11], "'cleanup token immutable'", "'x'", 1)
+			d[12] = strings.Replace(d[12], "'cleanup token immutable'", "'x'", 1)
 			return d
 		}, false, false, nil, "cleanup trigger body changed"},
 		{"trigger_cleanup_set_outside_activation", func(d []string) []string {
-			d[11] = strings.Replace(d[11], "when new.cleanup_token is not null and old.cleanup_token is null and new.state = 'active' and not (old.state = 'creating' and old.create_token is not null and old.create_token = new.cleanup_token and new.create_token is null)",
+			d[12] = strings.Replace(d[12], "when new.cleanup_token is not null and old.cleanup_token is null and new.state = 'active' and not (old.state = 'creating' and old.create_token is not null and old.create_token = new.cleanup_token and new.create_token is null)",
 				"when new.cleanup_token is not null and not (new.cleanup_token = old.cleanup_token)", 1)
 			return d
 		}, false, false, nil, "cleanup token settable outside activation"},
 		{"trigger_cleanup_cleared_from_creating", func(d []string) []string {
-			d[11] = strings.Replace(d[11], "when old.cleanup_token is not null and new.cleanup_token is null and old.state not in ('active','finalized')",
+			d[12] = strings.Replace(d[12], "when old.cleanup_token is not null and new.cleanup_token is null and old.state not in ('active','finalized')",
 				"when old.cleanup_token is not null and new.cleanup_token is null", 1)
 			return d
 		}, false, false, nil, "cleanup token clearable from any state"},
@@ -1028,19 +1050,19 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			return d
 		}, false, false, nil, "cleanup token chars loosened"},
 		{"trigger_delete_softened", func(d []string) []string {
-			d[12] = strings.Replace(d[12], "'delete only via deleting state'", "'x'", 1)
+			d[13] = strings.Replace(d[13], "'delete only via deleting state'", "'x'", 1)
 			return d
 		}, false, false, nil, "delete trigger body changed"},
 		{"trigger_blob_insert_softened", func(d []string) []string {
-			d[13] = strings.Replace(d[13], "'staged blob must match active session'", "'x'", 1)
+			d[14] = strings.Replace(d[14], "'staged blob must match active session'", "'x'", 1)
 			return d
 		}, false, false, nil, "blob insert trigger body changed"},
 		{"trigger_blob_update_wrong_table", func(d []string) []string {
-			d[14] = strings.Replace(d[14], "on staged_blobs", "on upload_sessions", 1)
+			d[15] = strings.Replace(d[15], "on staged_blobs", "on upload_sessions", 1)
 			return d
 		}, false, false, nil, "blob update trigger on the wrong table"},
 		{"trigger_blob_delete_softened", func(d []string) []string {
-			d[15] = strings.Replace(d[15], "'cannot delete staged blob of live session'", "'x'", 1)
+			d[16] = strings.Replace(d[16], "'cannot delete staged blob of live session'", "'x'", 1)
 			return d
 		}, false, false, nil, "blob delete trigger body changed"},
 		{"version_table_shape", nil, true, false, nil, "version table without not null"},
