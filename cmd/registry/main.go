@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/uncloud-registry/registry/internal/auth"
@@ -195,12 +196,43 @@ func buildBeeHandler() (http.Handler, error) {
 		return nil, fmt.Errorf("staging service: %w", err)
 	}
 
+	// Shared production resolver used by both the handler and the cleanup's
+	// committed-repository-state provider (so cleanup never unpins a blob a
+	// committed publication still references).
+	resolver := resolve.RegistryResolver{
+		Registries: registryResolver,
+		Docs:       docs,
+		Feeds:      feeds,
+	}
+
+	// Task 18: bounded periodic cleanup of expired staging. The cleanup unpins
+	// an expired finalized blob's Bee content and removes it, but refuses to
+	// unpin or remove any blob still referenced by committed repository state.
+	// The loop honors context cancellation. The staging store handed to the
+	// handler is wrapped so that closing the handler cancels the loop BEFORE
+	// the underlying staging service (spool + SQLite) is released.
+	cleanup, err := buildCleanup(stageStore, objects, resolver)
+	if err != nil {
+		return nil, fmt.Errorf("staging cleanup: %w", err)
+	}
+	interval, err := cleanupIntervalFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	batch, err := cleanupBatchFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+	runCleanupLoop(cleanupCtx, cleanup, interval, batch)
+	closeSvc := func() error { return nil }
+	if ic, ok := stageStore.(io.Closer); ok {
+		closeSvc = ic.Close
+	}
+	stageStore = &cancelOnCloseStore{RegistryStore: stageStore, cancel: cancelCleanup, close: closeSvc}
+
 	handler := registry.NewHandler(
-		resolve.RegistryResolver{
-			Registries: registryResolver,
-			Docs:       docs,
-			Feeds:      feeds,
-		},
+		resolver,
 		objects,
 		objects,
 		policy.PullAuthorizer{Policies: policy.AuthPolicyResolver{Docs: docs, Feeds: feeds}},
@@ -223,6 +255,173 @@ func buildBeeHandler() (http.Handler, error) {
 		rh.SessionTTL = stageCfg.UploadTTL
 	}
 	return handler, nil
+}
+
+// ---------------------------------------------------------------------------
+// Task 18: periodic staging cleanup wiring.
+// ---------------------------------------------------------------------------
+
+// committedRefProvider resolves the Bee refs currently referenced by committed
+// repository state for a repo, across every registry identity the resolver
+// serves. A repo's committed state document's Blobs are the contents a live
+// publication references; their refs must never be unpinned. A conclusive
+// absent feed yields no refs; any resolution error FAILS CLOSED so the cleanup
+// refuses to unpin without authoritative committed-state knowledge. No
+// configured identity also fails closed (an empty committed set would silently
+// permit unpinning published blobs).
+type committedRefProvider struct {
+	resolver   resolve.RegistryResolver
+	identities []resolve.RegistryIdentity
+}
+
+func (p *committedRefProvider) CommittedRefs(ctx context.Context, repo string) (map[string]struct{}, error) {
+	if len(p.identities) == 0 {
+		return nil, errors.New("cleanup committed-state provider has no registry identity")
+	}
+	refs := make(map[string]struct{})
+	for _, id := range p.identities {
+		doc, found, err := p.resolver.ResolveRepoStateOptional(ctx, id, repo)
+		if err != nil {
+			// Fail closed: without authoritative committed-state knowledge we
+			// must not unpin anything this pass.
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		for _, blob := range doc.Blobs {
+			if blob.SwarmRef != "" {
+				refs[swarm.CanonicalObjectRef(blob.SwarmRef)] = struct{}{}
+			}
+		}
+	}
+	return refs, nil
+}
+
+// registryIdentities extracts the static host -> RegistryIdentity map as a
+// slice. Bee-mode requires exactly such a static map (see requireRegistryIDs);
+// anything else cannot scope a repo to a feed owner and fails closed.
+func registryIdentities(r resolve.RegistryIdentityResolver) ([]resolve.RegistryIdentity, error) {
+	static, ok := r.(resolve.StaticRegistryIdentityResolver)
+	if !ok {
+		return nil, errors.New("Bee-mode staging cleanup requires a static registry identity map")
+	}
+	ids := make([]resolve.RegistryIdentity, 0, len(static.Hosts))
+	for _, id := range static.Hosts {
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, errors.New("Bee-mode staging cleanup requires at least one mapped registry identity")
+	}
+	return ids, nil
+}
+
+// buildCleanup constructs the staging Cleanup over the durable service held by
+// stageStore, unpinning through the Bee object store and gating eligibility on
+// the committed repository state so a published blob is never unpinned.
+func buildCleanup(stageStore staging.RegistryStore, unpin staging.Unpinner, resolver resolve.RegistryResolver) (*staging.Cleanup, error) {
+	identities, err := registryIdentities(resolver.Registries)
+	if err != nil {
+		return nil, err
+	}
+	committed := &committedRefProvider{resolver: resolver, identities: identities}
+	return staging.NewCleanup(stageStore, unpin, committed)
+}
+
+// Env knobs for the periodic cleanup loop.
+const (
+	envCleanupInterval      = "REGISTRY_CLEANUP_INTERVAL"
+	envCleanupBatch         = "REGISTRY_CLEANUP_BATCH"
+	defaultCleanupInterval  = 5 * time.Minute
+	defaultCleanupBatchSize = 100
+)
+
+// cleanupIntervalFromEnv reads the cleanup loop interval (a positive duration)
+// strictly; an unset value uses the default and a malformed value fails closed.
+func cleanupIntervalFromEnv() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(envCleanupInterval))
+	if raw == "" {
+		return defaultCleanupInterval, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", envCleanupInterval)
+	}
+	return d, nil
+}
+
+// cleanupBatchFromEnv reads the per-pass candidate batch bound (a positive
+// integer) strictly; an unset value uses the default and a malformed value
+// fails closed.
+func cleanupBatchFromEnv() (int, error) {
+	raw := strings.TrimSpace(os.Getenv(envCleanupBatch))
+	if raw == "" {
+		return defaultCleanupBatchSize, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", envCleanupBatch)
+	}
+	return n, nil
+}
+
+// runCleanupLoop runs one bounded cleanup pass per interval until ctx is
+// canceled, logging the per-class counts only when work was examined. It is
+// safe to call once per process.
+func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time.Duration, batch int) {
+	if cleanup == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = defaultCleanupInterval
+	}
+	if batch <= 0 {
+		batch = defaultCleanupBatchSize
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				res, err := cleanup.RunOnce(ctx, time.Now(), batch)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("staging cleanup: %v", err)
+					continue
+				}
+				if res.Examined > 0 {
+					log.Printf("staging cleanup: examined=%d expired=%d removed=%d unpinned=%d failed=%d",
+						res.Examined, res.Expired, res.Removed, res.Unpinned, res.Failed)
+				}
+			}
+		}
+	}()
+}
+
+// cancelOnCloseStore wraps the durable staging store so that closing the
+// handler (registry.Handler.Close closes h.Staging when it is an io.Closer)
+// cancels the periodic cleanup loop BEFORE the underlying staging service
+// (spool + database) is released. The registry-facing RegistryStore contract
+// is otherwise unchanged.
+type cancelOnCloseStore struct {
+	staging.RegistryStore
+	cancel func()
+	close  func() error
+}
+
+func (s *cancelOnCloseStore) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.close != nil {
+		return s.close()
+	}
+	return nil
 }
 
 // validateBeeBaseURL rejects anything but an absolute http/https ORIGIN with

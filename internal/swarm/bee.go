@@ -302,6 +302,49 @@ func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes i
 	return data, nil
 }
 
+// Unpin removes a pinned Bee object reference via the pinned-content deletion
+// endpoint DELETE /pins/{ref} — the object-store half of the eligible staged
+// blob cleanup (Task 18). The cleanup calls it ONLY for expired finalized blobs
+// whose ref is NOT referenced by committed repository state, so a live
+// publication's content is never unpinned. A definitive 404 is IDEMPOTENT
+// SUCCESS (the content was already unpinned — an expected retry outcome after
+// a crash or concurrent reaper); any other non-2xx status, a malformed ref, or
+// a transport failure fails closed with a data-free error. Only genuine 64-hex
+// Swarm references are accepted. The response body is bounded and always
+// closed; the caller's deadline is respected with the same bounded per-request
+// timeout as every other Bee call.
+func (s *BeeObjectStore) Unpin(ctx context.Context, ref string) error {
+	if !isBeeReference(ref) {
+		return errors.New("bee unpin requires a 64-hex object reference")
+	}
+	reqCtx, cancel := writeRequestContext(ctx)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodDelete, s.BaseURL+"/pins/"+url.PathEscape(ref), nil)
+	if err != nil {
+		return sanitizeBeeTransportError(reqCtx, "create bee unpin request", err)
+	}
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		return sanitizeBeeTransportError(reqCtx, "bee unpin request", err)
+	}
+	defer resp.Body.Close()
+	// Drain a BOUNDED amount of the body (never the whole payload) so the
+	// connection can be reused; the body is untrusted and never echoed.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		// Pinned content successfully removed.
+		return nil
+	case resp.StatusCode == http.StatusNotFound:
+		// The content is already unpinned: idempotent success.
+		return nil
+	default:
+		// Classified dependency failure; the fixed status number may appear but
+		// the body never survives into the error.
+		return fmt.Errorf("bee unpin failed with status %d", resp.StatusCode)
+	}
+}
+
 func (s *BeeObjectStore) Put(ctx context.Context, data []byte, batchID string) (string, error) {
 	if batchID == "" {
 		return "", fmt.Errorf("missing postage batch id")

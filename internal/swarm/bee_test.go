@@ -16,6 +16,98 @@ import (
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
+// TestBeeObjectStoreUnpin proves the eligible-Bee-unpin primitive: DELETE
+// /pins/{ref} removes pinned content. A definitive 404 is idempotent success
+// (the content is already unpinned); a non-2xx error status and any malformed
+// or non-genuine ref fail closed. This is the object-store half of the Task 18
+// staging cleanup (the cleanup refuses to unpin blobs referenced by committed
+// repository state before it ever calls this).
+func TestBeeObjectStoreUnpin(t *testing.T) {
+	t.Parallel()
+
+	ref := strings.Repeat("a", 64)
+	var mode string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/pins/"+ref {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		switch mode {
+		case "ok":
+			w.WriteHeader(http.StatusNoContent)
+		case "notfound":
+			w.WriteHeader(http.StatusNotFound)
+		case "unavailable":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("backend exploded"))
+		default:
+			http.Error(w, "bad test mode", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	store := NewBeeObjectStore(server.URL, server.Client())
+
+	// A 204 confirms the pinned content was removed.
+	mode = "ok"
+	if err := store.Unpin(context.Background(), ref); err != nil {
+		t.Fatalf("Unpin (204): %v", err)
+	}
+
+	// A 200 is equally a success answer (older Bee lines).
+	mode = "ok"
+	if err := store.Unpin(context.Background(), ref); err != nil {
+		t.Fatalf("Unpin (200): %v", err)
+	}
+
+	// A definitive 404 is IDEMPOTENT SUCCESS: the content was already unpinned.
+	mode = "notfound"
+	if err := store.Unpin(context.Background(), ref); err != nil {
+		t.Fatalf("Unpin (404) must be idempotent success, got %v", err)
+	}
+
+	// A non-2xx/non-404 status is a classified dependency failure, and the
+	// response body is never echoed into the returned error.
+	mode = "unavailable"
+	err := store.Unpin(context.Background(), ref)
+	if err == nil {
+		t.Fatal("Unpin (500) must fail")
+	}
+	if strings.Contains(err.Error(), "backend exploded") {
+		t.Fatalf("unpin error must not echo the response body: %v", err)
+	}
+}
+
+func TestBeeObjectStoreUnpinRejectsMalformedRef(t *testing.T) {
+	t.Parallel()
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	store := NewBeeObjectStore(server.URL, server.Client())
+
+	for _, bad := range []string{"", "abc", strings.Repeat("g", 64), strings.Repeat("a", 63)} {
+		if err := store.Unpin(context.Background(), bad); err == nil {
+			t.Fatalf("Unpin(%q) must fail closed on a non-genuine ref", bad)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("malformed refs must fail before any request, got %d requests", hits)
+	}
+}
+
+func TestBeeObjectStoreUnpinTransportFailure(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	store := NewBeeObjectStore(server.URL, server.Client())
+	server.Close()
+	if err := store.Unpin(context.Background(), strings.Repeat("a", 64)); err == nil {
+		t.Fatal("Unpin after the Bee endpoint vanished must fail")
+	}
+}
+
 func TestBeeDocumentStoreReadsBZZAndFeedReferences(t *testing.T) {
 	t.Parallel()
 
