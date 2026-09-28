@@ -9,6 +9,7 @@ import (
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/resolve"
 	"github.com/uncloud-registry/registry/internal/spec"
+	"github.com/uncloud-registry/registry/internal/staging"
 )
 
 // The manifest/publication error surface is ENTIRELY centralized here: typed
@@ -122,6 +123,7 @@ var ErrTargetNotCurrentState = errors.New("publication target is not the current
 const (
 	messageUnverified            = "the published repository state could not be verified; retain the request and retry"
 	messageConflict              = "the request conflicts with an already-recorded publication or with a newer repository generation"
+	messageClaimConflict         = "the staged content for this publication is no longer available; re-upload it and retry"
 	messageDependencyUnavailable = "a required service is temporarily unavailable; retain the request and retry"
 	messageUnknown               = "internal server error"
 )
@@ -143,6 +145,14 @@ func classifyPublicationError(err error) (int, string, string) {
 		// (see Publisher.PublishCommitWithConflictRebuild / IsGenerationConflict)
 		// and is never exposed on the public surface.
 		return http.StatusConflict, ErrorCodeManifestConflict, messageConflict
+	case errors.Is(err, staging.ErrClaimConflict):
+		// The publication's staged-content claim failed closed BEFORE any
+		// immutable object or feed write: cleanup unpinned/removed the row, a
+		// foreign operation claimed it, or it expired/was deleted between
+		// listing and commit. Zero external writes occurred and the claim (if
+		// any) is RETAINED for the exact-operation retry. A fixed data-free
+		// 409 CONFLICT distinct from a commit conflict by its message.
+		return http.StatusConflict, ErrorCodeManifestConflict, messageClaimConflict
 	case errors.As(err, new(*DependencyError)):
 		return http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable
 	case errors.Is(err, publish.ErrCommitBackend),

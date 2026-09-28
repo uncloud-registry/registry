@@ -33,6 +33,7 @@ type memorySession struct {
 	mediaType       string
 	size            int64
 	finalizeToken   string
+	operationID     string
 	createdAt       time.Time
 	expiresAt       time.Time
 }
@@ -315,6 +316,11 @@ func (m *MemoryStore) Delete(_ context.Context, id, repo, actor string) error {
 		// its bytes may have reached the object store with no recorded receipt.
 		return ErrInvalidState
 	}
+	if s.state == StateClaimed {
+		// A publication-owned claim may only be consumed by its owning
+		// operation after a verified publication; generic delete fails closed.
+		return ErrInvalidState
+	}
 	delete(m.sessions, id)
 	return nil
 }
@@ -340,6 +346,140 @@ func (m *MemoryStore) ClearStagedBlobsByDigest(ctx context.Context, repo string,
 	}
 	for id, s := range m.sessions {
 		if s.state == StateFinalized && s.repo == repo && s.actor == actor {
+			if _, ok := wanted[s.digest]; ok {
+				delete(m.sessions, id)
+			}
+		}
+	}
+	return nil
+}
+
+func (m *MemoryStore) ClaimStagedForPublish(_ context.Context, repo, actor, operationID string, digests []string) ([]spec.StagedBlob, error) {
+	if err := validateRepo(repo); err != nil {
+		return nil, err
+	}
+	if err := validateActor(actor); err != nil {
+		return nil, err
+	}
+	if err := validateOperationID(operationID); err != nil {
+		return nil, err
+	}
+	if len(digests) == 0 {
+		return nil, ErrInvalidInput
+	}
+	set := make(map[string]struct{}, len(digests))
+	for _, d := range digests {
+		if err := validateDigest(d); err != nil {
+			return nil, err
+		}
+		set[d] = struct{}{}
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Collect candidate ids per digest, ordered by id for determinism.
+	var out []spec.StagedBlob
+	for digest := range set {
+		var ownedID string
+		var finalizedID string
+		for id, s := range m.sessions {
+			if s.repo != repo || s.actor != actor || s.digest != digest {
+				continue
+			}
+			switch s.state {
+			case StateClaimed:
+				if s.operationID == operationID {
+					if ownedID == "" || id < ownedID {
+						ownedID = id
+					}
+				} else {
+					// A row claimed by a DIFFERENT operation fails the claim
+					// closed (never latch onto a foreign claim).
+					return nil, ErrClaimConflict
+				}
+			case StateFinalized:
+				if s.expiresAt.After(now) {
+					if finalizedID == "" || id < finalizedID {
+						finalizedID = id
+					}
+				}
+			}
+		}
+		if ownedID != "" {
+			out = append(out, m.sessions[ownedID].stagedBlob())
+			continue
+		}
+		if finalizedID == "" {
+			return nil, ErrClaimConflict
+		}
+		s := m.sessions[finalizedID]
+		s.state = StateClaimed
+		s.operationID = operationID
+		out = append(out, s.stagedBlob())
+	}
+	return out, nil
+}
+
+func (m *MemoryStore) ClaimedDigests(_ context.Context, repo, actor, operationID string) (map[string]struct{}, error) {
+	if err := validateRepo(repo); err != nil {
+		return nil, err
+	}
+	if err := validateActor(actor); err != nil {
+		return nil, err
+	}
+	if err := validateOperationID(operationID); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]struct{}{}
+	for _, s := range m.sessions {
+		if s.repo == repo && s.actor == actor && s.state == StateClaimed && s.operationID == operationID {
+			out[s.digest] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// ClaimedStagedBlobs returns the staged-blob descriptors for ALL rows the
+// caller's repo/actor currently has in the publication-owned `claimed` state
+// (across every operationID). It is a concrete MemoryStore-only helper used by
+// tests to assert that a failed publication RETAINED its durable claim (the
+// row survived without being consumed) even though it is invisible to the
+// general finalized-only listing.
+func (m *MemoryStore) ClaimedStagedBlobs(_ context.Context, repo, actor string) []spec.StagedBlob {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []spec.StagedBlob{}
+	for _, s := range m.sessions {
+		if s.repo == repo && s.actor == actor && s.state == StateClaimed {
+			out = append(out, s.stagedBlob())
+		}
+	}
+	return out
+}
+
+func (m *MemoryStore) ConsumeStagedForPublish(_ context.Context, repo, actor, operationID string, digests []string) error {
+	if err := validateRepo(repo); err != nil {
+		return err
+	}
+	if err := validateActor(actor); err != nil {
+		return err
+	}
+	if err := validateOperationID(operationID); err != nil {
+		return err
+	}
+	wanted := make(map[string]struct{}, len(digests))
+	for _, d := range digests {
+		if err := validateDigest(d); err != nil {
+			return err
+		}
+		wanted[d] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, s := range m.sessions {
+		if s.repo == repo && s.actor == actor && s.state == StateClaimed && s.operationID == operationID {
 			if _, ok := wanted[s.digest]; ok {
 				delete(m.sessions, id)
 			}

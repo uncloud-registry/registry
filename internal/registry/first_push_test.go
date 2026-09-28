@@ -506,11 +506,14 @@ func TestManifestPutStaleFeedReadBackFailsClosed502(t *testing.T) {
 	if code != ErrorCodePublicationUnverified {
 		t.Fatalf("expected PUBLICATION_UNVERIFIED code, got %q (body %s)", code, body)
 	}
-	remaining, err := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
-	if err != nil {
-		t.Fatalf("list staged: %v", err)
+	// Retained as a publication-owned claim (never consumed): invisible to the
+	// general publishable listing, but durably present and reclaimable by the
+	// exact operation.
+	if got := mustListFinalized(t, h); len(got) != 0 {
+		t.Fatalf("claimed rows must not be listed as generally publishable, got %+v", got)
 	}
-	if len(remaining) != 1 || remaining[0].Digest != configDigest {
-		t.Fatalf("verification failure must retain the referenced staging for retry, got %+v", remaining)
+	claims := mustClaimedStagedBlobs(t, h)
+	if len(claims) != 1 || claims[0].Digest != configDigest {
+		t.Fatalf("verification failure must retain the referenced staging as a durable claim, got %+v", claims)
 	}
 }

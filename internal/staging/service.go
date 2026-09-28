@@ -447,6 +447,7 @@ type sessionRow struct {
 	offset                 int64
 	createdNanos           int64
 	expiresNanos           int64
+	operationID            sql.NullString
 	digest                 sql.NullString
 	beeRef                 sql.NullString
 	mediaType              sql.NullString
@@ -456,14 +457,14 @@ type sessionRow struct {
 	finalizeToken          sql.NullString
 }
 
-const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, digest, bee_ref, media_type, size, create_token, cleanup_token, finalize_token`
+const sessionColumns = `id, repo, actor, state, offset, created_at, expires_at, operation_id, digest, bee_ref, media_type, size, create_token, cleanup_token, finalize_token`
 
 func fetchSession(ctx context.Context, q queryer, id string) (*sessionRow, bool, error) {
 	var row sessionRow
 	err := q.QueryRowContext(ctx,
 		`select `+sessionColumns+` from upload_sessions where id = ?`, id).
 		Scan(&row.id, &row.repo, &row.actor, &row.state, &row.offset,
-			&row.createdNanos, &row.expiresNanos, &row.digest, &row.beeRef,
+			&row.createdNanos, &row.expiresNanos, &row.operationID, &row.digest, &row.beeRef,
 			&row.mediaType, &row.size, &row.createToken, &row.cleanupToken, &row.finalizeToken)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
@@ -1365,7 +1366,7 @@ func (s *service) maxGrowth(ctx context.Context, conn *sql.Conn, repo string, cu
 // an astronomically large usage can never pass any positive quota). A genuine
 // query failure is returned for the caller to wrap as a dependency error.
 func usageSum(ctx context.Context, conn *sql.Conn, repo *string) (int64, error) {
-	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalizing','finalized','deleting','expiring')`
+	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalizing','finalized','deleting','expiring','claimed')`
 	args := []any{}
 	if repo != nil {
 		query += ` and repo = ?`
@@ -2014,6 +2015,17 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 			// unpin and strand its pinned content. Fail closed.
 			return ErrInvalidState
 		}
+		if row.state == string(StateClaimed) {
+			// A claimed row is publication-OWNED: it is fenced for an
+			// in-flight (or crash-paused) logical publication whose manifest
+			// commit may still occur. A user Delete must never remove it — that
+			// would destroy the only content backing the pending commit and
+			// could strand a published manifest referencing unpinned content.
+			// Only the owning operation's ConsumeStagedForPublish (after a
+			// VERIFIED publication) or an explicit reconciliation path may
+			// consume it. Fail closed.
+			return ErrInvalidState
+		}
 		proceed = true
 		if row.state != string(StateDeleting) {
 			// Capture the byte-authenticating token BEFORE the tombstone
@@ -2168,6 +2180,16 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 			// no recorded receipt. Expiry (automatic deletion) would destroy
 			// the only reconciliation path; fail closed and skip it. Its
 			// bytes still count toward quota, bounding the uncertainty.
+			return nil
+		}
+		if row.state == string(StateClaimed) {
+			// A claimed row is publication-OWNED (fenced for an in-flight or
+			// crash-paused publication). Automatic expiry must NEVER remove it:
+			// doing so could strand a committed manifest whose staged content
+			// it was about to consume. The owning operation's
+			// ConsumeStagedForPublish (after a VERIFIED publication) or an
+			// explicit reconciliation path consumes it; expiry skips it and
+			// its bytes keep counting toward quota.
 			return nil
 		}
 		proceed = true
@@ -2358,6 +2380,18 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 			// must finish it, never startup. Align the staged file so its
 			// bytes are preserved and attributed, and leave the row (and its
 			// retained bee_ref + cleanup_token provenance) strictly alone.
+			if err := s.spool.align(ri.id, ri.offset); err != nil {
+				return typed(ErrDependency, err)
+			}
+		case StateClaimed:
+			// A durable PUBLICATION-OWNED claim left by a crash between the
+			// atomic claim and the owning operation's consume (or an error after
+			// external writes). Startup PRESERVES the claim exactly — it is the
+			// fail-closed fence that keeps cleanup from ever unpinning the row
+			// while the logical publication retry (same operation_id) must be
+			// able to reacquire and complete it. Align the staged file so its
+			// bytes are preserved and attributed; never clear the operation_id
+			// and never consume it. Its bytes keep charging quota.
 			if err := s.spool.align(ri.id, ri.offset); err != nil {
 				return typed(ErrDependency, err)
 			}

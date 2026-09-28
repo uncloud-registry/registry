@@ -373,6 +373,15 @@ func (s *service) cleanupPrepare(ctx context.Context, id string, committedRefs f
 		cand.expiring = true
 		cand.willing = cand.found
 		return cand, nil
+	case string(StateClaimed):
+		// A PUBLICATION-OWNED claimed row is NEVER cleanup-eligible. It is not
+		// even selected by the candidate batch query (state in
+		// ('active','finalized','expiring')), and this switch case is the
+		// defensive re-check: cleanup must never move it to expiring, never
+		// unpin it, and never remove its staged bytes. Only the owning
+		// operation's ConsumeStagedForPublish (after a VERIFIED publication)
+		// consumes it. Examined only.
+		return cand, nil
 	case string(StateDeleting):
 		if cand.beeRef != "" {
 			// A generic Delete/Expire tombstone that still carries content:
@@ -509,4 +518,3 @@ func (s *service) captureResumeAuth(ctx context.Context, id string, cand *cleanu
 		return nil
 	})
 }
-

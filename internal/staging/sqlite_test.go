@@ -128,7 +128,7 @@ func TestSchemaColumnsAndTypes(t *testing.T) {
 		// the typeof() CHECKs are the sole storage-class authority.
 		"offset": "", "created_at": "", "expires_at": "",
 		"create_token": "text", "cleanup_token": "text", "finalize_token": "text",
-		"digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
+		"operation_id": "text", "digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
 	}
 	assertColumns(t, db, "upload_sessions", wantSessions, map[string]bool{"id": true})
 
@@ -932,7 +932,7 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			return d
 		}, false, false, nil, "actor '+' punctuation allowed"},
 		{"sessions_state_creating", func(d []string) []string {
-			d[0] = strings.Replace(d[0], "state in ('active','creating','finalizing','finalized','deleting','expiring')", "state in ('active','finalizing','finalized','deleting')", 1)
+			d[0] = strings.Replace(d[0], "state in ('active','creating','finalizing','finalized','deleting','expiring','claimed')", "state in ('active','finalizing','finalized','deleting')", 1)
 			return d
 		}, false, false, nil, "creating state removed"},
 		{"sessions_offset_check", func(d []string) []string { d[0] = strings.Replace(d[0], "offset >= 0", "offset >= -1", 1); return d }, false, false, nil, "negative offsets allowed"},
@@ -1093,6 +1093,7 @@ func TestSchemaExactPhysicalShape(t *testing.T) {
 		{"create_token", "text", false, false},
 		{"cleanup_token", "text", false, false},
 		{"finalize_token", "text", false, false},
+		{"operation_id", "text", false, false},
 		{"digest", "text", false, false},
 		{"bee_ref", "text", false, false},
 		{"media_type", "text", false, false},

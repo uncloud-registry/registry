@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -461,6 +462,21 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 						}
 						verr := VerifyPublishedRetryState(ctx, h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
 						if verr == nil {
+							// The prior attempt for THIS operation committed and was
+							// verified. It may have crashed before consuming the
+							// staged rows it claimed under pub.OperationID; finish
+							// those surviving claims now (best-effort: the verified
+							// 201 must not be withheld for a staging cleanup
+							// failure, and a surviving claim is safe — it is
+							// publication-owned and fails closed). This never
+							// consumes rows owned by a different operation.
+							consumed := make([]string, 0, len(referencedDigests))
+							for digest := range referencedDigests {
+								consumed = append(consumed, digest)
+							}
+							if pub.OperationID != "" {
+								_ = h.Staging.ConsumeStagedForPublish(ctx, repo, actor, pub.OperationID, consumed)
+							}
 							writePublishedSuccess(w, repo, reference, manifestDigest, pub.OperationID)
 							return nil
 						}
@@ -523,25 +539,123 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			}
 		}
 
+		// Determine the referenced staged candidates from the CURRENT
+		// publishable listing (only genuinely finalized, non-expired rows).
+		// Then ATOMICALLY claim them under operationID BEFORE any immutable
+		// object or feed write: the claim re-reads authoritative row state
+		// inside one serialized write transaction, so a candidate row that
+		// cleanup won (expiring/removed) or a FOREIGN operation claimed
+		// between this listing and the claim FAILS the whole claim closed and
+		// this publication makes ZERO immutable-object, feed, or
+		// staging-consumption writes. This closes the cross-process
+		// publication-versus-unpin race: a manifest is never committed
+		// referencing staged content that cleanup concurrently unpinned. The
+		// descriptors fed to the build are the FRESH claim-time descriptors
+		// returned by the claim — never the stale pre-claim listing. A
+		// referenced digest that was claimed by a PRIOR crashed attempt of
+		// THIS SAME operation (a surviving claim) is reacquired idempotently.
 		stagedBlobs, err := h.Staging.ListStagedBlobs(ctx, repo, actor)
 		if err != nil {
 			return err
 		}
-		blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
+		present := map[string]struct{}{}
 		for _, blob := range stagedBlobs {
-			// Referenced-only staging selection: staged blobs this manifest
-			// does not reference never enter the build input.
 			if _, isRef := referencedDigests[blob.Digest]; !isRef {
 				continue
 			}
-			blobMap[blob.Digest] = spec.BlobDescriptor{
-				SwarmRef:  blob.SwarmRef,
-				Size:      blob.Size,
-				MediaType: blob.MediaType,
+			present[blob.Digest] = struct{}{}
+		}
+		// Digests already durably claimed by THIS operation from a prior
+		// crashed/retried attempt (rows in the publication-owned claimed
+		// state owned by operationID).
+		owned, err := h.Staging.ClaimedDigests(ctx, repo, actor, operationID)
+		if err != nil {
+			return err
+		}
+
+		// A referenced digest is genuinely UNRESOLVABLE only when it is
+		// neither a staged candidate, nor already committed in repository
+		// state, nor a surviving same-operation claim. In that case the
+		// publication is impossible and the builder reports the exact missing
+		// reference (400) — so claim NOTHING: the staged candidates stay
+		// finalized and visible, and the failed publication performs zero
+		// immutable/feed/staging-mutation writes. This preserves the contract
+		// that a manifest referencing a never-staged, never-committed blob
+		// fails typed (400) before any fence or external write.
+		unresolvable := false
+		for digest := range referencedDigests {
+			if _, isCand := present[digest]; isCand {
+				continue
+			}
+			if _, committed := current.Blobs[digest]; committed {
+				continue
+			}
+			if _, reused := owned[digest]; reused {
+				continue
+			}
+			unresolvable = true
+			break
+		}
+		if unresolvable {
+			// Let the builder report the missing reference with the exact
+			// typed 400; feed the plain finalized listing as input (no claim,
+			// no staging mutation).
+			blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
+			for _, blob := range stagedBlobs {
+				if _, isRef := referencedDigests[blob.Digest]; !isRef {
+					continue
+				}
+				blobMap[blob.Digest] = spec.BlobDescriptor{
+					SwarmRef:  blob.SwarmRef,
+					Size:      blob.Size,
+					MediaType: blob.MediaType,
+				}
+			}
+			input.StagedBlobs = blobMap
+		} else {
+			// Claim the union of staged candidates and surviving same-operation
+			// claims for every referenced digest. ClaimStagedForPublish claims
+			// the finalized candidates, reacquires the already-claimed-by-this-op
+			// rows, and fails the WHOLE claim closed if any referenced digest's
+			// row became unpinnable (cleanup won / foreign claim / expiry)
+			// between the listing and the commit — zero external writes.
+			claimSet := make(map[string]struct{}, len(present)+len(owned))
+			for d := range present {
+				claimSet[d] = struct{}{}
+			}
+			for d := range owned {
+				if _, isRef := referencedDigests[d]; isRef {
+					claimSet[d] = struct{}{}
+				}
+			}
+			claimDigests := make([]string, 0, len(claimSet))
+			for d := range claimSet {
+				claimDigests = append(claimDigests, d)
+			}
+			sort.Strings(claimDigests)
+			if len(claimDigests) == 0 {
+				// Nothing to fence: every referenced digest is already
+				// committed in repository state (no staged candidate, no
+				// surviving same-operation claim). Proceed with an empty
+				// staged input.
+				input.StagedBlobs = map[string]spec.BlobDescriptor{}
+			} else {
+				claimedBlobs, err := h.Staging.ClaimStagedForPublish(ctx, repo, actor, operationID, claimDigests)
+				if err != nil {
+					return err
+				}
+				blobMap := make(map[string]spec.BlobDescriptor, len(claimedBlobs))
+				for _, blob := range claimedBlobs {
+					blobMap[blob.Digest] = spec.BlobDescriptor{
+						SwarmRef:  blob.SwarmRef,
+						Size:      blob.Size,
+						MediaType: blob.MediaType,
+					}
+				}
+				input.StagedBlobs = blobMap
 			}
 		}
 
-		input.StagedBlobs = blobMap
 		// Byte-stable state rebuilds across retries and conflict rebuilds: the
 		// state timestamp is derived deterministically from the STABLE
 		// publication identity, never the clock, and never the per-attempt
@@ -572,13 +686,15 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			return err
 		}
 
-		// Consume ONLY the staged digests the published manifest referenced;
-		// unrelated staged blobs remain staged for a later manifest.
+		// Consume ONLY the staged rows claimed by THIS operation and referenced by
+		// the published manifest, WITHOUT unpinning; unrelated staged blobs and
+		// rows claimed by a DIFFERENT operation remain staged. This is the
+		// publication-owned consume: it never clears another operation's claim.
 		consumed := make([]string, 0, len(referencedDigests))
 		for digest := range referencedDigests {
 			consumed = append(consumed, digest)
 		}
-		if err := h.Staging.ClearStagedBlobsByDigest(ctx, repo, actor, consumed); err != nil {
+		if err := h.Staging.ConsumeStagedForPublish(ctx, repo, actor, operationID, consumed); err != nil {
 			return err
 		}
 

@@ -64,6 +64,21 @@ const (
 	// live operation may return to active/finalizing/finalized from expiring;
 	// the cleanup transition carries the row to deleting to complete removal.
 	StateExpiring State = "expiring"
+	// StateClaimed is the durable PUBLICATION-OWNED claim: set by the manifest
+	// PUT path (ClaimStagedForPublish) BEFORE any immutable object or feed
+	// commit, atomically fencing exactly the finalized staged upload rows a
+	// logical publication (identified by its stable operation_id) depends on.
+	// A claimed row is NEVER listed for a publication, NEVER claimed by
+	// cleanup to expiring, NEVER unpinned, and NEVER user-deleted/expired: the
+	// only legal transition is claimed -> deleting (the authenticated consume
+	// performed only by the owning operation after a VERIFIED publication).
+	// Same-operation retries idempotently reacquire their existing claims; a
+	// different operation, cleanup's expiring, a generic deleting, a missing,
+	// changed, or expired row all fail the claim closed BEFORE any external
+	// write. The claim is fail-closed and retained across restarts: on error
+	// or ambiguity it stays durably claimed for the exact-operation retry and
+	// its bytes keep charging quota.
+	StateClaimed State = "claimed"
 )
 
 // RegistryStore is the narrow registry-facing staging contract the HTTP
@@ -108,6 +123,41 @@ type RegistryStore interface {
 	Delete(ctx context.Context, id, repo, actor string) error
 	ListStagedBlobs(ctx context.Context, repo, actor string) ([]spec.StagedBlob, error)
 	ClearStagedBlobsByDigest(ctx context.Context, repo, actor string, digests []string) error
+	// ClaimStagedForPublish durably claims, under operationID, exactly the
+	// finalized, non-expired staged upload rows for the caller's repo/actor
+	// whose digests are in digests — BEFORE any immutable object or feed write.
+	// The claim is ATOMIC (one serialized write transaction): every requested
+	// digest's eligible finalized row becomes publication-owned (claimed) under
+	// operationID, or the ENTIRE claim fails closed with ZERO rows claimed and
+	// ZERO external side effects. A row already claimed by the SAME operationID
+	// is a same-operation retry and is idempotently reacquired (its descriptor
+	// returned); a row claimed by a DIFFERENT operation, a row in cleanup's
+	// expiring state, a generic deleting tombstone, a missing, changed, or
+	// expired row, any of them fails the claim closed (ErrClaimConflict). The
+	// returned descriptors are the FRESH claim-time descriptors read from the
+	// claimed rows (never a stale caller list), so a publication whose candidate
+	// row cleanup won between listing and claiming is never continued from stale
+	// data. A claimed row is never listed, never cleaned/unpinned, never
+	// user-deleted/expired, and keeps charging quota until its owning operation
+	// consumes it (ConsumeStagedForPublish) or an explicit reconciliation path
+	// releases it.
+	ClaimStagedForPublish(ctx context.Context, repo, actor, operationID string, digests []string) ([]spec.StagedBlob, error)
+	// ClaimedDigests returns the set of staged digests the caller's
+	// repo/actor currently has claimed under operationID (rows in the
+	// publication-owned `claimed` state owned by that operation). It is the
+	// surviving-claim read that lets a same-operation retry reacquire its
+	// prior crash-paused claims and lets a fresh publication detect, BEFORE
+	// claiming, that a referenced digest is genuinely unresolvable (not
+	// staged, not committed, not reclaimed) rather than merely already-claimed
+	// by THIS operation. It never reveals rows owned by another operation.
+	ClaimedDigests(ctx context.Context, repo, actor, operationID string) (map[string]struct{}, error)
+	// ConsumeStagedForPublish durably consumes (removes WITHOUT unpinning)
+	// ONLY the staged upload rows claimed by operationID whose digests are in
+	// digests, after a VERIFIED publication of that operation. Claimed rows
+	// not referenced by the manifest, and rows claimed by a DIFFERENT
+	// operation, are never touched (a foreign operation's claim is never
+	// cleared). Unrelated finalized/active rows remain staged.
+	ConsumeStagedForPublish(ctx context.Context, repo, actor, operationID string, digests []string) error
 }
 
 // Limits configures the atomic durable staging quotas enforced INSIDE the
@@ -191,6 +241,14 @@ var (
 	// ErrFinalizeConflict reports a second finalization whose metadata
 	// differs from the already-finalized row.
 	ErrFinalizeConflict = errors.New("staging upload already finalized with different metadata")
+	// ErrClaimConflict reports a publication claim that cannot be atomically
+	// satisfied: a referenced staged digest's row is missing, changed, expired,
+	// already claimed by a DIFFERENT operation, in cleanup's expiring state,
+	// or a generic deleting tombstone. The claim performs ZERO external writes
+	// and no row is claimed. It is the fail-closed fence that stops a
+	// publication from committing a manifest whose staged content cleanup won
+	// (or a foreign publication stole) between listing and commit.
+	ErrClaimConflict = errors.New("staging publication claim conflict")
 )
 
 // typedError reports a fixed-text sentinel. Error() and Unwrap() expose only
@@ -369,6 +427,32 @@ func validateMediaType(media string) error {
 		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
 		case c == '.' || c == '+' || c == '-' || c == '_' || c == '/':
 		default:
+			return ErrInvalidInput
+		}
+	}
+	return nil
+}
+
+// validateOperationID enforces the bounded canonical publication-operation
+// identifier grammar mirrored from the publish package: non-empty, at most 256
+// bytes, and every byte a printable-ASCII character that JSON can emit
+// verbatim (no control, DEL, or the JSON/XML escaping code points
+// " \ < > &, and no space). The durable claim never stores an operation ID a
+// caller could not have validated upstream, and never echoes one with
+// separators or NUL.
+const operationIDMaxLen = 256
+
+func validateOperationID(opID string) error {
+	if opID == "" || len(opID) > operationIDMaxLen {
+		return ErrInvalidInput
+	}
+	for i := 0; i < len(opID); i++ {
+		c := opID[i]
+		if c < 0x21 || c > 0x7e {
+			return ErrInvalidInput
+		}
+		switch c {
+		case '"', '\\', '<', '>', '&':
 			return ErrInvalidInput
 		}
 	}

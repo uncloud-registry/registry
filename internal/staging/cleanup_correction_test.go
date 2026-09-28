@@ -369,7 +369,6 @@ func TestListFinalizedPublishabilityBoundary(t *testing.T) {
 	}
 }
 
-
 // TestCleanupConcurrentIndependentInstancesConverge forces the vulnerable
 // ownership interleavings with FILE-BACKED INDEPENDENT store instances: two
 // cleanup reapers, each holding its own service handle over the SAME store,
@@ -413,8 +412,20 @@ func TestCleanupConcurrentIndependentInstancesConverge(t *testing.T) {
 	var resA, resB CleanupResult
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); r, _ := cA.RunOnce(context.Background(), runAt, 100); mu.Lock(); resA = r; mu.Unlock() }()
-	go func() { defer wg.Done(); r, _ := cB.RunOnce(context.Background(), runAt, 100); mu.Lock(); resB = r; mu.Unlock() }()
+	go func() {
+		defer wg.Done()
+		r, _ := cA.RunOnce(context.Background(), runAt, 100)
+		mu.Lock()
+		resA = r
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		r, _ := cB.RunOnce(context.Background(), runAt, 100)
+		mu.Lock()
+		resB = r
+		mu.Unlock()
+	}()
 	wg.Wait()
 	t.Logf("concurrent results: A=%+v B=%+v unpA=%d unpB=%d", resA, resB, len(unpA.calls()), len(unpB.calls()))
 

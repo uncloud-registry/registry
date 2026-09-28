@@ -17,6 +17,7 @@ import (
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/resolve"
 	"github.com/uncloud-registry/registry/internal/spec"
+	"github.com/uncloud-registry/registry/internal/staging"
 )
 
 // scriptedCommitter is an in-process model of the control-plane feed signer
@@ -67,6 +68,32 @@ func (b failingBuilder) BuildNext(spec.RepoStateDocument, publish.BuildInput) (s
 }
 
 // task14World builds the first-push world plus a live test server.
+// mustListFinalized returns the caller's currently publishable (finalized,
+// non-expired) staged blobs, failing the test on store error. Claimed
+// publication-owner rows are intentionally NOT included — the fence makes then
+// visible only to exact-claim reacquisition.
+func mustListFinalized(t *testing.T, h *Handler) []spec.StagedBlob {
+	t.Helper()
+	out, err := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
+	if err != nil {
+		t.Fatalf("list staged blobs: %v", err)
+	}
+	return out
+}
+
+// mustClaimedStagedBlobs returns the surviving publication-owner claims
+// (rows durably moved to the `claimed` state by a publication that did not
+// finish), via the concrete in-memory store. It fails the test if the staging
+// backend is not the in-memory store.
+func mustClaimedStagedBlobs(t *testing.T, h *Handler) []spec.StagedBlob {
+	t.Helper()
+	ms, ok := h.Staging.(*staging.MemoryStore)
+	if !ok {
+		t.Fatalf("expected in-memory staging store, got %T", h.Staging)
+	}
+	return ms.ClaimedStagedBlobs(context.Background(), "backend/api", "user:alice")
+}
+
 func task14World(t *testing.T) (*Handler, *resolve.MemoryDocumentStore, *resolve.MemoryFeedStore, *auth.RegistryTokenIssuer, string) {
 	t.Helper()
 	h, docs, feeds, issuer := newFirstPushWorld(t)
@@ -229,9 +256,22 @@ func TestPublicationErrorMatrixThroughRealHandler(t *testing.T) {
 		if _, ok := feeds.Feeds[repoStateFeed()]; ok {
 			t.Fatal("conflicted publication must never advance the feed")
 		}
-		remaining, err := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
-		if err != nil || len(remaining) != 1 {
-			t.Fatalf("conflicted publication must retain staging, got %+v (err %v)", remaining, err)
+		// Under the publication fence the referenced staged row is durably
+		// RETAINED as a publication-owned CLAIM for THIS operation (not
+		// consumed): it becomes invisible to the general ListStagedBlobs
+		// listing but remains reclaimable by the exact same operation. A
+		// same-keyed retry (generation is still 0, so the operation ID is
+		// unchanged) reacquires the surviving claim and re-attempts — hitting
+		// the same scripted commit conflict rather than a missing-reference /
+		// claim-conflict failure.
+		if got := len(mustListFinalized(t, h)); got != 0 {
+			t.Fatalf("claimed rows must not be listed as generally publishable, got %d", got)
+		}
+		retryResp := putManifest(t, serverURL, issuer, manifestFor(configDigest, len(configBytes)))
+		retryBody, _ := io.ReadAll(retryResp.Body)
+		retryResp.Body.Close()
+		if retryResp.StatusCode != http.StatusConflict {
+			t.Fatalf("retry after conflicted publication must reuse the surviving claim and remain 409, got %d (%s)", retryResp.StatusCode, retryBody)
 		}
 	})
 
@@ -254,9 +294,16 @@ func TestPublicationErrorMatrixThroughRealHandler(t *testing.T) {
 		if strings.Contains(message, marker) {
 			t.Fatalf("503 leaks injected marker: %s", respBody)
 		}
-		remaining, _ := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
-		if len(remaining) != 1 {
-			t.Fatalf("dependency failure must retain staging, got %+v", remaining)
+		// Retained as a publication-owned claim (see 409 subtest): invisible
+		// to the general listing, reclaimable by the same-operation retry.
+		if got := len(mustListFinalized(t, h)); got != 0 {
+			t.Fatalf("claimed rows must not be listed as generally publishable, got %d", got)
+		}
+		retryResp := putManifest(t, serverURL, issuer, manifestFor(configDigest, len(configBytes)))
+		retryBody, _ := io.ReadAll(retryResp.Body)
+		retryResp.Body.Close()
+		if retryResp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("retry must reuse the surviving claim and remain 503, got %d (%s)", retryResp.StatusCode, retryBody)
 		}
 	})
 
@@ -281,9 +328,15 @@ func TestPublicationErrorMatrixThroughRealHandler(t *testing.T) {
 		if strings.Contains(message, marker) {
 			t.Fatalf("502 leaks injected marker: %s", respBody)
 		}
-		remaining, _ := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
-		if len(remaining) != 1 || remaining[0].Digest != configDigest {
-			t.Fatalf("verification failure must retain the referenced staging, got %+v", remaining)
+		// Retained as a publication-owned claim (see 409 subtest): invisible
+		// to the general listing, but durably present and reclaimable by the
+		// exact operation.
+		if got := mustListFinalized(t, h); len(got) != 0 {
+			t.Fatalf("claimed rows must not be listed as generally publishable, got %+v", got)
+		}
+		claims := mustClaimedStagedBlobs(t, h)
+		if len(claims) != 1 || claims[0].Digest != configDigest {
+			t.Fatalf("verification failure must retain the referenced staging as a durable claim, got %+v", claims)
 		}
 	})
 

@@ -140,16 +140,16 @@ func (f *failNthUploader) Put(ctx context.Context, data []byte, batchID string) 
 // failOnceClearStaging fails the FIRST staging consumption after a verified
 // publication (models a crash AFTER read-back verification but BEFORE staging
 // clean-up) without touching the committed feed.
-type failOnceClearStaging struct {
+type failOnceConsumeStaging struct {
 	staging.RegistryStore
 	fail atomic.Bool
 }
 
-func (c *failOnceClearStaging) ClearStagedBlobsByDigest(ctx context.Context, repo, actor string, digests []string) error {
+func (c *failOnceConsumeStaging) ConsumeStagedForPublish(ctx context.Context, repo, actor, operationID string, digests []string) error {
 	if c.fail.CompareAndSwap(true, false) {
-		return errors.New("injected staging clear failure")
+		return errors.New("injected staging consume failure")
 	}
-	return c.RegistryStore.ClearStagedBlobsByDigest(ctx, repo, actor, digests)
+	return c.RegistryStore.ConsumeStagedForPublish(ctx, repo, actor, operationID, digests)
 }
 
 // ---------------------------------------------------------------------------
@@ -669,17 +669,18 @@ func TestPublishRetryCrashAfterCommitFeedUpdate(t *testing.T) {
 }
 
 // TestPublishRetryCrashAfterVerificationBeforeStagingClear models a crash
-// after read-back verification passed but before the staging clean-up: the
-// committed result stays effective, the retry is recognized and answered without
-// advancing the feed, and the un-cleared staged blob is retained (never
-// prematurely cleared and never re-consumed by the retry).
+// after read-back verification passed but before the staging consume: the
+// committed result stays effective, the retry is recognized and answered
+// without advancing the feed, and the retry FINISHES the publication-owned
+// consume of its own surviving claim (the staged blob is cleaned up exactly
+// once, by the correct operation).
 func TestPublishRetryCrashAfterVerificationBeforeStagingClear(t *testing.T) {
 	h, docs, feeds, issuer, serverURL := task14World(t)
 	committer := &generationCommitter{feeds: feeds, docs: docs}
 	h.Publisher.Commits = committer
-	clearFail := &failOnceClearStaging{RegistryStore: h.Staging}
-	clearFail.fail.Store(true)
-	h.Staging = clearFail
+	consumeFail := &failOnceConsumeStaging{RegistryStore: h.Staging}
+	consumeFail.fail.Store(true)
+	h.Staging = consumeFail
 
 	configBytes := configFor("amd64")
 	configDigest := stageBlob(t, serverURL, issuer, configBytes, "application/vnd.oci.image.config.v1+json")
@@ -718,13 +719,15 @@ func TestPublishRetryCrashAfterVerificationBeforeStagingClear(t *testing.T) {
 	if pub, ok := state.TagPublications["latest"]; !ok || pub.OperationID != opID {
 		t.Fatalf("retry must return the exact prior operation identity: %+v", pub)
 	}
-	// The referenced blob stayed staged (clean-up crashed); a retried publication
-	// is recognized as already-published and must neither clear nor orphan it.
+	// The first attempt's consume crashed, so its publication-owned claim
+	// SURVIVES; the verified-retry path finishes that exact claim (consume by
+	// the correct operation, never clearing a foreign row). The blob is now
+	// cleaned up and no longer staged.
 	remaining, err := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
 	if err != nil {
 		t.Fatalf("list staged: %v", err)
 	}
-	if len(remaining) != 1 || remaining[0].Digest != configDigest {
-		t.Fatalf("un-cleared staged blob must be retained, got %+v", remaining)
+	if len(remaining) != 0 {
+		t.Fatalf("verified retry must finish its own surviving claim and consume the staged blob, got %+v", remaining)
 	}
 }

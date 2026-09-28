@@ -25,20 +25,29 @@ import (
 // ONLY by its exact frozen object surface plus version, never guessed at. A
 // pre-existing database that matches none of them is rejected, never adopted.
 //
-// v5 is the current schema. It carries one forward change over v4: the
-// cleanup-owned `expiring` state value, which the Task 18 cleanup reaper
-// commits BEFORE any irreversible side effect (an eligible Bee unpin and the
-// final staged-file removal) so a crash between the claim and the side effect
-// never loses the blob's metadata. v4 had no such distinct cleanup-ownership
-// tombstone, so a generic Delete/Expire `deleting` tombstone could be
-// mis-read as cleanup-eligible and unpin a live published blob's content.
-// v5 adds the expiring value to the state CHECK, the coherence CHECK, and the
-// state-transition trigger (expiring only from active/finalized, only to
-// deleting); no existing row is ever re-derived by the migration.
+// v6 is the current schema. It carries one forward change over v5: the
+// durable publication-claim fence that closes the cross-process
+// publication-versus-unpin TOCTOU. Publication AND cleanup operate on the
+// SAME SQLite staging database under serialized write transactions, so the
+// fence is enforced at the DB level. A finalized blob that a publication
+// claims transitions to the publication-owned `claimed` state and records its
+// stable operation_id. Cleanup's candidate query (`state in
+// ('active','finalized','expiring')`) and its expiring-transition rule
+// (`expiring only from active/finalized`) can therefore NEVER select, move to
+// expiring, or unpin a claimed row — and the claim itself atomically requires
+// a genuinely finalized, non-expired, repo/actor/digest-matching row, so it
+// can never latch onto a row cleanup already unpinned (expiring) or a generic
+// Delete stole (deleting). A publication that listed a blob and then had a
+// concurrent cleanup win the row fails its claim closed (zero external
+// writes); a publication whose claim won means cleanup provably does zero
+// unpins. v6 adds the `claimed` value to the state CHECK, the coherence
+// CHECK, the state-transition trigger, and the `operation_id` column (with a
+// bounded grammar CHECK) to upload_sessions; every other column/row is
+// carried across the migration exactly and no existing row is ever re-derived.
 //
-// v4 is the prior committed schema (the durable finalizing claim state). It
-// is retained for migration detection and parity.
-const latestSchemaVersion = 5
+// v5 is the prior committed schema (the cleanup-owned `expiring` state value).
+// It is retained for migration detection and parity.
+const latestSchemaVersion = 6
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -100,6 +109,7 @@ var schemaDDL = []string{
 		create_token text,
 		cleanup_token text,
 		finalize_token text,
+		operation_id text,
 		digest     text,
 		bee_ref    text,
 		media_type text,
@@ -107,20 +117,21 @@ var schemaDDL = []string{
 		check (typeof(id) = 'text' and length(hex(id)) = 128 and id = lower(id) and id not glob '*[^0-9a-f]*' and instr(hex(id), '00') = 0),
 		check (typeof(repo) = 'text' and length(hex(repo)) between 2 and 400 and instr(hex(repo), '00') = 0 and repo = lower(repo) and repo not glob '*[^a-z0-9._/-]*' and repo not glob '/**' and repo not glob '*/' and repo not glob '*//*' and repo not glob '*..*' and ('/' || repo) not glob '*[/][._-]*'),
 		check (typeof(actor) = 'text' and length(hex(actor)) between 2 and 400 and instr(hex(actor), '00') = 0 and actor not glob '*[^a-zA-Z0-9:_@.-]*' and actor not glob '[+._:@-]*'),
-		check (state in ('active','creating','finalizing','finalized','deleting','expiring')),
+		check (state in ('active','creating','finalizing','finalized','deleting','expiring','claimed')),
 		check (typeof(offset) = 'integer' and offset >= 0),
 		check (typeof(created_at) = 'integer' and typeof(expires_at) = 'integer' and expires_at > created_at),
 		check (cleanup_token is null or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128 and cleanup_token = lower(cleanup_token) and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)),
 		check (finalize_token is null or (typeof(finalize_token) = 'text' and length(hex(finalize_token)) = 128 and finalize_token = lower(finalize_token) and finalize_token not glob '*[^0-9a-f]*' and instr(hex(finalize_token), '00') = 0)),
+		check (operation_id is null or (typeof(operation_id) = 'text' and length(operation_id) between 1 and 256)),
 		check (
-			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null and finalize_token is null)
+			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null and finalize_token is null and operation_id is null)
 			or (state = 'finalizing' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null
 				and typeof(finalize_token) = 'text' and length(hex(finalize_token)) = 128
 				and finalize_token = lower(finalize_token)
-				and finalize_token not glob '*[^0-9a-f]*' and instr(hex(finalize_token), '00') = 0)
+				and finalize_token not glob '*[^0-9a-f]*' and instr(hex(finalize_token), '00') = 0 and operation_id is null)
 			or (state = 'creating' and digest is null and bee_ref is null and media_type is null and size is null and offset = 0
 				and typeof(create_token) = 'text' and length(hex(create_token)) = 128 and create_token = lower(create_token)
-				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0 and cleanup_token is null and finalize_token is null)
+				and create_token not glob '*[^0-9a-f]*' and instr(hex(create_token), '00') = 0 and cleanup_token is null and finalize_token is null and operation_id is null)
 			or (state = 'finalized' and digest is not null and bee_ref is not null and media_type is not null
 				and size is not null and typeof(size) = 'integer' and size = offset
 				and typeof(digest) = 'text' and length(hex(digest)) = 142 and instr(hex(digest), '00') = 0
@@ -129,13 +140,23 @@ var schemaDDL = []string{
 				and bee_ref = lower(bee_ref) and bee_ref not glob '*[^0-9a-f]*'
 				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
-				and create_token is null and finalize_token is null)
-			or (state = 'deleting' and create_token is null and finalize_token is null
+				and create_token is null and finalize_token is null and operation_id is null)
+			or (state = 'claimed' and digest is not null and bee_ref is not null and media_type is not null
+				and size is not null and typeof(size) = 'integer' and size = offset
+				and typeof(digest) = 'text' and length(hex(digest)) = 142 and instr(hex(digest), '00') = 0
+				and digest = lower(digest) and substr(digest, 1, 7) = 'sha256:' and substr(digest, 8) not glob '*[^0-9a-f]*'
+				and typeof(bee_ref) = 'text' and length(hex(bee_ref)) = 128 and instr(hex(bee_ref), '00') = 0
+				and bee_ref = lower(bee_ref) and bee_ref not glob '*[^0-9a-f]*'
+				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
+				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
+				and create_token is null and finalize_token is null
+				and typeof(operation_id) = 'text' and length(operation_id) between 1 and 256)
+			or (state = 'deleting' and create_token is null and finalize_token is null and operation_id is null
 				and (cleanup_token is null
 					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
 						and cleanup_token = lower(cleanup_token)
 						and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)))
-			or (state = 'expiring' and create_token is null and finalize_token is null
+			or (state = 'expiring' and create_token is null and finalize_token is null and operation_id is null
 				and (cleanup_token is null
 					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
 						and cleanup_token = lower(cleanup_token)
@@ -189,6 +210,8 @@ var schemaDDL = []string{
 			when new.state = 'active' and new.state <> old.state and old.state not in ('creating','finalizing') then raise(abort, 'cannot return to active')
 			when new.state = 'creating' and new.state <> old.state then raise(abort, 'cannot enter creating')
 			when new.state = 'finalizing' and new.state <> old.state and old.state <> 'active' then raise(abort, 'finalizing requires active')
+			when new.state = 'claimed' and new.state <> old.state and old.state <> 'finalized' then raise(abort, 'claim requires finalized')
+			when old.state = 'claimed' and new.state <> 'claimed' and new.state <> 'deleting' then raise(abort, 'claimed is publication-owned')
 			when new.state = 'finalized' and not (
 				select exists(select 1 from staged_blobs b where b.upload_id = new.id
 					and b.repo = new.repo and b.actor = new.actor and b.created_at = new.created_at
@@ -375,8 +398,16 @@ var schemaGoldenV4JSON []byte
 //go:embed schema_golden_v5.json
 var schemaGoldenV5JSON []byte
 
-// schemaGold is the current (v5) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV5JSON)
+//go:embed schema_golden_v6.json
+var schemaGoldenV6JSON []byte
+
+// schemaGold is the current (v6) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV6JSON)
+
+// schemaGoldV5 is the exact frozen v5 predecessor manifest (the previously
+// committed "current" shape before v6), retained for migration detection and
+// parity. It is never renamed or called v6.
+var schemaGoldV5 = mustLoadSchemaGolden(schemaGoldenV5JSON)
 
 // schemaGoldV4 is the exact frozen v4 predecessor manifest (the previously
 // committed "current" shape before v5), retained for migration detection and
@@ -684,7 +715,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1439,6 +1470,7 @@ const (
 	schemaMigrateV2
 	schemaMigrateV3
 	schemaMigrateV4
+	schemaMigrateV5
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1490,6 +1522,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 5:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV5, 5); err == nil {
+			return schemaMigrateV5, nil
 		}
 	case 4:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV4, 4); err == nil {
@@ -1744,6 +1780,21 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// can be born expiring; the CHECK and state trigger enforce it), so no
 		// existing row is ever altered or re-derived and a generic deleting
 		// tombstone is never re-interpreted as cleanup-owned.
+		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV5:
+		if err := verifyAgainst(ctx, conn, schemaGoldV5, 5); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v5 -> v6: the durable publication-claim fence. Rebuild
+		// upload_sessions carrying every row/field across exactly (the new
+		// operation_id column is reconstructed NULL everywhere — no existing
+		// row is ever born claimed and no row's operation ownership is ever
+		// invented), so the tightened state CHECK, coherence CHECK, and state
+		// transition trigger (changes sourced from v5: the claim requires a
+		// finalized row and a claimed row is publication-owned) all take
+		// effect without altering a single existing row.
 		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
 			return depErr(err, ctx)
 		}
