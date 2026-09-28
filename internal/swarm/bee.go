@@ -332,11 +332,15 @@ func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes i
 // whose ref is NOT referenced by committed repository state, so a live
 // publication's content is never unpinned. A definitive 404 is IDEMPOTENT
 // SUCCESS (the content was already unpinned — an expected retry outcome after
-// a crash or concurrent reaper); any other non-2xx status, a malformed ref, or
-// a transport failure fails closed with a data-free error. Only genuine 64-hex
-// Swarm references are accepted. The response body is bounded and always
-// closed; the caller's deadline is respected with the same bounded per-request
-// timeout as every other Bee call.
+// a crash or concurrent reaper); any other non-2xx status — INCLUDING every
+// direct 3xx redirect, which is disabled and treated as a fixed dependency
+// failure — a malformed ref, or a transport failure fails closed with a
+// data-free error. The unpin runs through a shallow per-call COPY of the
+// caller-owned HTTP client with a fail-closed CheckRedirect (see unpinClient),
+// so the caller's shared client is never mutated. Only genuine 64-hex Swarm
+// references are accepted. The response body is bounded and always closed; the
+// caller's deadline is respected with the same bounded per-request timeout as
+// every other Bee call.
 func (s *BeeObjectStore) Unpin(ctx context.Context, ref string) error {
 	if s == nil {
 		// A nil receiver must fail closed, never panic on field access.
@@ -360,7 +364,7 @@ func (s *BeeObjectStore) Unpin(ctx context.Context, ref string) error {
 	if err != nil {
 		return sanitizeBeeTransportError(reqCtx, "create bee unpin request", err)
 	}
-	resp, err := s.HTTPClient.Do(req)
+	resp, err := unpinClient(s.HTTPClient).Do(req)
 	if err != nil {
 		return sanitizeBeeTransportError(reqCtx, "bee unpin request", err)
 	}
@@ -380,6 +384,28 @@ func (s *BeeObjectStore) Unpin(ctx context.Context, ref string) error {
 		// the body never survives into the error.
 		return fmt.Errorf("bee unpin failed with status %d", resp.StatusCode)
 	}
+}
+
+// unpinClient returns a fail-closed client for ONE DELETE /pins/{ref} request:
+// a SHALLOW COPY of the caller-owned HTTP client with a CheckRedirect that
+// never follows a redirect. A configured Bee DELETE that answers with any 3xx
+// (301/302/303/307/308) can otherwise be steered to another endpoint — a 302
+// becomes a GET, a 307/308 forwards the DELETE — and a redirected 2xx would be
+// accepted as a successful unpin even though the deletion never happened.
+// Returning http.ErrUseLastResponse from CheckRedirect stops the redirect
+// chain and returns the direct 3xx as the response, which Unpin then
+// classifies as a fixed dependency failure. The shallow copy preserves the
+// caller's Transport, Timeout, Jar, and every other field (connection reuse
+// and deadlines are untouched) and ONLY overrides CheckRedirect, so the
+// caller-owned shared client is never mutated and concurrent Unpin calls on it
+// do not race.
+func unpinClient(client *http.Client) *http.Client {
+	c := new(http.Client)
+	*c = *client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return c
 }
 
 func (s *BeeObjectStore) Put(ctx context.Context, data []byte, batchID string) (string, error) {

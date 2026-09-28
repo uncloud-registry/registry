@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1279,5 +1280,147 @@ func TestCanonicalObjectRef(t *testing.T) {
 	}
 	if got := CanonicalObjectRef(""); got != "" {
 		t.Fatalf("empty ref must stay empty, got %q", got)
+	}
+}
+
+// TestBeeObjectStoreUnpinRejectsRedirect proves Unpin runs DELETE /pins/{ref}
+// with redirects DISABLED (fail-closed): every direct 3xx — 301, 302, 303,
+// 307, 308 — is a fixed, DATA-FREE dependency failure. A configured Bee DELETE
+// that responds with a redirect can otherwise be steered to another endpoint
+// (302 becomes GET, 307/308 forward the DELETE) and a redirected 2xx would be
+// accepted as a successful unpin even though the deletion never happened. The
+// redirect Location is never followed (the cross-origin target is NEVER
+// contacted), the request stays confined to the configured Bee, and the
+// returned error never echoes the ref, the Location, the target URL, or any
+// response body.
+func TestBeeObjectStoreUnpinRejectsRedirect(t *testing.T) {
+	t.Parallel()
+
+	ref := strings.Repeat("b", 64)
+	bodyMarker := "REDIRECT-BODY-" + ref[:8]
+	locationPath := "/evil/" + ref[:8]
+
+	// A cross-origin target that a followed redirect (302->GET, 307/308->
+	// DELETE) would contact. It records any hit so the test can prove the
+	// request never left the configured Bee.
+	var targetContacted atomic.Value // string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetContacted.Store(r.Method + " " + r.URL.String())
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	var pendingStatus atomic.Int32
+	redirectingBee := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/pins/"+ref {
+			t.Fatalf("unexpected %s %s on configured Bee", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Location", target.URL+locationPath)
+		w.WriteHeader(int(pendingStatus.Load()))
+		_, _ = w.Write([]byte(bodyMarker))
+	}))
+	defer redirectingBee.Close()
+
+	// The store's shared client deliberately keeps the DEFAULT (redirect-
+	// following) CheckRedirect policy — the exact configuration the fix must
+	// neutralize without mutating the caller-owned client.
+	store := NewBeeObjectStore(redirectingBee.URL, redirectingBee.Client())
+	shared := store.HTTPClient
+	sharedPreCheckRedirect := shared.CheckRedirect
+	if sharedPreCheckRedirect != nil {
+		t.Fatalf("fixture: httptest server client must have the default nil CheckRedirect, got %T", sharedPreCheckRedirect)
+	}
+
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{"Moved Permanently", http.StatusMovedPermanently},
+		{"Found", http.StatusFound},
+		{"See Other", http.StatusSeeOther},
+		{"Temporary Redirect", http.StatusTemporaryRedirect},
+		{"Permanent Redirect", http.StatusPermanentRedirect},
+	}
+	for _, tc := range cases {
+		pendingStatus.Store(int32(tc.status))
+		targetContacted.Store("")
+
+		err := store.Unpin(context.Background(), ref)
+		if err == nil {
+			t.Fatalf("Unpin on %s (status %d) must fail closed", tc.name, tc.status)
+		}
+		if d := targetContacted.Load().(string); d != "" {
+			t.Fatalf("%s redirect was followed to the cross-origin target (%s); the request left the configured Bee", tc.name, d)
+		}
+
+		// Data-free: never the ref, the Location, the target URL, the request
+		// path, or the response body.
+		emsg := err.Error()
+		for _, banned := range []string{
+			ref, locationPath, target.URL, bodyMarker, "evil", "/pins/", tc.name,
+		} {
+			if strings.Contains(emsg, banned) {
+				t.Fatalf("%s error must be data-free (leaks %q): %v", tc.name, banned, err)
+			}
+		}
+	}
+
+	// The shared, caller-owned client is byte-for-byte untouched: still the
+	// same pointer with the default nil CheckRedirect.
+	if shared != store.HTTPClient {
+		t.Fatal("Unpin must not replace the store's shared HTTP client")
+	}
+	if shared.CheckRedirect != nil {
+		t.Fatal("Unpin must not mutate the shared HTTP client's CheckRedirect (still the default nil)")
+	}
+}
+
+// TestBeeObjectStoreUnpinSharedClientNotMutatedAndConcurrent proves Unpin runs
+// on a shallow per-call COPY of the caller-owned HTTP client, so the shared
+// client's CheckRedirect/config is never mutated by a call AND concurrent
+// Unpin calls on one shared client do not race or disturb it. A single shared
+// client (default following CheckRedirect) serves many concurrent unpins and a
+// successful one is still a real 2xx, with the shared config unchanged after.
+func TestBeeObjectStoreUnpinSharedClientNotMutatedAndConcurrent(t *testing.T) {
+	t.Parallel()
+
+	ref := strings.Repeat("c", 64)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/pins/"+ref {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	store := NewBeeObjectStore(server.URL, server.Client())
+	shared := store.HTTPClient
+	if shared.CheckRedirect != nil {
+		t.Fatalf("fixture: httptest server client must have the default nil CheckRedirect, got %T", shared.CheckRedirect)
+	}
+
+	const workers = 32
+	var wg sync.WaitGroup
+	errs := make([]error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = store.Unpin(context.Background(), ref)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Unpin %d: %v", i, err)
+		}
+	}
+	// The shared client must be the SAME pointer with the SAME redirect config
+	// after all concurrent calls (never mutated, never replaced).
+	if shared != store.HTTPClient {
+		t.Fatal("concurrent Unpin calls replaced the shared HTTP client")
+	}
+	if shared.CheckRedirect != nil {
+		t.Fatal("concurrent Unpin calls mutated the shared HTTP client's CheckRedirect (still the default nil)")
 	}
 }
