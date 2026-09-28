@@ -108,6 +108,50 @@ func TestBeeObjectStoreUnpinTransportFailure(t *testing.T) {
 	}
 }
 
+// TestBeeObjectStoreUnpinNilAndBlankFailClosed proves Unpin fails closed (and
+// NEVER panics) on a nil receiver, a nil HTTP client, a blank/invalid base
+// URL, and a malformed ref — the pre-review defect that a zero-valued or nil
+// store could dereference a nil client / empty base URL at the request build
+// or Do step.
+func TestBeeObjectStoreUnpinNilAndBlankFailClosed(t *testing.T) {
+	t.Parallel()
+
+	// A nil receiver must return a data-free error, not panic.
+	var nilStore *BeeObjectStore
+	if err := nilStore.Unpin(context.Background(), strings.Repeat("a", 64)); err == nil {
+		t.Fatal("Unpin on a nil receiver must fail closed")
+	}
+	// A zero-value struct (nil client, empty base) must fail closed, not panic.
+	zero := &BeeObjectStore{}
+	if err := zero.Unpin(context.Background(), strings.Repeat("a", 64)); err == nil {
+		t.Fatal("Unpin on a zero-value store (blank base) must fail closed")
+	}
+	// Explicit nil client with a base URL fails closed before any request.
+	noClient := &BeeObjectStore{BaseURL: "http://127.0.0.1:9"}
+	if err := noClient.Unpin(context.Background(), strings.Repeat("a", 64)); err == nil {
+		t.Fatal("Unpin with a nil HTTP client must fail closed")
+	}
+	// An invalid (non-host) base URL also fails closed without panicking.
+	badBase := &BeeObjectStore{BaseURL: "://invalid", HTTPClient: http.DefaultClient}
+	if err := badBase.Unpin(context.Background(), strings.Repeat("a", 64)); err == nil {
+		t.Fatal("Unpin with an invalid base URL must fail closed")
+	}
+	// The error must be data-free: it must not echo the ref or the base URL.
+	for _, err := range []error{
+		nilStore.Unpin(context.Background(), strings.Repeat("a", 64)),
+		zero.Unpin(context.Background(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		noClient.Unpin(context.Background(), strings.Repeat("a", 64)),
+		badBase.Unpin(context.Background(), strings.Repeat("a", 64)),
+	} {
+		if err == nil {
+			continue
+		}
+		if strings.Contains(err.Error(), "://") || strings.Contains(err.Error(), strings.Repeat("a", 64)) {
+			t.Fatalf("unpin error must be data-free (no base URL / ref): %v", err)
+		}
+	}
+}
+
 func TestBeeDocumentStoreReadsBZZAndFeedReferences(t *testing.T) {
 	t.Parallel()
 

@@ -25,15 +25,20 @@ import (
 // ONLY by its exact frozen object surface plus version, never guessed at. A
 // pre-existing database that matches none of them is rejected, never adopted.
 //
-// v4 is the current schema. It carries one forward change over v3: the durable
-// finalization claim state `finalizing`, which an upload winner commits BEFORE
-// any external object-store write so concurrent or retried finalizes serialize
-// to a single Bee write. A finalizing row freezes its exact staged snapshot
-// (offset == the hashed size), rejects appends, fails delete/expire closed,
-// and is never listed for publication; it is retained fail-closed across
-// restarts until an explicit reconciliation path settles it. v3 never had such
-// a frozen pre-write claim, so two concurrent PUTs could both reach Bee.
-const latestSchemaVersion = 4
+// v5 is the current schema. It carries one forward change over v4: the
+// cleanup-owned `expiring` state value, which the Task 18 cleanup reaper
+// commits BEFORE any irreversible side effect (an eligible Bee unpin and the
+// final staged-file removal) so a crash between the claim and the side effect
+// never loses the blob's metadata. v4 had no such distinct cleanup-ownership
+// tombstone, so a generic Delete/Expire `deleting` tombstone could be
+// mis-read as cleanup-eligible and unpin a live published blob's content.
+// v5 adds the expiring value to the state CHECK, the coherence CHECK, and the
+// state-transition trigger (expiring only from active/finalized, only to
+// deleting); no existing row is ever re-derived by the migration.
+//
+// v4 is the prior committed schema (the durable finalizing claim state). It
+// is retained for migration detection and parity.
+const latestSchemaVersion = 5
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -102,7 +107,7 @@ var schemaDDL = []string{
 		check (typeof(id) = 'text' and length(hex(id)) = 128 and id = lower(id) and id not glob '*[^0-9a-f]*' and instr(hex(id), '00') = 0),
 		check (typeof(repo) = 'text' and length(hex(repo)) between 2 and 400 and instr(hex(repo), '00') = 0 and repo = lower(repo) and repo not glob '*[^a-z0-9._/-]*' and repo not glob '/**' and repo not glob '*/' and repo not glob '*//*' and repo not glob '*..*' and ('/' || repo) not glob '*[/][._-]*'),
 		check (typeof(actor) = 'text' and length(hex(actor)) between 2 and 400 and instr(hex(actor), '00') = 0 and actor not glob '*[^a-zA-Z0-9:_@.-]*' and actor not glob '[+._:@-]*'),
-		check (state in ('active','creating','finalizing','finalized','deleting')),
+		check (state in ('active','creating','finalizing','finalized','deleting','expiring')),
 		check (typeof(offset) = 'integer' and offset >= 0),
 		check (typeof(created_at) = 'integer' and typeof(expires_at) = 'integer' and expires_at > created_at),
 		check (cleanup_token is null or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128 and cleanup_token = lower(cleanup_token) and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)),
@@ -126,6 +131,11 @@ var schemaDDL = []string{
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
 				and create_token is null and finalize_token is null)
 			or (state = 'deleting' and create_token is null and finalize_token is null
+				and (cleanup_token is null
+					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
+						and cleanup_token = lower(cleanup_token)
+						and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)))
+			or (state = 'expiring' and create_token is null and finalize_token is null
 				and (cleanup_token is null
 					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
 						and cleanup_token = lower(cleanup_token)
@@ -170,7 +180,10 @@ var schemaDDL = []string{
 	// State transitions: active may only be ENTERED from creating; nothing
 	// may re-enter creating; finalize requires a fully matching staged blob
 	// (identity, metadata, timing) and size == offset; the deleting tombstone
-	// is terminal.
+	// is terminal. The cleanup-owned `expiring` tombstone may only be ENTERED
+	// from a live active/finalized row and may only LEAVE to the deleting
+	// tombstone, so a cleanup claim is never re-purposed by another operation
+	// and a generic delete can never be mis-read as a cleanup unpin claim.
 	`create trigger trg_session_state before update of state on upload_sessions begin
 		select case
 			when new.state = 'active' and new.state <> old.state and old.state not in ('creating','finalizing') then raise(abort, 'cannot return to active')
@@ -186,6 +199,8 @@ var schemaDDL = []string{
 				then raise(abort, 'finalize requires matching staged blob')
 			when new.state = 'deleting' and old.state = 'deleting' then raise(abort, 'already deleting')
 			when old.state = 'deleting' and new.state <> 'deleting' then raise(abort, 'deleting is terminal')
+			when new.state = 'expiring' and new.state <> old.state and old.state not in ('active','finalized') then raise(abort, 'expiring requires a live finalized/active row')
+			when old.state = 'expiring' and new.state <> 'expiring' and new.state <> 'deleting' then raise(abort, 'expiring is cleanup-owned')
 			else null end;
 	end`,
 	// Finalize metadata columns are immutable once set and may only be SET
@@ -357,8 +372,16 @@ var schemaGoldenV3JSON []byte
 //go:embed schema_golden_v4.json
 var schemaGoldenV4JSON []byte
 
-// schemaGold is the current (v4) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV4JSON)
+//go:embed schema_golden_v5.json
+var schemaGoldenV5JSON []byte
+
+// schemaGold is the current (v5) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV5JSON)
+
+// schemaGoldV4 is the exact frozen v4 predecessor manifest (the previously
+// committed "current" shape before v5), retained for migration detection and
+// parity. It is never renamed or called v5.
+var schemaGoldV4 = mustLoadSchemaGolden(schemaGoldenV4JSON)
 
 // schemaGoldV3 is the exact frozen v3 predecessor manifest (the previously
 // committed "current" shape before v4), retained for migration detection and
@@ -661,7 +684,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1415,6 +1438,7 @@ const (
 	schemaMigrateV1Cleanup
 	schemaMigrateV2
 	schemaMigrateV3
+	schemaMigrateV4
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1466,6 +1490,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 4:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV4, 4); err == nil {
+			return schemaMigrateV4, nil
 		}
 	case 3:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV3, 3); err == nil {
@@ -1704,6 +1732,18 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// carrying every row/field across exactly (no active/finalized row can
 		// be born finalizing; the CHECK and state trigger enforce it), so no
 		// existing row is ever altered or re-derived.
+		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV4:
+		if err := verifyAgainst(ctx, conn, schemaGoldV4, 4); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v4 -> v5: the cleanup-owned expiring state. Rebuild
+		// upload_sessions carrying every row/field across exactly (no v4 row
+		// can be born expiring; the CHECK and state trigger enforce it), so no
+		// existing row is ever altered or re-derived and a generic deleting
+		// tombstone is never re-interpreted as cleanup-owned.
 		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
 			return depErr(err, ctx)
 		}

@@ -955,8 +955,22 @@ func (s *service) finishDeletion(ctx context.Context, id string, a deleteAuth) (
 			// anything on a stale identity.
 			return nil
 		}
-		if row.state != string(StateDeleting) {
-			return typed(ErrDependency, errors.New("cleanup row left the deleting tombstone"))
+		if row.state == string(StateExpiring) {
+			// A cleanup-owned expiring claim (eligible finalized blob whose Bee
+			// content was already unpinned, or an expiring claim mid-crash):
+			// transition it to the deleting tombstone so the row deletion below
+			// (and the trg_session_delete guard) is satisfied. finishDeletion is
+			// reached for an expiring row ONLY by the cleanup reaper — a generic
+			// Delete/Expire path never produces expiring — so accepting it here
+			// never unpins content: the unpin already happened, or there is no
+			// content (active). A crash after this transition leaves a deleting
+			// tombstone that a later pass or startup reconciliation finishes.
+			if _, err := conn.ExecContext(ctx,
+				`update upload_sessions set state = 'deleting' where id = ? and state = 'expiring'`, id); err != nil {
+				return typed(ErrDependency, err)
+			}
+		} else if row.state != string(StateDeleting) {
+			return typed(ErrDependency, errors.New("cleanup row left the deleting/expiring tombstone"))
 		}
 		// Attempt EVERY file cleanup (canonical payload + token sidecar),
 		// even if an earlier one fails, so no spool residue accumulates on
@@ -1351,7 +1365,7 @@ func (s *service) maxGrowth(ctx context.Context, conn *sql.Conn, repo string, cu
 // an astronomically large usage can never pass any positive quota). A genuine
 // query failure is returned for the caller to wrap as a dependency error.
 func usageSum(ctx context.Context, conn *sql.Conn, repo *string) (int64, error) {
-	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalizing','finalized','deleting')`
+	query := `select coalesce(sum(offset), 0) from upload_sessions where state in ('active','finalizing','finalized','deleting','expiring')`
 	args := []any{}
 	if repo != nil {
 		query += ` and repo = ?`
@@ -1661,6 +1675,9 @@ func (s *service) ClaimFinalize(ctx context.Context, id, repo, actor string, siz
 			return ErrInvalidState
 		case string(StateDeleting):
 			return ErrInvalidState
+		case string(StateExpiring):
+			// A cleanup-OWNED claim: never a finalize target.
+			return ErrInvalidState
 		case string(StateActive):
 			if size != row.offset {
 				// A concurrent append advanced the durable offset after the
@@ -1818,6 +1835,9 @@ func (s *service) MarkFinalized(ctx context.Context, id, repo, actor, token, dig
 		switch row.state {
 		case string(StateDeleting):
 			return ErrInvalidState
+		case string(StateExpiring):
+			// A cleanup-OWNED claim can never be finalized.
+			return ErrInvalidState
 		case string(StateFinalized):
 			// Idempotent only for byte-identical metadata.
 			if row.digest.Valid && row.digest.String == digest &&
@@ -1889,9 +1909,20 @@ func (s *service) ListFinalized(ctx context.Context, repo, actor string) ([]spec
 		return nil, err
 	}
 	defer s.pool.release(conn)
+	// Only genuinely FINALIZED, non-expired, non-tombstoned staged blobs are
+	// publishable. A staged blob whose session is expiring (a cleanup-OWNED
+	// claim) or deleting (a generic Delete/Expire tombstone) must never be
+	// listed: once the cleanup claims a blob it must be newly-uncontributed to
+	// any publication, and a blob already expired is outside the publication
+	// window entirely. Joining the session state makes the tombstoning-then-
+	// listing exclusion real (the initial Task 18 comment claimed it without
+	// the join).
+	nowNanos := s.now().UTC().UnixNano()
 	rows, err := conn.QueryContext(ctx,
-		`select upload_id, repo, actor, digest, bee_ref, size, media_type, created_at, expires_at
-		 from staged_blobs where repo = ? and actor = ? order by created_at, upload_id`, repo, actor)
+		`select b.upload_id, b.repo, b.actor, b.digest, b.bee_ref, b.size, b.media_type, b.created_at, b.expires_at
+		 from staged_blobs b join upload_sessions u on u.id = b.upload_id
+		 where b.repo = ? and b.actor = ? and u.state = 'finalized' and u.expires_at > ?
+		 order by b.created_at, b.upload_id`, repo, actor, nowNanos)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
@@ -1973,6 +2004,14 @@ func (s *service) Delete(ctx context.Context, id, repo, actor string) error {
 			// recorded. Deleting would destroy the only path to reconciliation
 			// and is never automatic; fail closed and force an explicit
 			// reconciliation path.
+			return ErrInvalidState
+		}
+		if row.state == string(StateExpiring) {
+			// An expiring row is a cleanup-OWNED claim: the cleanup reaper
+			// (and only it) decides eligibility and finishes the unpin +
+			// removal. A user Delete must never steal the claim by tombstoning
+			// it to deleting, which would remove the row WITHOUT the planned
+			// unpin and strand its pinned content. Fail closed.
 			return ErrInvalidState
 		}
 		proceed = true
@@ -2312,6 +2351,16 @@ func (s *service) reconcileStartup(ctx context.Context) error {
 			// recorded. Startup NEVER completes or releases it automatically
 			// — it retains the fail-closed uncertainty for an explicit
 			// reconciliation path, and its bytes remain frozen and quota-billed.
+		case StateExpiring:
+			// A cleanup-OWNED expiring claim left by a crash/failed-pass: the
+			// background cleanup reaper (which holds the authoritative
+			// committed-state provider and the fresh pre-unpin revalidation)
+			// must finish it, never startup. Align the staged file so its
+			// bytes are preserved and attributed, and leave the row (and its
+			// retained bee_ref + cleanup_token provenance) strictly alone.
+			if err := s.spool.align(ri.id, ri.offset); err != nil {
+				return typed(ErrDependency, err)
+			}
 		default:
 			return typed(ErrDependency, errors.New("unknown session state"))
 		}

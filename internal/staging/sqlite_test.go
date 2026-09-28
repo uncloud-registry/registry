@@ -932,7 +932,7 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			return d
 		}, false, false, nil, "actor '+' punctuation allowed"},
 		{"sessions_state_creating", func(d []string) []string {
-			d[0] = strings.Replace(d[0], "state in ('active','creating','finalizing','finalized','deleting')", "state in ('active','finalizing','finalized','deleting')", 1)
+			d[0] = strings.Replace(d[0], "state in ('active','creating','finalizing','finalized','deleting','expiring')", "state in ('active','finalizing','finalized','deleting')", 1)
 			return d
 		}, false, false, nil, "creating state removed"},
 		{"sessions_offset_check", func(d []string) []string { d[0] = strings.Replace(d[0], "offset >= 0", "offset >= -1", 1); return d }, false, false, nil, "negative offsets allowed"},

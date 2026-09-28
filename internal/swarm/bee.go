@@ -314,6 +314,19 @@ func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes i
 // closed; the caller's deadline is respected with the same bounded per-request
 // timeout as every other Bee call.
 func (s *BeeObjectStore) Unpin(ctx context.Context, ref string) error {
+	if s == nil {
+		// A nil receiver must fail closed, never panic on field access.
+		return errors.New("bee unpin requires a bee object store")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.HTTPClient == nil {
+		return errors.New("bee unpin requires an http client")
+	}
+	if strings.TrimSpace(s.BaseURL) == "" {
+		return errors.New("bee unpin requires a configured base url")
+	}
 	if !isBeeReference(ref) {
 		return errors.New("bee unpin requires a 64-hex object reference")
 	}

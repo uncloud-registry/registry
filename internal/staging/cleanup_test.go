@@ -81,7 +81,7 @@ func TestCleanupExpiredActiveSessionRemoved(t *testing.T) {
 	runAt := fixClockAhead(svc, now)
 
 	unp := &fakeUnpinner{}
-	c, err := NewCleanup(svc, unp, nil)
+	c, err := NewCleanup(svc, unp, &fakeCommitted{})
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestCleanupExpiredFinalizedBlobUnpinsAndRemoves(t *testing.T) {
 	runAt := fixClockAhead(svc, now)
 
 	unp := &fakeUnpinner{}
-	c, err := NewCleanup(svc, unp, nil)
+	c, err := NewCleanup(svc, unp, &fakeCommitted{})
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestCleanupMissingFileTolerated(t *testing.T) {
 		t.Fatalf("remove staged file %s: %v", canonical, err)
 	}
 
-	c, err := NewCleanup(svc, &fakeUnpinner{}, nil)
+	c, err := NewCleanup(svc, &fakeUnpinner{}, &fakeCommitted{})
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestCleanupUnpinFailureRetainsMetadataAndRetries(t *testing.T) {
 	runAt := fixClockAhead(svc, now)
 
 	unp := &fakeUnpinner{failErr: errors.New("bee unavailable"), failAfter: 0}
-	c, err := NewCleanup(svc, unp, nil)
+	c, err := NewCleanup(svc, unp, &fakeCommitted{})
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestCleanupUnpinFailureRetainsMetadataAndRetries(t *testing.T) {
 
 	// A later pass with a healthy Bee completes the same logical blob.
 	healthy := &fakeUnpinner{}
-	ch, err := NewCleanup(svc, healthy, nil)
+	ch, err := NewCleanup(svc, healthy, &fakeCommitted{})
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestCleanupBoundedBatch(t *testing.T) {
 	runAt := fixClockAhead(svc, now)
 
 	unp := &fakeUnpinner{}
-	c, err := NewCleanup(svc, unp, nil)
+	c, err := NewCleanup(svc, unp, &fakeCommitted{})
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
@@ -305,12 +305,15 @@ func TestCleanupBoundedBatch(t *testing.T) {
 		t.Fatalf("batch unpin calls = %d, want 2", len(unp.calls()))
 	}
 
-	// The third expired blob is NOT touched yet.
+	// The third expired blob is NOT cleaned yet — but because it is expired it
+	// is no longer publishable: only genuinely FINALIZED, non-expired blobs are
+	// listed for publication (a cleanup-eligible blob outside the publication
+	// window can never be newly referenced).
 	remaining, err := svc.ListFinalized(context.Background(), "backend/api", "user:alice")
 	if err != nil {
 		t.Fatalf("ListFinalized: %v", err)
 	}
-	if len(remaining) != 1 {
-		t.Fatalf("remaining staged blobs = %d, want 1", len(remaining))
+	if len(remaining) != 0 {
+		t.Fatalf("expired leftover must not be publishable, listed %d, want 0", len(remaining))
 	}
 }

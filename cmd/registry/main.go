@@ -224,12 +224,12 @@ func buildBeeHandler() (http.Handler, error) {
 		return nil, err
 	}
 	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
-	runCleanupLoop(cleanupCtx, cleanup, interval, batch)
+	cleanupDone := runCleanupLoop(cleanupCtx, cleanup, interval, batch)
 	closeSvc := func() error { return nil }
 	if ic, ok := stageStore.(io.Closer); ok {
 		closeSvc = ic.Close
 	}
-	stageStore = &cancelOnCloseStore{RegistryStore: stageStore, cancel: cancelCleanup, close: closeSvc}
+	stageStore = &cancelOnCloseStore{RegistryStore: stageStore, cancel: cancelCleanup, done: cleanupDone, close: closeSvc}
 
 	handler := registry.NewHandler(
 		resolver,
@@ -334,6 +334,20 @@ const (
 	envCleanupBatch         = "REGISTRY_CLEANUP_BATCH"
 	defaultCleanupInterval  = 5 * time.Minute
 	defaultCleanupBatchSize = 100
+	// maxCleanupBatchSize is the documented finite upper bound on a per-pass
+	// cleanup batch. A single pass is a tightly-bounded, non-overlapping unit
+	// of work and the periodic loop is the only writer, so unbounded values
+	// serve no purpose and would only enlarge the shutdown-join window (and the
+	// per-pass committed-state revalidation cost). Any configured batch above
+	// this fails closed rather than being silently clamped.
+	maxCleanupBatchSize = 10000
+	// cleanupShutdownTimeout bounds the graceful shutdown join: after
+	// cancelling the loop, the handler Close waits up to this long for an
+	// in-flight cleanup pass to finish before releasing the staging store, so
+	// the SQLite/spool close can never race a pass that is mid-transaction.
+	// A pathological pass that exceeds the bound is conceded (the store is
+	// closed anyway) rather than hanging shutdown indefinitely.
+	cleanupShutdownTimeout = 5 * time.Second
 )
 
 // cleanupIntervalFromEnv reads the cleanup loop interval (a positive duration)
@@ -350,9 +364,10 @@ func cleanupIntervalFromEnv() (time.Duration, error) {
 	return d, nil
 }
 
-// cleanupBatchFromEnv reads the per-pass candidate batch bound (a positive
-// integer) strictly; an unset value uses the default and a malformed value
-// fails closed.
+// cleanupBatchFromEnv reads the per-pass candidate batch bound strictly: an
+// unset value uses the default, a positive value within the documented finite
+// maximum is honored, and a non-positive or over-the-maximum value FAILS
+// CLOSED (never silently clamped, never read as a default).
 func cleanupBatchFromEnv() (int, error) {
 	raw := strings.TrimSpace(os.Getenv(envCleanupBatch))
 	if raw == "" {
@@ -362,15 +377,22 @@ func cleanupBatchFromEnv() (int, error) {
 	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", envCleanupBatch)
 	}
+	if n > maxCleanupBatchSize {
+		return 0, fmt.Errorf("%s must not exceed %d", envCleanupBatch, maxCleanupBatchSize)
+	}
 	return n, nil
 }
 
 // runCleanupLoop runs one bounded cleanup pass per interval until ctx is
 // canceled, logging the per-class counts only when work was examined. It is
-// safe to call once per process.
-func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time.Duration, batch int) {
+// safe to call once per process. It returns a channel closed exactly when the
+// loop goroutine has fully exited (no pass is still in flight), so a caller
+// can cancel and JOIN the loop before releasing the underlying staging store.
+func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time.Duration, batch int) <-chan struct{} {
+	done := make(chan struct{})
 	if cleanup == nil {
-		return
+		close(done)
+		return done
 	}
 	if interval <= 0 {
 		interval = defaultCleanupInterval
@@ -378,7 +400,11 @@ func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time
 	if batch <= 0 {
 		batch = defaultCleanupBatchSize
 	}
+	if batch > maxCleanupBatchSize {
+		batch = maxCleanupBatchSize
+	}
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -401,22 +427,40 @@ func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time
 			}
 		}
 	}()
+	return done
 }
 
 // cancelOnCloseStore wraps the durable staging store so that closing the
 // handler (registry.Handler.Close closes h.Staging when it is an io.Closer)
-// cancels the periodic cleanup loop BEFORE the underlying staging service
-// (spool + database) is released. The registry-facing RegistryStore contract
-// is otherwise unchanged.
+// cancels the periodic cleanup loop and then JOINS it (bounded) BEFORE the
+// underlying staging service (spool + database) is released. Cancellation
+// alone is not a work-completion signal: a pass already mid-transaction keeps
+// running until it observes ctx — so the close waits on the loop's done
+// channel (up to cleanupShutdownTimeout) to ensure no in-flight pass races the
+// SQLite/spool teardown. The registry-facing RegistryStore contract is
+// otherwise unchanged.
 type cancelOnCloseStore struct {
 	staging.RegistryStore
 	cancel func()
+	done   <-chan struct{}
 	close  func() error
 }
 
 func (s *cancelOnCloseStore) Close() error {
 	if s.cancel != nil {
 		s.cancel()
+	}
+	// Join the cleanup loop: a canceled context does not mean a pass has
+	// finished, and releasing the store while one is mid-SQL would be unsafe.
+	if s.done != nil {
+		timer := time.NewTimer(cleanupShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-s.done:
+		case <-timer.C:
+			// A pathological pass exceeded the bound: concede and close anyway
+			// rather than hang shutdown (documented in cleanupShutdownTimeout).
+		}
 	}
 	if s.close != nil {
 		return s.close()

@@ -51,6 +51,19 @@ const (
 	// removed, so an interrupted deletion is completed by a later delete or by
 	// startup reconciliation instead of stranding an unknown file.
 	StateDeleting State = "deleting"
+	// StateExpiring is the durable CLEANUP-OWNED claim: set by the cleanup
+	// reaper BEFORE any irreversible side effect (an eligible Bee unpin and the
+	// final staged-file removal) so a crash between the claim and the side
+	// effect never loses the blob's metadata (digest/bee_ref survive in the
+	// expiring row for an idempotent, restart-safe re-run). It is DISTINCT from
+	// StateDeleting: deleting is the generic Delete/Expire/startup tombstone,
+	// whereas expiring is created ONLY by the cleanup reaper for a blob it has
+	// independently proved eligible to unpin (authoritative committed state).
+	// A pre-existing deleting row is therefore never assumed cleanup-eligible,
+	// and only a cleanup-created expiring row may be resumed for an unpin. No
+	// live operation may return to active/finalizing/finalized from expiring;
+	// the cleanup transition carries the row to deleting to complete removal.
+	StateExpiring State = "expiring"
 )
 
 // RegistryStore is the narrow registry-facing staging contract the HTTP
