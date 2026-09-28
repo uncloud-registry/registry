@@ -313,13 +313,37 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 	if publish.ComputeDigest(raw) != digest {
 		return newIntegrityError(fmt.Errorf("verify publication: manifest document bytes do not match the target digest"))
 	}
-	for _, ref := range artifact.References() {
-		blob, ok := doc.Blobs[ref.Digest]
-		if !ok {
-			return newIntegrityError(fmt.Errorf("verify publication: a referenced blob is missing from published state"))
+	switch artifact.Kind {
+	case publish.ArtifactKindIndex:
+		// An index's READ-ONLY operands are its child MANIFESTS, recorded as
+		// their own entries in the state manifests map (not blobs). Every child
+		// must be durably present with EXACT media type and size and its object
+		// bytes must hash to the referenced digest.
+		for _, ref := range artifact.Manifests {
+			child, ok := doc.Manifests[ref.Digest]
+			if !ok {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest is missing from published state"))
+			}
+			if child.Size != ref.Size || child.MediaType != ref.MediaType {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest descriptor disagrees with the index reference"))
+			}
+			childRaw, err := docs.Read(ctx, child.SwarmRef)
+			if err != nil {
+				return classifyResolverFailure(fmt.Sprintf("verify publication: read child manifest %q", child.SwarmRef), err)
+			}
+			if publish.ComputeDigest(childRaw) != ref.Digest {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body does not match its digest"))
+			}
 		}
-		if blob.Size != ref.Size || blob.MediaType != ref.MediaType {
-			return newIntegrityError(fmt.Errorf("verify publication: a referenced blob descriptor disagrees with the manifest reference"))
+	default:
+		for _, ref := range artifact.References() {
+			blob, ok := doc.Blobs[ref.Digest]
+			if !ok {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced blob is missing from published state"))
+			}
+			if blob.Size != ref.Size || blob.MediaType != ref.MediaType {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced blob descriptor disagrees with the manifest reference"))
+			}
 		}
 	}
 	return nil

@@ -215,6 +215,18 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 		return
 	}
 
+	// Distribution Accept negotiation: serve the stored representation ONLY if
+	// it is acceptable for the request (matching concrete type, matching
+	// wildcard, or an absent Accept that accepts anything). We never transcode
+	// OCI↔Docker and never descend into child manifests for the top-level, so
+	// an explicitly unacceptable stored media type is a documented 404
+	// MANIFEST_UNKNOWN with a fixed data-free message, and returns WITHOUT
+	// touching the object store or any state.
+	if !acceptAccepts(r.Header.Get("Accept"), desc.MediaType) {
+		writeError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", messageManifestNotAcceptable)
+		return
+	}
+
 	data, err := h.Objects.Get(r.Context(), desc.SwarmRef)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "MANIFEST_BLOB_UNKNOWN", messageManifestUnavailable)
@@ -597,6 +609,15 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			if _, committed := current.Blobs[digest]; committed {
 				continue
 			}
+			// An index child manifest is a committed manifest — not a staged blob —
+			// so it resolves through the manifests map (the authoritative record a
+			// previously-published single-platform manifest left behind). Ordinary
+			// manifest references (blobs) never resolve through the manifest map.
+			if artifact.Kind == publish.ArtifactKindIndex {
+				if _, committedManifest := current.Manifests[digest]; committedManifest {
+					continue
+				}
+			}
 			if _, reused := owned[digest]; reused {
 				continue
 			}
@@ -766,12 +787,91 @@ func computeDigest(data []byte) string {
 // document, decoder, or store detail — never crosses the HTTP boundary; each
 // path answers with exactly one of these fixed strings and a fixed status/code.
 const (
-	messageRepositoryNotFound  = "repository not found"
-	messageManifestUnavailable = "the manifest content is unavailable"
-	messageBlobUnavailable     = "the blob content is unavailable"
-	messageUploadBodyRead      = "failed to read the upload body"
-	messageBlobUploadFailed    = "blob upload failed"
+	messageRepositoryNotFound    = "repository not found"
+	messageManifestUnavailable   = "the manifest content is unavailable"
+	messageBlobUnavailable       = "the blob content is unavailable"
+	messageUploadBodyRead        = "failed to read the upload body"
+	messageBlobUploadFailed      = "blob upload failed"
+	messageManifestNotAcceptable = "the stored manifest representation is not acceptable for the requested media types"
 )
+
+// acceptAccepts reports whether the request's Accept header permits serving
+// the exact stored media type, per Distribution negotiation semantics:
+//   - an absent or empty Accept accepts any representation;
+//   - each comma-separated Accept item is a media range tested against the
+//     stored type with HTTP wildcard rules (`*/*` matches any type,
+//     `type/*` matches any subtype, an exact `type/subtype` matches exactly);
+//   - an item whose q parameter is 0 excludes the representation;
+//   - a match by ANY accepted item with q>0 serves the representation.
+//
+// Matching is case-insensitive; parameters other than q are ignored for
+// match/no-match. Malformed items are skipped rather than poisoning the whole
+// header. This function is data-free — it never echoes any Accept value.
+func acceptAccepts(header, storedMediaType string) bool {
+	if strings.TrimSpace(header) == "" {
+		return true
+	}
+	stored := strings.ToLower(strings.TrimSpace(storedMediaType))
+	for _, item := range strings.Split(header, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if acceptItemExplicitlyExcluded(item) {
+			continue
+		}
+		base := strings.TrimSpace(strings.SplitN(item, ";", 2)[0])
+		if mediaRangeMatches(strings.ToLower(base), stored) {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptItemExplicitlyExcluded reports whether an Accept item carries q=0
+// (the client explicitly refuses this representation). Parameters are scanned
+// after the first ';'; malformed q values are ignored (treated as acceptable).
+func acceptItemExplicitlyExcluded(item string) bool {
+	parts := strings.Split(item, ";")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts[1:] {
+		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
+		if len(kv) != 2 || strings.ToLower(strings.TrimSpace(kv[0])) != "q" {
+			continue
+		}
+		q, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+		if err != nil {
+			continue
+		}
+		if q <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// mediaRangeMatches reports whether an Accept media range (already
+// lowercased, parameters stripped) matches a stored low (also lowercased)
+// media type under HTTP wildcard rules.
+func mediaRangeMatches(rangeBase, stored string) bool {
+	if rangeBase == "*/*" {
+		return true
+	}
+	rType, rSub, rok := strings.Cut(rangeBase, "/")
+	sType, sSub, sok := strings.Cut(stored, "/")
+	if !rok || !sok {
+		return false
+	}
+	if rType == "*" && rSub == "*" {
+		return true
+	}
+	if rType != sType || rSub == "" {
+		return false
+	}
+	return rSub == sSub || rSub == "*"
+}
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {
 	w.Header().Set("Content-Type", "application/json")

@@ -35,6 +35,26 @@ const (
 	maxPlatformFeatures       = 64
 )
 
+// supportedChildManifestMediaTypes are the ONLY media types an index child
+// descriptor may reference. Each child of an OCI image index / Docker manifest
+// list MUST be a single-platform image manifest; a nested index (an index
+// referencing another index) is NOT supported in v1 — no recursion. Anything
+// else (a bare blob type, an artifact type, etc.) is an invalid child and is
+// rejected before any publication write.
+var supportedChildManifestMediaTypes = map[string]struct{}{
+	MediaTypeOCIManifest:    {},
+	MediaTypeDockerManifest: {},
+}
+
+// IsSupportedChildManifestMediaType reports whether mt is a media type an
+// index child descriptor may reference: a supported single-platform image
+// manifest, and never a nested index. It is the single authority used by the
+// publication reference gate and the read-after-write verification.
+func IsSupportedChildManifestMediaType(mt string) bool {
+	_, ok := supportedChildManifestMediaTypes[mt]
+	return ok
+}
+
 // ArtifactKind discriminates the two supported top-level shapes.
 type ArtifactKind int
 
@@ -133,9 +153,16 @@ const (
 	ErrKindDigestMismatch         ValidationErrorKind = "digest_mismatch"
 	ErrKindSizeMismatch           ValidationErrorKind = "size_mismatch"
 	ErrKindMissingReference       ValidationErrorKind = "missing_reference"
-	// ErrKindUnsupportedPublication rejects publishing an index kind (empty or
-	// non-empty). Parser support for indexes is separate (ParseArtifact accepts
-	// them); their PUBLICATION is gated until Task 19 enables it.
+	// ErrKindUnsupportedNestedMediaType rejects an index child whose media
+	// type is itself an index (OCI image index / Docker manifest list) or any
+	// media type that is not a supported single-platform child manifest.
+	// Recursive nested indexes are not supported in v1.
+	ErrKindUnsupportedNestedMediaType ValidationErrorKind = "unsupported_nested_media_type"
+	// ErrKindUnsupportedPublication is a retained, stable validation kind that
+	// was the pre-Task-19 gate rejecting index publication. Task 19 enabled
+	// index publication, so this kind is no longer emitted; it is preserved in
+	// the stable kind surface for compatibility and not reused for a new
+	// meaning.
 	ErrKindUnsupportedPublication ValidationErrorKind = "unsupported_artifact_publication"
 )
 

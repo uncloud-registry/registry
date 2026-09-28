@@ -981,7 +981,7 @@ func TestPublishValidatesBeforeAnyWrite(t *testing.T) {
 			wantKind: ErrKindMissingReference,
 		},
 		{
-			name: "non-empty index publication rejected before reference resolution (Task 19)",
+			name: "index referencing a child neither committed nor staged (Task 19)",
 			mut: func(input BuildInput) BuildInput {
 				body := []byte(ociIndex())
 				input.ManifestJSON = body
@@ -991,12 +991,12 @@ func TestPublishValidatesBeforeAnyWrite(t *testing.T) {
 				input.StagedBlobs = map[string]spec.BlobDescriptor{}
 				return input
 			},
-			wantKind: ErrKindUnsupportedPublication,
+			wantKind: ErrKindMissingReference,
 		},
 		{
-			name: "empty index publication rejected (Task 19)",
+			name: "index incomplete body is rejected (Task 19)",
 			mut: func(input BuildInput) BuildInput {
-				body := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, ociIndexMT))
+				body := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux"}}]}`, ociIndexMT, ociIndexMT, dig('b')))
 				input.ManifestJSON = body
 				input.ManifestDigest = ComputeDigest(body)
 				input.Manifest.MediaType = ociIndexMT
@@ -1004,7 +1004,7 @@ func TestPublishValidatesBeforeAnyWrite(t *testing.T) {
 				input.StagedBlobs = map[string]spec.BlobDescriptor{}
 				return input
 			},
-			wantKind: ErrKindUnsupportedPublication,
+			wantKind: ErrKindUnsupportedNestedMediaType,
 		},
 	}
 
@@ -1259,38 +1259,34 @@ func TestPublishReferenceMetadata(t *testing.T) {
 	}
 }
 
-// TestBuildNextRejectsIndexPublication proves direct BuildNext refuses ANY
-// index kind (empty and non-empty) with a typed unsupported-publication error
-// BEFORE deriving state or mutating current. Parser support for indexes is
-// unaffected; publication is gated until Task 19.
-func TestBuildNextRejectsIndexPublication(t *testing.T) {
-	bodies := []string{
-		fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, ociIndexMT),
-		ociIndex(),
-	}
-	for _, body := range bodies {
-		input := validBuildInput(t)
-		input.ManifestJSON = []byte(body)
-		input.ManifestDigest = ComputeDigest([]byte(body))
-		input.Manifest.MediaType = ociIndexMT
-		input.Manifest.Size = int64(len(body))
-		input.StagedBlobs = map[string]spec.BlobDescriptor{}
+// TestBuildNextRejectsUnsupportedNestedIndex proves direct BuildNext refuses
+// an index whose child is itself an index-typed media type (recursive nested
+// indexes are not supported in v1) BEFORE deriving state or mutating current.
+func TestBuildNextRejectsUnsupportedNestedIndex(t *testing.T) {
+	body := makeIndex(t, ociIndexMT, childSpec{mediaType: ociIndexMT, digest: dig('b'), size: 512, arch: "amd64", os: "linux"})
+	input := validBuildInput(t)
+	input.ManifestJSON = body
+	input.ManifestDigest = ComputeDigest(body)
+	input.Manifest.MediaType = ociIndexMT
+	input.Manifest.Size = int64(len(body))
+	input.StagedBlobs = map[string]spec.BlobDescriptor{}
 
-		current := spec.RepoStateDocument{Generation: 7}
-		next, err := (DefaultBuilder{}).BuildNext(current, input)
-		if err == nil {
-			t.Fatal("expected direct BuildNext to reject index publication")
-		}
-		var ve *ValidationError
-		if !errors.As(err, &ve) || ve.Kind != ErrKindUnsupportedPublication {
-			t.Fatalf("expected unsupported_artifact_publication, got %v", err)
-		}
-		if next.Generation != 0 || next.Repo != "" {
-			t.Fatalf("BuildNext derived state on index rejection: %+v", next)
-		}
-		if current.Generation != 7 {
-			t.Fatalf("BuildNext mutated current: generation=%d", current.Generation)
-		}
+	current := spec.RepoStateDocument{Generation: 7, Manifests: map[string]spec.ManifestDescriptor{
+		dig('b'): {SwarmRef: "child-ref", MediaType: ociIndexMT, Size: 512},
+	}}
+	next, err := (DefaultBuilder{}).BuildNext(current, input)
+	if err == nil {
+		t.Fatal("expected direct BuildNext to reject a nested index child")
+	}
+	var ve *ValidationError
+	if !errors.As(err, &ve) || ve.Kind != ErrKindUnsupportedNestedMediaType {
+		t.Fatalf("expected unsupported_nested_media_type, got %v", err)
+	}
+	if next.Generation != 0 || next.Repo != "" {
+		t.Fatalf("BuildNext derived state on nested-index rejection: %+v", next)
+	}
+	if current.Generation != 7 {
+		t.Fatalf("BuildNext mutated current: generation=%d", current.Generation)
 	}
 }
 

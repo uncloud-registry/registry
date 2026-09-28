@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"mime"
+	"sort"
 	"strings"
 	"time"
 
@@ -386,18 +387,10 @@ func validateInputArtifact(current spec.RepoStateDocument, input BuildInput) (Ar
 	if err != nil {
 		return Artifact{}, err
 	}
-	// Publication gate: ParseArtifact accepts OCI indexes / Docker manifest
-	// lists (including empty ones), but their PUBLICATION is not supported
-	// until Task 19. Reject index kinds with a stable typed error here — BEFORE
-	// reference availability, state derivation, or any object/feed write — so
-	// both Publisher.publish and DefaultBuilder.BuildNext refuse index
-	// publication with zero writes. Parser support is deliberately separate.
-	if artifact.Kind == ArtifactKindIndex {
-		return Artifact{}, &ValidationError{
-			Kind: ErrKindUnsupportedPublication,
-			Err:  errors.New("index publication is not supported in v1 until Task 19"),
-		}
-	}
+	// Publication gate is REMOVED as of Task 19: ParseArtifact accepts OCI image
+	// indexes / Docker manifest lists and their PUBLICATION is now supported.
+	// Reference availability for index kinds is validated per-child (see
+	// validateIndexReferences); manifest kinds keep the blob reference gate.
 	if got := ComputeDigest(input.ManifestJSON); got != input.ManifestDigest {
 		return Artifact{}, newValidationError(ErrKindDigestMismatch, "",
 			"computed manifest body digest disagrees with the handler-provided digest")
@@ -406,8 +399,15 @@ func validateInputArtifact(current spec.RepoStateDocument, input BuildInput) (Ar
 		return Artifact{}, newValidationError(ErrKindSizeMismatch, "",
 			"manifest body size disagrees with the handler-provided descriptor")
 	}
-	if err := validateManifestReferences(current, input, artifact); err != nil {
-		return Artifact{}, err
+	switch artifact.Kind {
+	case ArtifactKindIndex:
+		if err := validateIndexReferences(current, input, artifact); err != nil {
+			return Artifact{}, err
+		}
+	default:
+		if err := validateManifestReferences(current, input, artifact); err != nil {
+			return Artifact{}, err
+		}
 	}
 	return artifact, nil
 }
@@ -460,6 +460,74 @@ func validateManifestReferences(current spec.RepoStateDocument, input BuildInput
 		}
 	}
 	return nil
+}
+
+// validateIndexReferences requires every child manifest referenced by an OCI
+// image index / Docker manifest list to be AVAILABLE and EXACTLY coherent:
+//   - each child media type MUST be a supported single-platform manifest
+//     (OCI image manifest or Docker schema-2 manifest) — a nested index or any
+//     other media type is rejected (no recursion);
+//   - each child digest MUST be present in CURRENT committed repository state
+//     (the Manifests map) with EXACTLY the descriptor's size and media type.
+//
+// Index children publish IMMEDIATELY as their own manifest entries — this
+// registry has no staged-manifest transport (a manifest PUT publishes
+// directly) — so the ONLY way a child can be available is committed in
+// current.Manifests, which is exactly how Docker/OCI push an index (each
+// single-platform manifest first, then the index). A child that is neither
+// committed nor staged is a missing reference. Any failure returns a typed
+// error BEFORE any object or feed write, so the failed publication performs
+// zero puts and zero feed updates.
+func validateIndexReferences(current spec.RepoStateDocument, input BuildInput, artifact Artifact) error {
+	platforms := make(map[string]struct{}, len(artifact.Manifests))
+	for _, ref := range artifact.Manifests {
+		if !IsSupportedChildManifestMediaType(ref.MediaType) {
+			return newValidationError(ErrKindUnsupportedNestedMediaType, "",
+				"an index child must be a single-platform manifest; nested indexes are not supported")
+		}
+		stored, ok := current.Manifests[ref.Digest]
+		if !ok {
+			return newValidationError(ErrKindMissingReference, "",
+				"index references a child manifest that is neither committed in repository state nor staged")
+		}
+		if stored.Size != ref.Size {
+			return newValidationError(ErrKindSizeMismatch, "",
+				"stored child manifest size disagrees with the index descriptor")
+		}
+		if stored.MediaType != ref.MediaType {
+			return newValidationError(ErrKindMediaTypeMismatch, "",
+				"stored child manifest media type disagrees with the index descriptor")
+		}
+		// At most one child per resolved platform: both the OCI image-index and
+		// the Docker manifest-list specs require the platform to be unique so a
+		// client can disambiguate. A duplicated platform is rejected (never
+		// last-wins); children without a platform are not compared.
+		if key := resolvedPlatformKey(ref.Platform); key != "" {
+			if _, dup := platforms[key]; dup {
+				return newValidationError(ErrKindInvalidPlatform, "",
+					"an index must not contain more than one child for the same platform")
+			}
+			platforms[key] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// resolvedPlatformKey returns a stable, order-independent key for a child
+// platform, or "" for a nil (absent) platform. The platform parts are bounded
+// at parse time, so the key is bounded too. It is used only to reject
+// duplicate platforms within one index (never echoed in an error).
+func resolvedPlatformKey(p *Platform) string {
+	if p == nil {
+		return ""
+	}
+	var feats string
+	if len(p.OSFeatures) > 0 {
+		sorted := append([]string(nil), p.OSFeatures...)
+		sort.Strings(sorted)
+		feats = strings.Join(sorted, ",")
+	}
+	return strings.Join([]string{p.OS, p.Architecture, p.OSVersion, p.Variant, feats}, "\x00")
 }
 
 // CheckBlobReferenceCoherence verifies ONE stored blob record against the
