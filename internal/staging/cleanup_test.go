@@ -54,6 +54,35 @@ func (f *fakeCommitted) CommittedRefs(_ context.Context, repo string) (map[strin
 	return f.byRepo[repo], nil
 }
 
+// runCleanupToRemoval runs bounded RunOnce passes (each on a FRESH Cleanup
+// handle over the same durable service) until a pass reports Removed > 0. Since
+// the durable cursor advances BEFORE side effects, a row left `expiring` by an
+// earlier failure is skipped until the traversal WRAPS (an empty batch resets
+// the cursor to fresh) — so it is revisited on a later pass, but only after that
+// bounded wrap. This helper runs -- and bounds -- those passes, returning the
+// FIRST pass that removed ≥1 row. A regression to permanent starvation (the row
+// never revisited) fails the test at maxPasses.
+func runCleanupToRemoval(t *testing.T, svc *service, unp Unpinner, committed CommittedRefs, runAt time.Time, limit, maxPasses int) CleanupResult {
+	t.Helper()
+	var last CleanupResult
+	for i := 0; i < maxPasses; i++ {
+		c, err := NewCleanup(svc, unp, committed)
+		if err != nil {
+			t.Fatalf("NewCleanup pass %d: %v", i, err)
+		}
+		r, err := c.RunOnce(context.Background(), runAt, limit)
+		if err != nil {
+			t.Fatalf("RunOnce pass %d: %v", i, err)
+		}
+		last = r
+		if r.Removed > 0 {
+			return r
+		}
+	}
+	t.Fatalf("row not removed within %d bounded passes (last=%+v); durable traversal failed to wrap/revisit", maxPasses, last)
+	return CleanupResult{}
+}
+
 // mustFinalize transitions a live active session to finalized with durable
 // metadata and asserts it succeeded.
 func mustFinalize(t *testing.T, svc *service, s Session, digest, ref, media string, size int64) Session {
@@ -256,17 +285,14 @@ func TestCleanupUnpinFailureRetainsMetadataAndRetries(t *testing.T) {
 		t.Fatalf("bee ref lost on unpin failure: %q", st.BeeRef)
 	}
 
-	// A later pass with a healthy Bee completes the same logical blob.
+	// A later pass with a healthy Bee completes the same logical blob. The
+	// durable traversal cursor advanced past the row when the first unpin
+	// failed, so the retry must first let the traversal WRAP (an empty pass
+	// resets the cursor to fresh) then re-examine the row. runCleanupToRemoval
+	// bounds those passes and fails on any permanent starvation.
 	healthy := &fakeUnpinner{}
-	ch, err := NewCleanup(svc, healthy, &fakeCommitted{})
-	if err != nil {
-		t.Fatalf("NewCleanup: %v", err)
-	}
-	res2, err := ch.RunOnce(context.Background(), runAt, 10)
-	if err != nil {
-		t.Fatalf("retry RunOnce: %v", err)
-	}
-	if res2.Examined != 1 || res2.Removed != 1 || res2.Unpinned != 1 || res2.Failed != 0 {
+	res2 := runCleanupToRemoval(t, svc, healthy, &fakeCommitted{}, runAt, 10, 5)
+	if res2.Removed != 1 || res2.Unpinned != 1 || res2.Failed != 0 {
 		t.Fatalf("retry counts = %+v, want removed=1 unpinned=1", res2)
 	}
 	if _, err := svc.Status(context.Background(), s.ID, s.Repo, s.Actor); !errors.Is(err, ErrNotFound) {

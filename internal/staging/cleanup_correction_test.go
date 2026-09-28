@@ -247,14 +247,12 @@ func TestCleanupExpiringSurvivesRestartAndResumes(t *testing.T) {
 	defer svc2.Close()
 	fixedClock(svc2, runAt)
 	healthy := &fakeUnpinner{}
-	c2, err := NewCleanup(svc2, healthy, &fakeCommitted{})
-	if err != nil {
-		t.Fatalf("NewCleanup2: %v", err)
-	}
-	res2, err := c2.RunOnce(context.Background(), runAt, 10)
-	if err != nil {
-		t.Fatalf("RunOnce2: %v", err)
-	}
+	// The durable cursor advanced past the row when the first pass's unpin
+	// failed, and the new handle shares that persisted position (no fresh
+	// re-traversal). runCleanupToRemoval lets the traversal WRAP (an empty pass
+	// resets the cursor to fresh) and then re-examines and resumes the expiring
+	// claim, failing if the wrap never comes.
+	res2 := runCleanupToRemoval(t, svc2, healthy, &fakeCommitted{}, runAt, 10, 5)
 	if res2.Removed != 1 || res2.Unpinned != 1 || res2.Failed != 0 {
 		t.Fatalf("resume counts = %+v, want removed=1 unpinned=1", res2)
 	}
@@ -287,19 +285,17 @@ func TestCleanupIndependentHandlesResume(t *testing.T) {
 		t.Fatalf("handle A pass failed=%d, want 1", res.Failed)
 	}
 
-	// Independent handle B over the same store has no other work in flight and
-	// resumes the single expiring claim exactly once (idempotent).
+	// Independent handle B over the same store resumes the single expiring claim
+	// exactly once (idempotent). B shares the durable cursor A's pass advanced
+	// (which is past the row), so B must let the traversal WRAP before it
+	// re-examines and resumes the row; runCleanupToRemoval bounds those passes.
 	b := openServiceOn(t, dir)
 	defer b.Close()
 	fixedClock(b, runAt)
 	healthy := &fakeUnpinner{}
-	cB, _ := NewCleanup(b, healthy, &fakeCommitted{})
-	res, err := cB.RunOnce(context.Background(), runAt, 10)
-	if err != nil {
-		t.Fatalf("RunOnce B: %v", err)
-	}
-	if res.Removed != 1 || res.Unpinned != 1 || res.Failed != 0 {
-		t.Fatalf("handle B resume counts = %+v, want removed=1 unpinned=1", res)
+	r := runCleanupToRemoval(t, b, healthy, &fakeCommitted{}, runAt, 10, 5)
+	if r.Removed != 1 || r.Unpinned != 1 || r.Failed != 0 {
+		t.Fatalf("handle B resume counts = %+v, want removed=1 unpinned=1", r)
 	}
 	if got := healthy.calls(); len(got) != 1 || got[0] != ref {
 		t.Fatalf("handle B resume unpin = %v, want exactly [%s]", got, ref)

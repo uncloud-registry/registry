@@ -54,7 +54,7 @@ import (
 // in mandatory BEFORE INSERT/UPDATE triggers. v8 is retained as a frozen
 // predecessor for migration detection and parity.
 //
-// v9 is the current schema. It carries ONE forward change over v8: the
+// v9 is a PRIOR committed schema. It carries ONE forward change over v8: the
 // publication operation_id column is made AFFINITY-FREE (no declared type).
 // v8 declared `operation_id text`, so SQLite TEXT affinity coerced a numeric
 // INTEGER/REAL value into TEXT BEFORE the storage CHECK / BEFORE triggers
@@ -70,7 +70,24 @@ import (
 // v8's already-coerced-to-TEXT numeric leftovers that still satisfy the
 // service grammar); any byte-malformed predecessor value still fails the
 // migration atomically.
-const latestSchemaVersion = 9
+//
+// v10 is the current schema. It carries ONE forward change over v9: the
+// durable, cross-process cleanup traversal cursor. The Task 18 garbage
+// reaper previously kept its fair-traversal position in per-instance memory,
+// so a restart -- or several instances each running one pass -- re-traversed
+// from the oldest eligible rows every time and could starve later eligible
+// rows behind a full batch of retained (committed) rows forever. v10 adds a
+// single-row `cleanup_cursor` table holding the traversal position
+// `(exp_at, sess)` (the (expires_at,id) of the last selected batch, or a
+// fresh-traversal sentinel). The cleanup claims / reads-and-advances / resets
+// this cursor ATOMICALLY under SQLite write serialization, so independent
+// processes share one persistent fair traversal and no process restart can
+// re-introduce starvation. The cursor has NO dependency on upload_sessions or
+// staged_blobs (its sess value is a bare session id, not a FK), so v9 -> v10
+// needs no upload_sessions rebuild -- it creates the cursor table and
+// initializes the single fresh row. v9 is retained as a frozen predecessor for
+// migration detection and parity.
+const latestSchemaVersion = 10
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -101,6 +118,28 @@ var reconcileSnapshotHook func()
 // part of the verified schema surface like every other object.
 const versionTableDDL = `create table staging_schema (version integer primary key, applied_at integer not null)`
 
+// cleanupCursorDDL is the exact DDL of the single-row durable cleanup
+// traversal cursor (v10). One row only (id PK forced to 1 via CHECK). exp_at
+// holds the (expires_at,id)-ordered position's expires_at; sess holds the
+// matching session id. A FRESH traversal is exp_at = -1 with sess NULL (the
+// sentinel sorts before every real expires_at >= 0, so a fresh guarantee ==
+// "start from the oldest eligible row"). The cross-column CHECK pins the two
+// legal states: either the fresh sentinel, or a real position (exp_at >= 0
+// with sess a valid 64-lowercase-hex session id). A malformed / tampered row
+// -- a NULL sess on a non-sentinel exp_at, or a valid exp_at with NULL sess --
+// cannot be written, and a row written by weakening the schema no longer
+// matches the frozen golden, so verification fails closed. sess is NOT a
+// foreign key to upload_sessions (a cursor position may transiently reference
+// a row that was since removed): it is a bare session-id value.
+const cleanupCursorDDL = `create table cleanup_cursor (
+	id     integer primary key check (id = 1),
+	exp_at not null,
+	sess   text,
+	check (typeof(id) = 'integer' and id = 1),
+	check (typeof(exp_at) = 'integer'),
+	check ((exp_at = -1 and sess is null) or (exp_at >= 0 and typeof(sess) = 'text' and length(sess) = 64 and sess = lower(sess) and sess not glob '*[^0-9a-f]*'))
+)`
+
 // schemaDDL is the ordered DDL for the staging schema (version 1).
 //
 // Storage classes are pinned with typeof() checks; timestamps are signed
@@ -125,7 +164,7 @@ const versionTableDDL = `create table staging_schema (version integer primary ke
 //   - repo rejects leading/dot/hyphen/underscore segment starts (and empty
 //     segments) via ('/' || repo) — first character included.
 //   - actor rejects '+' and requires an alphanumeric first character.
-var schemaDDL = append([]string{
+var schemaDDL = append(append([]string{
 	`create table upload_sessions (
 		id         text primary key,
 		repo       text not null,
@@ -368,7 +407,7 @@ var schemaDDL = append([]string{
 		select case when (select state from upload_sessions where id = old.upload_id) not in ('deleting')
 			then raise(abort, 'cannot delete staged blob of live session') else null end;
 	end`,
-}, operationIDGrammarTriggerDDL()...)
+}, operationIDGrammarTriggerDDL()...), cleanupCursorDDL)
 
 // operationIDGrammarViolationCond returns the condition under which a NON-NULL
 // operation_id violates the byte-exact validateOperationID grammar: it is not
@@ -507,8 +546,16 @@ var schemaGoldenV8JSON []byte
 //go:embed schema_golden_v9.json
 var schemaGoldenV9JSON []byte
 
-// schemaGold is the current (v9) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV9JSON)
+//go:embed schema_golden_v10.json
+var schemaGoldenV10JSON []byte
+
+// schemaGold is the current (v10) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV10JSON)
+
+// schemaGoldV9 is the exact frozen v9 predecessor manifest (the previously
+// committed "current" shape before v10), retained for migration detection and
+// parity. It is never renamed or called v10.
+var schemaGoldV9 = mustLoadSchemaGolden(schemaGoldenV9JSON)
 
 // schemaGoldV8 is the exact frozen v8 predecessor manifest (the previously
 // committed "current" shape before v9), retained for migration detection and
@@ -836,7 +883,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7, schemaMigrateV8:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7, schemaMigrateV8, schemaMigrateV9:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1595,6 +1642,7 @@ const (
 	schemaMigrateV6
 	schemaMigrateV7
 	schemaMigrateV8
+	schemaMigrateV9
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1646,6 +1694,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 9:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV9, 9); err == nil {
+			return schemaMigrateV9, nil
 		}
 	case 8:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV8, 8); err == nil {
@@ -1790,6 +1842,11 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return depErr(err, ctx)
 		}
+	}
+	// The durable cleanup traversal cursor is born as exactly one fresh row
+	// (a brand-new database has never traversed anything).
+	if _, err := tx.ExecContext(ctx, `insert into cleanup_cursor (id, exp_at, sess) values (1, -1, NULL)`); err != nil {
+		return depErr(err, ctx)
 	}
 	if migrationFault != nil {
 		return depErr(migrationFault, ctx)
@@ -2026,8 +2083,30 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		if err := rebuildUploadSessions(ctx, conn, exec, true, true, false); err != nil {
 			return depErr(err, ctx)
 		}
+	case schemaMigrateV9:
+		if err := verifyAgainst(ctx, conn, schemaGoldV9, 9); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v9 -> v10: add the durable, cross-process cleanup traversal
+		// cursor. v9 has no upload_sessions change to rebuild — the cursor
+		// table is the ONLY new object, and it has no dependency on the staged
+		// tables (sess is a bare session id, not a FK). Create the table here
+		// under its exact DDL; every uploaded row and blob is untouched. The
+		// single fresh row is seeded by the shared step below.
+		if err := exec(cleanupCursorDDL); err != nil {
+			return depErr(err, ctx)
+		}
 	default:
 		return depErr(errors.New("staging migration does not recognize the source schema"), ctx)
+	}
+	// Every predecessor path now ends on a current-shaped upload_sessions. The
+	// durable cleanup traversal cursor table exists too (created above for v9;
+	// created by the v1-v8 rebuild's schema-tail recreate), but is EMPTY — seed
+	// its single fresh row so a migrated database carries a valid, coherent
+	// fresh-traversal cursor exactly like a fresh-created one. Nothing about
+	// this touches a session or blob.
+	if err := exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, -1, NULL)`); err != nil {
+		return depErr(err, ctx)
 	}
 	// The full current surface must hold on this live write connection, and
 	// every migrated row must satisfy it (the rebuild's copy goes through the

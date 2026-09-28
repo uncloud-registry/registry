@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -87,43 +86,42 @@ type CommittedRefs interface {
 // Cleanup reaps expired staging in bounded batches over a durable
 // staging service.
 //
-// Batch fairness: the candidate batch is selected in deterministic
-// (expires_at, id) order STRICTLY AFTER this instance's traversal cursor. A
-// batch of retained rows (published/ambiguous finalized blobs that keep their
-// state and order) is examined and then the cursor advances PAST it, so the
-// eligible rows behind it are reached on a later pass instead of being starved
-// forever by a full batch of re-selected oldest rows. When a pass finds no
-// rows past the cursor the cursor resets to the start of a fresh traversal, so
-// newly-expired rows and previously-retained rows (whose committed status may
-// have changed) are re-examined on a later pass. The cursor is per-instance
-// (in-memory): an instance always ADVANCES within its lifetime, so no retained
-// row can monopolize batches; a restart simply re-traverses from the oldest
-// eligible rows and advances again (idempotent, crash-safe), never
-// re-introducing permanent starvation. Processing is idempotent under
-// concurrent independent instances via the durable `expiring` claim, so
-// independent cleanups converge safely.
+// Batch fairness is DURABLE and cross-process. The candidate batch is selected
+// in deterministic (expires_at, id) order STRICTLY AFTER the shared durable
+// cursor. A batch of retained rows (published/ambiguous finalized blobs that
+// keep their state and order) is examined and then the cursor ADVANCES PAST it,
+// so the eligible rows behind it are reached on a later pass instead of being
+// starved forever by a full batch of re-selected oldest rows. The cursor is a
+// single row in the v10 `cleanup_cursor` table that independent processes share
+// and claim/advance/reset ATOMICALLY under SQLite write serialization, so no
+// process restart and no set of independent instances can re-introduce
+// starvation: progress is persisted, not remembered. When a pass finds no rows
+// past the cursor it resets the cursor to a fresh traversal, so newly-expired
+// rows and previously-retained rows (whose committed status may have changed)
+// are re-examined on a later pass.
+//
+// The cursor is advanced (committed) BEFORE the batch's side effects run. If a
+// process crashes in that window, the rows it claimed are skipped for the
+// immediate next pass but are REVISITED on the next traversal wrap (an empty
+// batch resets the cursor to fresh), so a crash causes only bounded delay and
+// never permanent starvation. Processing itself is idempotent under concurrent
+// independent instances via the durable `expiring` claim, so independent
+// cleanups converge safely with no double unpin/removal.
 type Cleanup struct {
 	svc       *service
 	unpin     Unpinner
 	committed CommittedRefs
 	now       func() time.Time
-
-	// mu serializes the in-memory traversal cursor so concurrent RunOnce calls
-	// on the SAME instance each get a distinct, advancing window. The durable
-	// claim/work items are always performed under the store's own locks, so mu
-	// never guards the side effects themselves.
-	mu sync.Mutex
-	// cursor is this instance's next batch position in (expires_at, id) order.
-	cursor cleanupCursor
 }
 
-// cleanupCursor is one instance's traversal position. inited=false means the
-// next pass starts a fresh traversal (no position seen yet).
-type cleanupCursor struct {
-	inited bool
-	exp    int64
-	id     string
-}
+// cleanupClaimedCrashHook is a test-only injection point (nil in production).
+// When set, it fires immediately after a RunOnce pass ATOMICALLY advances the
+// durable cursor (the batch claim is committed and the shared traversal
+// position is durably past that batch) and BEFORE any side effect. Returning a
+// non-nil error aborts the pass with the batch unprocessed — simulating a
+// process crash exactly in the durable-advance-before-side-effects window so
+// a test can prove the skipped rows are revisited after the traversal wraps.
+var cleanupClaimedCrashHook func() error
 
 // CleanupResult is the observable count of one RunOnce pass.
 type CleanupResult struct {
@@ -178,80 +176,28 @@ func (c *Cleanup) RunOnce(ctx context.Context, now time.Time, limit int) (Cleanu
 		return res, err
 	}
 
-	// Serialize the traversal cursor so concurrent RunOnce calls on this same
-	// instance each get a distinct advancing window. Side effects themselves
-	// are guarded by the store's own durability locks; this only protects the
-	// in-memory batch-position bookkeeping.
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Select the limit old-expiring cleanable rows in deterministic order,
-	// STRICTLY AFTER this instance's cursor so a full batch of retained rows is
-	// examined once and then passed — later eligible rows cannot be starved.
-	// Cleanup-eligible candidate states: active (expired session, contentless),
-	// finalized (expired blob needing eligibility proof), expiring (a durable
-	// cleanup-OWNED claim to resume), and a `deleting` row WITHOUT a bee_ref
-	// (a contentless tombstone — cleanup's own active-deletion crash residue or
-	// a generic contentless Delete — safe to finish because there is no content
-	// to unpin). A `deleting` row WITH a bee_ref is deliberately NOT selected:
-	// it is a generic Delete/Expire tombstone whose eligibility the cleanup
-	// never infers, and unpinning it could destroy live published content.
-	// finalizing/creating rows are excluded (retained fail-closed for explicit
-	// reconciliation / the startup reconciler).
-	curExp := int64(-1) // sentinel: every expires_at (>=0) sorts after it
-	curID := ""
-	if c.cursor.inited {
-		curExp = c.cursor.exp
-		curID = c.cursor.id
-	}
-	conn, err := c.svc.pool.acquire(ctx)
+	// Atomically claim one bounded batch STRICTLY AFTER the shared durable
+	// cursor and advance the cursor to the last selected row (or reset it on an
+	// empty batch) — all inside a single BEGIN IMMEDIATE write transaction. The
+	// cursor is persisted, so independent processes / restarts share ONE fair
+	// traversal: a batch of retained oldest rows is examined once and then
+	// passed, and later eligible rows are reached instead of starved. The claim
+	// is committed before the side effects below; a crash in that window is
+	// bounded by the traversal wrap (see cleanupClaimBatch and the crash
+	// regression test).
+	ids, _, err := c.svc.cleanupClaimBatch(ctx, nowNanos, limit)
 	if err != nil {
-		return res, ctxOr(err, ctx)
+		return res, err
 	}
-	rows, err := conn.QueryContext(ctx,
-		`select expires_at, id from upload_sessions
-		 where expires_at <= ? and (
-		   state in ('active','finalized','expiring')
-		   or (state = 'deleting' and bee_ref is null))
-		 and (expires_at > ? or (expires_at = ? and id > ?))
-		 order by expires_at, id limit ?`, nowNanos, curExp, curExp, curID, limit)
-	if err != nil {
-		c.svc.pool.release(conn)
-		return res, depErr(err, ctx)
-	}
-	var ids []string
-	var exps []int64
-	for rows.Next() {
-		var id string
-		var exp int64
-		if err := rows.Scan(&exp, &id); err != nil {
-			rows.Close()
-			c.svc.pool.release(conn)
-			return res, depErr(err, ctx)
-		}
-		ids = append(ids, id)
-		exps = append(exps, exp)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		c.svc.pool.release(conn)
-		return res, depErr(err, ctx)
-	}
-	rows.Close()
-	c.svc.pool.release(conn)
 	res.Examined = len(ids)
 
-	// Advance the traversal cursor past this batch so the SAME retained oldest
-	// rows cannot monopolize the next pass. On an empty batch the whole
-	// traversal has been scanned: reset to the start of a fresh round so
-	// newly-expired rows and previously-retained rows get another chance.
-	if len(ids) > 0 {
-		last := len(ids) - 1
-		c.cursor.exp = exps[last]
-		c.cursor.id = ids[last]
-		c.cursor.inited = true
-	} else {
-		c.cursor = cleanupCursor{}
+	// Test-only crash-window injection: the durable cursor has advanced past
+	// this batch, but no side effect has run. A non-nil return aborts the pass
+	// unprocessed, simulating a process death exactly in that window.
+	if cleanupClaimedCrashHook != nil {
+		if cerr := cleanupClaimedCrashHook(); cerr != nil {
+			return res, cerr
+		}
 	}
 
 	// Per-repo committed-refs cache so one pass never re-resolves the same
@@ -585,4 +531,126 @@ func (s *service) captureResumeAuth(ctx context.Context, id string, cand *cleanu
 		cand.auth = a
 		return nil
 	})
+}
+
+// cleanupClaimBatch atomically claims one bounded traversal batch on the SHARED
+// durable cursor and advances it, all inside a single BEGIN IMMEDIATE write
+// transaction (see service.withTx). It returns the selected (expires_at,id)
+// pairs strictly after the persisted cursor position, or an error.
+//
+// Because the cursor is a single row in the `cleanup_cursor` table and
+// read+select+advance happen under SQLite write serialization, independent
+// processes and restarts SHARE one fair traversal: no instance can re-select
+// the same retained oldest batch, so later eligible rows cannot be starved by a
+// restart or by several instances each running one pass.
+//
+// The advance is COMMITTED before the caller runs any side effect. A crash in
+// that window (cursor durably past a batch that was never processed) means the
+// claimed rows are skipped for the immediate next pass, but the traversal is
+// re-examined after it wraps: an empty batch resets the cursor to the fresh
+// sentinel, so the skipped rows (and any newly-expired rows) are revisited on a
+// later pass. This is the bounded-delay / eventual-revisit guarantee (never
+// permanent starvation) that makes advancing-before-side-effects acceptable.
+// The cursor never deletes or mutates a staged row, and it never references a
+// row via FK, so claiming progress cannot disturb upload_sessions/staged_blobs.
+func (s *service) cleanupClaimBatch(ctx context.Context, nowNanos int64, limit int) (ids []string, exps []int64, err error) {
+	err = s.withTx(ctx, func(tc *sql.Conn) error {
+		curExp, curID, err := readCleanupCursor(ctx, tc)
+		if err != nil {
+			return err
+		}
+		rows, err := tc.QueryContext(ctx,
+			`select expires_at, id from upload_sessions
+			 where expires_at <= ? and (
+			   state in ('active','finalized','expiring')
+			   or (state = 'deleting' and bee_ref is null))
+			 and (expires_at > ? or (expires_at = ? and id > ?))
+			 order by expires_at, id limit ?`, nowNanos, curExp, curExp, curID, limit)
+		if err != nil {
+			return depErr(err, ctx)
+		}
+		ids = ids[:0]
+		exps = exps[:0]
+		for rows.Next() {
+			var id string
+			var exp int64
+			if err := rows.Scan(&exp, &id); err != nil {
+				rows.Close()
+				return depErr(err, ctx)
+			}
+			ids = append(ids, id)
+			exps = append(exps, exp)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return depErr(err, ctx)
+		}
+		// Advance the durable cursor to the last selected row, so the SAME
+		// retained oldest rows cannot monopolize the next pass. On an empty
+		// batch the whole traversal has been scanned: reset to the fresh
+		// sentinel so newly-expired and previously-retained rows get another
+		// pass on the next traversal wrap.
+		if len(ids) > 0 {
+			last := len(ids) - 1
+			if _, err := tc.ExecContext(ctx, `update cleanup_cursor set exp_at = ?, sess = ? where id = 1`, exps[last], ids[last]); err != nil {
+				return depErr(err, ctx)
+			}
+		} else {
+			if _, err := tc.ExecContext(ctx, `update cleanup_cursor set exp_at = -1, sess = NULL where id = 1`); err != nil {
+				return depErr(err, ctx)
+			}
+		}
+		return ctx.Err()
+	})
+	return ids, exps, err
+}
+
+// readCleanupCursor reads the single shared cleanup traversal cursor row under
+// the caller's (already-open write) transaction and validates it, failing closed
+// on a missing, duplicated, or malformed row. It returns the cursor's
+// (expires_at, id) as a raw position; the fresh sentinel maps to
+// (exp, id) = (-1, ""), which the batch query treats as "start from the oldest".
+// A malformed/tampered cursor — zero rows, more than one row, or a row that
+// violates the pinned coherence (fresh must be exp_at=-1/sess NULL; an advanced
+// cursor needs a real exp_at AND a valid session id) — is a hard error: the
+// cleanup refuses to guess a position rather than mis-traverse.
+func readCleanupCursor(ctx context.Context, conn *sql.Conn) (int64, string, error) {
+	rows, err := conn.QueryContext(ctx, `select exp_at, sess from cleanup_cursor`)
+	if err != nil {
+		return 0, "", depErr(err, ctx)
+	}
+	count := 0
+	var exp int64
+	var sess sql.NullString
+	for rows.Next() {
+		count++
+		if count > 1 {
+			rows.Close()
+			return 0, "", errors.New("staging cleanup cursor is corrupted: more than one row")
+		}
+		if err := rows.Scan(&exp, &sess); err != nil {
+			rows.Close()
+			return 0, "", depErr(err, ctx)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, "", depErr(err, ctx)
+	}
+	if count == 0 {
+		return 0, "", errors.New("staging cleanup cursor is missing (no traversal row)")
+	}
+	// Fail closed on a coherently-impossible row. The table CHECK already
+	// forbids these, but a tampered (weakened) schema could admit them; never
+	// mis-traverse.
+	if exp == -1 {
+		if sess.Valid {
+			return 0, "", errors.New("staging cleanup cursor is malformed: fresh sentinel carries a session id")
+		}
+		return -1, "", nil
+	}
+	if !sess.Valid || exp < 0 {
+		return 0, "", errors.New("staging cleanup cursor is malformed: advanced position has no valid session id")
+	}
+	return exp, sess.String, nil
 }

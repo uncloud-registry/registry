@@ -111,15 +111,28 @@ func sessionStateOf(t *testing.T, db *sql.DB, id string) string {
 	return st
 }
 
-// TestV9OperationIDColumnAffinityFree proves the CURRENT (v9) schema declares
+// TestV9OperationIDColumnAffinityFree proves the CURRENT schema (v10) declares
 // operation_id with NO type (affinity-free, so numeric storage is never
-// coerced) while the frozen v8 predecessor still declares it `text`.
+// coerced), that the frozen v9 predecessor still declares it affinity-free
+// (v9's one forward change over v8), while the frozen v8 predecessor still
+// declares it `text`.
 func TestV9OperationIDColumnAffinityFree(t *testing.T) {
 	gold := schemaGold
-	if gold.Version != 9 {
-		t.Fatalf("current schema must be v9, got %d", gold.Version)
+	if gold.Version != latestSchemaVersion {
+		t.Fatalf("current schema must be v%d, got %d", latestSchemaVersion, gold.Version)
+	}
+	if gold.Version != 10 {
+		t.Fatalf("current schema version = %d, want v10", gold.Version)
 	}
 	if typ := goldenColumnType(t, gold, "upload_sessions", "operation_id"); typ != "" {
+		t.Fatalf("current operation_id column type = %q, want \"\" (affinity-free)", typ)
+	}
+	// The frozen v9 predecessor carried the same affinity-free change.
+	v9 := mustLoadTestManifest(t, schemaGoldenV9JSON)
+	if v9.Version != 9 {
+		t.Fatalf("v9 predecessor manifest must be frozen at 9, got %d", v9.Version)
+	}
+	if typ := goldenColumnType(t, v9, "upload_sessions", "operation_id"); typ != "" {
 		t.Fatalf("v9 operation_id column type = %q, want \"\" (affinity-free)", typ)
 	}
 	// The frozen v8 predecessor must keep its TEXT declaration.
@@ -130,10 +143,10 @@ func TestV9OperationIDColumnAffinityFree(t *testing.T) {
 	if typ := goldenColumnType(t, v8, "upload_sessions", "operation_id"); typ != "text" {
 		t.Fatalf("v8 operation_id column type = %q, want \"text\"", typ)
 	}
-	// A live v9 database reports the same affinity-free physical shape.
+	// A live current database reports the same affinity-free physical shape.
 	db, _ := newStagingDB(t)
 	if typ := liveColumnType(t, db, "upload_sessions", "operation_id"); typ != "" {
-		t.Fatalf("live v9 operation_id table_xinfo type = %q, want \"\"", typ)
+		t.Fatalf("live current operation_id table_xinfo type = %q, want \"\"", typ)
 	}
 }
 
