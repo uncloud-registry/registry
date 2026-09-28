@@ -345,10 +345,21 @@ const (
 	// cancelling the loop, the handler Close waits up to this long for an
 	// in-flight cleanup pass to finish before releasing the staging store, so
 	// the SQLite/spool close can never race a pass that is mid-transaction.
-	// A pathological pass that exceeds the bound is conceded (the store is
-	// closed anyway) rather than hanging shutdown indefinitely.
-	cleanupShutdownTimeout = 5 * time.Second
 )
+
+// cleanupShutdownTimeout bounds the graceful shutdown join: after cancelling
+// the loop, the handler Close waits up to this long for an in-flight cleanup
+// pass to finish before releasing the staging store, so the SQLite/spool close
+// can never race a pass that is mid-transaction. A worker that exceeds the
+// bound is NOT conceded: Close returns a shutdown error WITHOUT releasing the
+// shared staging resources, and a later Close retries the join. Declared as a
+// var so tests may shrink the window (exactly 5s in production).
+var cleanupShutdownTimeout = 5 * time.Second
+
+// errCleanupWorkerBusy is the shutdown error returned when the cleanup worker
+// is still running past the join deadline — the shared staging store is left
+// open (never closed under an in-flight pass) for a retried Close.
+var errCleanupWorkerBusy = errors.New("staging cleanup worker still running during shutdown")
 
 // cleanupIntervalFromEnv reads the cleanup loop interval (a positive duration)
 // strictly; an unset value uses the default and a malformed value fails closed.
@@ -437,8 +448,12 @@ func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time
 // alone is not a work-completion signal: a pass already mid-transaction keeps
 // running until it observes ctx — so the close waits on the loop's done
 // channel (up to cleanupShutdownTimeout) to ensure no in-flight pass races the
-// SQLite/spool teardown. The registry-facing RegistryStore contract is
-// otherwise unchanged.
+// SQLite/spool teardown. If the worker does not exit within the deadline the
+// close FAILS CLOSED: it returns errCleanupWorkerBusy WITHOUT releasing the
+// shared staging resources, so a pathological/uncooperative pass can never be
+// force-closed underneath; a retried Close re-joins and releases once the
+// worker yields. The registry-facing RegistryStore contract is otherwise
+// unchanged.
 type cancelOnCloseStore struct {
 	staging.RegistryStore
 	cancel func()
@@ -457,9 +472,15 @@ func (s *cancelOnCloseStore) Close() error {
 		defer timer.Stop()
 		select {
 		case <-s.done:
+			// The worker has fully exited: it is now safe to release the
+			// shared staging store (spool + SQLite) underneath it.
 		case <-timer.C:
-			// A pathological pass exceeded the bound: concede and close anyway
-			// rather than hang shutdown (documented in cleanupShutdownTimeout).
+			// The worker did NOT exit within the join deadline. NEVER concede
+			// and close the shared staging resources while it may still be
+			// touching them: return a shutdown error so the caller retries
+			// Close once the worker yields. Close is retry-safe — this call
+			// performs no release, and a later Close re-joins.
+			return errCleanupWorkerBusy
 		}
 	}
 	if s.close != nil {

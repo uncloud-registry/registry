@@ -478,8 +478,12 @@ func (m *MemoryStore) ConsumeStagedForPublish(_ context.Context, repo, actor, op
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Scoped by the authoritative operation identity (repo + operationID +
+	// referenced digests), never by the calling actor — a verified retry by
+	// any repo-authorized actor finishes a prior actor's surviving claim
+	// without ever clearing a DIFFERENT operation's rows.
 	for id, s := range m.sessions {
-		if s.repo == repo && s.actor == actor && s.state == StateClaimed && s.operationID == operationID {
+		if s.repo == repo && s.state == StateClaimed && s.operationID == operationID {
 			if _, ok := wanted[s.digest]; ok {
 				delete(m.sessions, id)
 			}

@@ -156,7 +156,12 @@ type RegistryStore interface {
 	// digests, after a VERIFIED publication of that operation. Claimed rows
 	// not referenced by the manifest, and rows claimed by a DIFFERENT
 	// operation, are never touched (a foreign operation's claim is never
-	// cleared). Unrelated finalized/active rows remain staged.
+	// cleared). Unrelated finalized/active rows remain staged. The consume is
+	// scoped by the authoritative operation identity (repo + the globally
+	// unique operationID + referenced digests), NOT by the calling principal:
+	// the caller is already authorized for the repo, so a verified retry by
+	// ANY repo-authorized actor finishes a claim a prior authorized actor
+	// created and committed but crashed before consuming.
 	ConsumeStagedForPublish(ctx context.Context, repo, actor, operationID string, digests []string) error
 }
 

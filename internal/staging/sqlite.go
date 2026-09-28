@@ -1736,8 +1736,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		if err := verifyAgainst(ctx, conn, schemaGoldV1Pre, 1); err != nil {
 			return depErr(err, ctx)
 		}
-		// v1-pre copies the reconstructed cleanup_token as NULL everywhere.
-		if err := rebuildUploadSessions(ctx, conn, exec, false); err != nil {
+		// v1-pre copies the reconstructed cleanup_token and finalize_token as
+		// NULL everywhere (neither column ever existed in this predecessor).
+		if err := rebuildUploadSessions(ctx, conn, exec, false, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV1Cleanup:
@@ -1747,8 +1748,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// The cleanup-token-v1 surface equals v2, but the current surface (v3)
 		// differs (the deleting-tombstone provenance change), so this shape
 		// also rebuilds upload_sessions to v3, carrying rows and any
-		// cleanup_token exactly across.
-		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+		// cleanup_token exactly across. finalize_token is synthesized NULL (the
+		// column does not exist in this predecessor).
+		if err := rebuildUploadSessions(ctx, conn, exec, true, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV2:
@@ -1757,7 +1759,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		}
 		// Exact v2 -> v4: rebuild upload_sessions carrying every row/field
 		// across, including any cleanup_token (NULL deleting rows stay NULL).
-		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+		// finalize_token is synthesized NULL (a v2 row never had a finalizing
+		// claim).
+		if err := rebuildUploadSessions(ctx, conn, exec, true, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV3:
@@ -1767,8 +1771,9 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// Exact v3 -> v4: the finalizing claim state. Rebuild upload_sessions
 		// carrying every row/field across exactly (no active/finalized row can
 		// be born finalizing; the CHECK and state trigger enforce it), so no
-		// existing row is ever altered or re-derived.
-		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+		// existing row is ever altered or re-derived. finalize_token is
+		// synthesized NULL (a v3 row never carried a finalizing claim).
+		if err := rebuildUploadSessions(ctx, conn, exec, true, false); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV4:
@@ -1780,7 +1785,7 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// can be born expiring; the CHECK and state trigger enforce it), so no
 		// existing row is ever altered or re-derived and a generic deleting
 		// tombstone is never re-interpreted as cleanup-owned.
-		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true); err != nil {
 			return depErr(err, ctx)
 		}
 	case schemaMigrateV5:
@@ -1794,8 +1799,10 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// invented), so the tightened state CHECK, coherence CHECK, and state
 		// transition trigger (changes sourced from v5: the claim requires a
 		// finalized row and a claimed row is publication-owned) all take
-		// effect without altering a single existing row.
-		if err := rebuildUploadSessions(ctx, conn, exec, true); err != nil {
+		// effect without altering a single existing row. The v4/v5 finalize_token
+		// is preserved exactly: a valid finalizing row carries a non-null claim
+		// token the v6 coherence CHECK requires, so it must survive verbatim.
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true); err != nil {
 			return depErr(err, ctx)
 		}
 	default:
@@ -1831,22 +1838,30 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 // golden fingerprint. Rows are moved field-by-field (explicit column lists,
 // never INSERT ... SELECT *). preserveCleanup selects whether the source
 // already carries a cleanup_token column that must be carried over exactly
-// (v2), or whether the reconstructed column is synthesized NULL everywhere
-// (v1-pre, which never had it; provenance is never invented). The full current
+// (v2 and later), or whether the reconstructed column is synthesized NULL
+// everywhere (v1-pre, which never had it; provenance is never invented).
+// preserveFinalize selects whether the source already carries a finalize_token
+// column whose value must survive exactly (v4/v5, whose valid `finalizing` rows
+// REQUIRE a non-null claim token), or whether it is synthesized NULL everywhere
+// (v1-pre/v1-cleanup/v2/v3, which predate the column). The full current
 // indexes/triggers are recreated. The scratch copy table is dropped before
 // verification so the live object set is exactly the current one.
-func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error, preserveCleanup bool) error {
+func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error, preserveCleanup, preserveFinalize bool) error {
 	cleanupExpr := "NULL"
 	if preserveCleanup {
 		cleanupExpr = "cleanup_token"
+	}
+	finalizeExpr := "NULL"
+	if preserveFinalize {
+		finalizeExpr = "finalize_token"
 	}
 	copyDDL := strings.Replace(schemaDDL[0], "upload_sessions", "upload_sessions_copy", 1)
 	if err := exec(copyDDL); err != nil {
 		return err
 	}
 	if err := exec(`insert into upload_sessions_copy
-		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, digest, bee_ref, media_type, size )
-		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `,
+		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, finalize_token, digest, bee_ref, media_type, size )
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `, ` + finalizeExpr + `,
 		       digest, bee_ref, media_type, size from upload_sessions`); err != nil {
 		return err
 	}
@@ -1885,8 +1900,8 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 		return err
 	}
 	if err := exec(`insert into upload_sessions
-		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, digest, bee_ref, media_type, size )
-		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `,
+		( id, repo, actor, state, offset, created_at, expires_at, create_token, cleanup_token, finalize_token, digest, bee_ref, media_type, size )
+		select id, repo, actor, state, offset, created_at, expires_at, create_token, ` + cleanupExpr + `, ` + finalizeExpr + `,
 		       digest, bee_ref, media_type, size from upload_sessions_copy`); err != nil {
 		return err
 	}

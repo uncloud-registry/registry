@@ -263,6 +263,18 @@ func (s *service) ClaimedDigests(ctx context.Context, repo, actor, operationID s
 // publication of that operation. Rows claimed by a different operation, rows
 // not in the claimed state, and rows whose digest is not referenced are never
 // touched.
+//
+// The consume is scoped by the AUTHORITATIVE (global) operation identity —
+// repo + operationID + referenced digests — never by the calling actor. The
+// caller is a principal ALREADY authorized for the repo (that authorization
+// happens upstream), and the durable operation binding (repo + globally unique
+// operationID) is what actually owns the claim, so a VERIFIED retry by ANY
+// authorized actor for the repo SAFELY finishes a claim a prior authorized
+// actor created and committed but crashed before consuming. Because operationID
+// is globally unique per publication, scoping by it (plus repo and referenced
+// digests) can never clear a DIFFERENT operation's claim, and the actor of the
+// original claim is irrelevant. The `actor` argument is retained in the
+// signature only for interface stability; it does not restrict consumption.
 func (s *service) ConsumeStagedForPublish(ctx context.Context, repo, actor, operationID string, digests []string) error {
 	if err := validateRepo(repo); err != nil {
 		return err
@@ -291,8 +303,8 @@ func (s *service) ConsumeStagedForPublish(ctx context.Context, repo, actor, oper
 	}
 	rows, err := conn.QueryContext(ctx,
 		`select u.id from staged_blobs b join upload_sessions u on u.id = b.upload_id
-		  where b.repo = ? and b.actor = ? and b.digest in (select value from json_each(?)) and u.state = 'claimed' and u.operation_id = ?`,
-		repo, actor, digestJSON(wanted), operationID)
+		  where b.repo = ? and b.digest in (select value from json_each(?)) and u.state = 'claimed' and u.operation_id = ?`,
+		repo, digestJSON(wanted), operationID)
 	if err != nil {
 		s.pool.release(conn)
 		if cerr := ctx.Err(); cerr != nil {
@@ -327,7 +339,7 @@ func (s *service) ConsumeStagedForPublish(ctx context.Context, repo, actor, oper
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		done, err := s.consumeClaimed(ctx, id, repo, actor, operationID)
+		done, err := s.consumeClaimed(ctx, id, repo, operationID)
 		if err != nil {
 			return err
 		}
@@ -343,7 +355,7 @@ func (s *service) ConsumeStagedForPublish(ctx context.Context, repo, actor, oper
 // consumeClaimed tombstone + atomically quarantine-removes ONE claimed-by-op
 // staged upload row WITHOUT unpinning. It reports whether THIS call performed
 // the final metadata removal (so concurrent instances converge on count 1).
-func (s *service) consumeClaimed(ctx context.Context, id, repo, actor, operationID string) (bool, error) {
+func (s *service) consumeClaimed(ctx context.Context, id, repo, operationID string) (bool, error) {
 	var a deleteAuth
 	proceed := false
 	err := s.withTx(ctx, func(conn *sql.Conn) error {
@@ -351,7 +363,7 @@ func (s *service) consumeClaimed(ctx context.Context, id, repo, actor, operation
 		if err != nil {
 			return err
 		}
-		if !found || !ownsSession(row, repo, actor) {
+		if !found || row.repo != repo {
 			return nil
 		}
 		if row.state != string(StateClaimed) {
