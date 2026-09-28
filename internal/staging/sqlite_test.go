@@ -1028,9 +1028,24 @@ func TestSchemaLookalikeObjectsRejected(t *testing.T) {
 			return d
 		}, false, false, nil, "operation id clearable from a claimed/deleting row"},
 		{"sessions_deleting_op_grammar", func(d []string) []string {
-			d[0] = strings.Replace(d[0], "(operation_id is null or (typeof(operation_id) = 'text' and length(operation_id) between 1 and 256))", "(operation_id is null or 1)", 1)
+			d[0] = strings.Replace(d[0], "(operation_id is null or (typeof(operation_id) = 'text' and length(hex(cast(operation_id as blob))) between 2 and 512))", "(operation_id is null or 1)", 1)
 			return d
-		}, false, false, nil, "deleting-row operation ownership untyped"},
+		}, false, false, nil, "operation ownership storage/length untyped"},
+		{"sessions_deleting_op_bytelength", func(d []string) []string {
+			d[0] = strings.Replace(d[0], "length(hex(cast(operation_id as blob))) between 2 and 512", "length(hex(cast(operation_id as blob))) between 2 and 600", 1)
+			return d
+		}, false, false, nil, "operation_id byte-length loosened beyond 256 bytes"},
+		{"trigger_operation_grammar_ins_weakened", func(d []string) []string {
+			d[17] = strings.Replace(d[17], "or pair in ('22','26','3C','3E','5C')", "", 1)
+			return d
+		}, false, false, nil, "grammar insert trigger admits the JSON/XML escape set"},
+		{"trigger_operation_grammar_upd_admits_space", func(d []string) []string {
+			d[18] = strings.Replace(d[18], "pair < '21'", "pair < '20'", 1)
+			return d
+		}, false, false, nil, "grammar update trigger admits space bytes"},
+		{"trigger_operation_grammar_upd_removed", func(d []string) []string {
+			return append(d[:18], d[19:]...)
+		}, false, false, nil, "grammar update trigger removed entirely"},
 		{"trigger_cleanup_softened", func(d []string) []string {
 			d[12] = strings.Replace(d[12], "'cleanup token immutable'", "'x'", 1)
 			return d

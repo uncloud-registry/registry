@@ -46,10 +46,32 @@ import (
 // finishes an owned deleting tombstone but never converts it back to
 // publishable state.
 //
-// v6 is the prior committed schema (the durable publication-claim fence with
-// `claimed` + operation_id, whose deleting tombstones were forced NULL). It
-// is retained for migration detection and parity.
-const latestSchemaVersion = 7
+// v7 is the prior committed schema (the durable post-transition publication-
+// consume retry). It is retained for migration detection and parity.
+//
+// v8 is the current schema. It carries one forward change over v7: byte-vs-
+// character enforcement of the publication operation_id. v7 constrained
+// operation_id by CHARACTER count only (typeof text, length 1..256) and its
+// ownership trigger permitted values during finalized -> claimed that the Go
+// validateOperationID rejects — spaces, forbidden JSON/XML punctuation,
+// non-ASCII/multibyte strings whose BYTE length exceeds 256, and malformed
+// UTF-8 TEXT (e.g. a value produced by CAST(X'80' AS TEXT)). Direct DB writes
+// could therefore persist claimed rows the API cannot address, that startup
+// reconciliation and cleanup exclude, and that permanently charge quota.
+// v8 re-binds the storage CHECK to RAW BYTES (hex(cast(operation_id as
+// blob)), 1..256 bytes, TEXT storage class) and enforces the byte-exact
+// validateOperationID grammar in mandatory BEFORE INSERT and BEFORE UPDATE
+// triggers (a recursive CTE walks every raw byte and rejects anything outside
+// 0x21..0x7E or in the JSON/XML escape set " \\ < > &, including space,
+// controls, NUL, DEL, and any non-ASCII or malformed byte). SQLite forbids
+// subqueries in CHECK constraints, so the byte grammar CANNOT be a CHECK; it
+// lives in the triggers plus schema-fingerprint verification. v7 -> v8
+// classifies every predecessor operation_id BYTE-FOR-BYTE before copying: a
+// malformed value fails the migration atomically (v8 is never stamped, the
+// v7 bytes stay intact); valid values preserve exact bytes. The
+// finalized -> claimed ownership trigger, immutability, and never-clear rule
+// are retained unchanged.
+const latestSchemaVersion = 8
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -99,7 +121,7 @@ const versionTableDDL = `create table staging_schema (version integer primary ke
 //   - repo rejects leading/dot/hyphen/underscore segment starts (and empty
 //     segments) via ('/' || repo) — first character included.
 //   - actor rejects '+' and requires an alphanumeric first character.
-var schemaDDL = []string{
+var schemaDDL = append([]string{
 	`create table upload_sessions (
 		id         text primary key,
 		repo       text not null,
@@ -124,7 +146,7 @@ var schemaDDL = []string{
 		check (typeof(created_at) = 'integer' and typeof(expires_at) = 'integer' and expires_at > created_at),
 		check (cleanup_token is null or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128 and cleanup_token = lower(cleanup_token) and cleanup_token not glob '*[^0-9a-f]*' and instr(hex(cleanup_token), '00') = 0)),
 		check (finalize_token is null or (typeof(finalize_token) = 'text' and length(hex(finalize_token)) = 128 and finalize_token = lower(finalize_token) and finalize_token not glob '*[^0-9a-f]*' and instr(hex(finalize_token), '00') = 0)),
-		check (operation_id is null or (typeof(operation_id) = 'text' and length(operation_id) between 1 and 256)),
+		check (operation_id is null or (typeof(operation_id) = 'text' and length(hex(cast(operation_id as blob))) between 2 and 512)),
 		check (
 			(state = 'active' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null and finalize_token is null and operation_id is null)
 			or (state = 'finalizing' and digest is null and bee_ref is null and media_type is null and size is null and create_token is null
@@ -152,10 +174,10 @@ var schemaDDL = []string{
 				and typeof(media_type) = 'text' and length(hex(media_type)) between 2 and 400
 				and instr(hex(media_type), '00') = 0 and media_type not glob '*[^a-z0-9.+/_-]*'
 				and create_token is null and finalize_token is null
-				and typeof(operation_id) = 'text' and length(operation_id) between 1 and 256)
+				and typeof(operation_id) = 'text' and length(hex(cast(operation_id as blob))) between 2 and 512)
 			or (state = 'deleting' and create_token is null and finalize_token is null
 				and (operation_id is null
-					or (typeof(operation_id) = 'text' and length(operation_id) between 1 and 256))
+					or (typeof(operation_id) = 'text' and length(hex(cast(operation_id as blob))) between 2 and 512))
 				and (cleanup_token is null
 					or (typeof(cleanup_token) = 'text' and length(hex(cleanup_token)) = 128
 						and cleanup_token = lower(cleanup_token)
@@ -342,6 +364,56 @@ var schemaDDL = []string{
 		select case when (select state from upload_sessions where id = old.upload_id) not in ('deleting')
 			then raise(abort, 'cannot delete staged blob of live session') else null end;
 	end`,
+}, operationIDGrammarTriggerDDL()...)
+
+// operationIDGrammarViolationCond returns the condition under which a NON-NULL
+// operation_id violates the byte-exact validateOperationID grammar: it is not
+// TEXT storage, is not 1..256 RAW BYTES, or contains a byte outside 0x21..0x7e
+// or in the JSON/XML escape set " \\ < > & (which also rejects space 0x20,
+// controls, NUL, DEL 0x7f, and every non-ASCII/malformed byte). It inspects
+// RAW BYTES via hex(cast(col as blob)) — immune to UTF-8 character counting and
+// to malformed TEXT — with a recursive CTE that yields one hex byte-pair per
+// byte; the byte-pairs are compared lexicographically, which is byte-exact
+// because every reject pair begins with a '2'/'3'/'4'/'5'/'6'/'7' digit so a
+// leading '0'/'f' pair can never collide with the reject set. `col` is a bare
+// column reference (e.g. NEW.operation_id for a trigger, or operation_id for a
+// row audit). SQLite forbids subqueries in CHECK constraints, so this can only
+// be enforced by INSERT/UPDATE triggers (mandatory, schema-fingerprinted) and
+// by an explicit migration row audit.
+func operationIDGrammarViolationCond(col string) string {
+	cte := "scan_opbytes"
+	return `(` + col + ` is not null and (typeof(` + col + `) <> 'text'
+		or length(hex(cast(` + col + ` as blob))) not between 2 and 512
+		or length(hex(cast(` + col + ` as blob))) % 2 != 0
+		or exists (
+			with recursive ` + cte + `(i, pair) as (
+				select 1, substr(hex(cast(` + col + ` as blob)), 1, 2)
+				union all
+				select i + 1, substr(hex(cast(` + col + ` as blob)), 2 * (i + 1) - 1, 2)
+				from ` + cte + `
+				where i < length(hex(cast(` + col + ` as blob))) / 2
+			)
+			select 1 from ` + cte + `
+			where pair < '21' or pair > '7E' or pair in ('22','26','3C','3E','5C')
+		)))`
+}
+
+// operationIDGrammarTriggerDDL returns the two mandatory triggers (BEFORE
+// INSERT and BEFORE UPDATE on upload_sessions) that enforce the byte-exact
+// operation_id grammar, so a direct SQL write can never store a grammar-
+// violating operation_id through either path. Ownership immutability and the
+// finalized -> claimed set-only rule are enforced separately by
+// trg_session_operation.
+func operationIDGrammarTriggerDDL() []string {
+	ins := operationIDGrammarViolationCond("NEW.operation_id")
+	return []string{
+		`create trigger trg_session_operation_grammar_ins
+			before insert on upload_sessions for each row
+			begin select raise(abort, 'operation id violates the byte-exact grammar') where ` + ins + `; end`,
+		`create trigger trg_session_operation_grammar_upd
+			before update on upload_sessions for each row
+			begin select raise(abort, 'operation id violates the byte-exact grammar') where ` + ins + `; end`,
+	}
 }
 
 // sessionTable, blobTable are the required physical tables for schema
@@ -425,8 +497,16 @@ var schemaGoldenV6JSON []byte
 //go:embed schema_golden_v7.json
 var schemaGoldenV7JSON []byte
 
-// schemaGold is the current (v7) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV7JSON)
+//go:embed schema_golden_v8.json
+var schemaGoldenV8JSON []byte
+
+// schemaGold is the current (v8) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV8JSON)
+
+// schemaGoldV7 is the exact frozen v7 predecessor manifest (the previously
+// committed "current" shape before v8), retained for migration detection and
+// parity. It is never renamed or called v8.
+var schemaGoldV7 = mustLoadSchemaGolden(schemaGoldenV7JSON)
 
 // schemaGoldV6 is the exact frozen v6 predecessor manifest (the previously
 // committed "current" shape before v7), retained for migration detection and
@@ -744,7 +824,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1501,6 +1581,7 @@ const (
 	schemaMigrateV4
 	schemaMigrateV5
 	schemaMigrateV6
+	schemaMigrateV7
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1552,6 +1633,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 7:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV7, 7); err == nil {
+			return schemaMigrateV7, nil
 		}
 	case 6:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV6, 6); err == nil {
@@ -1706,6 +1791,27 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// auditOperationIDGrammar runs the byte-exact operation_id classification over
+// the live predecessor upload_sessions table INSIDE the migration transaction,
+// before any copy. A single byte-malformed operation_id (whatever the v7/v6
+// character-count CHECK permitted) fails the migration closed: the caller's
+// ROLLBACK restores the predecessor bytes intact, so a partially stamped v8 is
+// never observable. This is mandatory because the rebuild's row copy passes
+// only the new table's CHECKs (storage-class/byte-length), which cannot reject
+// a grammar-violating byte — the grammar lives in triggers that are not yet
+// attached during the copy. Values validateOperationID accepts count 0 here.
+func auditOperationIDGrammar(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error) error {
+	var bad int
+	if err := conn.QueryRowContext(ctx,
+		`select count(*) from upload_sessions where `+operationIDGrammarViolationCond("operation_id")).Scan(&bad); err != nil {
+		return depErr(err, ctx)
+	}
+	if bad > 0 {
+		return errors.New("staging migration refuses a predecessor operation_id that violates the byte-exact grammar")
+	}
+	return nil
+}
+
 // migrateSchema atomically upgrades one of the exact predecessor shapes to the
 // current schema on a pinned connection under a serialized BEGIN IMMEDIATE
 // write transaction:
@@ -1826,14 +1932,39 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		if err := verifyAgainst(ctx, conn, schemaGoldV6, 6); err != nil {
 			return depErr(err, ctx)
 		}
-		// Exact v6 -> v7: the durable post-transition publication-consume retry.
-		// Rebuild upload_sessions carrying every row/field across exactly
-		// (operation_id is carried verbatim: a published-consuming deleting
-		// tombstone from an in-flight v7 runtime retains its ownership). No
-		// v6 row can carry a non-null operation_id on a deleting tombstone (the
-		// v6 coherence CHECK forced NULL), and no row's ownership is ever
-		// invented, so the new deleting-ownership CHECK and the
-		// trg_session_operation trigger take effect without altering a row.
+		// Exact v6 -> v8: rebuild upload_sessions carrying every row/field
+		// across exactly (operation_id is carried verbatim). v6's ownership
+		// grammar matched v7 (character-count CHECK only), so a v6 database
+		// can carry a byte-malformed operation_id an attacker wrote directly.
+		// Classify every predecessor operation_id BYTE-FOR-BYTE BEFORE
+		// copying: a malformed value fails the migration atomically (v8 is
+		// never stamped, the v6 bytes stay intact); valid values preserve
+		// exact bytes. v6 coherence forced deleting tombstones to NULL
+		// ownership, and no row's ownership is ever invented.
+		if err := auditOperationIDGrammar(ctx, conn, exec); err != nil {
+			return err
+		}
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true, true); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV7:
+		if err := verifyAgainst(ctx, conn, schemaGoldV7, 7); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v7 -> v8: the byte-exact operation_id grammar. v7's
+		// ownership grammar matched character count ONLY (typeof text,
+		// length 1..256), so a v7 database can carry a claimed row whose
+		// operation_id contains spaces, forbidden punctuation, non-ASCII or
+		// multibyte bytes >256 chars, or malformed UTF-8 TEXT — all values
+		// Go's validateOperationID rejects. Classify every predecessor
+		// operation_id BYTE-FOR-BYTE BEFORE copying, so a malformed value
+		// fails the migration atomically with NO partially stamped v8 and the
+		// original v7 bytes intact; valid IDs preserve their exact bytes. The
+		// new byte CHECK and grammar triggers then take effect without
+		// altering a row.
+		if err := auditOperationIDGrammar(ctx, conn, exec); err != nil {
+			return err
+		}
 		if err := rebuildUploadSessions(ctx, conn, exec, true, true, true); err != nil {
 			return depErr(err, ctx)
 		}

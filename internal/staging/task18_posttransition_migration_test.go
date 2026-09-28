@@ -127,6 +127,7 @@ func TestUpgradeEveryPredecessorToV7(t *testing.T) {
 		{"v4", mustLoadTestManifest(t, schemaGoldenV4JSON), seedFullLifecycle},
 		{"v5", mustLoadTestManifest(t, schemaGoldenV5JSON), seedFullLifecycle},
 		{"v6", mustLoadTestManifest(t, schemaGoldenV6JSON), seedFullLifecycleV6Owned},
+		{"v7", mustLoadTestManifest(t, schemaGoldenV7JSON), seedFullLifecycleV6Owned},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
