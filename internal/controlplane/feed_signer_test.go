@@ -80,8 +80,29 @@ type feedDocSet struct {
 // modify the request before asserting a decided outcome.
 func newFeedTestWorld(t *testing.T, req publish.FeedCommitRequest, dst feedDocSet) *feedTestWorld {
 	t.Helper()
+	// Legacy signature: a shared-cache in-memory store keyed only on t.Name().
+	// Retained for pre-Task-17/19 tests that still rely on the in-memory backing.
+	return newFeedTestWorldWithStore(t, newProvisioningStore(t), req, dst)
+}
+
+// newFeedTestWorldFile builds the SAME fixture but over a REAL unique
+// file-backed durable store (a per-invocation temp file, registered to close
+// on cleanup). Unlike newProvisioningStore's shared-cache in-memory database
+// (whose name is keyed only on t.Name(), and therefore collides across
+// repeated runs of the SAME test under `go test -count=N`), a per-invocation
+// temp file can never alias a prior run's rows — so Task-19's repeated-run
+// proofs stay isolated under `-race -count=20`.
+func newFeedTestWorldFile(t *testing.T, req publish.FeedCommitRequest, dst feedDocSet) *feedTestWorld {
+	t.Helper()
+	return newFeedTestWorldWithStore(t, newFileBackedProvisioningStore(t), req, dst)
+}
+
+// newFeedTestWorldWithStore is the shared construction core: the caller
+// supplies the durable store (in-memory or file-backed), which owns its own
+// lifecycle so resources close cleanly and no DB artifact lands in the repo.
+func newFeedTestWorldWithStore(t *testing.T, store *Store, req publish.FeedCommitRequest, dst feedDocSet) *feedTestWorld {
+	t.Helper()
 	ctx := context.Background()
-	store := newProvisioningStore(t)
 	owner := seedProvisioningOwner(t, store)
 
 	feedOwner := testFeedOwner

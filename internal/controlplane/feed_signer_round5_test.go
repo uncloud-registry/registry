@@ -489,7 +489,7 @@ func TestFeedSignerAcceptsEmptyIndexPublication(t *testing.T) {
 	req := validCommitReq(1, "batch-1")
 	body := fixtureEmptyIndexBody(t)
 	digest := publish.ComputeDigest(body)
-	w := newFeedTestWorld(t, req, feedDocSet{
+	w := newFeedTestWorldFile(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 0, targetRef: refHex('a'), targetGen: 1, stampRef: refHex('c'),
 	})
 	req.RegistryID = w.registry.ID

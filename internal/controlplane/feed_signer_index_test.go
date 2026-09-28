@@ -76,7 +76,7 @@ func buildIndex(t *testing.T, arch string, children ...indexChildFixture) indexF
 func indexWorld(t *testing.T, tag string, curGen int64, children []indexChildFixture, fx indexFixture) (*feedTestWorld, publish.FeedCommitRequest) {
 	t.Helper()
 	req := validCommitReq(1, "batch-1")
-	w := newFeedTestWorld(t, req, feedDocSet{
+	w := newFeedTestWorldFile(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: curGen,
 		targetRef: refHex('a'), targetGen: curGen + 1,
 		stampRef: refHex('c'),
@@ -237,7 +237,7 @@ func TestFeedSignerRejectsIndexChildByteLengthMismatch(t *testing.T) {
 	curManifests := map[string]spec.ManifestDescriptor{c1.digest: c1.manifest, c2.digest: childRec}
 
 	req := validCommitReq(1, "batch-1")
-	w := newFeedTestWorld(t, req, feedDocSet{
+	w := newFeedTestWorldFile(t, req, feedDocSet{
 		currentRef: refHex('b'), currentGen: 1, targetRef: refHex('a'), targetGen: 2, stampRef: refHex('c'),
 	})
 	req.RegistryID = w.registry.ID
