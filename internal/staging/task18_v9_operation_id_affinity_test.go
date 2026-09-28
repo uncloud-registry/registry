@@ -121,13 +121,15 @@ func TestV9OperationIDColumnAffinityFree(t *testing.T) {
 	if gold.Version != latestSchemaVersion {
 		t.Fatalf("current schema must be v%d, got %d", latestSchemaVersion, gold.Version)
 	}
-	if gold.Version != 10 {
-		t.Fatalf("current schema version = %d, want v10", gold.Version)
+	if gold.Version == 10 {
+		t.Fatalf("current schema must have advanced past v10 (now %d)", gold.Version)
 	}
 	if typ := goldenColumnType(t, gold, "upload_sessions", "operation_id"); typ != "" {
 		t.Fatalf("current operation_id column type = %q, want \"\" (affinity-free)", typ)
 	}
-	// The frozen v9 predecessor carried the same affinity-free change.
+	// The frozen v9 predecessor carried the same affinity-free change (and the
+	// forward v9->v11 path preserves it: v10/v11 changed only the cleanup
+	// cursor, never upload_sessions).
 	v9 := mustLoadTestManifest(t, schemaGoldenV9JSON)
 	if v9.Version != 9 {
 		t.Fatalf("v9 predecessor manifest must be frozen at 9, got %d", v9.Version)

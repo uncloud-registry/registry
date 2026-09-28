@@ -29,6 +29,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -306,12 +309,14 @@ func sessionBlobDigest(t *testing.T, dbPath string) string {
 	return b.String()
 }
 
-// TestCleanupV9ToV10MigrationPreservesAndInitializesCursor proves the
-// v9 -> v10 forward migration (1) preserves every upload_sessions row and every
-// staged_blob byte-for-byte, (2) creates the cleanup_cursor table and seeds its
-// single FRESH row (exp_at=-1, sess NULL), and (3) reopens idempotently
-// (version still current, cursor row still fresh, sessions still identical).
-func TestCleanupV9ToV10MigrationPreservesAndInitializesCursor(t *testing.T) {
+// TestCleanupV9ToV11MigrationPreservesAndInitializesCursor proves the
+// v9 -> v11 forward migration (through the shared upgrade path) (1) preserves
+// every upload_sessions row and every staged_blob byte-for-byte, (2) creates
+// the cleanup_cursor table and seeds its single FRESH row (exp_at=NULL,
+// sess=NULL, the v11 fresh sentinel distinct from every signed timestamp), and
+// (3) reopens idempotently (version still current, cursor row still fresh,
+// sessions still identical).
+func TestCleanupV9ToV11MigrationPreservesAndInitializesCursor(t *testing.T) {
 	v9 := mustLoadTestManifest(t, schemaGoldenV9JSON)
 	if v9.Version != 9 {
 		t.Fatalf("v9 predecessor manifest must be frozen at 9, got %d", v9.Version)
@@ -323,7 +328,7 @@ func TestCleanupV9ToV10MigrationPreservesAndInitializesCursor(t *testing.T) {
 
 	db, err := migrateThenOpen(t, dbPath)
 	if err != nil {
-		t.Fatalf("migrate v9 -> v10: %v", err)
+		t.Fatalf("migrate v9 -> v11: %v", err)
 	}
 	db.Close()
 	if v := versionOf(t, dbPath); v != latestSchemaVersion {
@@ -331,17 +336,17 @@ func TestCleanupV9ToV10MigrationPreservesAndInitializesCursor(t *testing.T) {
 	}
 	// Every session/blob preserved byte-for-byte.
 	if after := sessionBlobDigest(t, dbPath); after != before {
-		t.Fatalf("v9->v10 altered upload_sessions/staged_blobs:\nBEFORE:\n%s\nAFTER:\n%s", before, after)
+		t.Fatalf("v9->v11 altered upload_sessions/staged_blobs:\nBEFORE:\n%s\nAFTER:\n%s", before, after)
 	}
-	// The cursor table exists with exactly one FRESH row.
+	// The cursor table exists with exactly one FRESH row (NULL, NULL).
 	raw := mustRawDB(t, dbPath)
-	var exp int64
+	var exp sql.NullInt64
 	var sess sql.NullString
 	if err := raw.QueryRow(`select exp_at, sess from cleanup_cursor`).Scan(&exp, &sess); err != nil {
 		t.Fatalf("read cleanup_cursor: %v", err)
 	}
-	if exp != -1 || sess.Valid {
-		t.Fatalf("fresh cursor = (exp_at=%d, sess=%v), want (-1, NULL)", exp, sess)
+	if exp.Valid || sess.Valid {
+		t.Fatalf("fresh cursor = (exp_at=%v, sess=%v), want (NULL, NULL)", exp, sess)
 	}
 	var n int
 	if err := raw.QueryRow(`select count(*) from cleanup_cursor`).Scan(&n); err != nil {
@@ -368,26 +373,27 @@ func TestCleanupV9ToV10MigrationPreservesAndInitializesCursor(t *testing.T) {
 	if err := raw2.QueryRow(`select exp_at, sess from cleanup_cursor`).Scan(&exp, &sess); err != nil {
 		t.Fatalf("reopen cursor read: %v", err)
 	}
-	if exp != -1 || sess.Valid {
-		t.Fatalf("reopen cursor no longer fresh: (exp_at=%d, sess=%v)", exp, sess)
+	if exp.Valid || sess.Valid {
+		t.Fatalf("reopen cursor no longer fresh: (exp_at=%v, sess=%v)", exp, sess)
 	}
 	raw2.Close()
 }
 
-// TestCleanupTamperedV10CursorFailsClosed proves malformed/tampered v10 cursor
-// state fails closed: (a) a WEAPENED cleanup_cursor schema object is rejected
-// by byte-identity verification on open, leaving the database untouched; and
-// (b) deleting the single cursor row makes the cleanup refuse to run (it never
-// guesses a traversal position), and a coherently-impossible second row cannot
-// even be written (the table CHECK/PK refuses it).
-func TestCleanupTamperedV10CursorFailsClosed(t *testing.T) {
+// TestCleanupTamperedV11CursorFailsClosed proves malformed/tampered current
+// (v11) cursor state fails closed: (a) a WEAPENED cleanup_cursor schema object
+// is rejected by byte-identity verification on open, leaving the database
+// untouched; (b) a coherently-impossible cursor row — a NULL/non-NULL state
+// mix, a mixed-null pair, a non-INTEGER exp_at, or a second row — is refused
+// by the table CHECK/PK; and (c) deleting the single cursor row makes the
+// cleanup refuse to run (it never guesses a traversal position).
+func TestCleanupTamperedV11CursorFailsClosed(t *testing.T) {
 	// (a) Weakened schema: the reconciliation/open must reject it, byte-clean.
-	v10 := mustLoadTestManifest(t, schemaGoldenV10JSON)
-	if v10.Version != latestSchemaVersion {
-		t.Fatalf("v10 manifest must be frozen at current, got %d", v10.Version)
+	v11 := mustLoadTestManifest(t, schemaGoldenV11JSON)
+	if v11.Version != latestSchemaVersion {
+		t.Fatalf("v11 manifest must be frozen at current, got %d", v11.Version)
 	}
-	dbPath := mutatedFixture(t, v10, "cleanup_cursor", func(body string) string {
-		return strings.Replace(body, "(exp_at = -1 and sess is null)", "(1)", 1)
+	dbPath := mutatedFixture(t, v11, "cleanup_cursor", func(body string) string {
+		return strings.Replace(body, "(exp_at is null and sess is null)", "(1)", 1)
 	})
 	before := hashFile(t, dbPath)
 	if db, err := openStagingDB(context.Background(), dbPath, 0); err == nil {
@@ -406,13 +412,22 @@ func TestCleanupTamperedV10CursorFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCleanup: %v", err)
 	}
-	// A coherently-impossible second cursor row is refused by the schema.
 	db := mustOpenRaw(t, dir)
-	if _, err := db.Exec(`insert into cleanup_cursor (id, exp_at, sess) values (2, -1, NULL)`); err == nil {
+	// A coherently-impossible second cursor row is refused (PK id=1).
+	if _, err := db.Exec(`insert into cleanup_cursor (id, exp_at, sess) values (2, NULL, NULL)`); err == nil {
 		t.Fatal("a second cleanup_cursor row was accepted (single-row guard broken)")
 	}
+	// A NULL/non-NULL mix (advanced exp_at with NULL sess) is refused.
 	if _, err := db.Exec(`update cleanup_cursor set exp_at = 5 where id = 1`); err == nil {
 		t.Fatal("an advanced cursor position without a session id was accepted (coherence broken)")
+	}
+	// A non-INTEGER exp_at is refused (affinity-free column + typeof guard).
+	if _, err := db.Exec(`update cleanup_cursor set exp_at = '5', sess = '` + strings.Repeat("a", 64) + `' where id = 1`); err == nil {
+		t.Fatal("a non-INTEGER exp_at was accepted (storage-class guard broken)")
+	}
+	// A malformed (non-hex) sess is refused.
+	if _, err := db.Exec(`update cleanup_cursor set exp_at = 5, sess = '` + strings.Repeat("z", 64) + `' where id = 1`); err == nil {
+		t.Fatal("a malformed session id was accepted (grammar guard broken)")
 	}
 	// Delete the single row: the cleanup must fail closed, never guess a
 	// position and never traverse (and therefore never unpin anything).
@@ -428,16 +443,18 @@ func TestCleanupTamperedV10CursorFailsClosed(t *testing.T) {
 	}
 }
 
-// TestUpgradeEveryPredecessorToCurrent includes v9 in the full predecessor
-// upgrade chain so the v9->v10 forward migration is regressed alongside every
-// shipped predecessor. (Extends the existing upgrade regression list.)
-func TestUpgradeV9ToCurrentIncluded(t *testing.T) {
+// TestUpgradeV9AndV10ToCurrentIncluded includes v9 and v10 in the full
+// predecessor upgrade chain so the forward migrations to v11 are regressed
+// alongside every shipped predecessor. (Extends the existing upgrade
+// regression list.)
+func TestUpgradeV9AndV10ToCurrentIncluded(t *testing.T) {
 	cases := []struct {
 		name string
 		gold *schemaManifest
 		seed func(t *testing.T, db *sql.DB)
 	}{
 		{"v9", mustLoadTestManifest(t, schemaGoldenV9JSON), seedFullLifecycleV6Owned},
+		{"v10", mustLoadTestManifest(t, schemaGoldenV10JSON), seedFullLifecycleV10WithCursor},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -470,5 +487,344 @@ func TestUpgradeV9ToCurrentIncluded(t *testing.T) {
 			}
 			raw.Close()
 		})
+	}
+}
+
+// seedFullLifecycleV10WithCursor seeds the full lifecycle AND the single v10
+// cleanup-cursor row a genuine v10 predecessor always carries: the fresh
+// sentinel (exp_at = -1, sess NULL). A real v10-database cursor is never empty.
+func seedFullLifecycleV10WithCursor(t *testing.T, db *sql.DB) {
+	t.Helper()
+	seedFullLifecycleV6Owned(t, db)
+	if _, err := db.Exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, -1, NULL)`); err != nil {
+		t.Fatalf("seed v10 fresh cursor: %v", err)
+	}
+}
+
+// TestCleanupV10ToV11MigrationPreservesAndMapsCursor proves the v10 -> v11
+// forward migration (1) preserves every upload_sessions row and staged_blob
+// byte-for-byte — including a row with negative (pre-epoch) expires_at — and
+// (2) maps the v10 cursor row losslessly: fresh (-1, NULL) becomes v11 fresh
+// (NULL, NULL), and a valid v10 ADVANCED cursor (exp_at >= 0, sess) is carried
+// unchanged. It also proves that after migration a FRESH signed-domain cursor
+// reaches and cleans the negative-expired row that a v10 cursor could never
+// even have selected.
+func TestCleanupV10ToV11MigrationPreservesAndMapsCursor(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		advEx   *int64 // nil = fresh, else advanced exp_at
+		reaches bool   // whether cleanup must reach the negative row after migrate
+	}{
+		{"fresh", nil, true},
+		{"advanced", int64ptr(5), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v10 := mustLoadTestManifest(t, schemaGoldenV10JSON)
+			dbPath := fixtureFromGolden(t, v10, func(db *sql.DB) {
+				// Only the negative-expired finalized blob (created=-5s,
+				// expires=-4s, i.e. before the 1970 epoch) is seeded, so the
+				// post-migration reachability count is decisive.
+				seedRawFinalizedAt(t, db, strings.Repeat("1", 64), -5_000_000_000, -4_000_000_000, strings.Repeat("f", 64))
+				if tc.advEx != nil {
+					if _, err := db.Exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, ?, ?)`, *tc.advEx, strings.Repeat("a", 64)); err != nil {
+						t.Fatalf("seed advanced cursor: %v", err)
+					}
+				} else {
+					if _, err := db.Exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, -1, NULL)`); err != nil {
+						t.Fatalf("seed fresh cursor: %v", err)
+					}
+				}
+			})
+			before := sessionBlobDigest(t, dbPath)
+
+			db, err := migrateThenOpen(t, dbPath)
+			if err != nil {
+				t.Fatalf("migrate v10 -> v11: %v", err)
+			}
+			db.Close()
+			if v := versionOf(t, dbPath); v != latestSchemaVersion {
+				t.Fatalf("version after migration = %d, want %d", v, latestSchemaVersion)
+			}
+			if after := sessionBlobDigest(t, dbPath); after != before {
+				t.Fatalf("v10->v11 altered upload_sessions/staged_blobs:\nBEFORE:\n%s\nAFTER:\n%s", before, after)
+			}
+			// The cursor row is mapped losslessly.
+			raw := mustRawDB(t, dbPath)
+			var ex sql.NullInt64
+			var sess sql.NullString
+			if err := raw.QueryRow(`select exp_at, sess from cleanup_cursor`).Scan(&ex, &sess); err != nil {
+				t.Fatalf("read migrated cursor: %v", err)
+			}
+			if tc.advEx != nil {
+				if !ex.Valid || ex.Int64 != *tc.advEx || sess.String != strings.Repeat("a", 64) {
+					t.Fatalf("advanced cursor mapped wrongly: exp=%v sess=%q, want exp=%d sess=a…a", ex, sess.String, *tc.advEx)
+				}
+			} else if ex.Valid || sess.Valid {
+				t.Fatalf("fresh cursor mapped wrongly: exp=%v sess=%q, want (NULL,NULL)", ex, sess.String)
+			}
+			raw.Close()
+
+			// A FRESH migrated cursor must reach the negative-expired row; an
+			// ADVANCED cursor at exp=5 sits past it (its expires=-4s < 5), so it
+			// reaches nothing.
+			spool := filepath.Join(filepath.Dir(dbPath), "spool")
+			if err := os.Mkdir(spool, 0o700); err != nil {
+				t.Fatalf("mkdir spool: %v", err)
+			}
+			// Startup reconciliation verifies every file-backed row against a
+			// durable spool file at the committed offset. The seeded finalized
+			// blob (offset 0) needs a matching empty backing file (a real
+			// contentless-finalized row never had bytes to commit).
+			if err := os.WriteFile(filepath.Join(spool, strings.Repeat("1", 64)), nil, 0o600); err != nil {
+				t.Fatalf("seed backing file: %v", err)
+			}
+			svc, err := NewService(context.Background(), spool, dbPath)
+			if err != nil {
+				t.Fatalf("service over migrated db: %v", err)
+			}
+			unp := &fakeUnpinner{}
+			c, err := NewCleanup(svc, unp, &fakeCommitted{})
+			if err != nil {
+				svc.Close()
+				t.Fatalf("NewCleanup: %v", err)
+			}
+			if _, err := c.RunOnce(context.Background(), time.Unix(0, 0).UTC(), 10); err != nil {
+				svc.Close()
+				t.Fatalf("post-migration RunOnce: %v", err)
+			}
+			svc.Close()
+			got := unp.calls()
+			if tc.reaches {
+				if len(got) != 1 || got[0] != strings.Repeat("f", 64) {
+					t.Fatalf("post-migration negative-expired cleanup unpins = %v, want exactly [%s]", got, strings.Repeat("f", 64))
+				}
+			} else if len(got) != 0 {
+				t.Fatalf("advanced-cursor post-migration unpins = %v, want 0 (negative row is before the advanced position)", got)
+			}
+		})
+	}
+}
+
+// int64ptr returns a pointer to v (test helper).
+func int64ptr(v int64) *int64 { return &v }
+
+// seedRawFinalizedAt writes a finalized blob row (active -> staged_blob ->
+// finalized) with explicit signed created/expires nanosecond timestamps,
+// bypassing a host-time conversion so negative and boundary values are stored
+// exactly. This is the only safe way to reach the signed domain edges SQLite
+// supports without time.Time/UnixNano overflow mistakes.
+func seedRawFinalizedAt(t *testing.T, db *sql.DB, id string, created, expires int64, beeRef string) {
+	t.Helper()
+	if expires <= created {
+		t.Fatalf("seed requires expires(%d) > created(%d)", expires, created)
+	}
+	digest := "sha256:" + strings.Repeat("d", 64)
+	if _, err := db.Exec(
+		`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?,?,?, 'active', 0, ?, ?)`,
+		id, seedRepo, seedActor, created, expires); err != nil {
+		t.Fatalf("seed active row: %v", err)
+	}
+	if _, err := db.Exec(
+		`insert into staged_blobs (upload_id, repo, actor, digest, bee_ref, size, media_type, created_at, expires_at)
+		 values (?,?,?,?,?, 0, 'application/octet-stream', ?, ?)`,
+		id, seedRepo, seedActor, digest, beeRef, created, expires); err != nil {
+		t.Fatalf("seed staged blob: %v", err)
+	}
+	if _, err := db.Exec(
+		`update upload_sessions set state='finalized', digest=?, bee_ref=?, media_type=?, size=0 where id=?`,
+		digest, beeRef, "application/octet-stream", id); err != nil {
+		t.Fatalf("seed finalize transition: %v", err)
+	}
+}
+
+// TestCleanupSignedDomainNegativeExpiredReached proves the CURRENT v11 cleanup
+// reaches and safely removes both a negative-expired finalized blob (unpinned)
+// and a negative-expired contentless active session (removed, no unpin) — the
+// schema-valid rows the v10 fresh sentinel (exp_at=-1) could never select.
+// Rows are written with explicit negative nanosecond timestamps via raw SQL so
+// the assertion is exact and independent of service TTL clock math.
+func TestCleanupSignedDomainNegativeExpiredReached(t *testing.T) {
+	svc, dir := newTestService(t)
+	ref := distinctHexRef(0x5000)
+	raw := mustOpenRaw(t, dir)
+	// finalized blob: created=-6s expires=-5s
+	seedRawFinalizedAt(t, raw, strings.Repeat("5", 64), -6_000_000_000, -5_000_000_000, ref)
+	// contentless active session: created=-6s expires=-5s
+	if _, err := raw.Exec(
+		`insert into upload_sessions (id, repo, actor, state, offset, created_at, expires_at) values (?,?,?, 'active', 0, ?, ?)`,
+		strings.Repeat("6", 64), seedRepo, seedActor, -6_000_000_000, -5_000_000_000); err != nil {
+		raw.Close()
+		t.Fatalf("seed negative active session: %v", err)
+	}
+	raw.Close()
+
+	unp := &fakeUnpinner{}
+	c, err := NewCleanup(svc, unp, &fakeCommitted{})
+	if err != nil {
+		t.Fatalf("NewCleanup: %v", err)
+	}
+	// now = epoch: both rows (expires=-5s) are expired.
+	res, err := c.RunOnce(context.Background(), time.Unix(0, 0).UTC(), 10)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// Both removed: finalized blob unpinned once, active session removed with
+	// no unpin.
+	if res.Removed != 2 || res.Unpinned != 1 || res.Failed != 0 {
+		t.Fatalf("signed-domain counts = %+v, want removed=2 unpinned=1 failed=0", res)
+	}
+	if got := unp.calls(); len(got) != 1 || got[0] != ref {
+		t.Fatalf("negative-expired unpin = %v, want exactly [%s]", got, ref)
+	}
+	if n := rawCountByID(t, dir, strings.Repeat("5", 64)); n != 0 {
+		t.Fatalf("negative finalized blob %s not removed (%d rows)", ref, n)
+	}
+	if n := rawCountByID(t, dir, strings.Repeat("6", 64)); n != 0 {
+		t.Fatalf("negative active session not removed (%d rows)", n)
+	}
+}
+
+// rawCountByID counts upload_sessions rows carrying the given session id.
+func rawCountByID(t *testing.T, dir, id string) int {
+	t.Helper()
+	db := mustOpenRaw(t, dir)
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`select count(*) from upload_sessions where id = ?`, id).Scan(&n); err != nil {
+		t.Fatalf("count by id: %v", err)
+	}
+	return n
+}
+
+// TestCleanupSignedDomainBoundaryMinInt64 proves the raw cleanup boundary at
+// the most negative SQLite INTEGER reaches and removes an expired finalized
+// blob whose expires_at is MinInt64+1 (the smallest span above MinInt64, whose
+// very existence requires expires > created; MinInt64 itself cannot be expires
+// because expires_at must exceed created_at). Stored via raw SQL to avoid any
+// time.Time/UnixNano overflow or clamping.
+func TestCleanupSignedDomainBoundaryMinInt64(t *testing.T) {
+	svc, dir := newTestService(t)
+	raw := mustOpenRaw(t, dir)
+	const min = math.MinInt64
+	// created=min, expires=min+1 — the least positive span, fully representable.
+	seedRawFinalizedAt(t, raw, strings.Repeat("9", 64), min, min+1, strings.Repeat("e", 64))
+	raw.Close()
+
+	unp := &fakeUnpinner{}
+	c, err := NewCleanup(svc, unp, &fakeCommitted{})
+	if err != nil {
+		t.Fatalf("NewCleanup: %v", err)
+	}
+	res, err := c.RunOnce(context.Background(), time.Unix(0, 0).UTC(), 10)
+	if err != nil {
+		t.Fatalf("RunOnce boundary: %v", err)
+	}
+	if got := unp.calls(); len(got) != 1 || got[0] != strings.Repeat("e", 64) {
+		t.Fatalf("boundary MinInt64 unpin = %v, want 1", got)
+	}
+	if res.Unpinned != 1 || res.Removed != 1 || res.Failed != 0 {
+		t.Fatalf("boundary counts = %+v, want removed=1 unpinned=1", res)
+	}
+}
+
+// TestCleanupSignedDomainFairAcrossRestartAndHandles proves a traversal that
+// mixes negative (pre-epoch) and nonnegative expires_at values, spanning more
+// than one full batch of retained rows, stays FAIR across a restart and across
+// independent handles sharing the durable cursor. Both classes must eventually
+// be reached/cleaned and no retained ref unpinned — the same durability
+// guarantee as the nonnegative-only fair tests, now across the full signed
+// domain the v11 cursor spans.
+func TestCleanupSignedDomainFairAcrossRestartAndHandles(t *testing.T) {
+	// The service Create path refuses pre-epoch now() (its MaxInt64 overflow
+	// guard), so every row — retained and eligible, negative and nonnegative —
+	// is written via raw SQL with explicit nanosecond timestamps, and each
+	// finalized blob gets a matching empty spool backing file so a reopened
+	// service's startup reconciliation has a durable file to align.
+	dir := tempPrivate(t)
+	svc := openServiceOn(t, dir) // establishes v11 schema + spool + cursor
+	spoolRoot := filepath.Join(dir, "spool")
+	seedFile := func(id string) {
+		if err := os.WriteFile(filepath.Join(spoolRoot, id), nil, 0o600); err != nil {
+			t.Fatalf("spool backing file: %v", err)
+		}
+	}
+	raw := mustOpenRaw(t, dir)
+	const retainedN = 4 // > one full batch at batch=1, split across domains
+	const eligibleN = 2
+	retainedRefs := map[string]struct{}{}
+	for i := 0; i < retainedN; i++ {
+		// created < expires must hold. Even i: both far in the past (negative
+		// expires). Odd i: both a few seconds after epoch (nonnegative).
+		id := fmt.Sprintf("%064x", 0x6000+i)
+		ref := distinctHexRef(0x6000 + i)
+		var created, expires int64
+		if i%2 == 0 {
+			created, expires = -7_200_000_000_000, -3_599_000_000_000 // negative expires
+		} else {
+			created, expires = 1_000_000_000, 10_000_000_000 // nonnegative expires (t=1s, t=10s)
+		}
+		seedRawFinalizedAt(t, raw, id, created, expires, ref)
+		seedFile(id)
+		retainedRefs[ref] = struct{}{}
+	}
+	// Eligible rows, both sorted AFTER the retained rows in (expires_at,id)
+	// order so a full retained batch must be traversed first: one negative
+	// expires, one nonnegative.
+	for i := 0; i < eligibleN; i++ {
+		id := fmt.Sprintf("%064x", 0x6200+i)
+		ref := distinctHexRef(0x6200 + i)
+		var created, expires int64
+		if i == 0 {
+			created, expires = -3_598_000_000_000, -3_597_000_000_000 // negative, later than all retained negatives
+		} else {
+			created, expires = 11_000_000_000, 20_000_000_000 // nonnegative, later than all retained nonnegatives
+		}
+		seedRawFinalizedAt(t, raw, id, created, expires, ref)
+		seedFile(id)
+	}
+	raw.Close()
+	// runAt far past every expires (largest = eligible nonnegative t=20s).
+	runAt := time.Unix(200, 0).UTC()
+	svc.Close()
+
+	committed := &fakeCommitted{byRepo: map[string]map[string]struct{}{"backend/api": retainedRefs}}
+	unp := &fakeUnpinner{}
+
+	// Repeated passes across FRESH handles (restart) on the same store, batch=1,
+	// until the traversal wraps enough to examine the whole signed domain.
+	const batch = 1
+	for i := 0; i < 4*(retainedN+eligibleN); i++ {
+		h := openServiceOn(t, dir)
+		c, err := NewCleanup(h, unp, committed)
+		if err != nil {
+			h.Close()
+			t.Fatalf("pass %d NewCleanup: %v", i, err)
+		}
+		if _, err := c.RunOnce(context.Background(), runAt, batch); err != nil {
+			h.Close()
+			t.Fatalf("pass %d RunOnce: %v", i, err)
+		}
+		h.Close()
+	}
+
+	pinned := map[string]int{}
+	for _, r := range unp.calls() {
+		pinned[r]++
+		if _, retained := retainedRefs[r]; retained {
+			t.Fatalf("a retained ref %s was unpinned", r)
+		}
+	}
+	for _, want := range []string{distinctHexRef(0x6200), distinctHexRef(0x6201)} {
+		if pinned[want] != 1 {
+			t.Fatalf("eligible ref %s unpinned %d times across restart+handles, want exactly 1 (signed-domain starvation)", want, pinned[want])
+		}
+	}
+	if len(pinned) != eligibleN {
+		t.Fatalf("eligible unpins = %d (%v), want %d across mixed signed domain", len(pinned), unp.calls(), eligibleN)
+	}
+	// The negative-domain eligible row was actually reached (not skipped as
+	// fresh-before-cursor): its unpin proves negative expires_at is traversable.
+	if pinned[distinctHexRef(0x6200)] != 1 {
+		t.Fatalf("negative-domain eligible row never reached across restart+handles — fresh/negative cursor gap")
 	}
 }

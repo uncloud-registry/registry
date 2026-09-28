@@ -71,7 +71,7 @@ import (
 // service grammar); any byte-malformed predecessor value still fails the
 // migration atomically.
 //
-// v10 is the current schema. It carries ONE forward change over v9: the
+// v10 is a PRIOR committed schema. It carries ONE forward change over v9: the
 // durable, cross-process cleanup traversal cursor. The Task 18 garbage
 // reaper previously kept its fair-traversal position in per-instance memory,
 // so a restart -- or several instances each running one pass -- re-traversed
@@ -85,9 +85,29 @@ import (
 // re-introduce starvation. The cursor has NO dependency on upload_sessions or
 // staged_blobs (its sess value is a bare session id, not a FK), so v9 -> v10
 // needs no upload_sessions rebuild -- it creates the cursor table and
-// initializes the single fresh row. v9 is retained as a frozen predecessor for
-// migration detection and parity.
-const latestSchemaVersion = 10
+// initializes the single fresh row. v9 is retained as a frozen predecessor
+// for migration detection and parity.
+//
+// v11 is the current schema. It carries ONE forward change over v10: the
+// cleanup cursor is extended to the full signed Unix-nanosecond domain. v10
+// encoded the FRESH-traversal sentinel AS a timestamp (exp_at = -1) and
+// restricted every ADVANCED position to exp_at >= 0, so (a) a schema-valid
+// expired row whose expires_at is negative (a pre-epoch nanosecond timestamp,
+// which the signed-integer sessions schema already permits) is never selected
+// past the fresh sentinel, and (b) such a negative expires_at can never be
+// stored as an advanced cursor position. v11 represents the fresh traversal
+// SEPARATELY from every signed timestamp as (exp_at, sess) = (NULL, NULL),
+// and lets an advanced position carry ANY SQLite INTEGER exp_at (with sess a
+// valid session-id grammar). When fresh, the candidate batch is selected with
+// no after-cursor predicate (the oldest eligible row is the oldest signed
+// timestamp, including negative ones); when advanced, the keyset predicate
+// `expires_at > exp_at OR (expires_at = exp_at AND id > sess)` spans the full
+// signed domain. Because v10 could never store a negative advanced position
+// and its fresh sentinel was exactly (-1, NULL), the forward migration is
+// lossless: fresh maps to (NULL,NULL) and every valid v10 advanced cursor
+// maps unchanged. v10 is retained as a frozen predecessor for migration
+// detection and parity.
+const latestSchemaVersion = 11
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -119,25 +139,29 @@ var reconcileSnapshotHook func()
 const versionTableDDL = `create table staging_schema (version integer primary key, applied_at integer not null)`
 
 // cleanupCursorDDL is the exact DDL of the single-row durable cleanup
-// traversal cursor (v10). One row only (id PK forced to 1 via CHECK). exp_at
+// traversal cursor (v11). One row only (id PK forced to 1 via CHECK). exp_at
 // holds the (expires_at,id)-ordered position's expires_at; sess holds the
-// matching session id. A FRESH traversal is exp_at = -1 with sess NULL (the
-// sentinel sorts before every real expires_at >= 0, so a fresh guarantee ==
-// "start from the oldest eligible row"). The cross-column CHECK pins the two
-// legal states: either the fresh sentinel, or a real position (exp_at >= 0
-// with sess a valid 64-lowercase-hex session id). A malformed / tampered row
-// -- a NULL sess on a non-sentinel exp_at, or a valid exp_at with NULL sess --
-// cannot be written, and a row written by weakening the schema no longer
-// matches the frozen golden, so verification fails closed. sess is NOT a
-// foreign key to upload_sessions (a cursor position may transiently reference
-// a row that was since removed): it is a bare session-id value.
+// matching session id. A FRESH traversal is (exp_at, sess) = (NULL, NULL) —
+// the fresh state is represented SEPARATELY from every signed timestamp, so a
+// schema-valid expired row whose expires_at is any negative (pre-epoch)
+// nanosecond timestamp is reachable. An ADVANCED position is both non-NULL:
+// exp_at accepts ANY SQLite INTEGER (the full signed Unix-nanosecond domain,
+// positive and negative), and sess a valid 64-lowercase-hex session id. The
+// cross-column CHECK pins these two legal states and nothing else: NULL/NULL
+// is fresh, both-NON-NULL is advanced, and a NULL/non-NULL mix or a
+// non-INTEGER exp_at or a malformed sess is rejected. A malformed / tampered
+// row -- or a row written by weakening the schema -- no longer matches the
+// frozen golden, so verification fails closed. sess is NOT a foreign key to
+// upload_sessions (a cursor position may transiently reference a row that was
+// since removed): it is a bare session-id value. exp_at is deliberately
+// affinity-free (no declared type) so a REAL or numeric TEXT can never be
+// coerced into INTEGER storage before typeof(exp_at)='integer' inspects it.
 const cleanupCursorDDL = `create table cleanup_cursor (
 	id     integer primary key check (id = 1),
-	exp_at not null,
+	exp_at,
 	sess   text,
 	check (typeof(id) = 'integer' and id = 1),
-	check (typeof(exp_at) = 'integer'),
-	check ((exp_at = -1 and sess is null) or (exp_at >= 0 and typeof(sess) = 'text' and length(sess) = 64 and sess = lower(sess) and sess not glob '*[^0-9a-f]*'))
+	check ((exp_at is null and sess is null) or (exp_at is not null and sess is not null and typeof(exp_at) = 'integer' and typeof(sess) = 'text' and length(sess) = 64 and sess = lower(sess) and sess not glob '*[^0-9a-f]*'))
 )`
 
 // schemaDDL is the ordered DDL for the staging schema (version 1).
@@ -549,8 +573,16 @@ var schemaGoldenV9JSON []byte
 //go:embed schema_golden_v10.json
 var schemaGoldenV10JSON []byte
 
-// schemaGold is the current (v10) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV10JSON)
+//go:embed schema_golden_v11.json
+var schemaGoldenV11JSON []byte
+
+// schemaGold is the current (v11) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV11JSON)
+
+// schemaGoldV10 is the exact frozen v10 predecessor manifest (the previously
+// committed "current" shape before v11), retained for migration detection and
+// parity. It is never renamed or called v11.
+var schemaGoldV10 = mustLoadSchemaGolden(schemaGoldenV10JSON)
 
 // schemaGoldV9 is the exact frozen v9 predecessor manifest (the previously
 // committed "current" shape before v10), retained for migration detection and
@@ -883,7 +915,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7, schemaMigrateV8, schemaMigrateV9:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7, schemaMigrateV8, schemaMigrateV9, schemaMigrateV10:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1643,6 +1675,7 @@ const (
 	schemaMigrateV7
 	schemaMigrateV8
 	schemaMigrateV9
+	schemaMigrateV10
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1694,6 +1727,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 10:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV10, 10); err == nil {
+			return schemaMigrateV10, nil
 		}
 	case 9:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV9, 9); err == nil {
@@ -1844,8 +1881,10 @@ func createFreshSchema(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	// The durable cleanup traversal cursor is born as exactly one fresh row
-	// (a brand-new database has never traversed anything).
-	if _, err := tx.ExecContext(ctx, `insert into cleanup_cursor (id, exp_at, sess) values (1, -1, NULL)`); err != nil {
+	// (a brand-new database has never traversed anything): (exp_at, sess) =
+	// (NULL, NULL), the v11 fresh-sentinel that is distinct from every signed
+	// timestamp so negative-expired rows are reachable from the start.
+	if _, err := tx.ExecContext(ctx, `insert into cleanup_cursor (id, exp_at, sess) values (1, NULL, NULL)`); err != nil {
 		return depErr(err, ctx)
 	}
 	if migrationFault != nil {
@@ -1931,6 +1970,10 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 	if err := exec(`PRAGMA foreign_keys=OFF`); err != nil {
 		return depErr(err, ctx)
 	}
+	// cursorCarried records that the cursor row was already migrated into the
+	// v11 shape inside the schemaMigrateV10 case, so the shared fresh-seed
+	// step below does not double-create it.
+	cursorCarried := false
 	if err := exec(`BEGIN IMMEDIATE`); err != nil {
 		_, _ = conn.ExecContext(context.Background(), `PRAGMA foreign_keys=ON`)
 		return depErr(err, ctx)
@@ -2096,17 +2139,42 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		if err := exec(cleanupCursorDDL); err != nil {
 			return depErr(err, ctx)
 		}
+	case schemaMigrateV10:
+		if err := verifyAgainst(ctx, conn, schemaGoldV10, 10); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v10 -> v11: extend the durable cleanup cursor to the full
+		// signed Unix-nanosecond domain. v10's cursor carried a single row
+		// that was either FRESH (exp_at = -1, sess NULL) or an ADVANCED
+		// position (exp_at >= 0, sess a valid session id) — and v10 could
+		// never store a negative advanced position. The v11 shape represents
+		// fresh as (NULL, NULL) (distinct from every signed timestamp) and
+		// lets an advanced exp_at be any SQLite INTEGER. Because the cursor
+		// table has no FK and no dependency on the staged tables, rebuild just
+		// it, carrying the existing row across: v10 fresh -> v11 fresh, and
+		// every valid v10 advanced cursor -> unchanged. upload_sessions and
+		// staged_blobs are untouched. cursorCarried prevents the shared seed
+		// step from re-creating a fresh row.
+		if err := migrateCleanupCursorToV11(ctx, conn, exec); err != nil {
+			return depErr(err, ctx)
+		}
+		cursorCarried = true
 	default:
 		return depErr(errors.New("staging migration does not recognize the source schema"), ctx)
 	}
-	// Every predecessor path now ends on a current-shaped upload_sessions. The
-	// durable cleanup traversal cursor table exists too (created above for v9;
-	// created by the v1-v8 rebuild's schema-tail recreate), but is EMPTY — seed
-	// its single fresh row so a migrated database carries a valid, coherent
-	// fresh-traversal cursor exactly like a fresh-created one. Nothing about
-	// this touches a session or blob.
-	if err := exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, -1, NULL)`); err != nil {
-		return depErr(err, ctx)
+	// The durable cleanup traversal cursor is born as exactly one fresh row
+	// for every predecessor that does not already carry one: v1-v9 predecessors
+	// reach this point with an EMPTY cursor table (v1-v8 via the rebuild's
+	// schema-tail recreate, v9 via the explicit exec above), so seed the single
+	// v11 fresh row (exp_at, sess) = (NULL, NULL) exactly like fresh creation.
+	// The v10 predecessor instead carried its single cursor row (fresh or an
+	// advanced v10 position), which the schemaMigrateV10 case already rebuilt
+	// into the v11 shape — so it must NOT be re-seeded. Nothing here touches a
+	// session or staged blob.
+	if !cursorCarried {
+		if err := exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, NULL, NULL)`); err != nil {
+			return depErr(err, ctx)
+		}
 	}
 	// The full current surface must hold on this live write connection, and
 	// every migrated row must satisfy it (the rebuild's copy goes through the
@@ -2226,6 +2294,50 @@ func rebuildUploadSessions(ctx context.Context, conn *sql.Conn, exec func(q stri
 		if err := exec(schemaDDL[i]); err != nil {
 			return err
 		}
+	}
+	return ctx.Err()
+}
+
+// migrateCleanupCursorToV11 rebuilds the single-row cleanup_cursor table into
+// the v11 signed-domain shape, carrying the existing v10 row across. The v10
+// cursor held exactly one coherent row (verifyAgainst already proved it): a
+// FRESH sentinel (exp_at = -1, sess NULL) or an ADVANCED position (exp_at >=
+// 0, sess a valid session id). The v11 shape represents fresh as (NULL, NULL)
+// — distinct from every signed timestamp — and lets an advanced exp_at be any
+// SQLite INTEGER. The mapping is therefore one-to-one and lossless: v10 fresh
+// maps to v11 fresh, and every valid v10 advanced cursor (which v10 could
+// never store negative) maps unchanged. Because cleanup_cursor has no FK and
+// no dependency on upload_sessions/staged_blobs, it is dropped and recreated
+// in place; a failure (including the test-injected fault) rolls the caller's
+// transaction back so the v10 predecessor bytes stay intact.
+func migrateCleanupCursorToV11(ctx context.Context, conn *sql.Conn, exec func(q string, args ...any) error) error {
+	// Read the single v10 cursor row with nullability preserved (Scan into a
+	// bare string would turn NULL into "" and lose the NULL/non-NULL
+	// distinction needed to map fresh).
+	var expAt int64
+	var ns sql.NullString
+	if err := conn.QueryRowContext(ctx, `select exp_at, sess from cleanup_cursor`).Scan(&expAt, &ns); err != nil {
+		return depErr(err, ctx)
+	}
+	if err := exec(`drop table cleanup_cursor`); err != nil {
+		return depErr(err, ctx)
+	}
+	if err := exec(cleanupCursorDDL); err != nil {
+		return depErr(err, ctx)
+	}
+	if expAt == -1 && !ns.Valid {
+		// v10 fresh sentinel -> v11 fresh (NULL, NULL).
+		if err := exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, NULL, NULL)`); err != nil {
+			return depErr(err, ctx)
+		}
+		return ctx.Err()
+	}
+	// v10 advanced position (exp_at >= 0, sess valid): carry it unchanged.
+	if !ns.Valid {
+		return depErr(errors.New("staging cleanup cursor is malformed: v10 advanced position has no session id"), ctx)
+	}
+	if err := exec(`insert into cleanup_cursor (id, exp_at, sess) values (1, ?, ?)`, expAt, ns.String); err != nil {
+		return depErr(err, ctx)
 	}
 	return ctx.Err()
 }

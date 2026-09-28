@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -87,12 +88,15 @@ type CommittedRefs interface {
 // staging service.
 //
 // Batch fairness is DURABLE and cross-process. The candidate batch is selected
-// in deterministic (expires_at, id) order STRICTLY AFTER the shared durable
-// cursor. A batch of retained rows (published/ambiguous finalized blobs that
-// keep their state and order) is examined and then the cursor ADVANCES PAST it,
-// so the eligible rows behind it are reached on a later pass instead of being
-// starved forever by a full batch of re-selected oldest rows. The cursor is a
-// single row in the v10 `cleanup_cursor` table that independent processes share
+// in deterministic (expires_at, id) order — STRICTLY AFTER the shared durable
+// cursor when it is advanced, or from the oldest eligible row when it is FRESH
+// — across the FULL signed Unix-nanosecond domain, so negative (pre-epoch)
+// expires_at rows are never skipped. A batch of retained rows (published/
+// ambiguous finalized blobs that keep their state and order) is examined and
+// then the cursor ADVANCES PAST it, so the eligible rows behind it are reached
+// on a later pass instead of being starved forever by a full batch of
+// re-selected oldest rows. The cursor is a single row in the v11
+// `cleanup_cursor` table that independent processes share
 // and claim/advance/reset ATOMICALLY under SQLite write serialization, so no
 // process restart and no set of independent instances can re-introduce
 // starvation: progress is persisted, not remembered. When a pass finds no rows
@@ -555,17 +559,32 @@ func (s *service) captureResumeAuth(ctx context.Context, id string, cand *cleanu
 // row via FK, so claiming progress cannot disturb upload_sessions/staged_blobs.
 func (s *service) cleanupClaimBatch(ctx context.Context, nowNanos int64, limit int) (ids []string, exps []int64, err error) {
 	err = s.withTx(ctx, func(tc *sql.Conn) error {
-		curExp, curID, err := readCleanupCursor(ctx, tc)
+		fresh, curExp, curID, err := readCleanupCursor(ctx, tc)
 		if err != nil {
 			return err
 		}
-		rows, err := tc.QueryContext(ctx,
-			`select expires_at, id from upload_sessions
-			 where expires_at <= ? and (
-			   state in ('active','finalized','expiring')
-			   or (state = 'deleting' and bee_ref is null))
-			 and (expires_at > ? or (expires_at = ? and id > ?))
-			 order by expires_at, id limit ?`, nowNanos, curExp, curExp, curID, limit)
+		// When the traversal is FRESH there is NO after-cursor predicate: the
+		// oldest eligible row is the oldest signed (expires_at, id), including
+		// any negative (pre-epoch) timestamp. When ADVANCED, the keyset picks
+		// rows strictly after the persisted position across the FULL signed
+		// domain — no synthetic lower bound that could skip negative expires_at.
+		var rows *sql.Rows
+		if fresh {
+			rows, err = tc.QueryContext(ctx,
+				`select expires_at, id from upload_sessions
+				 where expires_at <= ? and (
+				   state in ('active','finalized','expiring')
+				   or (state = 'deleting' and bee_ref is null))
+				 order by expires_at, id limit ?`, nowNanos, limit)
+		} else {
+			rows, err = tc.QueryContext(ctx,
+				`select expires_at, id from upload_sessions
+				 where expires_at <= ? and (
+				   state in ('active','finalized','expiring')
+				   or (state = 'deleting' and bee_ref is null))
+				 and (expires_at > ? or (expires_at = ? and id > ?))
+				 order by expires_at, id limit ?`, nowNanos, curExp, curExp, curID, limit)
+		}
 		if err != nil {
 			return depErr(err, ctx)
 		}
@@ -596,7 +615,7 @@ func (s *service) cleanupClaimBatch(ctx context.Context, nowNanos int64, limit i
 				return depErr(err, ctx)
 			}
 		} else {
-			if _, err := tc.ExecContext(ctx, `update cleanup_cursor set exp_at = -1, sess = NULL where id = 1`); err != nil {
+			if _, err := tc.ExecContext(ctx, `update cleanup_cursor set exp_at = NULL, sess = NULL where id = 1`); err != nil {
 				return depErr(err, ctx)
 			}
 		}
@@ -607,50 +626,60 @@ func (s *service) cleanupClaimBatch(ctx context.Context, nowNanos int64, limit i
 
 // readCleanupCursor reads the single shared cleanup traversal cursor row under
 // the caller's (already-open write) transaction and validates it, failing closed
-// on a missing, duplicated, or malformed row. It returns the cursor's
-// (expires_at, id) as a raw position; the fresh sentinel maps to
-// (exp, id) = (-1, ""), which the batch query treats as "start from the oldest".
+// on a missing, duplicated, or malformed row. It returns whether the cursor is
+// FRESH and, when advanced, the (expires_at, id) position. A FRESH cursor is
+// (exp_at, sess) = (NULL, NULL) — distinct from every signed timestamp, so the
+// batch query runs with NO after-cursor predicate and negative-expired rows are
+// reachable from the start. An ADVANCED cursor is both non-NULL with a real
+// exp_at of ANY SQLite INTEGER storage class and a valid session id; the batch
+// query then picks rows strictly after it across the signed domain.
+//
 // A malformed/tampered cursor — zero rows, more than one row, or a row that
-// violates the pinned coherence (fresh must be exp_at=-1/sess NULL; an advanced
-// cursor needs a real exp_at AND a valid session id) — is a hard error: the
+// violates the pinned v11 coherence (a NULL/non-NULL mix, a non-INTEGER exp_at,
+// or an advanced position with a malformed session id) — is a hard error: the
 // cleanup refuses to guess a position rather than mis-traverse.
-func readCleanupCursor(ctx context.Context, conn *sql.Conn) (int64, string, error) {
+func readCleanupCursor(ctx context.Context, conn *sql.Conn) (fresh bool, curExp int64, curID string, err error) {
 	rows, err := conn.QueryContext(ctx, `select exp_at, sess from cleanup_cursor`)
 	if err != nil {
-		return 0, "", depErr(err, ctx)
+		return false, 0, "", depErr(err, ctx)
 	}
 	count := 0
-	var exp int64
+	var exp sql.NullInt64
 	var sess sql.NullString
 	for rows.Next() {
 		count++
 		if count > 1 {
 			rows.Close()
-			return 0, "", errors.New("staging cleanup cursor is corrupted: more than one row")
+			return false, 0, "", errors.New("staging cleanup cursor is corrupted: more than one row")
 		}
 		if err := rows.Scan(&exp, &sess); err != nil {
 			rows.Close()
-			return 0, "", depErr(err, ctx)
+			return false, 0, "", depErr(err, ctx)
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return 0, "", depErr(err, ctx)
+		return false, 0, "", depErr(err, ctx)
 	}
 	if count == 0 {
-		return 0, "", errors.New("staging cleanup cursor is missing (no traversal row)")
+		return false, 0, "", errors.New("staging cleanup cursor is missing (no traversal row)")
 	}
 	// Fail closed on a coherently-impossible row. The table CHECK already
 	// forbids these, but a tampered (weakened) schema could admit them; never
 	// mis-traverse.
-	if exp == -1 {
-		if sess.Valid {
-			return 0, "", errors.New("staging cleanup cursor is malformed: fresh sentinel carries a session id")
-		}
-		return -1, "", nil
+	if !exp.Valid && !sess.Valid {
+		// Fresh: both NULL.
+		return true, 0, "", nil
 	}
-	if !sess.Valid || exp < 0 {
-		return 0, "", errors.New("staging cleanup cursor is malformed: advanced position has no valid session id")
+	if !exp.Valid || !sess.Valid {
+		return false, 0, "", errors.New("staging cleanup cursor is malformed: NULL/non-NULL state mix is not coherent")
 	}
-	return exp, sess.String, nil
+	// exp.Valid is only true for a genuine INTEGER storage class (a REAL or
+	// TEXT would surface as a scan error before this point inside
+	// database/sql). Advanced requires a valid 64-lowercase-hex session id.
+	if !(len(sess.String) == 64 && sess.String == strings.ToLower(sess.String) &&
+		!strings.ContainsFunc(sess.String, func(r rune) bool { return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') })) {
+		return false, 0, "", errors.New("staging cleanup cursor is malformed: advanced position has an invalid session id")
+	}
+	return false, exp.Int64, sess.String, nil
 }
