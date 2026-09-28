@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -85,11 +86,43 @@ type CommittedRefs interface {
 
 // Cleanup reaps expired staging in bounded batches over a durable
 // staging service.
+//
+// Batch fairness: the candidate batch is selected in deterministic
+// (expires_at, id) order STRICTLY AFTER this instance's traversal cursor. A
+// batch of retained rows (published/ambiguous finalized blobs that keep their
+// state and order) is examined and then the cursor advances PAST it, so the
+// eligible rows behind it are reached on a later pass instead of being starved
+// forever by a full batch of re-selected oldest rows. When a pass finds no
+// rows past the cursor the cursor resets to the start of a fresh traversal, so
+// newly-expired rows and previously-retained rows (whose committed status may
+// have changed) are re-examined on a later pass. The cursor is per-instance
+// (in-memory): an instance always ADVANCES within its lifetime, so no retained
+// row can monopolize batches; a restart simply re-traverses from the oldest
+// eligible rows and advances again (idempotent, crash-safe), never
+// re-introducing permanent starvation. Processing is idempotent under
+// concurrent independent instances via the durable `expiring` claim, so
+// independent cleanups converge safely.
 type Cleanup struct {
 	svc       *service
 	unpin     Unpinner
 	committed CommittedRefs
 	now       func() time.Time
+
+	// mu serializes the in-memory traversal cursor so concurrent RunOnce calls
+	// on the SAME instance each get a distinct, advancing window. The durable
+	// claim/work items are always performed under the store's own locks, so mu
+	// never guards the side effects themselves.
+	mu sync.Mutex
+	// cursor is this instance's next batch position in (expires_at, id) order.
+	cursor cleanupCursor
+}
+
+// cleanupCursor is one instance's traversal position. inited=false means the
+// next pass starts a fresh traversal (no position seen yet).
+type cleanupCursor struct {
+	inited bool
+	exp    int64
+	id     string
 }
 
 // CleanupResult is the observable count of one RunOnce pass.
@@ -145,7 +178,16 @@ func (c *Cleanup) RunOnce(ctx context.Context, now time.Time, limit int) (Cleanu
 		return res, err
 	}
 
-	// Select the limit oldest-expiring cleanable rows in deterministic order.
+	// Serialize the traversal cursor so concurrent RunOnce calls on this same
+	// instance each get a distinct advancing window. Side effects themselves
+	// are guarded by the store's own durability locks; this only protects the
+	// in-memory batch-position bookkeeping.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Select the limit old-expiring cleanable rows in deterministic order,
+	// STRICTLY AFTER this instance's cursor so a full batch of retained rows is
+	// examined once and then passed — later eligible rows cannot be starved.
 	// Cleanup-eligible candidate states: active (expired session, contentless),
 	// finalized (expired blob needing eligibility proof), expiring (a durable
 	// cleanup-OWNED claim to resume), and a `deleting` row WITHOUT a bee_ref
@@ -156,29 +198,39 @@ func (c *Cleanup) RunOnce(ctx context.Context, now time.Time, limit int) (Cleanu
 	// never infers, and unpinning it could destroy live published content.
 	// finalizing/creating rows are excluded (retained fail-closed for explicit
 	// reconciliation / the startup reconciler).
+	curExp := int64(-1) // sentinel: every expires_at (>=0) sorts after it
+	curID := ""
+	if c.cursor.inited {
+		curExp = c.cursor.exp
+		curID = c.cursor.id
+	}
 	conn, err := c.svc.pool.acquire(ctx)
 	if err != nil {
 		return res, ctxOr(err, ctx)
 	}
 	rows, err := conn.QueryContext(ctx,
-		`select id from upload_sessions
+		`select expires_at, id from upload_sessions
 		 where expires_at <= ? and (
 		   state in ('active','finalized','expiring')
 		   or (state = 'deleting' and bee_ref is null))
-		 order by expires_at, id limit ?`, nowNanos, limit)
+		 and (expires_at > ? or (expires_at = ? and id > ?))
+		 order by expires_at, id limit ?`, nowNanos, curExp, curExp, curID, limit)
 	if err != nil {
 		c.svc.pool.release(conn)
 		return res, depErr(err, ctx)
 	}
 	var ids []string
+	var exps []int64
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err != nil {
+		var exp int64
+		if err := rows.Scan(&exp, &id); err != nil {
 			rows.Close()
 			c.svc.pool.release(conn)
 			return res, depErr(err, ctx)
 		}
 		ids = append(ids, id)
+		exps = append(exps, exp)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -188,6 +240,19 @@ func (c *Cleanup) RunOnce(ctx context.Context, now time.Time, limit int) (Cleanu
 	rows.Close()
 	c.svc.pool.release(conn)
 	res.Examined = len(ids)
+
+	// Advance the traversal cursor past this batch so the SAME retained oldest
+	// rows cannot monopolize the next pass. On an empty batch the whole
+	// traversal has been scanned: reset to the start of a fresh round so
+	// newly-expired rows and previously-retained rows get another chance.
+	if len(ids) > 0 {
+		last := len(ids) - 1
+		c.cursor.exp = exps[last]
+		c.cursor.id = ids[last]
+		c.cursor.inited = true
+	} else {
+		c.cursor = cleanupCursor{}
+	}
 
 	// Per-repo committed-refs cache so one pass never re-resolves the same
 	// repo's committed state for every blob in the batch during the claim
@@ -240,6 +305,9 @@ func (c *Cleanup) RunOnce(ctx context.Context, now time.Time, limit int) (Cleanu
 			refs, err := c.committed.CommittedRefs(ctx, cand.repo)
 			if err != nil {
 				// Fail closed: cannot prove the ref is still unpublishable.
+				// Counted in Failed (mirroring the claim-time committed-refs
+				// failure) so the pass's observable counts preserve it.
+				res.Failed++
 				return res, fmt.Errorf("%w: %v", errCleanupCommittedRefs, err)
 			}
 			if cand.beeRef != "" {

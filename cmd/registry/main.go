@@ -195,6 +195,19 @@ func buildBeeHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("staging service: %w", err)
 	}
+	// A subsequent constructor/config failure AFTER the durable service has been
+	// opened must release it (closing the spool + SQLite). Guard every error
+	// return below so a failed startup never leaks an open staging service;
+	// once the handler owns the store (wrapped in cancelOnCloseStore) the
+	// handler's Close is the sole owner and this deferred close is disabled.
+	stageOwnedByHandler := false
+	defer func() {
+		if !stageOwnedByHandler {
+			if ic, ok := stageStore.(io.Closer); ok {
+				_ = ic.Close()
+			}
+		}
+	}()
 
 	// Shared production resolver used by both the handler and the cleanup's
 	// committed-repository-state provider (so cleanup never unpins a blob a
@@ -254,6 +267,9 @@ func buildBeeHandler() (http.Handler, error) {
 		rh.MaxUploadBytes = stageCfg.MaxUploadBytes
 		rh.SessionTTL = stageCfg.UploadTTL
 	}
+	// The handler now owns the (cancelOnCloseStore-wrapped) staging store via
+	// its Close; disable the startup-failure deferred close.
+	stageOwnedByHandler = true
 	return handler, nil
 }
 
@@ -394,11 +410,20 @@ func cleanupBatchFromEnv() (int, error) {
 	return n, nil
 }
 
+// cleanupPassAbortedClass is the FIXED (data-free) classification the periodic
+// cleanup loop logs when a pass fails closed (a committed-state provider
+// failure or other dependency error). The raw error is never written to the
+// log: an error chain may accrue data-free wrapping, and a fixed classification
+// guarantees a future data-bearing leaf can never reach the logs.
+const cleanupPassAbortedClass = "staging cleanup: pass aborted (committed-state or dependency failure)"
+
 // runCleanupLoop runs one bounded cleanup pass per interval until ctx is
-// canceled, logging the per-class counts only when work was examined. It is
-// safe to call once per process. It returns a channel closed exactly when the
-// loop goroutine has fully exited (no pass is still in flight), so a caller
-// can cancel and JOIN the loop before releasing the underlying staging store.
+// canceled. It logs the per-class COUNTS only when work was examined, and on a
+// failed pass logs only the FIXED cleanupPassAbortedClass classification —
+// never the raw error (the cleanup is data-free end to end). It is safe to
+// call once per process. It returns a channel closed exactly when the loop
+// goroutine has fully exited (no pass is still in flight), so a caller can
+// cancel and JOIN the loop before releasing the underlying staging store.
 func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time.Duration, batch int) <-chan struct{} {
 	done := make(chan struct{})
 	if cleanup == nil {
@@ -428,7 +453,7 @@ func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time
 					if ctx.Err() != nil {
 						return
 					}
-					log.Printf("staging cleanup: %v", err)
+					log.Print(cleanupPassAbortedClass)
 					continue
 				}
 				if res.Examined > 0 {

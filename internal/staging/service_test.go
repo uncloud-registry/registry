@@ -1345,11 +1345,24 @@ func TestServiceExpireIsContextAware(t *testing.T) {
 	}
 }
 
-func TestServiceExpireFinalizedRowsIncluded(t *testing.T) {
+// TestServiceExpireIsContentlessOnlySkipsFinalized proves generic Service.Expire
+// is STRICTLY contentless-only (Task 18 finding 2): an expired CONTENTLESS
+// active session is still reaped, but an expired FINALIZED blob (content-bearing
+// — its committed-state eligibility and Bee unpin belong to the authoritative
+// Cleanup) is NOT reaped by generic Expire and must never be directly deleted
+// (which would bypass the unpin and steal a cleanup-owned claim).
+func TestServiceExpireIsContentlessOnlySkipsFinalized(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	fixedClock(svc, now)
+
+	// An expired active (contentless) session IS still reaped by generic Expire.
+	act := mustCreate(t, svc, "backend/api", "user:alice")
+	act = mustAppend(t, svc, act, "active-bytes")
+
+	// An expired finalized blob is content-bearing: generic Expire must NOT reap
+	// it; it is left for the authoritative cleanup's RunOnce to unpin/remove.
 	s := mustCreate(t, svc, "backend/api", "user:alice")
 	s = mustAppend(t, svc, s, "final")
 	digest, ref, media, size := finalizeArgs(s)
@@ -1357,16 +1370,25 @@ func TestServiceExpireFinalizedRowsIncluded(t *testing.T) {
 		t.Fatalf("finalize: %v", err)
 	}
 
-	// Expiry policy covers finalized rows.
 	n, err := svc.Expire(ctx, now.Add(time.Hour), 10)
 	if err != nil {
 		t.Fatalf("Expire: %v", err)
 	}
+	// Only the contentless active session is expired; the finalized blob survives
+	// (never directly deleted, so no Bee unpin is bypassed).
 	if n != 1 {
-		t.Fatalf("finalized row not expired: n=%d", n)
+		t.Fatalf("Expire must reap only the contentless active session (no Bee unpin bypassed): n=%d, want 1", n)
 	}
-	if list, _ := svc.ListFinalized(ctx, s.Repo, s.Actor); len(list) != 0 {
-		t.Fatalf("finalized list after expiry: %+v", list)
+	if list, _ := svc.ListFinalized(ctx, s.Repo, s.Actor); len(list) != 1 {
+		t.Fatalf("finalized blob must survive generic Expire, listed=%d, want 1", len(list))
+	}
+	if _, err := svc.Status(ctx, act.ID, act.Repo, act.Actor); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("contentless active session must be reaped, Status err=%v", err)
+	}
+	if st, err := svc.Status(ctx, s.ID, s.Repo, s.Actor); err != nil {
+		t.Fatalf("finalized session must survive generic Expire, Status err=%v", err)
+	} else if st.BeeRef != ref {
+		t.Fatalf("finalized session Bee ref lost: %q want %q", st.BeeRef, ref)
 	}
 }
 

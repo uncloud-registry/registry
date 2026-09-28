@@ -2119,8 +2119,15 @@ func (s *service) Expire(ctx context.Context, now time.Time, limit int) (int, er
 	return count, nil
 }
 
-// expiredIDs lists the limit oldest-expiring row ids whose expiry has
-// passed, in deterministic order.
+// expiredIDs lists the limit oldest-expiring row ids whose expiry has passed,
+// in deterministic order, restricted to CONTENTLESS rows only (bee_ref IS
+// NULL). A content-bearing row — a finalized/expiring blob, or a generic
+// deleting-with-ref tombstone — is NEVER selected by generic Expire: unpinning
+// an eligible finalized blob is the authoritative Cleanup's job (with
+// committed-state eligibility), an expiring row is cleanup-owned, and a
+// deleting-with-ref tombstone is publication/generic-delete-owned. Expire only
+// ever handles active sessions, creating sessions, and contentless deleting
+// tombstones — so it cannot bypass a Bee unpin or steal a cleanup-owned claim.
 func (s *service) expiredIDs(ctx context.Context, nowNanos int64, limit int) ([]string, error) {
 	conn, err := s.pool.acquire(ctx)
 	if err != nil {
@@ -2128,7 +2135,7 @@ func (s *service) expiredIDs(ctx context.Context, nowNanos int64, limit int) ([]
 	}
 	defer s.pool.release(conn)
 	rows, err := conn.QueryContext(ctx,
-		`select id from upload_sessions where expires_at <= ? order by expires_at, id limit ?`, nowNanos, limit)
+		`select id from upload_sessions where expires_at <= ? and bee_ref is null order by expires_at, id limit ?`, nowNanos, limit)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
@@ -2190,6 +2197,17 @@ func (s *service) expireOne(ctx context.Context, id string) (bool, error) {
 			// ConsumeStagedForPublish (after a VERIFIED publication) or an
 			// explicit reconciliation path consumes it; expiry skips it and
 			// its bytes keep counting toward quota.
+			return nil
+		}
+		// Generic Expire is STRICTLY contentless-only. Any row carrying a
+		// bee_ref — a finalized blob (its Bee unpin and committed-state
+		// eligibility belong to the authoritative Cleanup), a cleanup-owned
+		// `expiring` claim, or a generic deleting-with-ref tombstone
+		// (publication/generic-delete-owned) — is NEVER touched here. This is
+		// the per-row backstop under the batch query's `bee_ref is null`
+		// filter: a direct tombstone of content-bearing rows would bypass the
+		// Cleanup's eligibility/unpin and steal a durable expiring claim.
+		if row.beeRef.Valid && row.beeRef.String != "" {
 			return nil
 		}
 		proceed = true

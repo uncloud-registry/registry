@@ -25,7 +25,7 @@ import (
 // ONLY by its exact frozen object surface plus version, never guessed at. A
 // pre-existing database that matches none of them is rejected, never adopted.
 //
-// v7 is the current schema. It carries one forward change over v6: the
+// v7 is a PRIOR committed schema. It carries one forward change over v6: the
 // durable post-transition publication-consume retry. Under v6, a `claimed`
 // row's consume transition (`claimed -> deleting`) CLEARED operation_id
 // (the coherence CHECK required NULL on deleting). If the filesystem /
@@ -44,10 +44,8 @@ import (
 // consume retry selects BOTH claimed rows and owned deleting tombstones and
 // durably removes them (without unpinning); startup reconciliation safely
 // finishes an owned deleting tombstone but never converts it back to
-// publishable state.
-//
-// v7 is the prior committed schema (the durable post-transition publication-
-// consume retry). It is retained for migration detection and parity.
+// publishable state. v7 is retained as a frozen predecessor for migration
+// detection and parity.
 //
 // v8 is the PRIOR committed schema: byte-vs-character enforcement of the
 // publication operation_id. v7 constrained operation_id by CHARACTER count

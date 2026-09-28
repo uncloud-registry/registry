@@ -206,6 +206,22 @@ func (s *BeeDocumentStore) Get(ctx context.Context, ref string) ([]byte, error) 
 	return s.Read(ctx, ref)
 }
 
+// BeeDocumentReadMaxBody bounds a Bee document read's SUCCESS payload (the
+// immutable /bzz document or the feed payload the registry reads as a
+// repository-state document). Repository-state documents are small bounded
+// JSON; the bound is deliberately generous so legitimate resolution is never
+// weakened, while a hostile or broken Bee node can never make the cleanup (or
+// any document reader) buffer an unbounded body in memory. The success body is
+// read at bound+1 with overflow rejection (never silent truncation) and an
+// oversized body is a DATA-FREE error that never echoes the payload — a
+// response body may carry a SECRET that must never leak into an error or log.
+const BeeDocumentReadMaxBody = 1 << 23 // 8 MiB
+
+// beeDocumentErrorMaxBody bounds how much of a non-404 error body is drained
+// (enough to let the connection be reused); the drained bytes are discarded and
+// never echoed into an error or log.
+const beeDocumentErrorMaxBody = 512
+
 func (s *BeeDocumentStore) readPath(ctx context.Context, path string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.BaseURL+path, nil)
 	if err != nil {
@@ -219,22 +235,30 @@ func (s *BeeDocumentStore) readPath(ctx context.Context, path string) ([]byte, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// Drain a BOUNDED amount of the error body and discard it: the body is
+		// untrusted and must never be echoed into an error or log.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeDocumentErrorMaxBody+1))
 		if resp.StatusCode == http.StatusNotFound {
 			// A definitive 404 is the conclusively-absent outcome (a repo
 			// feed payload that has never been written, or a content chunk
 			// that does not exist). Wrap the stable sentinel so the optional
 			// resolver can distinguish absence from corruption/transport
 			// failures; the raw Bee body is never echoed.
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			return nil, fmt.Errorf("bee read failed with status %d: %w", resp.StatusCode, resolve.ErrDocumentNotFound)
 		}
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("bee read failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// DATA-FREE: only the fixed status number, never the response body.
+		return nil, fmt.Errorf("bee read failed with status %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	// Bounded success read with overflow rejection: read at most bound+1 bytes
+	// so an oversized legitimate-looking 200 can never be buffered unbounded,
+	// and DETECT (rather than silently truncate) an overflow.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, BeeDocumentReadMaxBody+1))
 	if err != nil {
 		return nil, fmt.Errorf("read bee response body: %w", err)
+	}
+	if int64(len(data)) > BeeDocumentReadMaxBody {
+		return nil, errors.New("bee document read exceeded the bound")
 	}
 	return data, nil
 }
