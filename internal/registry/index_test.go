@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -432,6 +433,9 @@ func TestIndexPullAcceptNegotiation(t *testing.T) {
 		{"docker-only rejected", indexTestListMT, false},
 		{"text/plain rejected", "text/plain", false},
 		{"q=0 refuses the matching type", indexTestMT + "; q=0", false},
+		{"exact q=0 overrides a positive wildcard", indexTestMT + ";q=0, */*;q=1", false},
+		{"exact positive overrides a global q=0", "*/*;q=0, " + indexTestMT + ";q=1", true},
+		{"malformed q skipped, wildcard serves", indexTestMT + ";q=abc, */*;q=1", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -537,6 +541,140 @@ func TestOrdinaryManifestBehaviorUnchanged(t *testing.T) {
 	b, _ := io.ReadAll(p.Body)
 	if p.StatusCode != http.StatusOK || !bytes.Equal(b, manifestBody) {
 		t.Fatalf("ordinary manifest pull with matching Accept status=%d body=%q", p.StatusCode, b)
+	}
+}
+
+// TestVerifyIndexChildByteLengthProof proves the read-after-write
+// verification requires the ACTUAL committed child-manifest body length to
+// equal the index descriptor's declared size (not merely the recorded
+// descriptor's size). A child whose stored body is a different length than
+// both the index reference AND the recorded descriptor claims is rejected as
+// an integrity violation even when its digest matches.
+func TestVerifyIndexChildByteLengthProof(t *testing.T) {
+	childBody := []byte(`{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":11,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"layers":[]}`)
+	childDigest := publish.ComputeDigest(childBody)
+	// Both the recorded descriptor and the index reference agree on a size far
+	// larger than the real body, so the size-vs-size checks pass; only the
+	// byte-length proof against the actual object can catch it.
+	const claimedSize = 4096
+	indexBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":%d,"digest":%q}]}`, indexTestMT, indexTestManMT, claimedSize, childDigest)
+	indexDigest := publish.ComputeDigest([]byte(indexBody))
+
+	docs := resolve.NewMemoryDocumentStore()
+	docs.Documents["index-doc-ref"] = []byte(indexBody)
+	docs.Documents["child-doc-ref"] = childBody
+	doc := spec.RepoStateDocument{
+		Version: 1, Repo: "backend/api", Generation: 3,
+		Tags: map[string]string{"multi": indexDigest},
+		Manifests: map[string]spec.ManifestDescriptor{
+			indexDigest: {SwarmRef: "index-doc-ref", MediaType: indexTestMT, Size: int64(len(indexBody))},
+			childDigest: {SwarmRef: "child-doc-ref", MediaType: indexTestManMT, Size: claimedSize},
+		},
+		Blobs: map[string]spec.BlobDescriptor{},
+	}
+	artifact := publish.Artifact{Kind: publish.ArtifactKindIndex, MediaType: indexTestMT,
+		Manifests: []publish.Descriptor{{MediaType: indexTestManMT, Digest: childDigest, Size: claimedSize}}}
+	err := verifyPublicationCoherence(context.Background(), docs, doc, "backend/api", "multi", indexDigest,
+		spec.ManifestDescriptor{MediaType: indexTestMT, Size: int64(len(indexBody))}, artifact)
+	if err == nil {
+		t.Fatal("verify must reject an index child whose stored body length disagrees with the declared size")
+	}
+	var ie *IntegrityError
+	if !errors.As(err, &ie) {
+		t.Fatalf("expected an integrity violation, got %T: %v", err, err)
+	}
+}
+
+// TestVerifyIndexRejectsNestedChildIndex proves the read-after-write
+// verification independently parses each child under its declared media type
+// and rejects a child that is itself an index (recursive nested index) even
+// when its digest and size match — defense in depth beyond the builder's
+// pre-publication nested-type rejection.
+func TestVerifyIndexRejectsNestedChildIndex(t *testing.T) {
+	childBody := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[]}`, indexTestMT))
+	childDigest := publish.ComputeDigest(childBody)
+	indexBody := fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":%d,"digest":%q}]}`, indexTestMT, indexTestMT, len(childBody), childDigest)
+	indexDigest := publish.ComputeDigest([]byte(indexBody))
+
+	docs := resolve.NewMemoryDocumentStore()
+	docs.Documents["index-doc-ref"] = []byte(indexBody)
+	docs.Documents["child-doc-ref"] = childBody
+	doc := spec.RepoStateDocument{
+		Version: 1, Repo: "backend/api", Generation: 3,
+		Tags: map[string]string{"multi": indexDigest},
+		Manifests: map[string]spec.ManifestDescriptor{
+			indexDigest: {SwarmRef: "index-doc-ref", MediaType: indexTestMT, Size: int64(len(indexBody))},
+			childDigest: {SwarmRef: "child-doc-ref", MediaType: indexTestMT, Size: int64(len(childBody))},
+		},
+		Blobs: map[string]spec.BlobDescriptor{},
+	}
+	artifact := publish.Artifact{Kind: publish.ArtifactKindIndex, MediaType: indexTestMT,
+		Manifests: []publish.Descriptor{{MediaType: indexTestMT, Digest: childDigest, Size: int64(len(childBody))}}}
+	err := verifyPublicationCoherence(context.Background(), docs, doc, "backend/api", "multi", indexDigest,
+		spec.ManifestDescriptor{MediaType: indexTestMT, Size: int64(len(indexBody))}, artifact)
+	if err == nil {
+		t.Fatal("verify must reject a child that parses as a nested index")
+	}
+	var ie *IntegrityError
+	if !errors.As(err, &ie) {
+		t.Fatalf("expected an integrity violation, got %T: %v", err, err)
+	}
+}
+
+// TestIndexDoesNotConsumeCollidingStagedBlob proves an index publication never
+// lists, claims, or consumes blob-staging rows for its CHILD-MANIFEST digests:
+// a finalized staged blob whose digest merely collides with a committed child
+// manifest digest is LEFT STAGED (zero unintended staging consumption) while
+// the index still publishes with exactly its own object writes and a single
+// feed advance.
+func TestIndexDoesNotConsumeCollidingStagedBlob(t *testing.T) {
+	t.Parallel()
+	h, _, _, issuer := newIndexWorld(t)
+	counter := &countingObjectUploader{inner: h.Publisher.Objects}
+	h.Publisher.Objects = counter
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	amdDigest := publish.ComputeDigest(indexChildAmd64)
+	// Stage a blob whose bytes are EXACTLY the committed child-manifest body:
+	// its digest collides with the child-manifest digest in the manifests map.
+	colliding := stageBlob(t, server.URL, issuer, indexChildAmd64, "application/octet-stream")
+	if colliding != amdDigest {
+		t.Fatalf("colliding staged digest %q want child digest %q", colliding, amdDigest)
+	}
+	unrelatedBody := []byte("unrelated-staged-blob-content")
+	stageBlob(t, server.URL, issuer, unrelatedBody, "application/octet-stream")
+
+	// Publish an index referencing the amd64 child (whose digest collides with
+	// the staged blob) plus the arm64 child.
+	indexBodyBytes := twoPlatformIndexBody(t)
+	resp := putIndex(t, server.URL, issuer, "multi", indexTestMT, indexBodyBytes)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("index publish status %d, want 201", resp.StatusCode)
+	}
+
+	// Side-effect counter: exactly 2 object writes (the index bytes + the
+	// repo-state doc) — the collision never causes a spurious blob write.
+	if counter.puts != 2 {
+		t.Fatalf("expected exactly 2 object writes, got %d", counter.puts)
+	}
+
+	// Zero unintended staging consumption: BOTH the colliding blob and the
+	// unrelated blob remain staged after the index published.
+	remaining, err := h.Staging.ListStagedBlobs(context.Background(), "backend/api", "user:alice")
+	if err != nil {
+		t.Fatalf("list staged: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, b := range remaining {
+		seen[b.Digest] = true
+	}
+	if !seen[amdDigest] {
+		t.Fatal("the staged blob whose digest collides with a child manifest was wrongly consumed by the index publication")
+	}
+	if !seen[publish.ComputeDigest(unrelatedBody)] {
+		t.Fatal("an unrelated staged blob was wrongly consumed by the index publication")
 	}
 }
 

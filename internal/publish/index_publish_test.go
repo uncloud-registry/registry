@@ -265,6 +265,31 @@ func TestBuildNextIndexDuplicatePlatformRejected(t *testing.T) {
 	}
 }
 
+// TestBuildNextIndexDistinctFeatureSetNotDuplicate proves two children whose
+// platforms differ ONLY in where a comma falls inside their os.features
+// arrays are TWO distinct platforms — never conflated by a naive comma-join
+// key (["a,b","c"] must not equal ["a","b,c"]). Under the old framing these
+// collided into the same key and were falsely rejected as a duplicate
+// platform.
+func TestBuildNextIndexDistinctFeatureSetNotDuplicate(t *testing.T) {
+	body := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[`+
+		`{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":["a,b","c"]}},`+
+		`{"mediaType":%q,"size":513,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":["a","b,c"]}}]}`,
+		ociIndexMT, ociManifestMT, dig('b'), ociManifestMT, dig('d')))
+	input, _ := indexInput(t)
+	input.ManifestJSON = body
+	input.ManifestDigest = ComputeDigest(body)
+	input.Manifest.Size = int64(len(body))
+
+	next, err := (DefaultBuilder{}).BuildNext(currentWithChildren(), input)
+	if err != nil {
+		t.Fatalf("distinct feature platforms must not be conflated as duplicates: %v", err)
+	}
+	if next.Tags["multi"] != input.ManifestDigest {
+		t.Fatalf("tag did not map to the index: %+v", next.Tags)
+	}
+}
+
 // TestBuildNextIndexDockerManifestListValid proves a Docker manifest list with
 // a single Docker schema-2 child publishes successfully.
 func TestBuildNextIndexDockerManifestListValid(t *testing.T) {

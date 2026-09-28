@@ -610,16 +610,28 @@ func decodePlatform(raw json.RawMessage, field string) (*Platform, error) {
 		if isNullRaw(fRaw) {
 			return nil, newValidationError(ErrKindWrongType, joinPath(field, "os.features"), "value must be a JSON array of strings, not null")
 		}
-		var feats []string
-		if err := json.Unmarshal(fRaw, &feats); err != nil {
+		// Decode into RAW members and STRICTLY require each to be a non-null
+		// JSON string. Unmarshaling straight into []string would silently
+		// coerce a null array member to "" (encoding/json's string-target
+		// null behavior), hiding a null behind an accepted empty string.
+		var items []json.RawMessage
+		if err := json.Unmarshal(fRaw, &items); err != nil {
 			return nil, newValidationError(ErrKindWrongType, joinPath(field, "os.features"), "value must be a JSON array of strings")
 		}
-		if feats == nil {
-			feats = []string{}
+		if items == nil {
+			items = []json.RawMessage{}
 		}
-		if len(feats) > maxPlatformFeatures {
+		if len(items) > maxPlatformFeatures {
 			return nil, newValidationError(ErrKindInvalidPlatform, joinPath(field, "os.features"),
 				fmt.Sprintf("platform os.features exceeds %d entries", maxPlatformFeatures))
+		}
+		feats := make([]string, 0, len(items))
+		for i, item := range items {
+			s, err := decodeRequiredString(item, fmt.Sprintf("%s.os.features[%d]", field, i))
+			if err != nil {
+				return nil, err
+			}
+			feats = append(feats, s)
 		}
 		p.OSFeatures = feats
 	}

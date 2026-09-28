@@ -373,9 +373,21 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID", err.Error())
 		return
 	}
-	referencedDigests := make(map[string]struct{}, len(artifact.References()))
+	referencedBlobDigests := make(map[string]struct{})
+	referencedManifestDigests := make(map[string]struct{})
 	for _, ref := range artifact.References() {
-		referencedDigests[ref.Digest] = struct{}{}
+		// The referenced digest set is split by NAMESPACE: an image index's
+		// operands are child MANIFESTS, resolved exclusively in the manifest/
+		// artifact namespace (comitted manifests), while an ordinary
+		// manifest's operands are BLOBS resolved in the blob/staging
+		// namespace. A child-manifest digest is NEVER treated as a blob — it
+		// must not be listed, claimed, or consumed as a staged blob even when
+		// a staged blob row merely collides with it by digest.
+		if artifact.Kind == publish.ArtifactKindIndex {
+			referencedManifestDigests[ref.Digest] = struct{}{}
+		} else {
+			referencedBlobDigests[ref.Digest] = struct{}{}
+		}
 	}
 
 	manifestDigest := computeDigest(body)
@@ -487,8 +499,8 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 							// quota-charged claim survives would strand the charge
 							// forever; this never consumes rows owned by a different
 							// operation.
-							consumed := make([]string, 0, len(referencedDigests))
-							for digest := range referencedDigests {
+							consumed := make([]string, 0, len(referencedBlobDigests))
+							for digest := range referencedBlobDigests {
 								consumed = append(consumed, digest)
 							}
 							if pub.OperationID != "" {
@@ -579,7 +591,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		}
 		present := map[string]struct{}{}
 		for _, blob := range stagedBlobs {
-			if _, isRef := referencedDigests[blob.Digest]; !isRef {
+			if _, isRef := referencedBlobDigests[blob.Digest]; !isRef {
 				continue
 			}
 			present[blob.Digest] = struct{}{}
@@ -602,23 +614,30 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		// that a manifest referencing a never-staged, never-committed blob
 		// fails typed (400) before any fence or external write.
 		unresolvable := false
-		for digest := range referencedDigests {
+		for digest := range referencedBlobDigests {
+			// Ordinary manifest operands are BLOBS: they resolve through a
+			// staged candidate, an already-committed blob record, or a
+			// surviving same-operation staging claim.
 			if _, isCand := present[digest]; isCand {
 				continue
 			}
 			if _, committed := current.Blobs[digest]; committed {
 				continue
 			}
-			// An index child manifest is a committed manifest — not a staged blob —
-			// so it resolves through the manifests map (the authoritative record a
-			// previously-published single-platform manifest left behind). Ordinary
-			// manifest references (blobs) never resolve through the manifest map.
-			if artifact.Kind == publish.ArtifactKindIndex {
-				if _, committedManifest := current.Manifests[digest]; committedManifest {
-					continue
-				}
-			}
 			if _, reused := owned[digest]; reused {
+				continue
+			}
+			unresolvable = true
+			break
+		}
+		for digest := range referencedManifestDigests {
+			// An index child manifest is a committed MANIFEST — never a staged
+			// blob — so it resolves ONLY through the manifests map (the
+			// authoritative record a previously-published single-platform
+			// manifest left behind). Blob staging is never consulted for a
+			// child-manifest digest, and v1 has no staged-manifest transport
+			// (a manifest PUT publishes directly).
+			if _, committedManifest := current.Manifests[digest]; committedManifest {
 				continue
 			}
 			unresolvable = true
@@ -630,7 +649,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 			// no staging mutation).
 			blobMap := make(map[string]spec.BlobDescriptor, len(stagedBlobs))
 			for _, blob := range stagedBlobs {
-				if _, isRef := referencedDigests[blob.Digest]; !isRef {
+				if _, isRef := referencedBlobDigests[blob.Digest]; !isRef {
 					continue
 				}
 				blobMap[blob.Digest] = spec.BlobDescriptor{
@@ -652,7 +671,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 				claimSet[d] = struct{}{}
 			}
 			for d := range owned {
-				if _, isRef := referencedDigests[d]; isRef {
+				if _, isRef := referencedBlobDigests[d]; isRef {
 					claimSet[d] = struct{}{}
 				}
 			}
@@ -718,8 +737,8 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		// the published manifest, WITHOUT unpinning; unrelated staged blobs and
 		// rows claimed by a DIFFERENT operation remain staged. This is the
 		// publication-owned consume: it never clears another operation's claim.
-		consumed := make([]string, 0, len(referencedDigests))
-		for digest := range referencedDigests {
+		consumed := make([]string, 0, len(referencedBlobDigests))
+		for digest := range referencedBlobDigests {
 			consumed = append(consumed, digest)
 		}
 		if err := h.Staging.ConsumeStagedForPublish(ctx, repo, actor, operationID, consumed); err != nil {
@@ -796,81 +815,105 @@ const (
 )
 
 // acceptAccepts reports whether the request's Accept header permits serving
-// the exact stored media type, per Distribution negotiation semantics:
+// the exact stored media type, per Distribution (RFC 7231 §5.3.2) semantics:
 //   - an absent or empty Accept accepts any representation;
 //   - each comma-separated Accept item is a media range tested against the
-//     stored type with HTTP wildcard rules (`*/*` matches any type,
-//     `type/*` matches any subtype, an exact `type/subtype` matches exactly);
-//   - an item whose q parameter is 0 excludes the representation;
-//   - a match by ANY accepted item with q>0 serves the representation.
+//     stored type with HTTP wildcard rules (`*/*`, `type/*`, exact
+//     `type/subtype`);
+//   - among the items that MATCH, the MOST SPECIFIC range governs: an exact
+//     match beats a type-wildcard, which beats the global wildcard, regardless
+//     of header order or q value;
+//   - that governing item's q is then applied: q==0 excludes the
+//     representation, q>0 serves it. So an exact `type/subtype;q=0` overrides
+//     a positive `*/*`, and an exact positive overrides a global `q=0`.
+//   - matching is case-insensitive; parameters other than q are ignored; a
+//     malformed media range or a malformed/out-of-range q (not a number, or
+//     outside [0,1]) skips that item rather than poisoning the whole header;
+//   - if NO item matches, the representation is refused.
 //
-// Matching is case-insensitive; parameters other than q are ignored for
-// match/no-match. Malformed items are skipped rather than poisoning the whole
-// header. This function is data-free — it never echoes any Accept value.
+// This function is data-free — it never echoes any Accept value.
 func acceptAccepts(header, storedMediaType string) bool {
 	if strings.TrimSpace(header) == "" {
 		return true
 	}
 	stored := strings.ToLower(strings.TrimSpace(storedMediaType))
-	for _, item := range strings.Split(header, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
+	bestSpecificity := -1
+	excluded := false
+	for _, raw := range strings.Split(header, ",") {
+		base, q, ok := parseAcceptItem(raw)
+		if !ok {
 			continue
 		}
-		if acceptItemExplicitlyExcluded(item) {
+		matches, specificity := mediaRangeMatchesSpec(strings.ToLower(base), stored)
+		if !matches {
 			continue
 		}
-		base := strings.TrimSpace(strings.SplitN(item, ";", 2)[0])
-		if mediaRangeMatches(strings.ToLower(base), stored) {
-			return true
+		if specificity > bestSpecificity {
+			bestSpecificity = specificity
+			excluded = q <= 0
+		} else if specificity == bestSpecificity && q <= 0 {
+			excluded = true
 		}
 	}
-	return false
-}
-
-// acceptItemExplicitlyExcluded reports whether an Accept item carries q=0
-// (the client explicitly refuses this representation). Parameters are scanned
-// after the first ';'; malformed q values are ignored (treated as acceptable).
-func acceptItemExplicitlyExcluded(item string) bool {
-	parts := strings.Split(item, ";")
-	if len(parts) < 2 {
+	if bestSpecificity < 0 {
 		return false
 	}
+	return !excluded
+}
+
+// parseAcceptItem splits one Accept item into its media-range base (the part
+// before the first ';') and its effective q value (default 1). ok=false means
+// the item is malformed and must be skipped: an empty media range, or a q
+// parameter that is not a number or is outside the valid [0,1] range. When
+// several q parameters appear, the LAST one governs. The returned base is
+// trimmed but not lowercased; callers lowercase it consistently.
+func parseAcceptItem(item string) (base string, q float64, ok bool) {
+	parts := strings.Split(item, ";")
+	basePart := strings.TrimSpace(parts[0])
+	if basePart == "" {
+		return "", 0, false
+	}
+	q = 1.0
 	for _, p := range parts[1:] {
 		kv := strings.SplitN(strings.TrimSpace(p), "=", 2)
 		if len(kv) != 2 || strings.ToLower(strings.TrimSpace(kv[0])) != "q" {
 			continue
 		}
-		q, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
-		if err != nil {
-			continue
+		v, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+		if err != nil || v < 0 || v > 1 {
+			return "", 0, false
 		}
-		if q <= 0 {
-			return true
-		}
+		q = v
 	}
-	return false
+	return basePart, q, true
 }
 
-// mediaRangeMatches reports whether an Accept media range (already
-// lowercased, parameters stripped) matches a stored low (also lowercased)
-// media type under HTTP wildcard rules.
-func mediaRangeMatches(rangeBase, stored string) bool {
-	if rangeBase == "*/*" {
-		return true
-	}
-	rType, rSub, rok := strings.Cut(rangeBase, "/")
+// mediaRangeMatchesSpec reports whether a lowercased Accept media range
+// matches a stored (also lowercased) media type under HTTP wildcard rules, and
+// its specificity: 2 for an exact type/subtype, 1 for a type wildcard
+// (type/*), 0 for the global wildcard (*/*). A malformed range (`*/subtype`, a
+// bare type or subtype) never matches.
+func mediaRangeMatchesSpec(rangeBase, stored string) (bool, int) {
+	rType, rSub, ok := strings.Cut(rangeBase, "/")
 	sType, sSub, sok := strings.Cut(stored, "/")
-	if !rok || !sok {
-		return false
+	if !ok || !sok || rType == "" || rSub == "" {
+		return false, 0
 	}
-	if rType == "*" && rSub == "*" {
-		return true
+	switch {
+	case rType == "*" && rSub == "*":
+		return true, 0
+	case rType == "*":
+		// `*/subtype` is not a valid HTTP media range; it never matches.
+		return false, 0
+	case rType != sType:
+		return false, 0
+	case rSub == "*":
+		return true, 1
+	case rSub == sSub:
+		return true, 2
+	default:
+		return false, 0
 	}
-	if rType != sType || rSub == "" {
-		return false
-	}
-	return rSub == sSub || rSub == "*"
 }
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {

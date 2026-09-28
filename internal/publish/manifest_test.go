@@ -405,6 +405,30 @@ func TestParseArtifact(t *testing.T) {
 			wantErr:     true,
 			wantErrKind: ErrKindWrongType,
 		},
+		{
+			name:      "platform os.features null member rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":["sse4",null]}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:      "platform os.features non-string member rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":["sse4",42]}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
+		{
+			name:      "platform os.features mixed null/number rejected",
+			mediaType: ociIndexMT,
+			body: fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux","os.features":[null,42,"avx"]}}]}`,
+				ociIndexMT, ociManifestMT, dig('b')),
+			wantErr:     true,
+			wantErrKind: ErrKindWrongType,
+		},
 
 		// schemaVersion.
 		{

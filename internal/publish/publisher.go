@@ -525,7 +525,13 @@ func resolvedPlatformKey(p *Platform) string {
 	if len(p.OSFeatures) > 0 {
 		sorted := append([]string(nil), p.OSFeatures...)
 		sort.Strings(sorted)
-		feats = strings.Join(sorted, ",")
+		// Canonical JSON framing is collision-free: ["a,b","c"] and ["a","b,c"]
+		// marshal to DISTINCT byte strings, so two platforms whose feature
+		// slices differ only by where a separator falls can never share a key.
+		// (A naive comma/byte join would conflate them into an identical key.)
+		if b, err := json.Marshal(sorted); err == nil {
+			feats = string(b)
+		}
 	}
 	return strings.Join([]string{p.OS, p.Architecture, p.OSVersion, p.Variant, feats}, "\x00")
 }

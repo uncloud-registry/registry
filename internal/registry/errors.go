@@ -334,6 +334,21 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 			if publish.ComputeDigest(childRaw) != ref.Digest {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body does not match its digest"))
 			}
+			if int64(len(childRaw)) != ref.Size {
+				// The ACTUAL committed child-manifest byte length must equal the
+				// index descriptor's declared size — a digest match alone does not
+				// prove the byte length claimed by the descriptor.
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body length disagrees with its declared size"))
+			}
+			// Independently parse the child under its DECLARED media type: it must
+			// decode as a coherent single-platform manifest, never as a nested
+			// index (recursive index levels are not supported) and never as an
+			// unsupported/malformed body.
+			if parsed, perr := publish.ParseArtifact(ref.MediaType, childRaw); perr != nil {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest is not a coherent manifest for its declared media type"))
+			} else if parsed.Kind == publish.ArtifactKindIndex {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest is itself an image index"))
+			}
 		}
 	default:
 		for _, ref := range artifact.References() {

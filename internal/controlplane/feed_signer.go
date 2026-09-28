@@ -1460,7 +1460,7 @@ func (s *FeedSigner) authenticatePublicationBinding(ctx context.Context, req pub
 // artifact/blob byte-level proof runs.
 func (s *FeedSigner) authenticateCurrentTagConsistency(ctx context.Context, targetDoc spec.RepoStateDocument, curDoc *spec.RepoStateDocument, done bool, operated string) error {
 	if done {
-		return s.validateArtifactBlobTransition(ctx, targetDoc.Blobs, targetDoc.Blobs, targetDoc, operated)
+		return s.validateArtifactTransition(ctx, targetDoc, targetDoc, operated)
 	}
 
 	var cur spec.RepoStateDocument
@@ -1493,7 +1493,7 @@ func (s *FeedSigner) authenticateCurrentTagConsistency(ctx context.Context, targ
 	if err := validateManifestTransition(cur.Manifests, targetDoc.Manifests, targetDoc.Tags[operated]); err != nil {
 		return err
 	}
-	return s.validateArtifactBlobTransition(ctx, cur.Blobs, targetDoc.Blobs, targetDoc, operated)
+	return s.validateArtifactTransition(ctx, cur, targetDoc, operated)
 }
 
 // changedTransitionTags computes the set of tag names whose TAG MAPPING or
@@ -1560,25 +1560,38 @@ func validateManifestTransition(cur, target map[string]spec.ManifestDescriptor, 
 	return nil
 }
 
-// validateArtifactBlobTransition is the signer's INDEPENDENT proof that the
-// transition's blob state is EXACTLY the operated manifest artifact's. It
-// reads the operated manifest's immutable BODY through the separately-wired
-// bounded /bytes reader (never the docs path, never unbounded) at the operated
-// descriptor's SwarmRef, and the body MUST parse with the strict Task-12
-// artifact parser under the descriptor media type, MUST hash to the operated
-// digest, MUST match the descriptor's size, and MUST NOT be an image index
-// (index publication is rejected — the Task 19 gate). The parser's exact
-// reference set is then enforced against the blob state: EVERY reference must
+// validateArtifactTransition is the signer's INDEPENDENT proof that the
+// transition's state is EXACTLY the operated artifact's, made KIND-AWARE so
+// image indexes (Task 19) are validated as first-class artifacts rather than
+// rejected. It reads the operated manifest/index's immutable BODY through the
+// separately-wired bounded /bytes reader (never the docs path, never
+// unbounded) at the operated descriptor's SwarmRef, and the body MUST parse
+// with the strict Task-12 artifact parser under the descriptor media type,
+// MUST hash to the operated digest, and MUST match the descriptor's size.
+//
+// A single-platform MANIFEST (cur/target blob namespace): the parsed
+// reference set is enforced against the blob state — EVERY reference must
 // exist in the target Blobs with coherent size/media, EVERY existing record
 // must be preserved byte-identically, and EVERY NEW target blob record must
-// belong to the reference set — an unreferenced addition, a missing or
-// mismatched descriptor, wrong manifest bytes/ref/media/size, or an oversize/
-// failed bounded read ALL fail closed with zero external updates (malformed
-// for provably-wrong content, backend for unreadable content). Errors are
+// belong to the reference set.
+//
+// An image INDEX (cur/target MANIFEST namespace): every child must be a
+// supported NON-INDEX child media type (no nested indexes), present in the
+// target manifest map with EXACT descriptor media type and size, and its
+// immutable child BODY independently read (bounded) with a digest AND
+// byte-length proof and parsed under its declared media type as a coherent
+// single-platform manifest. Every existing blob record is preserved
+// byte-identically and NO new blob record may be added (an index references no
+// blobs).
+//
+// Either kind: an unreferenced/mismatched/oversize addition, a missing or
+// mismatched descriptor, wrong bytes/ref/media/size, or an oversize/failed
+// bounded read ALL fail closed with zero external updates (malformed for
+// provably-wrong content, backend for unreadable content). Errors are
 // data-free: no digest, ref, size, media value, or error body ever appears.
-func (s *FeedSigner) validateArtifactBlobTransition(ctx context.Context, cur, target map[string]spec.BlobDescriptor, targetDoc spec.RepoStateDocument, operated string) error {
-	operatedDigest := targetDoc.Tags[operated]
-	desc, ok := targetDoc.Manifests[operatedDigest]
+func (s *FeedSigner) validateArtifactTransition(ctx context.Context, cur, target spec.RepoStateDocument, operated string) error {
+	operatedDigest := target.Tags[operated]
+	desc, ok := target.Manifests[operatedDigest]
 	if !ok {
 		return fmt.Errorf("%w: operated manifest descriptor is missing from the target document", errFeedSignerMalformed)
 	}
@@ -1600,39 +1613,89 @@ func (s *FeedSigner) validateArtifactBlobTransition(ctx context.Context, cur, ta
 	if err != nil {
 		return fmt.Errorf("%w: operated manifest body is not a valid artifact: %v", errFeedSignerMalformed, err)
 	}
-	if artifact.Kind == publish.ArtifactKindIndex {
-		return fmt.Errorf("%w: operated manifest is an image index, which cannot be published yet", errFeedSignerMalformed)
-	}
-	refs := artifact.References()
-	referenced := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		referenced[ref.Digest] = struct{}{}
-		blob, ok := target[ref.Digest]
-		if !ok {
-			return fmt.Errorf("%w: operated manifest references a blob absent from the target document", errFeedSignerMalformed)
+
+	switch artifact.Kind {
+	case publish.ArtifactKindManifest:
+		refs := artifact.References()
+		referenced := make(map[string]struct{}, len(refs))
+		for _, ref := range refs {
+			referenced[ref.Digest] = struct{}{}
+			blob, ok := target.Blobs[ref.Digest]
+			if !ok {
+				return fmt.Errorf("%w: operated manifest references a blob absent from the target document", errFeedSignerMalformed)
+			}
+			if err := publish.CheckBlobReferenceCoherence(ref, blob); err != nil {
+				return fmt.Errorf("%w: operated manifest reference disagrees with its stored blob record", errFeedSignerMalformed)
+			}
 		}
-		if err := publish.CheckBlobReferenceCoherence(ref, blob); err != nil {
-			return fmt.Errorf("%w: operated manifest reference disagrees with its stored blob record", errFeedSignerMalformed)
+		// Every existing blob record is cloned into the next state verbatim.
+		for digest, bd := range cur.Blobs {
+			targetDesc, ok := target.Blobs[digest]
+			if !ok {
+				return fmt.Errorf("%w: target document deletes an existing blob record", errFeedSignerMalformed)
+			}
+			if targetDesc != bd {
+				return fmt.Errorf("%w: target document mutates an existing blob record", errFeedSignerMalformed)
+			}
 		}
-	}
-	// Every existing record is cloned into the next state verbatim.
-	for digest, desc := range cur {
-		targetDesc, ok := target[digest]
-		if !ok {
-			return fmt.Errorf("%w: target document deletes an existing blob record", errFeedSignerMalformed)
+		// Every NEW target blob record must be one of the operated artifact's
+		// references — arbitrary additions are never inert.
+		for digest := range target.Blobs {
+			if _, inCur := cur.Blobs[digest]; inCur {
+				continue
+			}
+			if _, isRef := referenced[digest]; !isRef {
+				return fmt.Errorf("%w: target document adds a blob record the operated artifact does not reference", errFeedSignerMalformed)
+			}
 		}
-		if targetDesc != desc {
-			return fmt.Errorf("%w: target document mutates an existing blob record", errFeedSignerMalformed)
+
+	default: // ArtifactKindIndex
+		// Every child is a supported NON-INDEX manifest, present in the target
+		// MANIFEST map with EXACT descriptor media/size, and its immutable body
+		// independently verified (bounded read, digest AND byte-length proof,
+		// coherent single-platform parse).
+		for _, ref := range artifact.Manifests {
+			if !publish.IsSupportedChildManifestMediaType(ref.MediaType) {
+				return fmt.Errorf("%w: operated index references a child media type that is not a supported single-platform manifest", errFeedSignerMalformed)
+			}
+			child, ok := target.Manifests[ref.Digest]
+			if !ok {
+				return fmt.Errorf("%w: operated index references a child manifest absent from the target document", errFeedSignerMalformed)
+			}
+			if child.Size != ref.Size || child.MediaType != ref.MediaType {
+				return fmt.Errorf("%w: operated index child manifest descriptor disagrees with the index reference", errFeedSignerMalformed)
+			}
+			childRaw, err := s.Bytes.ReadBounded(ctx, child.SwarmRef, publish.MaxArtifactBodyBytes)
+			if err != nil {
+				return fmt.Errorf("%w: operated index child manifest object: %v", errFeedSignerBackend, err)
+			}
+			if publish.ComputeDigest(childRaw) != ref.Digest {
+				return fmt.Errorf("%w: operated index child manifest body does not match its digest", errFeedSignerMalformed)
+			}
+			if int64(len(childRaw)) != ref.Size {
+				return fmt.Errorf("%w: operated index child manifest body length disagrees with its declared size", errFeedSignerMalformed)
+			}
+			if parsed, perr := publish.ParseArtifact(ref.MediaType, childRaw); perr != nil {
+				return fmt.Errorf("%w: operated index child manifest is not a coherent manifest for its declared media type", errFeedSignerMalformed)
+			} else if parsed.Kind == publish.ArtifactKindIndex {
+				return fmt.Errorf("%w: operated index child manifest is itself an image index", errFeedSignerMalformed)
+			}
 		}
-	}
-	// Every NEW target blob record must be one of the operated artifact's
-	// references — arbitrary additions are never inert.
-	for digest := range target {
-		if _, inCur := cur[digest]; inCur {
-			continue
+		// An index references NO blobs: every existing blob record is
+		// preserved byte-identically and NO new blob record may be added.
+		for digest, bd := range cur.Blobs {
+			targetDesc, ok := target.Blobs[digest]
+			if !ok {
+				return fmt.Errorf("%w: target document deletes an existing blob record", errFeedSignerMalformed)
+			}
+			if targetDesc != bd {
+				return fmt.Errorf("%w: target document mutates an existing blob record", errFeedSignerMalformed)
+			}
 		}
-		if _, isRef := referenced[digest]; !isRef {
-			return fmt.Errorf("%w: target document adds a blob record the operated artifact does not reference", errFeedSignerMalformed)
+		for digest := range target.Blobs {
+			if _, inCur := cur.Blobs[digest]; !inCur {
+				return fmt.Errorf("%w: target document adds a blob record for an image index, which references no blobs", errFeedSignerMalformed)
+			}
 		}
 	}
 	return nil

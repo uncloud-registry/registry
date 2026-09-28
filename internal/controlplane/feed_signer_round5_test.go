@@ -478,11 +478,13 @@ func TestFeedSignerRejectsUnsupportedManifestMediaType(t *testing.T) {
 	}
 }
 
-// TestFeedSignerRejectsIndexPublicationUntilTask19 proves the operated
-// manifest object may NOT be an image index: index publication is rejected
-// (the Task 19 gate) as malformed with zero updates, even for a fully valid
-// zero-reference index whose content digest and descriptor sizes match.
-func TestFeedSignerRejectsIndexPublicationUntilTask19(t *testing.T) {
+// TestFeedSignerAcceptsEmptyIndexPublication proves an EMPTY (zero-reference)
+// OCI image index — a valid, childless shape under both the OCI and Docker
+// specs — is now ACCEPTED (the Task-19 gate that rejected every index is
+// lifted): no child is referenced, no child proof runs, the blob map is
+// preserved empty/verbatim, and exactly one feed update advances the
+// repository.
+func TestFeedSignerAcceptsEmptyIndexPublication(t *testing.T) {
 	const tag = "latest"
 	req := validCommitReq(1, "batch-1")
 	body := fixtureEmptyIndexBody(t)
@@ -504,11 +506,14 @@ func TestFeedSignerRejectsIndexPublicationUntilTask19(t *testing.T) {
 
 	signer, updater := w.countingSigner()
 	_, err := signer.Commit(context.Background(), req)
-	if !errors.Is(err, errFeedSignerMalformed) {
-		t.Fatalf("index publication must fail closed as malformed (Task 19 gate), got %v", err)
+	if err != nil {
+		t.Fatalf("empty index must now be accepted (Task 19), got %v", err)
 	}
-	if n := updater.count(); n != 0 {
-		t.Fatalf("index publication must cause ZERO external updates, got %d", n)
+	if n := updater.count(); n != 1 {
+		t.Fatalf("empty index must cause exactly 1 external update, got %d", n)
+	}
+	if got := w.feedStore.Feeds[w.repoTopic]; got != req.Reference {
+		t.Fatalf("feed must advance to the empty index, got %q", got)
 	}
 }
 
