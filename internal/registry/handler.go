@@ -465,17 +465,24 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 							// The prior attempt for THIS operation committed and was
 							// verified. It may have crashed before consuming the
 							// staged rows it claimed under pub.OperationID; finish
-							// those surviving claims now (best-effort: the verified
-							// 201 must not be withheld for a staging cleanup
-							// failure, and a surviving claim is safe — it is
-							// publication-owned and fails closed). This never
-							// consumes rows owned by a different operation.
+							// those surviving claims now. Claim cleanup is part of
+							// this operation's own state, so a consume failure FAILS
+							// CLOSED — the verified 201 is withheld and the fixed
+							// error surface returned instead. The client's exact
+							// retry then re-enters this fast path, re-verifies,
+							// retries the consumption, and only after it succeeds
+							// receives the verified 201. Returning 201 while a
+							// quota-charged claim survives would strand the charge
+							// forever; this never consumes rows owned by a different
+							// operation.
 							consumed := make([]string, 0, len(referencedDigests))
 							for digest := range referencedDigests {
 								consumed = append(consumed, digest)
 							}
 							if pub.OperationID != "" {
-								_ = h.Staging.ConsumeStagedForPublish(ctx, repo, actor, pub.OperationID, consumed)
+								if err := h.Staging.ConsumeStagedForPublish(ctx, repo, actor, pub.OperationID, consumed); err != nil {
+									return err
+								}
 							}
 							writePublishedSuccess(w, repo, reference, manifestDigest, pub.OperationID)
 							return nil
