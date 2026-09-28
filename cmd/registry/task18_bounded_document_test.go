@@ -138,6 +138,34 @@ func (m *markerErrCommitted) CommittedRefs(context.Context, string) (map[string]
 	return nil, errors.New("committed-state provider: " + cleanupDataLeakMarker)
 }
 
+// syncBuffer is a race-free log capture for the cleanup-loop assertion. The
+// loop's goroutine writes log records while this test polls for the fixed
+// classification, so a plain bytes.Buffer would race (-race). A mutex guards
+// the concurrent writer (log.SetOutput) and reader (contains/String) sides.
+// Each logger record is emitted as a single Write call, so records stay atomic.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) contains(s string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Contains(b.buf.String(), s)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // TestCleanupLoopLogsFixedClassificationNotRawError proves the periodic
 // cleanup worker logs a FIXED classification on a failed pass and NEVER the
 // raw error — so a future data-bearing dependency error cannot reach the logs.
@@ -156,8 +184,10 @@ func TestCleanupLoopLogsFixedClassificationNotRawError(t *testing.T) {
 		t.Fatalf("NewCleanup: %v", err)
 	}
 
-	// Capture the process logger so we can assert on what the loop emits.
-	var buf bytes.Buffer
+	// Capture the process logger so we can assert on what the loop emits. The
+	// capture is mutex-guarded because the loop's goroutine writes records
+	// while this test polls for the fixed classification.
+	var buf syncBuffer
 	oldWriter := log.Writer()
 	log.SetOutput(&buf)
 	oldFlags := log.Flags()
@@ -168,13 +198,25 @@ func TestCleanupLoopLogsFixedClassificationNotRawError(t *testing.T) {
 	defer cancel()
 	done := runCleanupLoop(ctx, cleanup, 20*time.Millisecond, 10)
 
-	// Wait until the loop has actually started a pass (reaching the committed
-	// provider), then cancel and join; the fixed-classification log write
-	// happens before the done channel closes.
+	// The first-pass committed-state provider fails synchronously; the loop's
+	// goroutine then logs the FIXED classification only if ctx is not already
+	// canceled (it returns silently when ctx.Err()!=nil). So canceling as soon
+	// as the provider is entered is racy — the cancellation can win before the
+	// log write and produce an empty capture. Instead, wait deterministically
+	// (bounded) until the fixed classification has actually been written, then
+	// cancel and join: this proves the failed pass completed and logged before
+	// cancellation, which is the event the test is asserting.
 	select {
 	case <-provider.entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("cleanup pass never invoked the committed-state provider")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !buf.contains(cleanupPassAbortedClass) {
+		if time.Now().After(deadline) {
+			t.Fatalf("cleanup loop never logged the fixed classification (want %q), got:\n%s", cleanupPassAbortedClass, buf.String())
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	select {
@@ -183,6 +225,8 @@ func TestCleanupLoopLogsFixedClassificationNotRawError(t *testing.T) {
 		t.Fatal("cleanup worker did not exit after cancellation")
 	}
 
+	// Logging is complete once the loop goroutine has exited (joined via done),
+	// so the final read is both mutex-safe and happens-after every write.
 	out := buf.String()
 	if strings.Contains(out, cleanupDataLeakMarker) {
 		t.Fatalf("the raw error (with marker) leaked into the cleanup log:\n%s", out)
