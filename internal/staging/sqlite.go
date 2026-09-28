@@ -49,29 +49,30 @@ import (
 // v7 is the prior committed schema (the durable post-transition publication-
 // consume retry). It is retained for migration detection and parity.
 //
-// v8 is the current schema. It carries one forward change over v7: byte-vs-
-// character enforcement of the publication operation_id. v7 constrained
-// operation_id by CHARACTER count only (typeof text, length 1..256) and its
-// ownership trigger permitted values during finalized -> claimed that the Go
-// validateOperationID rejects — spaces, forbidden JSON/XML punctuation,
-// non-ASCII/multibyte strings whose BYTE length exceeds 256, and malformed
-// UTF-8 TEXT (e.g. a value produced by CAST(X'80' AS TEXT)). Direct DB writes
-// could therefore persist claimed rows the API cannot address, that startup
-// reconciliation and cleanup exclude, and that permanently charge quota.
-// v8 re-binds the storage CHECK to RAW BYTES (hex(cast(operation_id as
-// blob)), 1..256 bytes, TEXT storage class) and enforces the byte-exact
-// validateOperationID grammar in mandatory BEFORE INSERT and BEFORE UPDATE
-// triggers (a recursive CTE walks every raw byte and rejects anything outside
-// 0x21..0x7E or in the JSON/XML escape set " \\ < > &, including space,
-// controls, NUL, DEL, and any non-ASCII or malformed byte). SQLite forbids
-// subqueries in CHECK constraints, so the byte grammar CANNOT be a CHECK; it
-// lives in the triggers plus schema-fingerprint verification. v7 -> v8
-// classifies every predecessor operation_id BYTE-FOR-BYTE before copying: a
-// malformed value fails the migration atomically (v8 is never stamped, the
-// v7 bytes stay intact); valid values preserve exact bytes. The
-// finalized -> claimed ownership trigger, immutability, and never-clear rule
-// are retained unchanged.
-const latestSchemaVersion = 8
+// v8 is the PRIOR committed schema: byte-vs-character enforcement of the
+// publication operation_id. v7 constrained operation_id by CHARACTER count
+// only and admitted values Go's validator rejects; v8 re-binds the storage
+// CHECK to RAW BYTES and enforces the byte-exact validateOperationID grammar
+// in mandatory BEFORE INSERT/UPDATE triggers. v8 is retained as a frozen
+// predecessor for migration detection and parity.
+//
+// v9 is the current schema. It carries ONE forward change over v8: the
+// publication operation_id column is made AFFINITY-FREE (no declared type).
+// v8 declared `operation_id text`, so SQLite TEXT affinity coerced a numeric
+// INTEGER/REAL value into TEXT BEFORE the storage CHECK / BEFORE triggers
+// inspected NEW.operation_id — e.g. integer 65 became bytes "65" and was
+// falsely accepted as a valid TEXT-only ownership byte. Under v9 the column
+// carries no type name (BLOB affinity: no storage-class coercion), so a
+// numeric storage class survives to the typeof(operation_id)='text' guard
+// (in both the CHECK and the grammar triggers) and is rejected before any
+// owned state persists. Textual affinity is unchanged for every other string
+// column, and the service bind/store/scan of a valid TEXT operation_id (mixed
+// case, boundary bytes) is byte-for-byte identical to v8. v8 -> v9 rebuilds
+// upload_sessions preserving every stored TEXT operation_id exactly (including
+// v8's already-coerced-to-TEXT numeric leftovers that still satisfy the
+// service grammar); any byte-malformed predecessor value still fails the
+// migration atomically.
+const latestSchemaVersion = 9
 
 // busytimeoutMS is the busy-timeout installed on every pooled connection
 // when the caller did not configure one.
@@ -112,7 +113,12 @@ const versionTableDDL = `create table staging_schema (version integer primary ke
 // cannot see. The integer fields are declared WITHOUT a type name (BLOB
 // affinity) so SQLite never coerces REAL or numeric TEXT into INTEGER
 // storage before the CHECK sees it — the typeof() checks below then provably
-// accept only genuine INTEGER storage-class values.
+// accept only genuine INTEGER storage-class values. The publication
+// operation_id is declared WITHOUT a type name for the same reason: a numeric
+// INTEGER/REAL must never be coerced into TEXT before the typeof()='text' guard
+// inspects it (TEXT affinity under v8 silently turned integer 65 into bytes
+// "65"), so the affinity-free column preserves the numeric storage class and
+// the guard rejects it.
 //
 // Grammar notes (mirroring the Go validators byte-for-byte):
 //   - digest is exactly "sha256:" + 64 lowercase hex: the prefix is compared
@@ -133,7 +139,7 @@ var schemaDDL = append([]string{
 		create_token text,
 		cleanup_token text,
 		finalize_token text,
-		operation_id text,
+		operation_id,
 		digest     text,
 		bee_ref    text,
 		media_type text,
@@ -500,8 +506,16 @@ var schemaGoldenV7JSON []byte
 //go:embed schema_golden_v8.json
 var schemaGoldenV8JSON []byte
 
-// schemaGold is the current (v8) manifest.
-var schemaGold = mustLoadSchemaGolden(schemaGoldenV8JSON)
+//go:embed schema_golden_v9.json
+var schemaGoldenV9JSON []byte
+
+// schemaGold is the current (v9) manifest.
+var schemaGold = mustLoadSchemaGolden(schemaGoldenV9JSON)
+
+// schemaGoldV8 is the exact frozen v8 predecessor manifest (the previously
+// committed "current" shape before v9), retained for migration detection and
+// parity. It is never renamed or called v9.
+var schemaGoldV8 = mustLoadSchemaGolden(schemaGoldenV8JSON)
 
 // schemaGoldV7 is the exact frozen v7 predecessor manifest (the previously
 // committed "current" shape before v8), retained for migration detection and
@@ -824,7 +838,7 @@ func openStagingDBAnchored(ctx context.Context, dbPath string, maxOpen int) (*sq
 		if err := createFreshSchema(ctx, db); err != nil {
 			return fail(err)
 		}
-	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7:
+	case schemaMigrateV1Pre, schemaMigrateV1Cleanup, schemaMigrateV2, schemaMigrateV3, schemaMigrateV4, schemaMigrateV5, schemaMigrateV6, schemaMigrateV7, schemaMigrateV8:
 		if err := migrateSchema(ctx, db, state); err != nil {
 			return fail(err)
 		}
@@ -1582,6 +1596,7 @@ const (
 	schemaMigrateV5
 	schemaMigrateV6
 	schemaMigrateV7
+	schemaMigrateV8
 )
 
 // inspectSchemaState examines an existing database on a read-only,
@@ -1633,6 +1648,10 @@ func inspectSchemaState(ctx context.Context, dbPath string) (schemaState, error)
 	case latestSchemaVersion:
 		if err := verifyAgainst(ctx, adapter, schemaGold, latestSchemaVersion); err == nil {
 			return schemaCurrent, nil
+		}
+	case 8:
+		if err := verifyAgainst(ctx, adapter, schemaGoldV8, 8); err == nil {
+			return schemaMigrateV8, nil
 		}
 	case 7:
 		if err := verifyAgainst(ctx, adapter, schemaGoldV7, 7); err == nil {
@@ -1962,6 +1981,30 @@ func migrateSchema(ctx context.Context, db *sql.DB, from schemaState) error {
 		// original v7 bytes intact; valid IDs preserve their exact bytes. The
 		// new byte CHECK and grammar triggers then take effect without
 		// altering a row.
+		if err := auditOperationIDGrammar(ctx, conn, exec); err != nil {
+			return err
+		}
+		if err := rebuildUploadSessions(ctx, conn, exec, true, true, true); err != nil {
+			return depErr(err, ctx)
+		}
+	case schemaMigrateV8:
+		if err := verifyAgainst(ctx, conn, schemaGoldV8, 8); err != nil {
+			return depErr(err, ctx)
+		}
+		// Exact v8 -> v9: make operation_id AFFINITY-FREE. v8 declared
+		// `operation_id text`, so TEXT affinity coerced numeric INTEGER/REAL
+		// input into TEXT before the storage CHECK/grammar triggers inspected
+		// it, letting a numeric value be stored as its TEXT rendering and pass
+		// the typeof()='text' guard. The affinity-free v9 column never coerces,
+		// so a numeric storage class now reaches the guard and is rejected.
+		// Rebuild upload_sessions carrying every row/field exactly; the stored
+		// operation_id values are already TEXT (v8 coerced them), so every valid
+		// TEXT operation_id preserves its exact bytes — including v8's
+		// already-coerced numeric-to-TEXT artifacts that still satisfy the
+		// service grammar. Classify every predecessor operation_id BYTE-FOR-BYTE
+		// BEFORE copying so any byte-malformed value (only reachable by a
+		// trigger-bypassing direct write, since v8's own grammar triggers reject
+		// it) still fails the migration atomically.
 		if err := auditOperationIDGrammar(ctx, conn, exec); err != nil {
 			return err
 		}

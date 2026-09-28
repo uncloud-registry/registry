@@ -92,7 +92,7 @@ func opProbes() []opProbe {
 		{"malformed-utf8-pair", string([]byte{0x41, 0x80}), "string", false},
 		{"multibyte-260-bytes", strings.Repeat("\xc3\xa9", 130), "string", false},
 		{"blob-storage", []byte("AABB"), "blob", false},
-		{"numeric-literal", 65, "numeric", true},
+		{"numeric-literal", 65, "numeric", false},
 		{"null", nil, "null", false},
 	}
 }
@@ -130,12 +130,22 @@ func TestOperationIDDirectWriteGrammarMatrix(t *testing.T) {
 					t.Fatalf("claimed row with NULL operation_id unexpectedly accepted")
 				}
 			case "numeric":
-				// TEXT affinity coerces a numeric literal to a valid TEXT value.
-				if uerr != nil {
-					t.Fatalf("numeric literal 65 rejected as claimed op: %v", uerr)
+				// The v9 affinity-free column never coerces a numeric
+				// storage class to TEXT, so the byte grammar's
+				// typeof(...)='text' guard rejects it: no numeric value
+				// can ever enter operation_id ownership.
+				if uerr == nil {
+					t.Fatalf("numeric value %v accepted as claimed op; numeric storage class must be rejected", tc.value)
 				}
-				if got := rawOperationIDHex(t, db, fid); got != "3635" {
-					t.Fatalf("numeric op storage bytes = %s, want %s", got, "3635")
+				if got := rawOperationIDHex(t, db, fid); got != "" {
+					t.Fatalf("rejected numeric probe left operation_id bytes %q behind", got)
+				}
+				var st string
+				if err := db.QueryRow(`select state from upload_sessions where id=?`, fid).Scan(&st); err != nil {
+					t.Fatalf("read state: %v", err)
+				}
+				if st != string(StateFinalized) {
+					t.Fatalf("rejected numeric probe mutated state to %q", st)
 				}
 			case "blob":
 				// BLOB storage is rejected outright: storage class must be TEXT.

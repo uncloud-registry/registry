@@ -128,7 +128,11 @@ func TestSchemaColumnsAndTypes(t *testing.T) {
 		// the typeof() CHECKs are the sole storage-class authority.
 		"offset": "", "created_at": "", "expires_at": "",
 		"create_token": "text", "cleanup_token": "text", "finalize_token": "text",
-		"operation_id": "text", "digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
+		// operation_id is deliberately affinity-free too (empty declared
+		// type, like the integer fields): a numeric INTEGER/REAL can never
+		// be coerced into TEXT before the typeof()='text' guard inspects it,
+		// so numeric storage class is rejected rather than stored.
+		"operation_id": "", "digest": "text", "bee_ref": "text", "media_type": "text", "size": "",
 	}
 	assertColumns(t, db, "upload_sessions", wantSessions, map[string]bool{"id": true})
 
@@ -1130,7 +1134,9 @@ func TestSchemaExactPhysicalShape(t *testing.T) {
 		{"create_token", "text", false, false},
 		{"cleanup_token", "text", false, false},
 		{"finalize_token", "text", false, false},
-		{"operation_id", "text", false, false},
+		// affinity-free (empty declared type) so numeric storage class is
+		// never coerced into TEXT before the typeof()='text' guard.
+		{"operation_id", "", false, false},
 		{"digest", "text", false, false},
 		{"bee_ref", "text", false, false},
 		{"media_type", "text", false, false},

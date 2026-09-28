@@ -162,11 +162,11 @@ func TestMigrateV7ToV8RejectsMalformedAtomically(t *testing.T) {
 	}
 }
 
-// TestUpgradeEveryPredecessorToV8 regresses the full upgrade chain from every
-// shipped predecessor (two v1 shapes, v2..v7) to the current v8 schema,
+// TestUpgradeEveryPredecessorToCurrent regresses the full upgrade chain from
+// every shipped predecessor (two v1 shapes, v2..v8) to the current schema,
 // proving coherent migration with valid ownership preserved and idempotent
 // reopen.
-func TestUpgradeEveryPredecessorToV8(t *testing.T) {
+func TestUpgradeEveryPredecessorToCurrent(t *testing.T) {
 	cases := []struct {
 		name string
 		gold *schemaManifest
@@ -180,6 +180,7 @@ func TestUpgradeEveryPredecessorToV8(t *testing.T) {
 		{"v5", mustLoadTestManifest(t, schemaGoldenV5JSON), seedFullLifecycle},
 		{"v6", mustLoadTestManifest(t, schemaGoldenV6JSON), seedFullLifecycleV6Owned},
 		{"v7", mustLoadTestManifest(t, schemaGoldenV7JSON), seedFullLifecycleV6Owned},
+		{"v8", mustLoadTestManifest(t, schemaGoldenV8JSON), func(t *testing.T, db *sql.DB) { seedV8ClaimedMixed(t, db) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -208,7 +209,7 @@ func TestUpgradeEveryPredecessorToV8(t *testing.T) {
 			if err := raw.QueryRow(`select count(*) from upload_sessions where operation_id = 'op-mig'`).Scan(&cnt); err != nil {
 				t.Fatalf("read op-mig: %v", err)
 			}
-			if strings.HasPrefix(tc.name, "v6") || strings.HasPrefix(tc.name, "v7") {
+			if strings.HasPrefix(tc.name, "v6") || strings.HasPrefix(tc.name, "v7") || strings.HasPrefix(tc.name, "v8") {
 				if cnt != 1 {
 					t.Fatalf("%s claimed row op-mig not preserved: count=%d", tc.name, cnt)
 				}
