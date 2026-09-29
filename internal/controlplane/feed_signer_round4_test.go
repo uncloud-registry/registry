@@ -911,3 +911,100 @@ func TestStoreGetPublicationBindingDistinguishesNotFoundFromFailure(t *testing.T
 		t.Fatalf("a broken store must surface a REAL failure, never an authoritative not-found: %v", err)
 	}
 }
+
+// buildIndexWithDescriptorArtifactType assembles a REAL OCI image index whose
+// child descriptors carry the OCI 1.1 descriptor artifactType AND a valid
+// RFC 3986 urls member, referencing the given committed children.
+func buildIndexWithDescriptorArtifactType(t *testing.T, arch string, children ...indexChildFixture) indexFixture {
+	t.Helper()
+	childJSON := make([]map[string]any, 0, len(children))
+	for i, c := range children {
+		childJSON = append(childJSON, map[string]any{
+			"mediaType":    c.ref.MediaType,
+			"digest":       c.ref.Digest,
+			"size":         c.ref.Size,
+			"artifactType": "application/vnd.example.child.sbom.v1",
+			"urls":         []string{"https://example.com/child/" + string(rune('a'+i))},
+			"platform":     map[string]any{"architecture": arch, "os": "linux"},
+		})
+	}
+	idx := map[string]any{"schemaVersion": 2, "mediaType": fixtureIndexMediaType, "manifests": childJSON}
+	body, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal index fixture: %v", err)
+	}
+	return indexFixture{
+		body:     body,
+		digest:   publish.ComputeDigest(body),
+		manifest: spec.ManifestDescriptor{SwarmRef: refHex('9'), MediaType: fixtureIndexMediaType, Size: int64(len(body))},
+		children: children,
+	}
+}
+
+// TestFeedSignerAcceptsDescriptorArtifactType proves the REAL production feed
+// signer accepts an OCI image-index transition whose child descriptors carry
+// the OCI 1.1 descriptor artifactType and a valid RFC 3986 urls member: the
+// operated index parses under its declared media type, every committed child
+// (with descriptor artifactType/urls intact) is verified, and exactly one feed
+// update advances the repository.
+func TestFeedSignerAcceptsDescriptorArtifactType(t *testing.T) {
+	const tag = "latest"
+	c1 := makeChild(t, '1', 'a', 100)
+	c2 := makeChild(t, '2', 'b', 101)
+	fx := buildIndexWithDescriptorArtifactType(t, "amd64", c1, c2)
+	w, req := indexWorld(t, tag, 1, []indexChildFixture{c1, c2}, fx)
+
+	signer, updater := w.countingSigner()
+	result, err := signer.Commit(context.Background(), req)
+	if err != nil {
+		t.Fatalf("valid descriptor-artifactType index transition must be accepted by the signer: %v", err)
+	}
+	if result.Feed != w.repoTopic || result.Reference != refHex('a') {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if n := updater.count(); n != 1 {
+		t.Fatalf("expected exactly 1 external feed update, got %d", n)
+	}
+	if got := w.feedStore.Feeds[w.repoTopic]; got != refHex('a') {
+		t.Fatalf("feed must advance to the index target, got %q", got)
+	}
+}
+
+// TestFeedSignerRejectsInvalidDescriptorArtifactType proves the signer rejects
+// (without any external update) an index whose child descriptor carries an
+// artifactType that is NOT a valid RFC 6838 media type — the operated body
+// fails its independent parse, so the transition is malformed.
+func TestFeedSignerRejectsInvalidDescriptorArtifactType(t *testing.T) {
+	const tag = "latest"
+	c1 := makeChild(t, '1', 'a', 100)
+	childJSON := []map[string]any{
+		{
+			"mediaType":    c1.ref.MediaType,
+			"digest":       c1.ref.Digest,
+			"size":         c1.ref.Size,
+			"artifactType": "not-a-media-type",
+			"platform":     map[string]any{"architecture": "amd64", "os": "linux"},
+		},
+	}
+	idx := map[string]any{"schemaVersion": 2, "mediaType": fixtureIndexMediaType, "manifests": childJSON}
+	body, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("marshal index fixture: %v", err)
+	}
+	fx := indexFixture{
+		body:     body,
+		digest:   publish.ComputeDigest(body),
+		manifest: spec.ManifestDescriptor{SwarmRef: refHex('9'), MediaType: fixtureIndexMediaType, Size: int64(len(body))},
+		children: []indexChildFixture{c1},
+	}
+	w, req := indexWorld(t, tag, 1, []indexChildFixture{c1}, fx)
+
+	signer, updater := w.countingSigner()
+	_, err = signer.Commit(context.Background(), req)
+	if err == nil {
+		t.Fatal("a malformed descriptor artifactType must fail closed in the signer")
+	}
+	if n := updater.count(); n != 0 {
+		t.Fatalf("malformed descriptor artifactType must cause ZERO external updates, got %d", n)
+	}
+}

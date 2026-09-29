@@ -202,6 +202,28 @@ func (m *MemoryDocumentStore) Get(ctx context.Context, ref string) ([]byte, erro
 	return m.Read(ctx, ref)
 }
 
+// ReadBounded implements the registry publication-verification bounded byte
+// reader (BoundedBytesReader): it returns the immutable object at ref only if
+// its length does not exceed maxBytes, so a verification read is strictly
+// bounded BEFORE allocation — matching the production BeeObjectStore.ReadBounded
+// /bytes contract used for artifact bodies. A non-negative bound is required;
+// an object larger than the bound and a missing object are data-free errors.
+func (m *MemoryDocumentStore) ReadBounded(_ context.Context, ref string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, errors.New("bounded read requires a non-negative bound")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	data, ok := m.Documents[ref]
+	if !ok {
+		return nil, fmt.Errorf("document %q not found: %w", ref, ErrDocumentNotFound)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("document read exceeded the bound")
+	}
+	return append([]byte(nil), data...), nil
+}
+
 // Put stores data under its deterministic content address — the exact
 // in-memory model of Bee's content-addressed immutable store that
 // restart-safe retries depend on: identical bytes ALWAYS produce the identical

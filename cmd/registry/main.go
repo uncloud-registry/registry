@@ -124,6 +124,12 @@ func buildBeeHandler() (http.Handler, error) {
 	}
 	docs := swarm.NewBeeDocumentStore(beeURL, http.DefaultClient)
 	objects := swarm.NewBeeObjectStore(beeURL, http.DefaultClient)
+	// The post-commit verification reads artifact BODIES through an explicit
+	// bounded byte reader (the /bytes object path); it never falls back to an
+	// unbounded read. The compile-time assertion pins the object store to that
+	// bounded reader so a future store that stops implementing it fails to
+	// build (startup) rather than silently running without it.
+	var _ registry.BoundedBytesReader = objects
 	// Production Bee read layering (Task 13): repository/auth/stamp feeds are
 	// resolved through the BeeFeedResolver — GET /feeds/{owner}/{topic}
 	// returns the 32 RAW BINARY payload bytes (with the required index

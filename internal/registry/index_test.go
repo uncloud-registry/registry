@@ -218,19 +218,25 @@ func TestIndexDockerManifestListPublish(t *testing.T) {
 	server := httptest.NewServer(h)
 	defer server.Close()
 
-	amd := publish.ComputeDigest(indexChildAmd64)
+	// A REAL Docker schema-2 single-platform manifest child (with the embedded
+	// mediaType the Docker schema-2 envelope requires).
+	dockerChild := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","size":11,"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"layers":[]}`)
+	amd := publish.ComputeDigest(dockerChild)
 	body := []byte(fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":%d,"digest":%q,"platform":{"architecture":"amd64","os":"linux"}}]}`,
-		indexTestListMT, indexTestDockerMT, len(indexChildAmd64), amd))
+		indexTestListMT, indexTestDockerMT, len(dockerChild), amd))
 
 	// Seed a Docker schema-2 child into state (the only child in the list).
 	docs := h.Resolver.Docs.(*resolve.MemoryDocumentStore)
 	feeds := h.Resolver.Feeds.(*resolve.MemoryFeedStore)
 	current := mustDecodeRepoState(t, docs, feeds, repoStateFeed())
 	newManifests := map[string]spec.ManifestDescriptor{
-		amd: {SwarmRef: "child-amd64-ref", MediaType: indexTestDockerMT, Size: int64(len(indexChildAmd64))},
+		amd: {SwarmRef: "child-amd64-ref", MediaType: indexTestDockerMT, Size: int64(len(dockerChild))},
 	}
 	current.Manifests = newManifests
 	current.Tags = map[string]string{"amd": amd}
+	// The committed child BODY must be readable at its SwarmRef (the fixture
+	// default is the OCI child; override with the real Docker child used here).
+	docs.Documents["child-amd64-ref"] = dockerChild
 	seedRepoState(t, docs, feeds, current)
 
 	resp := putIndex(t, server.URL, issuer, "dockerlist", indexTestListMT, body)
@@ -586,7 +592,7 @@ func TestVerifyIndexChildByteLengthProof(t *testing.T) {
 	}
 	artifact := publish.Artifact{Kind: publish.ArtifactKindIndex, MediaType: indexTestMT,
 		Manifests: []publish.Descriptor{{MediaType: indexTestManMT, Digest: childDigest, Size: claimedSize}}}
-	err := verifyPublicationCoherence(context.Background(), docs, doc, "backend/api", "multi", indexDigest,
+	err := verifyPublicationCoherence(context.Background(), docs, docs, doc, "backend/api", "multi", indexDigest,
 		spec.ManifestDescriptor{MediaType: indexTestMT, Size: int64(len(indexBody))}, artifact)
 	if err == nil {
 		t.Fatal("verify must reject an index child whose stored body length disagrees with the declared size")
@@ -622,7 +628,7 @@ func TestVerifyIndexRejectsNestedChildIndex(t *testing.T) {
 	}
 	artifact := publish.Artifact{Kind: publish.ArtifactKindIndex, MediaType: indexTestMT,
 		Manifests: []publish.Descriptor{{MediaType: indexTestMT, Digest: childDigest, Size: int64(len(childBody))}}}
-	err := verifyPublicationCoherence(context.Background(), docs, doc, "backend/api", "multi", indexDigest,
+	err := verifyPublicationCoherence(context.Background(), docs, docs, doc, "backend/api", "multi", indexDigest,
 		spec.ManifestDescriptor{MediaType: indexTestMT, Size: int64(len(indexBody))}, artifact)
 	if err == nil {
 		t.Fatal("verify must reject a child that parses as a nested index")

@@ -283,7 +283,7 @@ func TestVerifyPublishedStateReadBackMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			feeds, docs, receipt, input, artifact := verificationFixture(t)
 			tc.mutate(feeds, docs, &receipt, &input)
-			err := VerifyPublishedState(context.Background(), feeds, docs, receipt, input, artifact)
+			err := VerifyPublishedState(context.Background(), feeds, docs, docs, receipt, input, artifact)
 			if tc.wantNil {
 				if err != nil {
 					t.Fatalf("expected verified read-back, got %v", err)
@@ -321,7 +321,7 @@ func TestVerifyPublishedStateDependencyClassification(t *testing.T) {
 	t.Run("feed resolve transport failure is dependency", func(t *testing.T) {
 		_, _, receipt, input, artifact := verificationFixture(t)
 		feeds := failingFeedResolver{err: errors.New("MARKER_NETWORK_1be9")}
-		err := VerifyPublishedState(context.Background(), feeds, nil, receipt, input, artifact)
+		err := VerifyPublishedState(context.Background(), feeds, nil, nil, receipt, input, artifact)
 		var dep *DependencyError
 		if !errors.As(err, &dep) {
 			t.Fatalf("expected DependencyError, got %T: %v", err, err)
@@ -338,7 +338,7 @@ func TestVerifyPublishedStateDependencyClassification(t *testing.T) {
 	t.Run("feed resolve deadline is dependency", func(t *testing.T) {
 		_, _, receipt, input, artifact := verificationFixture(t)
 		feeds := failingFeedResolver{err: context.DeadlineExceeded}
-		err := VerifyPublishedState(context.Background(), feeds, nil, receipt, input, artifact)
+		err := VerifyPublishedState(context.Background(), feeds, nil, nil, receipt, input, artifact)
 		var dep *DependencyError
 		if !errors.As(err, &dep) {
 			t.Fatalf("expected DependencyError, got %T: %v", err, err)
@@ -348,7 +348,7 @@ func TestVerifyPublishedStateDependencyClassification(t *testing.T) {
 	t.Run("document read transport failure is dependency", func(t *testing.T) {
 		feeds, _, receipt, input, artifact := verificationFixture(t)
 		docs := failingDocReader{err: errors.New("MARKER_NETWORK_722d")}
-		err := VerifyPublishedState(context.Background(), feeds, docs, receipt, input, artifact)
+		err := VerifyPublishedState(context.Background(), feeds, docs, nil, receipt, input, artifact)
 		var dep *DependencyError
 		if !errors.As(err, &dep) {
 			t.Fatalf("expected DependencyError, got %T: %v", err, err)
@@ -358,7 +358,7 @@ func TestVerifyPublishedStateDependencyClassification(t *testing.T) {
 	t.Run("document conclusively missing is integrity", func(t *testing.T) {
 		feeds, _, receipt, input, artifact := verificationFixture(t)
 		docs := failingDocReader{err: fmt.Errorf("read: %w", resolve.ErrDocumentNotFound)}
-		err := VerifyPublishedState(context.Background(), feeds, docs, receipt, input, artifact)
+		err := VerifyPublishedState(context.Background(), feeds, docs, nil, receipt, input, artifact)
 		var igt *IntegrityError
 		if !errors.As(err, &igt) {
 			t.Fatalf("expected IntegrityError, got %T: %v", err, err)
@@ -374,7 +374,7 @@ func TestVerifyPublishedStateDependencyClassification(t *testing.T) {
 func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 	t.Run("current state matches the target", func(t *testing.T) {
 		feeds, docs, receipt, input, artifact := verificationFixture(t)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		if err != nil {
 			t.Fatalf("expected verified retry, got %v", err)
 		}
@@ -400,7 +400,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 			Digest:      movedDigest,
 		}
 		putStateDoc(t, docs, "state-ref", s)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		if !errors.Is(err, ErrTargetNotCurrentState) {
 			t.Fatalf("expected ErrTargetNotCurrentState, got %T: %v", err, err)
 		}
@@ -418,7 +418,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 			Digest:      input.ManifestDigest,
 		}
 		putStateDoc(t, docs, "state-ref", s)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		if !errors.Is(err, ErrTargetNotCurrentState) {
 			t.Fatalf("expected ErrTargetNotCurrentState for a differently-recorded mapping, got %T: %v", err, err)
 		}
@@ -435,7 +435,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 		if _, err := spec.DecodeRepoStateDocument(docs.Documents["state-ref"]); err != nil {
 			t.Fatalf("legacy document must stay schema-valid: %v", err)
 		}
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		if !errors.Is(err, ErrTargetNotCurrentState) {
 			t.Fatalf("expected ErrTargetNotCurrentState for a legacy document, got %T: %v", err, err)
 		}
@@ -444,7 +444,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 	t.Run("malformed state stays integrity", func(t *testing.T) {
 		feeds, docs, receipt, input, artifact := verificationFixture(t)
 		docs.Documents["state-ref"] = []byte(`garbage`)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var igt *IntegrityError
 		if !errors.As(err, &igt) {
 			t.Fatalf("expected IntegrityError, got %T: %v", err, err)
@@ -463,7 +463,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 			Digest:      input.ManifestDigest,
 		}
 		putStateDoc(t, docs, "state-ref", s)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var igt *IntegrityError
 		if !errors.As(err, &igt) {
 			t.Fatalf("expected IntegrityError for forged provenance, got %T: %v", err, err)
@@ -475,7 +475,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 		s := loadStateDoc(t, docs, "state-ref")
 		s.Generation = 0
 		putStateDoc(t, docs, "state-ref", s)
-		err := VerifyPublishedRetryState(context.Background(), feeds, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, docs, docs, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var igt *IntegrityError
 		if !errors.As(err, &igt) {
 			t.Fatalf("expected IntegrityError, got %T: %v", err, err)
@@ -485,7 +485,7 @@ func TestVerifyRetriedPublicationStateMatrix(t *testing.T) {
 	t.Run("feed reveal dependency failure", func(t *testing.T) {
 		_, _, receipt, input, artifact := verificationFixture(t)
 		feeds := failingFeedResolver{err: context.DeadlineExceeded}
-		err := VerifyPublishedRetryState(context.Background(), feeds, nil, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
+		err := VerifyPublishedRetryState(context.Background(), feeds, nil, nil, repoStateFeed(), "backend/api", "latest", input.ManifestDigest, receipt.OperationID, input, artifact)
 		var dep *DependencyError
 		if !errors.As(err, &dep) {
 			t.Fatalf("expected DependencyError, got %T: %v", err, err)
@@ -669,7 +669,7 @@ func TestVerifyPublishedStateProvenanceMismatchFailsClosed(t *testing.T) {
 			s := loadStateDoc(t, docs, "state-ref")
 			tc.mutate(&s)
 			putStateDoc(t, docs, "state-ref", s)
-			err := VerifyPublishedState(context.Background(), feeds, docs, receipt, input, artifact)
+			err := VerifyPublishedState(context.Background(), feeds, docs, docs, receipt, input, artifact)
 			var igt *IntegrityError
 			if !errors.As(err, &igt) {
 				t.Fatalf("expected IntegrityError, got %T: %v", err, err)

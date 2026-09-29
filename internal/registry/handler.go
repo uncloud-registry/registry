@@ -24,6 +24,20 @@ type ObjectStore interface {
 	Get(ctx context.Context, ref string) ([]byte, error)
 }
 
+// BoundedBytesReader reads an immutable ARTIFACT-CONTENT object (the Bee
+// /bytes object path) with an EXPLICIT upper bound on the returned payload. It
+// is the production counterpart of resolve.Reader for artifact BODIES — the
+// read-after-write publication verification reads manifest and index-child
+// bodies through it, bounded BEFORE allocation, while repo-state documents
+// continue to flow through resolve.Reader (the /bzz document path).
+// Production: *swarm.BeeObjectStore (ReadBounded) and the in-memory
+// MemoryDocumentStore implement it; the verification fails closed if it is
+// ever absent when an artifact body read is required (it never silently falls
+// back to an unbounded read).
+type BoundedBytesReader interface {
+	ReadBounded(ctx context.Context, ref string, maxBytes int64) ([]byte, error)
+}
+
 type ObjectUploader interface {
 	Put(ctx context.Context, data []byte, batchID string) (string, error)
 	// PutStream uploads a blob by streaming src with an EXACT size and an
@@ -49,6 +63,14 @@ type Handler struct {
 	Authenticator  Authenticator
 	Staging        staging.RegistryStore
 	Publisher      publish.Publisher
+	// BoundedBytes reads immutable ARTIFACT-CONTENT objects (the Bee /bytes
+	// path) with an explicit per-read byte bound, used by the post-commit
+	// read-after-write verification for manifest and index-child BODIES. It is
+	// the /bytes counterpart of Resolver.Docs (/bzz), which continues to serve
+	// repo-state documents. NewHandler wires it from the object store when it
+	// implements BoundedBytesReader; the verification fails closed (it never
+	// falls back to an unbounded read) if it is absent when needed.
+	BoundedBytes BoundedBytesReader
 	// Preflight durably binds an EXPLICIT caller operation key to exactly one
 	// logical payload (registry + owner + repo + tag + manifest digest) in the
 	// control-plane operation store BEFORE any immutable object, feed, or
@@ -76,7 +98,7 @@ type Handler struct {
 }
 
 func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.RegistryStore, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
-	return &Handler{
+	h := &Handler{
 		Resolver:       resolver,
 		Objects:        objects,
 		Uploader:       uploader,
@@ -90,6 +112,14 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 		SessionTTL:     15 * time.Minute,
 		AuthRealm:      authRealm,
 	}
+	// Wire the bounded artifact-byte reader from the object store when it
+	// implements it (production BeeObjectStore and the in-memory store both
+	// do). When absent the verification fails closed at the first artifact
+	// body read — it never silently falls back to an unbounded read.
+	if bb, ok := objects.(BoundedBytesReader); ok {
+		h.BoundedBytes = bb
+	}
+	return h
 }
 
 // ServeHTTP authenticates every repo-scoped request BEFORE any policy
@@ -489,7 +519,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 							}
 							boundOperationID = clientOperationID
 						}
-						verr := VerifyPublishedRetryState(ctx, h.Resolver.Feeds, h.Resolver.Docs, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
+						verr := VerifyPublishedRetryState(ctx, h.Resolver.Feeds, h.Resolver.Docs, h.BoundedBytes, stateFeed, repo, reference, manifestDigest, pub.OperationID, input, artifact)
 						if verr == nil {
 							// The prior attempt for THIS operation committed and was
 							// verified. It may have crashed before consuming the
@@ -734,7 +764,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 		// exact, coherent repository state. A 201 is only ever produced after
 		// this verification passes; on failure the referenced staging is
 		// RETAINED for a safe retry (never cleared before verified publication).
-		if err := VerifyPublishedState(ctx, h.Resolver.Feeds, h.Resolver.Docs, receipt, input, artifact); err != nil {
+		if err := VerifyPublishedState(ctx, h.Resolver.Feeds, h.Resolver.Docs, h.BoundedBytes, receipt, input, artifact); err != nil {
 			return err
 		}
 

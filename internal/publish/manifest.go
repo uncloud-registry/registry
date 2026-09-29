@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -62,7 +64,7 @@ const (
 //     within the same artifact size regime (each child is itself capped at
 //     MaxArtifactBodyBytes).
 const (
-	MaxIndexChildDescriptors    = 10000
+	MaxIndexChildDescriptors     = 10000
 	MaxUniqueIndexChildManifests = 4096
 	MaxAggregateIndexChildBytes  = 256 << 20 // 256 MiB
 )
@@ -117,6 +119,14 @@ type Descriptor struct {
 	URLs        []string          `json:"urls,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Data        []byte            `json:"data,omitempty"`
+	// ArtifactType is the OCI descriptor's OPTIONAL artifactType member: the
+	// RFC 6838 media type of the artifact the descriptor references when that
+	// differs from mediaType. It is permitted ONLY on OCI descriptors
+	// (config, layers, subject, and OCI index children); Docker descriptors
+	// reject it as an OCI-only member. Parsing is validation, never
+	// transcoding: the exact source bytes are retained for storage/pull and
+	// this value is introspection only.
+	ArtifactType string `json:"artifactType,omitempty"`
 }
 
 // descriptorPolicy controls which OPTIONAL descriptor members are valid in a
@@ -127,22 +137,23 @@ type Descriptor struct {
 // REQUIRES a platform object while an OCI image-index child keeps platform
 // optional.
 type descriptorPolicy struct {
-	allowPlatform    bool
-	requirePlatform  bool // Docker manifest-list children only
-	allowURLs        bool
-	allowAnnotations bool
-	allowData        bool
+	allowPlatform     bool
+	requirePlatform   bool // Docker manifest-list children only
+	allowURLs         bool
+	allowAnnotations  bool
+	allowData         bool
+	allowArtifactType bool // OCI descriptors only (OCI 1.1 descriptor artifactType)
 }
 
 var (
 	// ociDescriptorPolicy applies to OCI descriptors: manifest config, manifest
 	// layer, and any subject descriptor. All OCI 1.1 optional descriptor
-	// members (urls, annotations, data) are valid; platform is not (platform is
-	// only meaningful on index children).
-	ociDescriptorPolicy = descriptorPolicy{allowURLs: true, allowAnnotations: true, allowData: true}
+	// members (urls, annotations, data, artifactType) are valid; platform is
+	// not (platform is only meaningful on index children).
+	ociDescriptorPolicy = descriptorPolicy{allowURLs: true, allowAnnotations: true, allowData: true, allowArtifactType: true}
 	// ociIndexChildPolicy applies to an OCI image-index child descriptor:
 	// platform is additional and OPTIONAL, and OCI optional members are valid.
-	ociIndexChildPolicy = descriptorPolicy{allowPlatform: true, allowURLs: true, allowAnnotations: true, allowData: true}
+	ociIndexChildPolicy = descriptorPolicy{allowPlatform: true, allowURLs: true, allowAnnotations: true, allowData: true, allowArtifactType: true}
 	// dockerManifestConfigPolicy applies to a Docker schema-2 config
 	// descriptor: its spec surface is exactly mediaType / size / digest, with
 	// no optional members.
@@ -224,16 +235,26 @@ func (a Artifact) References() []Descriptor {
 type ValidationErrorKind string
 
 const (
-	ErrKindBodyTooLarge           ValidationErrorKind = "body_too_large"
-	ErrKindMalformedJSON          ValidationErrorKind = "malformed_json"
-	ErrKindDuplicateMember        ValidationErrorKind = "duplicate_member"
-	ErrKindUnknownMember          ValidationErrorKind = "unknown_member"
-	ErrKindWrongType              ValidationErrorKind = "wrong_type"
-	ErrKindSchemaVersion          ValidationErrorKind = "schema_version"
-	ErrKindMissingField           ValidationErrorKind = "missing_field"
-	ErrKindInvalidShape           ValidationErrorKind = "invalid_shape"
-	ErrKindInvalidDigest          ValidationErrorKind = "invalid_digest"
-	ErrKindInvalidSize            ValidationErrorKind = "invalid_size"
+	ErrKindBodyTooLarge    ValidationErrorKind = "body_too_large"
+	ErrKindMalformedJSON   ValidationErrorKind = "malformed_json"
+	ErrKindDuplicateMember ValidationErrorKind = "duplicate_member"
+	ErrKindUnknownMember   ValidationErrorKind = "unknown_member"
+	ErrKindWrongType       ValidationErrorKind = "wrong_type"
+	ErrKindSchemaVersion   ValidationErrorKind = "schema_version"
+	ErrKindMissingField    ValidationErrorKind = "missing_field"
+	ErrKindInvalidShape    ValidationErrorKind = "invalid_shape"
+	ErrKindInvalidDigest   ValidationErrorKind = "invalid_digest"
+	ErrKindInvalidSize     ValidationErrorKind = "invalid_size"
+	// ErrKindInvalidMediaType rejects a value that does not conform to the
+	// RFC 6838 media-type syntax (used for descriptor mediaType values and
+	// the OCI top-level/descriptor artifactType). The syntax check is strict
+	// and data-free: the rejected value is never echoed.
+	ErrKindInvalidMediaType ValidationErrorKind = "invalid_media_type"
+	// ErrKindInvalidURI rejects a descriptor urls entry that does not conform
+	// to the RFC 3986 URI-reference syntax (absolute URI or valid relative
+	// reference). The check is strict and data-free: the rejected value is
+	// never echoed.
+	ErrKindInvalidURI             ValidationErrorKind = "invalid_uri"
 	ErrKindIntegerOverflow        ValidationErrorKind = "integer_overflow"
 	ErrKindConflictingDescriptors ValidationErrorKind = "conflicting_descriptors"
 	ErrKindInvalidPlatform        ValidationErrorKind = "invalid_platform"
@@ -374,6 +395,9 @@ func descriptorKnownKeys(policy descriptorPolicy) map[string]struct{} {
 	}
 	if policy.allowData {
 		keys["data"] = struct{}{}
+	}
+	if policy.allowArtifactType {
+		keys["artifactType"] = struct{}{}
 	}
 	return keys
 }
@@ -542,10 +566,14 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 		return Artifact{}, newValidationError(ErrKindSchemaVersion, "schemaVersion", "schemaVersion must be exactly 2")
 	}
 
-	// Embedded mediaType: optional in presence, but a PRESENT value must be a
-	// non-empty string that EXACTLY equals the top-level media type. A present
-	// empty string is rejected (never equated with an absent member). Docker
-	// schema-2 requires it; when present on any type it must agree.
+	// Embedded mediaType. For Docker schema-2 manifests and Docker manifest
+	// lists the embedded member is REQUIRED (Docker Distribution's
+	// manifest-v2-2 schema requires it) and must EXACTLY equal the top-level
+	// media type; a missing member on a Docker envelope is rejected. For the
+	// OCI types the member is optional in presence, but a PRESENT value must be
+	// a non-empty string that EXACTLY equals the top-level media type (a
+	// present empty string is rejected, never equated with an absent member).
+	wantDockerMediaType := mediaType == MediaTypeDockerManifest || mediaType == MediaTypeDockerManifestList
 	if mtRaw, present := env["mediaType"]; present {
 		mt, err := decodeRequiredString(mtRaw, "mediaType")
 		if err != nil {
@@ -559,6 +587,9 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 			return Artifact{}, newValidationError(ErrKindMediaTypeMismatch, "mediaType",
 				"embedded mediaType disagrees with the top-level media type")
 		}
+	} else if wantDockerMediaType {
+		return Artifact{}, newValidationError(ErrKindMissingField, "mediaType",
+			"Docker manifests require an embedded mediaType matching the top-level media type")
 	}
 
 	a := Artifact{MediaType: mediaType, Kind: kind}
@@ -579,6 +610,12 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 		if len(s) > maxArtifactTypeLen {
 			return Artifact{}, newValidationError(ErrKindInvalidShape, "artifactType",
 				fmt.Sprintf("artifactType exceeds the %d-byte bound", maxArtifactTypeLen))
+		}
+		// The top-level OCI artifactType must be a syntactically valid RFC 6838
+		// media type, enforced strictly and data-free.
+		if err := ValidateMediaTypeSyntax(s); err != nil {
+			return Artifact{}, newValidationError(ErrKindInvalidMediaType, "artifactType",
+				"artifactType must be a valid RFC 6838 media type")
 		}
 		a.ArtifactType = s
 	}
@@ -678,6 +715,136 @@ var supportedArtifactMediaTypes = map[string]ArtifactKind{
 	MediaTypeDockerManifestList: ArtifactKindIndex,
 }
 
+// ValidateMediaTypeSyntax reports whether s is a syntactically valid RFC 6838
+// media type string, used to validate the descriptor mediaType value and the
+// OCI top-level/descriptor artifactType. It is STRICT:
+//
+//   - empty values are rejected;
+//   - no leading/trailing ASCII whitespace and no interior whitespace or
+//     control characters anywhere (a media type is a single token stream);
+//   - the type/subtype tokens and any "; param=value" parameters must satisfy
+//     the RFC 2045/6838/media-type grammar, enforced by the standard library
+//     mime.ParseMediaType (which correctly accepts vendor types, tree/suffix
+//     forms like "application/vnd.oci.image.manifest.v1+json", and parameters
+//     like "; charset=utf-8", and rejects malformed tokens, an empty type or
+//     subtype, extra slashes, and malformed parameter syntax).
+//
+// It deliberately does NOT reject any valid vendor/tree/suffix/parameter form
+// the OCI spec permits. The returned error is data-free: it never contains the
+// offending value.
+func ValidateMediaTypeSyntax(s string) error {
+	if s == "" {
+		return errors.New("media type must not be empty")
+	}
+	if strings.TrimSpace(s) != s {
+		return errors.New("media type must not have leading or trailing whitespace")
+	}
+	if hasMediaTypeControl(s) {
+		return errors.New("media type must not contain control characters")
+	}
+	mt, _, err := mime.ParseMediaType(s)
+	if err != nil {
+		return errors.New("value is not a valid RFC 6838 media type")
+	}
+	// mime.ParseMediaType tolerates a bare TYPE token with no subtype, but a
+	// valid media type requires exactly one "/" separating a non-empty type
+	// and subtype. Enforce that explicitly (mime already rejects extra
+	// slashes and an empty type/subtype).
+	parts := strings.Split(mt, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return errors.New("value is not a valid RFC 6838 media type")
+	}
+	return nil
+}
+
+// hasMediaTypeControl reports whether s contains a byte that must never appear
+// literally in a media type: any C0 control (other than the ASCII SPACE, which
+// is valid OWS around a ";" parameter separator / "="), DEL, and higher
+// controls. It deliberately ALLOWS the space that may appear around ";" and
+// "=" in the parameter portion "text/plain; charset=utf-8".
+func hasMediaTypeControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 && c != ' ') || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateDescriptorURI reports whether s is a syntactically valid RFC 3986
+// URI-reference, the OCI descriptor `urls` entry grammar. The documented
+// policy accepts BOTH an absolute URI and a valid RELATIVE reference (a
+// path-absolute, path-noscheme, network-path "//host/...", or query-/fragment-
+// only reference), since RFC 3986 and the OCI spec permit both. It rejects:
+//
+//   - empty values;
+//   - any ASCII whitespace or C0/delete control character anywhere (a URI
+//     reference cannot contain literal whitespace/control bytes); and
+//   - malformed percent-encoding, structurally malformed references, and
+//     syntactically invalid schemes/authorities, enforced by net/url.Parse
+//     plus an explicit check that an http/https absolute URI carries a
+//     non-empty host (an empty authority is a bad authority for those schemes).
+//
+// The returned error is data-free: it never contains the offending value.
+func ValidateDescriptorURI(s string) error {
+	if s == "" {
+		return errors.New("a descriptor url must not be empty")
+	}
+	if hasURIWhitespace(s) {
+		return errors.New("a descriptor url must not contain whitespace or control characters")
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return errors.New("value is not a valid RFC 3986 URI reference")
+	}
+	if u.Scheme != "" {
+		if !validURIScheme(u.Scheme) {
+			return errors.New("value carries a malformed RFC 3986 scheme")
+		}
+		if (u.Scheme == "http" || u.Scheme == "https") && u.Host == "" {
+			return errors.New("an http/https URI reference requires a non-empty authority")
+		}
+	}
+	return nil
+}
+
+// hasURIWhitespace reports whether s contains an ASCII whitespace or control
+// byte that a URI reference can never contain literally: space, tab, CR, LF,
+// vertical controls, DEL, and every C0 control. Unlike media types, a URI has
+// no OWS tolerance — every whitespace/control byte must be percent-encoded.
+func hasURIWhitespace(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 0x20 || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// validURIScheme reports whether s conforms to the RFC 3986 scheme grammar:
+// ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+func validURIScheme(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		alnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+				return false
+			}
+			continue
+		}
+		if !(alnum || c == '+' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeDescriptorArray decodes a descriptor array. A present null or any
 // non-array is the wrong type; each element must itself be an object
 // descriptor (never null).
@@ -726,6 +893,13 @@ func decodeDescriptor(raw json.RawMessage, field string, policy descriptorPolicy
 	if len(mediaType) > maxDescriptorMediaTypeLen {
 		return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "mediaType"),
 			fmt.Sprintf("descriptor mediaType exceeds the %d-byte bound", maxDescriptorMediaTypeLen))
+	}
+	// RFC 6838 media-type syntax is enforced strictly and data-free: any
+	// malformed type (empty outer whitespace, control bytes, malformed
+	// type/subtype/parameter) is rejected before publication.
+	if err := ValidateMediaTypeSyntax(mediaType); err != nil {
+		return Descriptor{}, newValidationError(ErrKindInvalidMediaType, joinPath(field, "mediaType"),
+			"descriptor mediaType must be a valid RFC 6838 media type")
 	}
 
 	dRaw, present := members["digest"]
@@ -790,6 +964,35 @@ func decodeDescriptor(raw json.RawMessage, field string, policy descriptorPolicy
 			return Descriptor{}, err
 		}
 		d.Data = data
+	}
+
+	// OCI descriptor artifactType (OCI 1.1): permitted ONLY on OCI descriptors
+	// (config, layer, subject, index child); Docker descriptors reject it. A
+	// present value must be non-empty, bounded, and a valid RFC 6838 media
+	// type — validated strictly and data-free. The parsed value is preserved
+	// for introspection while the exact source bytes remain for storage/pull.
+	if atRaw, present := members["artifactType"]; present {
+		if !policy.allowArtifactType {
+			return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "artifactType"),
+				"artifactType is only accepted on OCI descriptors")
+		}
+		at, err := decodeRequiredString(atRaw, joinPath(field, "artifactType"))
+		if err != nil {
+			return Descriptor{}, err
+		}
+		if at == "" {
+			return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "artifactType"),
+				"a present descriptor artifactType must be non-empty")
+		}
+		if len(at) > maxArtifactTypeLen {
+			return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "artifactType"),
+				fmt.Sprintf("descriptor artifactType exceeds the %d-byte bound", maxArtifactTypeLen))
+		}
+		if err := ValidateMediaTypeSyntax(at); err != nil {
+			return Descriptor{}, newValidationError(ErrKindInvalidMediaType, joinPath(field, "artifactType"),
+				"descriptor artifactType must be a valid RFC 6838 media type")
+		}
+		d.ArtifactType = at
 	}
 
 	pRaw, present := members["platform"]
@@ -884,6 +1087,14 @@ func decodeDescriptorURLs(raw json.RawMessage, field string) ([]string, error) {
 		if len(u) > maxDescriptorURLLen {
 			return nil, newValidationError(ErrKindInvalidShape, fmt.Sprintf("%s[%d]", field, i),
 				fmt.Sprintf("descriptor url exceeds the %d-byte bound", maxDescriptorURLLen))
+		}
+		// Each descriptor url must be a syntactically valid RFC 3986 URI
+		// reference (absolute URI or valid relative reference); malformed
+		// percent escapes, whitespace/control bytes, and bad schemes /
+		// authorities are rejected. The value is never echoed.
+		if err := ValidateDescriptorURI(u); err != nil {
+			return nil, newValidationError(ErrKindInvalidURI, fmt.Sprintf("%s[%d]", field, i),
+				"descriptor url must be a valid RFC 3986 URI reference")
 		}
 		out = append(out, u)
 	}

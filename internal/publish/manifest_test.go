@@ -274,7 +274,7 @@ func TestParseArtifact(t *testing.T) {
 		{
 			name:        "non-OCI Docker manifest layer rejects OCI-only descriptor annotations",
 			mediaType:   dockerManMT,
-			body:        fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"annotations":{"k":"v"}}]}`, dockerConfigMT, dig('c'), dockerLayerMT, dig('b')),
+			body:        fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"annotations":{"k":"v"}}]}`, dockerManMT, dockerConfigMT, dig('c'), dockerLayerMT, dig('b')),
 			wantErr:     true,
 			wantErrKind: ErrKindUnknownMember,
 		},

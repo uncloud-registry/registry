@@ -178,10 +178,10 @@ func TestParseArtifactDockerDescriptorRejectsOCIOnlyMembers(t *testing.T) {
 		body string
 		mt   string
 	}{
-		{"docker config urls", fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q,"urls":["https://x"]},"layers":[]}`, dockerConfigMT, dig('c')), dockerManMT},
-		{"docker config data", fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q,"data":"aGk="},"layers":[]}`, dockerConfigMT, dig('c')), dockerManMT},
-		{"docker layer annotations", fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"annotations":{"k":"v"}}]}`, dockerConfigMT, dig('c'), dockerLayerMT, dig('a')), dockerManMT},
-		{"docker layer data", fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"data":"aGk="}]}`, dockerConfigMT, dig('c'), dockerLayerMT, dig('a')), dockerManMT},
+		{"docker config urls", fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q,"urls":["https://x"]},"layers":[]}`, dockerManMT, dockerConfigMT, dig('c')), dockerManMT},
+		{"docker config data", fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q,"data":"aGk="},"layers":[]}`, dockerManMT, dockerConfigMT, dig('c')), dockerManMT},
+		{"docker layer annotations", fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"annotations":{"k":"v"}}]}`, dockerManMT, dockerConfigMT, dig('c'), dockerLayerMT, dig('a')), dockerManMT},
+		{"docker layer data", fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"data":"aGk="}]}`, dockerManMT, dockerConfigMT, dig('c'), dockerLayerMT, dig('a')), dockerManMT},
 		{"docker manifest-list child annotations", fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux"},"annotations":{"k":"v"}}]}`, dockerListMT, dockerManMT, dig('b')), dockerListMT},
 		{"docker manifest-list child urls", fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[{"mediaType":%q,"size":512,"digest":%q,"platform":{"architecture":"amd64","os":"linux"},"urls":["https://x"]}]}`, dockerListMT, dockerManMT, dig('b')), dockerListMT},
 	}
@@ -193,9 +193,10 @@ func TestParseArtifactDockerDescriptorRejectsOCIOnlyMembers(t *testing.T) {
 		})
 	}
 	// Docker LAYER descriptors DO allow urls (per the Docker Distribution
-	// manifest-v2-2 descriptor).
-	dockerLayerURL := fmt.Sprintf(`{"schemaVersion":2,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"urls":["https://x"]}]}`,
-		dockerConfigMT, dig('c'), dockerLayerMT, dig('a'))
+	// manifest-v2-2 descriptor) — and a Docker manifest must carry the required
+	// embedded mediaType.
+	dockerLayerURL := fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"config":{"mediaType":%q,"size":24,"digest":%q},"layers":[{"mediaType":%q,"size":24,"digest":%q,"urls":["https://x"]}]}`,
+		dockerManMT, dockerConfigMT, dig('c'), dockerLayerMT, dig('a'))
 	if _, err := ParseArtifact(dockerManMT, []byte(dockerLayerURL)); err != nil {
 		t.Fatalf("Docker layer descriptor must accept urls: %v", err)
 	}

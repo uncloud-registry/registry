@@ -224,6 +224,14 @@ func TestBeeHandlerProductionReadLayering(t *testing.T) {
 	if _, ok := hr.Objects.(*swarm.BeeObjectStore); !ok {
 		t.Fatalf("Bee mode must wire the BeeObjectStore as the object store, got %T", hr.Objects)
 	}
+	// The post-commit verification's bounded artifact-byte reader must be the
+	// BeeObjectStore (/bytes object path), never an unbounded fallback.
+	if hr.BoundedBytes == nil {
+		t.Fatal("Bee mode must wire an explicit bounded artifact byte reader (BoundedBytes)")
+	}
+	if _, ok := hr.BoundedBytes.(*swarm.BeeObjectStore); !ok {
+		t.Fatalf("Bee mode must wire the BeeObjectStore as the bounded artifact byte reader, got %T", hr.BoundedBytes)
+	}
 
 	ctx := context.Background()
 	identity := resolve.RegistryIdentity{Host: beeWiringHost, Owner: "0x" + beeWiringOwner, RegistryID: 7}

@@ -182,7 +182,7 @@ func classifyPublicationError(err error) (int, string, string) {
 // mismatch is a fail-closed *IntegrityError: the caller must NOT report
 // success and MUST retain staging for a safe retry. A read-side timeout
 // collapses to the dependency class (retryable), never to success.
-func VerifyPublishedState(ctx context.Context, feeds resolve.FeedResolver, docs resolve.Reader, receipt publish.PublicationReceipt, input publish.BuildInput, artifact publish.Artifact) error {
+func VerifyPublishedState(ctx context.Context, feeds resolve.FeedResolver, docs resolve.Reader, bounded BoundedBytesReader, receipt publish.PublicationReceipt, input publish.BuildInput, artifact publish.Artifact) error {
 	stateRef, err := feeds.ResolveFeed(ctx, receipt.StateFeed)
 	if err != nil {
 		return classifyResolverFailure("verify published state: resolve feed", err)
@@ -211,7 +211,7 @@ func VerifyPublishedState(ctx context.Context, feeds resolve.FeedResolver, docs 
 	if err := verifyPublicationProvenance(doc, receipt); err != nil {
 		return err
 	}
-	if err := verifyPublicationCoherence(ctx, docs, doc, receipt.Repo, receipt.Tag, receipt.ManifestDigest, input.Manifest, artifact); err != nil {
+	if err := verifyPublicationCoherence(ctx, docs, bounded, doc, receipt.Repo, receipt.Tag, receipt.ManifestDigest, input.Manifest, artifact); err != nil {
 		return err
 	}
 	return nil
@@ -231,7 +231,7 @@ func VerifyPublishedState(ctx context.Context, feeds resolve.FeedResolver, docs 
 // provenance stays schema-valid but is not a retry — the exact prior operation
 // identity is not recoverable and must never be fabricated. Any
 // structural/read/integrity problem is *IntegrityError.
-func VerifyPublishedRetryState(ctx context.Context, feeds resolve.FeedResolver, docs resolve.Reader, stateFeed string, repo string, tag string, digest string, expectedOperationID string, input publish.BuildInput, artifact publish.Artifact) error {
+func VerifyPublishedRetryState(ctx context.Context, feeds resolve.FeedResolver, docs resolve.Reader, bounded BoundedBytesReader, stateFeed string, repo string, tag string, digest string, expectedOperationID string, input publish.BuildInput, artifact publish.Artifact) error {
 	stateRef, err := feeds.ResolveFeed(ctx, stateFeed)
 	if err != nil {
 		return classifyResolverFailure("verify retry state: resolve feed", err)
@@ -263,7 +263,7 @@ func VerifyPublishedRetryState(ctx context.Context, feeds resolve.FeedResolver, 
 		// operation and its ID must never be fabricated or echoed.
 		return ErrTargetNotCurrentState
 	}
-	if err := verifyPublicationCoherence(ctx, docs, doc, repo, tag, digest, input.Manifest, artifact); err != nil {
+	if err := verifyPublicationCoherence(ctx, docs, bounded, doc, repo, tag, digest, input.Manifest, artifact); err != nil {
 		return err
 	}
 	return nil
@@ -292,7 +292,15 @@ func verifyPublicationProvenance(doc spec.RepoStateDocument, receipt publish.Pub
 // mapping, the manifest descriptor (media type and size), the manifest object
 // bytes (sha256 digest), and every referenced blob record's size and media
 // type. All failures are *IntegrityError whose diagnostic causes stay private.
-func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc spec.RepoStateDocument, repo string, tag string, digest string, manifest spec.ManifestDescriptor, artifact publish.Artifact) error {
+//
+// Artifact BODIES (the manifest document and any index-child manifest bodies)
+// are read through the bounded `bounded` byte reader — the /bytes object path
+// — with each read bounded to min(MaxArtifactBodyBytes, remaining aggregate
+// budget, declared size + 1 for mismatch) BEFORE allocation, and every child
+// body is accounted toward the shared aggregate bound. The reader never
+// silently falls back to an unbounded read: if `bounded` is absent when an
+// artifact body read is required, the publication FAILS CLOSED.
+func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, bounded BoundedBytesReader, doc spec.RepoStateDocument, repo string, tag string, digest string, manifest spec.ManifestDescriptor, artifact publish.Artifact) error {
 	if doc.Repo != repo {
 		return newIntegrityError(fmt.Errorf("verify publication: state document repo does not match the target repo"))
 	}
@@ -306,9 +314,13 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 	if desc.MediaType != manifest.MediaType || desc.Size != manifest.Size {
 		return newIntegrityError(fmt.Errorf("verify publication: manifest descriptor media/size disagree with the request target"))
 	}
-	raw, err := docs.Read(ctx, desc.SwarmRef)
+	// Read the manifest object BODY through the bounded artifact-byte reader,
+	// bounded to min(MaxArtifactBodyBytes, declared size + 1) so a body larger
+	// than the declared size (or than the artifact bound) fails closed BEFORE
+	// it is fully allocated.
+	raw, err := verifyReadBounded(ctx, bounded, "read manifest document", desc.SwarmRef, artifactReadBound(manifest.Size, 0))
 	if err != nil {
-		return classifyResolverFailure(fmt.Sprintf("verify publication: read manifest document %q", desc.SwarmRef), err)
+		return err
 	}
 	if publish.ComputeDigest(raw) != digest {
 		return newIntegrityError(fmt.Errorf("verify publication: manifest document bytes do not match the target digest"))
@@ -319,8 +331,8 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 		// descriptor set to DISTINCT digests (first-seen document order). Every
 		// descriptor — including identical duplicates — is still semantically
 		// validated against the committed record in order, but each DISTINCT
-		// child body is READ and HASHED exactly once, so duplicate descriptors
-		// can never amplify the verification read.
+		// child body is READ (bounded) and HASHED exactly once, so duplicate
+		// descriptors can never amplify the verification read.
 		unique, err := publish.UniqueIndexChildren(artifact.Manifests)
 		if err != nil {
 			return newIntegrityError(fmt.Errorf("verify publication: index child set exceeds the shared index bounds: %w", err))
@@ -340,13 +352,19 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 		var verifiedBytes int64
 		for _, ref := range unique {
 			child := doc.Manifests[ref.Digest]
-			childRaw, err := docs.Read(ctx, child.SwarmRef)
+			remaining := int64(publish.MaxAggregateIndexChildBytes) - verifiedBytes
+			// Bound each child body read to min(MaxArtifactBodyBytes, remaining
+			// aggregate budget, declared size + 1) so the aggregate verification
+			// read stays bounded WITHIN the same artifact-size regime, then
+			// ACCOUNT the actual read toward the aggregate budget.
+			childRaw, err := verifyReadBounded(ctx, bounded, "read child manifest", child.SwarmRef, artifactReadBound(ref.Size, remaining))
 			if err != nil {
-				return classifyResolverFailure(fmt.Sprintf("verify publication: read child manifest %q", child.SwarmRef), err)
+				return err
 			}
-			if int64(len(childRaw)) > publish.MaxArtifactBodyBytes {
-				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body exceeds the artifact size bound"))
+			if int64(len(childRaw)) > remaining {
+				return newIntegrityError(fmt.Errorf("verify publication: aggregate verified child bytes exceed the shared index bound"))
 			}
+			verifiedBytes += int64(len(childRaw))
 			if publish.ComputeDigest(childRaw) != ref.Digest {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body does not match its digest"))
 			}
@@ -356,12 +374,6 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 				// prove the byte length claimed by the descriptor.
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body length disagrees with its declared size"))
 			}
-			// Enforce the shared AGGREGATE verified-byte bound (overflow-safe) so
-			// the total verification read across DISTINCT children stays bounded.
-			if int64(len(childRaw)) > publish.MaxAggregateIndexChildBytes-verifiedBytes {
-				return newIntegrityError(fmt.Errorf("verify publication: aggregate verified child bytes exceed the shared index bound"))
-			}
-			verifiedBytes += int64(len(childRaw))
 			// Independently parse the child under its DECLARED media type: it must
 			// decode as a coherent single-platform manifest, never as a nested
 			// index (recursive index levels are not supported) and never as an
@@ -384,6 +396,50 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 		}
 	}
 	return nil
+}
+
+// artifactReadBound computes the per-read byte bound for an artifact-body
+// verification read: min(MaxArtifactBodyBytes, remaining, declaredSize + 1).
+// remaining == 0 means there is no aggregate-budget constraint for THIS read
+// (the top-level manifest body); for index children it is the remaining shared
+// aggregate budget. The declaredSize + 1 term lets a body that disagrees with
+// its declared size fail closed at the transport (the reader may read at most
+// bound+1 bytes and rejects a larger body). The result is never negative.
+func artifactReadBound(declaredSize, remaining int64) int64 {
+	b := int64(publish.MaxArtifactBodyBytes)
+	if remaining > 0 && remaining < b {
+		b = remaining
+	}
+	// declaredSize + 1 for mismatch detection, overflow-safe.
+	if declaredSize >= 0 {
+		if declaredSize+1 > declaredSize && declaredSize+1 < b {
+			b = declaredSize + 1
+		} else if declaredSize+1 < b {
+			// declaredSize+1 overflowed to a small value; keep the larger bound.
+		}
+	}
+	if b < 0 {
+		return 0
+	}
+	return b
+}
+
+// verifyReadBounded reads an artifact body through the bounded byte reader
+// with the given per-read bound, failing CLOSED if the bounded reader is not
+// configured (production wiring always provides it; a nil reader means an
+// unbounded fallback would otherwise be needed and is NEVER taken). A
+// conclusive not-found is an integrity violation; any other bounded-read
+// failure (transport, timeout, oversize beyond the bound) is the retryable
+// dependency class.
+func verifyReadBounded(ctx context.Context, bounded BoundedBytesReader, what, ref string, maxBytes int64) ([]byte, error) {
+	if bounded == nil {
+		return nil, newIntegrityError(fmt.Errorf("verify publication: %s: bounded artifact byte reader is not configured", what))
+	}
+	data, err := bounded.ReadBounded(ctx, ref, maxBytes)
+	if err != nil {
+		return nil, classifyResolverFailure(fmt.Sprintf("verify publication: %s", what), err)
+	}
+	return data, nil
 }
 
 // classifyResolverFailure translates a resolver/document-layer failure into
