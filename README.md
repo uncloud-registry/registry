@@ -1,6 +1,6 @@
 # Uncloud Registry
 
-`uncloud-registry` is a Docker Registry HTTP API v2 compatible server that stores both image content and published registry metadata in Swarm.
+`uncloud-registry` is a registry server implementing a **documented subset** of the Docker Registry HTTP API v2 / OCI Distribution API. It stores both image content and published registry metadata in Swarm. The exact wire contract — supported endpoints and methods, headers, error codes, media types, authentication behavior, and deferred operations — is pinned by the conformance matrix in [docs/compatibility.md](docs/compatibility.md) and enforced by `TestDistributionConformanceMatrix`. It is not a drop-in replacement for Docker Distribution; endpoints outside the documented subset are not supported.
 
 The core idea is:
 
@@ -286,14 +286,22 @@ This is why Bee-backed publish needs a signer private key.
 
 ## Current Limitations
 
-This repository is intentionally still early-stage. Important current limitations:
+The exact compatibility subset — including supported routes, methods, and
+error codes — is documented in [docs/compatibility.md](docs/compatibility.md)
+and enforced by the `TestDistributionConformanceMatrix` conformance test.
+Important current limitations:
 
-- manifest publish by digest is not supported
-- concurrent multi-writer publish is not handled yet
+- registry **catalog** (`/v2/_catalog`), **manifest/blob deletion**, and
+  **cross-repository blob mounting** are deferred and answer explicit
+  `405 UNSUPPORTED` (see docs/compatibility.md §2)
+- tag listing (`/v2/<name>/tags/list`) is not implemented
+- manifest publish by **digest** is not supported; publish by tag only
+- concurrent multi-writer publish is handled by per-repository serialization
+  plus an authoritative control-plane generation fence — no active-active
+  writers
 - staging is still in-memory even in Bee mode
 - secure JWKS key-file loading for registry token verification (kernel `O_NOFOLLOW`/`O_NONBLOCK` single-descriptor open) is implemented on macOS and Linux only; on any other platform the registry fails closed at startup rather than loading keys through a weaker fallback — there is no Windows (or other non-macOS/Linux) keys-file loading support
 - ENS resolution is currently subdomain-to-ENS naming convention, not a full external ENS resolver integration
-- OCI validation is still minimal
 - no GC or retention policy yet
 - no Redis-backed staging or repo locking yet
 
@@ -301,13 +309,13 @@ This repository is intentionally still early-stage. Important current limitation
 
 ### Entry point
 
-- [cmd/registry/main.go](/Users/Alok/dev/uncloud-registry/cmd/registry/main.go)
+- [cmd/registry/main.go](/cmd/registry/main.go)
 
 Chooses the backend and wires the HTTP handler.
 
 ### Spec layer
 
-- [internal/spec/documents.go](/Users/Alok/dev/uncloud-registry/internal/spec/documents.go)
+- [internal/spec/documents.go](/internal/spec/documents.go)
 
 Typed schema definitions and validation for:
 
@@ -320,7 +328,7 @@ Typed schema definitions and validation for:
 
 ### Resolution layer
 
-- [internal/resolve/registry.go](/Users/Alok/dev/uncloud-registry/internal/resolve/registry.go)
+- [internal/resolve/registry.go](/internal/resolve/registry.go)
 
 Responsible for:
 
@@ -330,8 +338,8 @@ Responsible for:
 
 ### Policy layer
 
-- [internal/policy/authz.go](/Users/Alok/dev/uncloud-registry/internal/policy/authz.go)
-- [internal/policy/stamps.go](/Users/Alok/dev/uncloud-registry/internal/policy/stamps.go)
+- [internal/policy/authz.go](/internal/policy/authz.go)
+- [internal/policy/stamps.go](/internal/policy/stamps.go)
 
 Responsible for:
 
@@ -341,19 +349,20 @@ Responsible for:
 
 ### Registry HTTP layer
 
-- [internal/registry/handler.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler.go)
+- [internal/registry/handler.go](/internal/registry/handler.go)
 
-Implements the registry API surface currently supported:
+Implements the registry API surface documented in [docs/compatibility.md](docs/compatibility.md):
 
-- `GET /v2/`
-- `GET/HEAD /v2/<name>/manifests/<reference>`
+- `GET/HEAD /v2`, `/v2/` (base ping)
+- `GET/HEAD /v2/<name>/manifests/<tag|digest>`
 - `PUT /v2/<name>/manifests/<tag>`
 - `GET/HEAD /v2/<name>/blobs/<digest>`
-- `POST/PATCH/PUT/GET/DELETE /v2/<name>/blobs/uploads/...`
+- `POST/GET/PATCH/PUT/DELETE /v2/<name>/blobs/uploads/...`
+- deferred (explicit `405 UNSUPPORTED`): catalog, manifest/blob deletion, cross-repo mount
 
 ### Staging layer
 
-- [internal/staging/store.go](/Users/Alok/dev/uncloud-registry/internal/staging/store.go)
+- [internal/staging/store.go](/internal/staging/store.go)
 
 Ephemeral upload state:
 
@@ -362,13 +371,13 @@ Ephemeral upload state:
 
 ### Publish layer
 
-- [internal/publish/publisher.go](/Users/Alok/dev/uncloud-registry/internal/publish/publisher.go)
+- [internal/publish/publisher.go](/internal/publish/publisher.go)
 
 Builds the next repo state and publishes it by moving the repo feed.
 
 ### Swarm adapter layer
 
-- [internal/swarm/bee.go](/Users/Alok/dev/uncloud-registry/internal/swarm/bee.go)
+- [internal/swarm/bee.go](/internal/swarm/bee.go)
 
 Bee-backed adapters for:
 
@@ -379,18 +388,37 @@ Bee-backed adapters for:
 
 ## Tests
 
+The compatibility contract, its gate commands, and the supported test suites
+are listed in [docs/compatibility.md](docs/compatibility.md) and enforced by
+the conformance matrix.
+
 Run all tests with:
 
 ```bash
 go test ./...
 ```
 
+Gate commands (all must pass before a release):
+
+```bash
+# Conformance matrix (distribution wire contract, no mocks)
+go test ./internal/registry -run TestDistributionConformanceMatrix -count=1 -v
+go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v
+
+# Full suite, vet, build, formatting, module hygiene
+go test ./...
+go vet ./...
+go build ./...
+gofmt -l .
+go mod tidy   # must produce no diff
+```
+
 The most useful test files are:
 
-- [internal/registry/handler_test.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler_test.go)
-- [internal/swarm/bee_test.go](/Users/Alok/dev/uncloud-registry/internal/swarm/bee_test.go)
-- [internal/staging/store_test.go](/Users/Alok/dev/uncloud-registry/internal/staging/store_test.go)
-- [internal/spec/documents_test.go](/Users/Alok/dev/uncloud-registry/internal/spec/documents_test.go)
+- [internal/registry/handler_test.go](/internal/registry/handler_test.go)
+- [internal/swarm/bee_test.go](/internal/swarm/bee_test.go)
+- [internal/staging/store_test.go](/internal/staging/store_test.go)
+- [internal/spec/documents_test.go](/internal/spec/documents_test.go)
 
 ## How To Run
 
@@ -561,12 +589,12 @@ The intended setup flow is:
 
 If you are new to the codebase, read in this order:
 
-1. [README.md](/Users/Alok/dev/uncloud-registry/README.md)
-2. [internal/spec/documents.go](/Users/Alok/dev/uncloud-registry/internal/spec/documents.go)
-3. [internal/registry/handler.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler.go)
-4. [internal/publish/publisher.go](/Users/Alok/dev/uncloud-registry/internal/publish/publisher.go)
-5. [internal/swarm/bee.go](/Users/Alok/dev/uncloud-registry/internal/swarm/bee.go)
-6. [internal/registry/handler_test.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler_test.go)
+1. [README.md](/README.md)
+2. [internal/spec/documents.go](/internal/spec/documents.go)
+3. [internal/registry/handler.go](/internal/registry/handler.go)
+4. [internal/publish/publisher.go](/internal/publish/publisher.go)
+5. [internal/swarm/bee.go](/internal/swarm/bee.go)
+6. [internal/registry/handler_test.go](/internal/registry/handler_test.go)
 
 That sequence goes from the conceptual model to the request flow to the Swarm integration.
 

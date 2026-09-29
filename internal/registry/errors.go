@@ -113,6 +113,21 @@ const (
 	// ErrorCodeInternal is 500: an unknown internal failure; the caller may
 	// retry but the operator should investigate.
 	ErrorCodeInternal = "UNKNOWN"
+	// ErrorCodeUnsupported is 405: the operation is not supported — an
+	// unsupported method on a supported route, or a documented deferred
+	// operation (catalog, deletion, or cross-repository blob mounting). The
+	// response always carries the Allow contract for the route.
+	ErrorCodeUnsupported = "UNSUPPORTED"
+	// ErrorCodeNameUnknown is 404: the requested path is not a known route or
+	// the repository state cannot be resolved. Fixed and data-free.
+	ErrorCodeNameUnknown = "NAME_UNKNOWN"
+	// ErrorCodeManifestUnknown is 404: the requested manifest (by tag or
+	// digest) does not exist in the resolved repository state, or its stored
+	// representation is not acceptable for the request's Accept header.
+	ErrorCodeManifestUnknown = "MANIFEST_UNKNOWN"
+	// ErrorCodeBlobUnknown is 404: the requested blob digest does not exist
+	// in the resolved repository state.
+	ErrorCodeBlobUnknown = "BLOB_UNKNOWN"
 )
 
 // ErrTargetNotCurrentState is returned by VerifyPublishedRetryState when the

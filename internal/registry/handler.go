@@ -166,14 +166,50 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 // token on pull may degrade to the anonymous principal, and only so the auth
 // policy can then explicitly allow or deny it.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Base ping — the Docker/OCI API version handshake every client performs
+	// before any other request. GET/HEAD answer 200 with the Distribution API
+	// version header; any other method is an explicit documented 405
+	// (conformance matrix row "ping unsupported method").
 	if r.URL.Path == "/v2" || r.URL.Path == "/v2/" {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeUnsupported(w, allowPing, messageUnsupportedMethod)
+			return
+		}
+		w.Header().Set(headerAPIVersion, "registry/2.0")
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Deferred catalog: /v2/_catalog (and the trailing-slash form) is a
+	// documented, data-free 405 UNSUPPORTED answered BEFORE identity
+	// resolution or authentication — see docs/compatibility.md.
+	if r.URL.Path == "/v2/_catalog" || r.URL.Path == "/v2/_catalog/" {
+		writeUnsupported(w, allowPing, messageCatalogDeferred)
 		return
 	}
 
 	repo, resource, reference, ok := parsePath(r.URL.Path)
 	if !ok {
-		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "unknown path")
+		writeError(w, http.StatusNotFound, ErrorCodeNameUnknown, messageUnknownPath)
+		return
+	}
+
+	// Deferred operations (manifest/blob deletion and cross-repository blob
+	// mounting) are answered BEFORE identity resolution and authentication:
+	// each response is fixed, data-free, and identical for every repository
+	// and host, so the deferral can never act as an existence oracle or leak
+	// repository detail. The Allow contract still names what the route DOES
+	// support so a client can adapt (a Docker/Podman client treats an
+	// unsupported mount by falling back to a plain upload session).
+	switch {
+	case resource == "manifests" && r.Method == http.MethodDelete:
+		writeUnsupported(w, allowManifests, messageDeleteDeferred)
+		return
+	case resource == "blobs" && r.Method == http.MethodDelete:
+		writeUnsupported(w, allowBlobs, messageDeleteDeferred)
+		return
+	case resource == "uploads" && reference == "" && r.Method == http.MethodPost && r.URL.Query().Get("mount") != "":
+		writeUnsupported(w, allowUploadStart, messageMountDeferred)
 		return
 	}
 
@@ -189,7 +225,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	action, ok := routeAction(resource, r.Method)
 	if !ok {
-		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "unknown path")
+		writeError(w, http.StatusNotFound, ErrorCodeNameUnknown, messageUnknownPath)
 		return
 	}
 
@@ -261,8 +297,11 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 	}
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		// Unsupported methods on the manifest route (POST/PATCH/OPTIONS/…)
+		// are an explicit data-free 405 UNSUPPORTED with the route's Allow
+		// contract. PUT is dispatched separately as the push path; DELETE is
+		// intercepted earlier as a documented deferred operation.
+		writeUnsupported(w, allowManifests, messageUnsupportedMethod)
 		return
 	}
 
@@ -271,14 +310,14 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 		var ok bool
 		digest, ok = state.Tags[reference]
 		if !ok {
-			writeError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "tag not found")
+			writeError(w, http.StatusNotFound, ErrorCodeManifestUnknown, "tag not found")
 			return
 		}
 	}
 
 	desc, ok := state.Manifests[digest]
 	if !ok {
-		writeError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "manifest not found")
+		writeError(w, http.StatusNotFound, ErrorCodeManifestUnknown, "manifest not found")
 		return
 	}
 
@@ -348,14 +387,16 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 	}
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		// Unsupported methods on the blob route are an explicit data-free 405
+		// UNSUPPORTED with the route's Allow contract; DELETE is intercepted
+		// earlier as a documented deferred operation.
+		writeUnsupported(w, allowBlobs, messageUnsupportedMethod)
 		return
 	}
 
 	desc, ok := state.Blobs[digest]
 	if !ok {
-		writeError(w, http.StatusNotFound, "BLOB_UNKNOWN", "blob not found")
+		writeError(w, http.StatusNotFound, ErrorCodeBlobUnknown, "blob not found")
 		return
 	}
 
@@ -1033,9 +1074,45 @@ const (
 	messageUploadBodyRead        = "failed to read the upload body"
 	messageBlobUploadFailed      = "blob upload failed"
 	messageManifestNotAcceptable = "the stored manifest representation is not acceptable for the requested media types"
+	messageUnknownPath           = "unknown path"
+	// Fixed, data-free messages for the 405 UNSUPPORTED surface. The generic
+	// form answers an unsupported method on a supported route; the deferred
+	// forms document the deliberately-unimplemented catalog, deletion, and
+	// cross-repository mounting operations. None carries request data, so the
+	// deferral can never act as an existence oracle.
+	messageUnsupportedMethod = "the requested method is not supported for this resource"
+	messageCatalogDeferred   = "the catalog API is not supported by this registry"
+	messageDeleteDeferred    = "manifest and blob deletion is not supported by this registry"
+	messageMountDeferred     = "cross-repository blob mounting is not supported by this registry; start a plain upload session instead"
 )
 
+// Allow contracts for the supported routes. Every 405 response carries the
+// exact Allow set of the route, and the conformance matrix pins them.
+const (
+	allowPing        = "GET, HEAD"
+	allowBlobs       = "GET, HEAD"
+	allowManifests   = "GET, HEAD, PUT"
+	allowUploadStart = "POST"
+	allowUploads     = "GET, PATCH, PUT, DELETE"
+)
+
+// headerAPIVersion is the Docker Distribution API version header set on the
+// /v2 base ping.
+const headerAPIVersion = "Docker-Distribution-API-Version"
+
 // Accept negotiation is implemented in accept.go (RFC 9110 §12.4.2/§12.5.1).
+
+// writeUnsupported emits the fixed 405 UNSUPPORTED surface for an operation
+// this registry does not support: the route's Allow contract naming the
+// supported methods, a JSON Distribution error body, and no other data. It is
+// used for both unsupported methods on supported routes and the documented
+// deferred operations (catalog, delete, mount).
+func writeUnsupported(w http.ResponseWriter, allow, message string) {
+	if allow != "" {
+		w.Header().Set("Allow", allow)
+	}
+	writeError(w, http.StatusMethodNotAllowed, ErrorCodeUnsupported, message)
+}
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {
 	w.Header().Set("Content-Type", "application/json")

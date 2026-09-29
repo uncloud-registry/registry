@@ -47,10 +47,12 @@ func (h *Handler) handleUploadV1(w http.ResponseWriter, r *http.Request, registr
 	}
 
 	if uploadID == "" {
-		// POST /v2/<repo>/blobs/uploads/ — start a session.
+		// POST /v2/<repo>/blobs/uploads/ — start a session. Every other
+		// method here is an explicit data-free 405 UNSUPPORTED with the
+		// Allow contract; a POST carrying mount=/from= was intercepted
+		// earlier as the documented deferred mount operation.
 		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", "POST")
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			writeUnsupported(w, allowUploadStart, messageUnsupportedMethod)
 			return
 		}
 		session, err := h.Staging.Create(r.Context(), repo, actor, h.SessionTTL)
@@ -90,8 +92,7 @@ func (h *Handler) handleUploadV1(w http.ResponseWriter, r *http.Request, registr
 		}
 		w.WriteHeader(http.StatusNoContent)
 	default:
-		w.Header().Set("Allow", "GET, PATCH, PUT, DELETE")
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeUnsupported(w, allowUploads, messageUnsupportedMethod)
 	}
 }
 
