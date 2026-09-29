@@ -1675,11 +1675,31 @@ func (s *FeedSigner) validateArtifactTransition(ctx context.Context, cur, target
 		var verifiedBytes int64
 		for _, ref := range unique {
 			child := target.Manifests[ref.Digest]
-			childRaw, err := s.Bytes.ReadBounded(ctx, child.SwarmRef, publish.MaxArtifactBodyBytes)
+			remaining := int64(publish.MaxAggregateIndexChildBytes) - verifiedBytes
+			// Fail closed BEFORE any read when the shared aggregate budget is
+			// exhausted or this child's declared size alone exceeds what
+			// remains of it: a crafted target document must never force the
+			// signer's verification reads past the aggregate bound — the
+			// budget is enforced at the READ boundary, computed before any
+			// bytes are pulled, exactly like the registry's read-after-write
+			// verification (artifactReadBound). Duplicate descriptors were
+			// already reduced to DISTINCT digests above, so a repeated digest
+			// is never double-counted against this budget.
+			if remaining <= 0 {
+				return fmt.Errorf("%w: aggregate verified child bytes exceed the shared index bound", errFeedSignerMalformed)
+			}
+			if ref.Size > remaining {
+				return fmt.Errorf("%w: aggregate verified child bytes exceed the shared index bound", errFeedSignerMalformed)
+			}
+			// Bound the read to min(MaxArtifactBodyBytes, remaining aggregate
+			// budget, declared size + 1) BEFORE the read: a child body larger
+			// than its declared size (or than the remaining budget) fails
+			// closed at the transport instead of being pulled in full.
+			childRaw, err := s.Bytes.ReadBounded(ctx, child.SwarmRef, indexChildReadBound(ref.Size, remaining))
 			if err != nil {
 				return fmt.Errorf("%w: operated index child manifest object: %v", errFeedSignerBackend, err)
 			}
-			if int64(len(childRaw)) > publish.MaxAggregateIndexChildBytes-verifiedBytes {
+			if int64(len(childRaw)) > remaining {
 				return fmt.Errorf("%w: aggregate verified child bytes exceed the shared index bound", errFeedSignerMalformed)
 			}
 			verifiedBytes += int64(len(childRaw))
@@ -1713,6 +1733,31 @@ func (s *FeedSigner) validateArtifactTransition(ctx context.Context, cur, target
 		}
 	}
 	return nil
+}
+
+// indexChildReadBound computes the per-read byte bound for an index-child
+// verification read: min(MaxArtifactBodyBytes, remaining aggregate budget,
+// declared size + 1) — the SAME pre-read budget discipline the registry's
+// read-after-write verification applies to index children. The remaining term
+// keeps the aggregate verification read within the shared index budget BEFORE
+// any bytes are pulled; the declared size + 1 term lets a child body that
+// disagrees with its declared size fail closed at the transport. remaining ==
+// 0 or negative means there is no aggregate-budget constraint for THIS read.
+// The result is never negative; declaredSize + 1 is overflow-safe.
+func indexChildReadBound(declaredSize, remaining int64) int64 {
+	b := int64(publish.MaxArtifactBodyBytes)
+	if remaining > 0 && remaining < b {
+		b = remaining
+	}
+	// declaredSize + 1 for mismatch detection; a wrapped (overflowed) sum can
+	// never shrink the bound.
+	if declaredSize >= 0 && declaredSize+1 > declaredSize && declaredSize+1 < b {
+		b = declaredSize + 1
+	}
+	if b < 0 {
+		return 0
+	}
+	return b
 }
 
 // publicationIdentity returns the request's STABLE logical publication
