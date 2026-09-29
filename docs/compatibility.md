@@ -108,13 +108,17 @@ Descriptor and blob behavior:
 
 Any Docker/Podman/nerdctl client that speaks the OCI Distribution subset
 documented above is expected to work for pull, first push, re-tag push,
-manifest-by-digest pull, and blob-by-digest pull. The release
-compatibility gate pins the **exact** tested Docker and Podman versions in
-`scripts/e2e/` and records the client versions, commands, digests, and
-results in
-[`docs/evidence/phase-4-compatibility.md`](evidence/phase-4-compatibility.md)
-(created by the Phase 4 gate). Untested client versions are not implied to be
-unsupported — they simply are not part of the recorded evidence.
+manifest-by-digest pull, and blob-by-digest pull.
+
+Real-client E2E compatibility verification against **pinned** Docker and
+Podman versions is a **planned Phase 4 gate that has NOT been executed yet**
+and is owned by a later task. When it runs, it will record the exact tested
+client versions, commands, image digests, and results as evidence under
+`docs/evidence/`; until then, no specific client version has been verified
+against this release and none is claimed as tested here. The wire contract
+in §1 is enforced by the conformance matrix (see §10 gate commands), not by
+a client E2E run. Untested client versions are not implied to be
+unsupported — they simply are not part of any recorded evidence yet.
 
 Docker/Podman features that require a deferred operation (catalog, deletion,
 mount) will surface as the documented `405 UNSUPPORTED`; Docker's own upload

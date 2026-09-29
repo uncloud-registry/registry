@@ -31,7 +31,11 @@ import (
 //   - unsupported methods on supported routes (405 UNSUPPORTED + Allow)
 //   - the deferred catalog, delete, and mount operations (data-free 405s
 //     answered before identity resolution or authentication)
-//   - the fixed Distribution error codes for the 4xx/5xx surfaces
+//   - the fixed Distribution error codes for the 400/401/403/404/405
+//     surfaces only; upload-range (416), idempotency/generation conflict
+//     (409), and availability/verification (500/502/503) codes are enforced
+//     by the upload, publication, pull-integrity, and fence test files, not
+//     by this matrix
 //
 // Deferred-operation rows deliberately send NO credential: they must answer
 // 405 UNSUPPORTED regardless of authentication state, proving the deferral
@@ -92,6 +96,10 @@ var conformanceMatrix = []conformanceCase{
 	{name: "ping", method: http.MethodGet, path: "/v2", wantStatus: http.StatusOK,
 		wantHeaders: map[string]string{"Docker-Distribution-API-Version": "registry/2.0"}, wantNoBody: true},
 	{name: "ping slash", method: http.MethodGet, path: "/v2/", wantStatus: http.StatusOK,
+		wantHeaders: map[string]string{"Docker-Distribution-API-Version": "registry/2.0"}, wantNoBody: true},
+	{name: "ping head", method: http.MethodHead, path: "/v2", wantStatus: http.StatusOK,
+		wantHeaders: map[string]string{"Docker-Distribution-API-Version": "registry/2.0"}, wantNoBody: true},
+	{name: "ping head slash", method: http.MethodHead, path: "/v2/", wantStatus: http.StatusOK,
 		wantHeaders: map[string]string{"Docker-Distribution-API-Version": "registry/2.0"}, wantNoBody: true},
 	{name: "ping unsupported method", method: http.MethodPost, path: "/v2",
 		wantStatus: http.StatusMethodNotAllowed, wantCode: ErrorCodeUnsupported, wantAllow: allowPing},
