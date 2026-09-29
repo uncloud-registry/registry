@@ -177,7 +177,10 @@ func TestPullPathFailuresDataFreeThroughRealHandler(t *testing.T) {
 	t.Run("failing manifest object read is fixed 502", func(t *testing.T) {
 		h, docs, feeds, issuer, serverURL := task14World(t)
 		seedRegistryDocuments(t, docs, feeds)
-		h.Objects = &failingObjectStore{err: fmt.Errorf("bee %q get %q: %w", "some-swarm-ref", "manifest-ref", errors.New(marker))}
+		// The pull path reads manifest bodies through the BOUNDED artifact
+		// reader (pre-verification), so the failure is injected there; the
+		// raw object store is no longer the read seam.
+		h.BoundedBytes = &failingBoundedReader{err: fmt.Errorf("bee %q get %q: %w", "some-swarm-ref", "manifest-ref", errors.New(marker))}
 		resp := pullManifest(t, serverURL, issuer)
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)

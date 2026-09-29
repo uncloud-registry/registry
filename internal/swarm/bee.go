@@ -326,6 +326,94 @@ func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes i
 	return data, nil
 }
 
+// OpenObject streams the immutable object at ref (GET /bytes/<ref>) with an
+// EXPLICIT upper bound enforced DURING streaming. It is the pull-integrity
+// counterpart of ReadBounded: blob content is streamed into a bounded
+// verification file without ever buffering the whole object in memory, so a
+// hostile or broken Bee node cannot force an unbounded allocation. An object
+// LARGER than maxBytes fails the STREAM closed at the read past the bound
+// (never a truncated payload masquerading as an in-bounds object), any
+// non-200 status and every transport failure are DATA-FREE errors (the fixed
+// status number may appear, never the response body or ref), the response
+// body is always closed (the returned closer closes it and releases the
+// per-request deadline), and maxBytes must be non-negative. A nil receiver
+// fails closed instead of panicking.
+func (s *BeeObjectStore) OpenObject(ctx context.Context, ref string, maxBytes int64) (io.ReadCloser, error) {
+	if s == nil {
+		return nil, errors.New("bee object stream requires a bee object store")
+	}
+	if maxBytes < 0 {
+		return nil, errors.New("bounded bee stream requires a non-negative bound")
+	}
+	reqCtx, cancel := writeRequestContext(ctx)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, s.BaseURL+"/bytes/"+url.PathEscape(ref), nil)
+	if err != nil {
+		cancel()
+		return nil, sanitizeBeeTransportError(reqCtx, "create bee bytes stream request", err)
+	}
+	resp, err := s.HTTPClient.Do(req)
+	if err != nil {
+		cancel()
+		return nil, sanitizeBeeTransportError(reqCtx, "bee bytes stream request", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Drain a BOUNDED amount of the error body and discard it; the body
+		// is untrusted and must never be echoed into an error or log.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, beeFeedWriteMaxBody+1))
+		_ = resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("bee bytes stream failed with status %d", resp.StatusCode)
+	}
+	return &boundedObjectStream{
+		body:   resp.Body,
+		cancel: cancel,
+		max:    maxBytes,
+	}, nil
+}
+
+// boundedObjectStream is the ReadCloser OpenObject returns. It counts bytes
+// as they stream and enforces maxBytes EXACTLY: after exactly maxBytes bytes
+// have been read it probes the underlying body once — a further byte is
+// overflow (data-free error), a real EOF is EOF. Reads never return more
+// bytes than remain under the bound, so no caller can ever receive a
+// truncated payload as if it were the full object. Close always closes the
+// underlying response body and releases the per-request deadline.
+type boundedObjectStream struct {
+	body     io.ReadCloser
+	cancel   context.CancelFunc
+	max      int64
+	read     int64
+	limitHit bool
+}
+
+func (b *boundedObjectStream) Read(p []byte) (int, error) {
+	if b.limitHit {
+		// Exactly at the bound: probe for overflow.
+		var probe [1]byte
+		n, err := b.body.Read(probe[:])
+		if n > 0 {
+			return 0, errors.New("bee object stream exceeded the bound")
+		}
+		return 0, err
+	}
+	remaining := b.max - b.read
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
+	}
+	n, err := b.body.Read(p)
+	b.read += int64(n)
+	if b.read >= b.max {
+		b.limitHit = true
+	}
+	return n, err
+}
+
+func (b *boundedObjectStream) Close() error {
+	err := b.body.Close()
+	b.cancel()
+	return err
+}
+
 // Unpin removes a pinned Bee object reference via the pinned-content deletion
 // endpoint DELETE /pins/{ref} — the object-store half of the eligible staged
 // blob cleanup (Task 18). The cleanup calls it ONLY for expired finalized blobs

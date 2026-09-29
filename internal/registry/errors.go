@@ -105,6 +105,11 @@ const (
 	// ErrorCodeDependencyUnavailable is 503: the control plane / Bee is
 	// temporarily unavailable; retryable.
 	ErrorCodeDependencyUnavailable = "DEPENDENCY_UNAVAILABLE"
+	// ErrorCodeIntegrity is 502: stored pull content EXISTS but failed
+	// SHA-256/size verification against its committed state descriptor —
+	// distinct from the unavailability codes, which mean the content could
+	// not be read at all. Data-free by construction (fixed message).
+	ErrorCodeIntegrity = "INTEGRITY_ERROR"
 	// ErrorCodeInternal is 500: an unknown internal failure; the caller may
 	// retry but the operator should investigate.
 	ErrorCodeInternal = "UNKNOWN"
@@ -125,6 +130,7 @@ const (
 	messageConflict              = "the request conflicts with an already-recorded publication or with a newer repository generation"
 	messageClaimConflict         = "the staged content for this publication is no longer available; re-upload it and retry"
 	messageDependencyUnavailable = "a required service is temporarily unavailable; retain the request and retry"
+	messageContentIntegrity      = "the stored content failed integrity verification"
 	messageUnknown               = "internal server error"
 )
 

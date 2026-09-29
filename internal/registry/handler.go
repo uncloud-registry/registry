@@ -3,11 +3,13 @@ package registry
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +48,21 @@ type ObjectUploader interface {
 	PutStream(ctx context.Context, src io.Reader, size int64, batchID string) (string, error)
 }
 
+// BoundedObjectStreamer streams an immutable object's content (the Bee
+// /bytes object path) with an EXPLICIT total byte bound enforced DURING
+// streaming: an object larger than maxBytes fails the stream closed, and no
+// caller ever receives a truncated payload masquerading as an in-bounds
+// object. It is the pull-integrity counterpart of BoundedBytesReader — blob
+// content is streamed through it into a bounded verification temp file
+// BEFORE HTTP success headers are committed, never buffered whole in memory.
+// Production: *swarm.BeeObjectStore (OpenObject); the in-memory
+// MemoryDocumentStore implements it for tests. The pull path fails closed if
+// it is ever absent when a blob read is required (it never falls back to an
+// unbounded in-memory read).
+type BoundedObjectStreamer interface {
+	OpenObject(ctx context.Context, ref string, maxBytes int64) (io.ReadCloser, error)
+}
+
 type PullAuthorizer interface {
 	Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, principal auth.Principal) (bool, error)
 }
@@ -71,6 +88,15 @@ type Handler struct {
 	// implements BoundedBytesReader; the verification fails closed (it never
 	// falls back to an unbounded read) if it is absent when needed.
 	BoundedBytes BoundedBytesReader
+	// ObjectStream streams immutable BLOB content with an explicit total byte
+	// bound (BoundedObjectStreamer) for pull-integrity PRE-VERIFICATION: blob
+	// bytes are streamed through it into a bounded per-request temp file, hashed
+	// and size-checked against the committed descriptor BEFORE any HTTP success
+	// header is committed, and only the verified file is served. NewHandler
+	// wires it from the object store when it implements BoundedObjectStreamer;
+	// the blob pull fails closed (502, data-free) if it is absent when needed —
+	// it never falls back to an unbounded in-memory read.
+	ObjectStream BoundedObjectStreamer
 	// Preflight durably binds an EXPLICIT caller operation key to exactly one
 	// logical payload (registry + owner + repo + tag + manifest digest) in the
 	// control-plane operation store BEFORE any immutable object, feed, or
@@ -95,6 +121,10 @@ type Handler struct {
 	// bounded default copy cap (the durable service still enforces the
 	// configured per-upload quota atomically).
 	MaxUploadBytes int64
+	// blobTempDir overrides the directory for pull pre-verification temp
+	// files; empty uses the process temp directory. Test-only override for
+	// deterministic cleanup assertions; production always uses the default.
+	blobTempDir string
 }
 
 func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.RegistryStore, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
@@ -118,6 +148,13 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 	// body read — it never silently falls back to an unbounded read.
 	if bb, ok := objects.(BoundedBytesReader); ok {
 		h.BoundedBytes = bb
+	}
+	// Wire the bounded blob-content streamer from the object store when it
+	// implements it (production BeeObjectStore and the in-memory store both
+	// do). When absent the blob pull fails closed before any success header —
+	// it never silently falls back to an unbounded in-memory read.
+	if os, ok := objects.(BoundedObjectStreamer); ok {
+		h.ObjectStream = os
 	}
 	return h
 }
@@ -262,20 +299,31 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 		return
 	}
 
-	data, err := h.Objects.Get(r.Context(), desc.SwarmRef)
+	// HEAD is descriptor-metadata-only: the committed descriptor's size is
+	// authoritative and no body is sent, so no content read is required —
+	// the body-bearing GET carries the pre-verification.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Header().Set("Content-Type", desc.MediaType)
+		w.Header().Set("Content-Length", strconv.FormatInt(desc.Size, 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// GET pre-verifies the manifest BODY against its committed digest AND
+	// size BEFORE any response byte is written: HTTP status cannot change
+	// after bytes are sent, so a digest/size mismatch is a data-free error
+	// with no body leaked, and corrupt content is never returned as 200.
+	data, err := h.readVerifiedManifest(r.Context(), desc, digest)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "MANIFEST_BLOB_UNKNOWN", messageManifestUnavailable)
+		status, code, message := classifyPullContentFailure(pullKindManifest, err)
+		writeError(w, status, code, message)
 		return
 	}
 
 	w.Header().Set("Docker-Content-Digest", digest)
 	w.Header().Set("Content-Type", desc.MediaType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -311,28 +359,166 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 		return
 	}
 
-	data, err := h.Objects.Get(r.Context(), desc.SwarmRef)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "BLOB_UNKNOWN", messageBlobUnavailable)
-		return
-	}
-
-	w.Header().Set("Docker-Content-Digest", digest)
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	if desc.MediaType != "" {
-		w.Header().Set("Content-Type", desc.MediaType)
-	}
+	// HEAD is descriptor-metadata-only: Content-Length and the digest come
+	// from the committed descriptor; no body is sent, so no content read is
+	// required — the body-bearing GET carries the pre-verification.
 	if r.Method == http.MethodHead {
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Header().Set("Content-Length", strconv.FormatInt(desc.Size, 10))
+		if desc.MediaType != "" {
+			w.Header().Set("Content-Type", desc.MediaType)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
+	// GET pre-verifies the blob BODY into a bounded per-request temp file
+	// BEFORE HTTP success headers are committed: content is streamed through
+	// the bounded object stream, hashed with SHA-256 and size-checked against
+	// the committed descriptor; only a fully verified file is served. A
+	// digest/size mismatch or read failure is a data-free error BEFORE any
+	// success byte — no corrupt bytes ever reach the client — and the temp
+	// file is always removed on success and failure paths.
+	verified, size, err := h.verifyBlobToTempFile(r.Context(), desc, digest)
+	if err != nil {
+		status, code, message := classifyPullContentFailure(pullKindBlob, err)
+		writeError(w, status, code, message)
+		return
+	}
+	defer func() {
+		name := verified.Name()
+		_ = verified.Close()
+		_ = os.Remove(name)
+	}()
+
+	w.Header().Set("Docker-Content-Digest", digest)
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+	if desc.MediaType != "" {
+		w.Header().Set("Content-Type", desc.MediaType)
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = io.Copy(w, verified)
 }
 
 func (h *Handler) handleUpload(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, uploadID string, principal auth.Principal) {
 	h.handleUploadV1(w, r, registryIdentity, repo, uploadID, principal)
+}
+
+// errPullIntegrity is the internal marker for pull content that EXISTS but
+// failed SHA-256/size verification against its committed state descriptor.
+// classifyPullContentFailure maps it to the DISTINCT 502 INTEGRITY_ERROR
+// surface; every other read failure stays in the unavailability class.
+var errPullIntegrity = errors.New("pull content integrity failure")
+
+// pullKind distinguishes the manifest and blob pull paths for the error
+// classifier (each has its own established unavailability code).
+type pullKind int
+
+const (
+	pullKindManifest pullKind = iota
+	pullKindBlob
+)
+
+// readVerifiedManifest reads and PRE-VERIFIES a manifest body against its
+// committed descriptor BEFORE any response byte is written: the body read is
+// bounded (BoundedBytesReader, never an unbounded fallback), the length must
+// equal the committed size, and the SHA-256 digest must equal the committed
+// digest. A size or digest mismatch is errPullIntegrity (data-free
+// INTEGRITY_ERROR); a transport/read failure or a missing bounded reader is
+// an unavailability-class failure. Corrupt manifest content is never
+// returned as 200.
+func (h *Handler) readVerifiedManifest(ctx context.Context, desc spec.ManifestDescriptor, digest string) ([]byte, error) {
+	if h.BoundedBytes == nil {
+		return nil, errors.New("manifest pull: bounded artifact byte reader is not configured")
+	}
+	data, err := h.BoundedBytes.ReadBounded(ctx, desc.SwarmRef, artifactReadBound(desc.Size, 0))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != desc.Size {
+		return nil, fmt.Errorf("manifest body length %d does not match the descriptor size %d: %w", len(data), desc.Size, errPullIntegrity)
+	}
+	if computeDigest(data) != digest {
+		return nil, fmt.Errorf("manifest body does not match the committed digest: %w", errPullIntegrity)
+	}
+	return data, nil
+}
+
+// verifyBlobToTempFile streams blob content from the BOUNDED object stream
+// (BoundedObjectStreamer — never an unbounded in-memory fallback) into an
+// exclusive per-request temp file while hashing it with SHA-256, then
+// verifies the byte length AND the digest against the committed descriptor
+// BEFORE the file is returned (positioned at offset 0 for serving). The
+// per-request temp file makes concurrent pulls of the same blob independent.
+// On ANY failure the temp file is removed and a classified error returned;
+// on success the caller owns the file and MUST close and remove it (the
+// handler's deferred cleanup covers success and error paths).
+func (h *Handler) verifyBlobToTempFile(ctx context.Context, desc spec.BlobDescriptor, digest string) (*os.File, int64, error) {
+	if h.ObjectStream == nil {
+		return nil, 0, errors.New("blob pull: bounded object streamer is not configured")
+	}
+	tmpDir := h.blobTempDir
+	if tmpDir == "" {
+		tmpDir = os.TempDir()
+	}
+	tmp, err := os.CreateTemp(tmpDir, "uncloud-pull-verify-*")
+	if err != nil {
+		return nil, 0, fmt.Errorf("create blob verification file: %w", err)
+	}
+	cleanup := func() {
+		name := tmp.Name()
+		_ = tmp.Close()
+		_ = os.Remove(name)
+	}
+
+	src, err := h.ObjectStream.OpenObject(ctx, desc.SwarmRef, desc.Size+1)
+	if err != nil {
+		cleanup()
+		return nil, 0, err
+	}
+	hasher := sha256.New()
+	// The handler's own limit (desc.Size+1) enforces the descriptor bound so
+	// an oversized object is detected as a SIZE mismatch (integrity); the
+	// streamer's bound is defense-in-depth for any other caller.
+	n, copyErr := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(src, desc.Size+1))
+	closeErr := src.Close()
+	if copyErr != nil {
+		cleanup()
+		return nil, 0, copyErr
+	}
+	if closeErr != nil {
+		cleanup()
+		return nil, 0, closeErr
+	}
+	if n != desc.Size {
+		cleanup()
+		return nil, 0, fmt.Errorf("blob body length %d does not match the descriptor size %d: %w", n, desc.Size, errPullIntegrity)
+	}
+	if "sha256:"+hex.EncodeToString(hasher.Sum(nil)) != digest {
+		cleanup()
+		return nil, 0, fmt.Errorf("blob body does not match the committed digest: %w", errPullIntegrity)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, 0, fmt.Errorf("rewind verified blob file: %w", err)
+	}
+	return tmp, n, nil
+}
+
+// classifyPullContentFailure maps pull pre-verification failures to the
+// fixed data-free surface: integrity mismatches (digest/size) are the
+// DISTINCT 502 INTEGRITY_ERROR (content exists but disagrees with its
+// committed descriptor), while transport/read/absent-reader failures stay
+// the existing 502 unavailability codes (MANIFEST_BLOB_UNKNOWN /
+// BLOB_UNKNOWN). The raw cause never crosses the HTTP boundary.
+func classifyPullContentFailure(kind pullKind, err error) (int, string, string) {
+	if errors.Is(err, errPullIntegrity) {
+		return http.StatusBadGateway, ErrorCodeIntegrity, messageContentIntegrity
+	}
+	if kind == pullKindManifest {
+		return http.StatusBadGateway, "MANIFEST_BLOB_UNKNOWN", messageManifestUnavailable
+	}
+	return http.StatusBadGateway, "BLOB_UNKNOWN", messageBlobUnavailable
 }
 
 func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string, principal auth.Principal) {

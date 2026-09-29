@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -60,7 +61,17 @@ type RegistryResolver struct {
 }
 
 func (r RegistryResolver) ResolveRegistry(ctx context.Context, host string) (RegistryIdentity, error) {
-	registry, err := r.Registries.ResolveRegistry(ctx, host)
+	// Every registry resolution happens under the canonical service name:
+	// raw client hosts (case, trailing dot, port, IPv6 spelling) are
+	// normalized exactly once at the request boundary before ANY resolver —
+	// configured-static, ENS, or subdomain — sees the value. The resolved
+	// identity's Host is what the token service comparison uses, so the
+	// canonical form must be in place before identity resolution.
+	normalized, err := NormalizeRegistryHost(host)
+	if err != nil {
+		return RegistryIdentity{}, fmt.Errorf("normalize registry host: %w", err)
+	}
+	registry, err := r.Registries.ResolveRegistry(ctx, normalized)
 	if err != nil {
 		return RegistryIdentity{}, fmt.Errorf("resolve registry identity: %w", err)
 	}
@@ -137,9 +148,18 @@ type StaticRegistryIdentityResolver struct {
 }
 
 func (s StaticRegistryIdentityResolver) ResolveRegistry(_ context.Context, host string) (RegistryIdentity, error) {
-	ref, ok := s.Hosts[host]
+	// Normalize the QUERY host so a configured canonical key matches
+	// regardless of client casing, trailing dot, or port spelling, even when
+	// this resolver is used directly (RegistryResolver also normalizes at its
+	// boundary; normalization is idempotent). Configured keys are expected to
+	// be canonical service names.
+	normalized, err := NormalizeRegistryHost(host)
+	if err != nil {
+		return RegistryIdentity{}, err
+	}
+	ref, ok := s.Hosts[normalized]
 	if !ok {
-		return RegistryIdentity{}, fmt.Errorf("host %q not found", host)
+		return RegistryIdentity{}, fmt.Errorf("host %q not found", normalized)
 	}
 	return ref, nil
 }
@@ -222,6 +242,28 @@ func (m *MemoryDocumentStore) ReadBounded(_ context.Context, ref string, maxByte
 		return nil, errors.New("document read exceeded the bound")
 	}
 	return append([]byte(nil), data...), nil
+}
+
+// OpenObject streams the immutable object at ref with an EXPLICIT upper
+// bound (BoundedObjectStreamer) — the in-memory counterpart of
+// *swarm.BeeObjectStore.OpenObject used by pull-integrity pre-verification.
+// The bound is enforced before any byte is returned (the whole object is
+// already in memory in this dev/test store); an object larger than the bound
+// and a missing object are data-free errors.
+func (m *MemoryDocumentStore) OpenObject(_ context.Context, ref string, maxBytes int64) (io.ReadCloser, error) {
+	if maxBytes < 0 {
+		return nil, errors.New("bounded object stream requires a non-negative bound")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	data, ok := m.Documents[ref]
+	if !ok {
+		return nil, fmt.Errorf("document %q not found: %w", ref, ErrDocumentNotFound)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("object stream exceeds the bound")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 // Put stores data under its deterministic content address — the exact

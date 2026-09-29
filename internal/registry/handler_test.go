@@ -77,7 +77,7 @@ func TestManifestAndBlobPullViaRepoState(t *testing.T) {
 		t.Fatalf("unexpected manifest body: %s", got)
 	}
 
-	blobReq, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/blobs/sha256:blob1", nil)
+	blobReq, err := http.NewRequest(http.MethodGet, server.URL+"/v2/backend/api/blobs/"+publish.ComputeDigest([]byte("blob-bytes")), nil)
 	if err != nil {
 		t.Fatalf("create blob request: %v", err)
 	}
@@ -794,19 +794,24 @@ func sessionBearerText(t *testing.T, subject string) string {
 func seedRegistryDocuments(t *testing.T, docs *resolve.MemoryDocumentStore, feeds *resolve.MemoryFeedStore) {
 	t.Helper()
 
-	docs.Documents["repo-state-ref"] = []byte(`{
+	manifestBody := []byte(`{"schemaVersion":2}`)
+	blobBody := []byte("blob-bytes")
+	manifestDigest := publish.ComputeDigest(manifestBody)
+	blobDigest := publish.ComputeDigest(blobBody)
+
+	docs.Documents["repo-state-ref"] = []byte(fmt.Sprintf(`{
 		"version":1,
 		"repo":"backend/api",
 		"generation":3,
 		"updatedAt":"2026-04-05T12:00:00Z",
-		"tags":{"latest":"sha256:manifest1"},
+		"tags":{"latest":%q},
 		"manifests":{
-			"sha256:manifest1":{"swarmRef":"manifest-ref","mediaType":"application/vnd.oci.image.manifest.v1+json","size":19}
+			%q:{"swarmRef":"manifest-ref","mediaType":"application/vnd.oci.image.manifest.v1+json","size":%d}
 		},
 		"blobs":{
-			"sha256:blob1":{"swarmRef":"blob-ref","size":10,"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip"}
+			%q:{"swarmRef":"blob-ref","size":%d,"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip"}
 		}
-	}`)
+	}`, manifestDigest, manifestDigest, len(manifestBody), blobDigest, len(blobBody)))
 	docs.Documents["auth-policy-ref"] = []byte(`{
 		"version":1,
 		"defaultAccess":"deny",
@@ -817,8 +822,8 @@ func seedRegistryDocuments(t *testing.T, docs *resolve.MemoryDocumentStore, feed
 		"defaultPolicy":{"batchID":"batch-default","allowPushFor":["user:alice"]},
 		"repos":{"backend/api":{"batchID":"batch-repo","allowPushFor":["user:alice"]}}
 	}`)
-	docs.Documents["manifest-ref"] = []byte(`{"schemaVersion":2}`)
-	docs.Documents["blob-ref"] = []byte("blob-bytes")
+	docs.Documents["manifest-ref"] = manifestBody
+	docs.Documents["blob-ref"] = blobBody
 	feeds.Feeds[spec.RepoStateFeedRef("0xaliceowner", "backend/api")] = "repo-state-ref"
 	feeds.Feeds[spec.AuthPolicyFeedRef("0xaliceowner")] = "auth-policy-ref"
 	feeds.Feeds[spec.StampPolicyFeedRef("0xaliceowner")] = "stamp-policy-ref"
