@@ -75,6 +75,24 @@ type Publisher struct {
 	// publishes through Feeds. It is never an in-process signer — the control
 	// plane alone holds and uses the feed-owner signing key.
 	Commits RepoCommitter
+	// Observer receives data-free telemetry callbacks from the conflict-safe
+	// commit path (Task 23 publication metrics). It is OPTIONAL: a nil
+	// observer disables publication telemetry entirely without changing any
+	// commit behavior. Implementations must never surface request data — the
+	// only argument is the bounded control-plane registry ID.
+	Observer PublicationObserver
+}
+
+// PublicationObserver is the data-free telemetry hook of the conflict-safe
+// commit path. ObservePublicationConflict fires for every AUTHORITATIVE
+// commit conflict (permanent operation conflicts AND recoverable generation
+// conflicts before a rebuild); ObservePublicationRebuild fires when a
+// generation conflict is recovered by the one-time re-resolve-and-rebuild.
+// The single argument is the bounded control-plane registry ID, never any
+// repository, digest, operation, or host data.
+type PublicationObserver interface {
+	ObservePublicationConflict(registryID int64)
+	ObservePublicationRebuild(registryID int64)
 }
 
 // PublicationReceipt is the exact observable outcome of one repository
@@ -171,7 +189,18 @@ type RebuildResolver func(ctx context.Context) (current spec.RepoStateDocument, 
 func (p Publisher) PublishCommitWithConflictRebuild(ctx context.Context, stateFeed string, current spec.RepoStateDocument, input BuildInput, batchID string, registryID int64, owner string, publicationID string, reResolve RebuildResolver) (PublicationReceipt, error) {
 	receipt, err := p.PublishCommit(ctx, stateFeed, current, input, batchID, registryID, owner, publicationID)
 	if err == nil || !IsGenerationConflict(err) {
+		// Every authoritative commit conflict — recoverable generation
+		// conflicts AND permanent operation/binding conflicts — is counted
+		// before the rebuild decision, so operators see the total conflict
+		// rate even when the one-time rebuild recovers it internally. A
+		// clean commit fires nothing.
+		if err != nil && p.Observer != nil {
+			p.Observer.ObservePublicationConflict(registryID)
+		}
 		return receipt, err
+	}
+	if p.Observer != nil {
+		p.Observer.ObservePublicationConflict(registryID)
 	}
 	fresh, _, rerr := reResolve(ctx)
 	if rerr != nil || fresh.Generation <= current.Generation {
@@ -179,6 +208,11 @@ func (p Publisher) PublishCommitWithConflictRebuild(ctx context.Context, stateFe
 		// surrender the original conflict rather than risk an orphaned write
 		// becoming authoritative.
 		return PublicationReceipt{}, err
+	}
+	if p.Observer != nil {
+		// The one-time re-resolve-and-rebuild is the retry event: a lost or
+		// conflicted attempt recovered by an identical logical publication.
+		p.Observer.ObservePublicationRebuild(registryID)
 	}
 	return p.PublishCommit(ctx, stateFeed, fresh, input, batchID, registryID, owner, publicationID)
 }

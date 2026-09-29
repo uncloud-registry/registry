@@ -263,3 +263,103 @@ func TestPublishCommitWithConflictRebuildPermanentConflictNeverRebuilds(t *testi
 		t.Fatalf("a PERMANENT conflict must never retry the commit: expected 1 attempt, got %d", len(committer.calls))
 	}
 }
+
+// recordingObserver records the data-free publication telemetry callbacks
+// with the bounded registry-ID argument only.
+type recordingObserver struct {
+	conflicts int
+	rebuilds  int
+	ids       []int64
+}
+
+func (o *recordingObserver) ObservePublicationConflict(registryID int64) {
+	o.conflicts++
+	o.ids = append(o.ids, registryID)
+}
+
+func (o *recordingObserver) ObservePublicationRebuild(registryID int64) {
+	o.rebuilds++
+	o.ids = append(o.ids, registryID)
+}
+
+// TestPublishCommitWithConflictRebuildFiresObserver proves the conflict-safe
+// commit path reports BOTH the authoritative generation conflict and the
+// one-time rebuild to the optional observer, each with the bounded
+// control-plane registry ID — never with repository, digest, operation, or
+// host data.
+func TestPublishCommitWithConflictRebuildFiresObserver(t *testing.T) {
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	committer := &recordingCommitter{failFirst: 1, failWith: ErrCommitGenerationConflict}
+	obs := &recordingObserver{}
+	p := Publisher{Builder: DefaultBuilder{}, Objects: docs, Feeds: feeds, Commits: committer, Observer: obs}
+
+	registryID := int64(7)
+	owner := "0xaliceowner"
+	current := freshRepoState("backend/api", 5)
+	fresh := freshRepoState("backend/api", 6)
+	input := validBuildInput(t)
+	publicationID := ComputeOperationID(registryID, owner, input.Repo, input.Tag, input.ManifestDigest, current.Generation)
+	input.UpdatedAt = DeterministicUpdatedAt(publicationID)
+	feed := spec.RepoStateFeedRef(owner, input.Repo)
+
+	if _, err := p.PublishCommitWithConflictRebuild(context.Background(), feed, current, input, "batch-1", registryID, owner, publicationID,
+		func(ctx context.Context) (spec.RepoStateDocument, bool, error) { return fresh, true, nil }); err != nil {
+		t.Fatalf("rebuild must succeed: %v", err)
+	}
+	if obs.conflicts != 1 {
+		t.Fatalf("observer conflicts = %d, want 1 (the authoritative generation conflict)", obs.conflicts)
+	}
+	if obs.rebuilds != 1 {
+		t.Fatalf("observer rebuilds = %d, want 1 (the one-time re-resolve-and-rebuild)", obs.rebuilds)
+	}
+	if len(obs.ids) != 2 {
+		t.Fatalf("observer ids = %v, want exactly the registry ID twice", obs.ids)
+	}
+	for _, id := range obs.ids {
+		if id != registryID {
+			t.Fatalf("observer registry id = %d, want %d", id, registryID)
+		}
+	}
+}
+
+// TestPublishCommitObserverPermanentConflictFiresConflictOnly proves a
+// PERMANENT operation/binding conflict reports a conflict to the observer but
+// never a rebuild, and an observer is never invoked on a clean commit.
+func TestPublishCommitObserverPermanentConflictFiresConflictOnly(t *testing.T) {
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+
+	owner := "0xaliceowner"
+	current := freshRepoState("backend/api", 5)
+	input := validBuildInput(t)
+	publicationID := ComputeOperationID(7, owner, input.Repo, input.Tag, input.ManifestDigest, current.Generation)
+	input.UpdatedAt = DeterministicUpdatedAt(publicationID)
+	feed := spec.RepoStateFeedRef(owner, input.Repo)
+
+	// A clean commit must not fire the observer at all.
+	cleanObs := &recordingObserver{}
+	clean := Publisher{Builder: DefaultBuilder{}, Objects: docs, Feeds: feeds, Commits: &recordingCommitter{}}
+	clean.Observer = cleanObs
+	if _, err := clean.PublishCommitWithConflictRebuild(context.Background(), feed, current, input, "batch-1", 7, owner, publicationID,
+		func(ctx context.Context) (spec.RepoStateDocument, bool, error) { return current, true, nil }); err != nil {
+		t.Fatalf("clean commit must succeed: %v", err)
+	}
+	if cleanObs.conflicts != 0 || cleanObs.rebuilds != 0 {
+		t.Fatalf("clean commit must not fire the observer: conflicts=%d rebuilds=%d", cleanObs.conflicts, cleanObs.rebuilds)
+	}
+
+	// A permanent conflict fires the conflict callback only.
+	conflictObs := &recordingObserver{}
+	conflicted := Publisher{Builder: DefaultBuilder{}, Objects: docs, Feeds: feeds, Commits: &recordingCommitter{failFirst: 99, failWith: ErrCommitConflict}}
+	conflicted.Observer = conflictObs
+	if _, err := conflicted.PublishCommitWithConflictRebuild(context.Background(), feed, current, input, "batch-1", 7, owner, publicationID,
+		func(ctx context.Context) (spec.RepoStateDocument, bool, error) {
+			return spec.RepoStateDocument{}, false, nil
+		}); !errors.Is(err, ErrCommitConflict) {
+		t.Fatalf("expected the permanent conflict to surface unchanged, got %v", err)
+	}
+	if conflictObs.conflicts != 1 || conflictObs.rebuilds != 0 {
+		t.Fatalf("permanent conflict: conflicts=%d rebuilds=%d, want 1 and 0", conflictObs.conflicts, conflictObs.rebuilds)
+	}
+}

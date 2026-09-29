@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"github.com/uncloud-registry/registry/internal/config"
 	"github.com/uncloud-registry/registry/internal/controlplane"
 	"github.com/uncloud-registry/registry/internal/credential"
+	"github.com/uncloud-registry/registry/internal/observability"
 	"github.com/uncloud-registry/registry/internal/server"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
@@ -415,7 +417,20 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 		}
 	}
 
+	// Task 23 telemetry: ONE instrumentation instance (the publication-queue
+	// gauges source is the Service's own OutboxStats) and the JSON request
+	// logger, wired onto the public router. The internal feed-signing
+	// listener intentionally gets NO request telemetry: it is a
+	// machine-to-machine side channel and stays as thin as it is today.
+	metrics := observability.New()
+	if err := metrics.RegisterOutbox(service); err != nil {
+		return nil, fmt.Errorf("register outbox metrics source: %w", err)
+	}
 	handler := controlplane.NewHTTPServerWithConfig(service, auth.SubjectResolver{Tokens: tokens}, cfg)
+	if hs, ok := handler.(*controlplane.HTTPServer); ok {
+		hs.Metrics = metrics
+		hs.Logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
 
 	comps := &controlPlaneComponents{handler: handler, tlsCert: tlsCert}
 	// Wire the provisioning reconciler against the validated, already-open

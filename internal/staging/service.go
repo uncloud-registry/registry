@@ -1353,6 +1353,57 @@ func (s *service) maxGrowth(ctx context.Context, conn *sql.Conn, repo string, cu
 	return allowance, nil
 }
 
+// StagingStats returns the bounded aggregate snapshot for /metrics (Task 23):
+// the total byte-bearing staged bytes and the count of byte-bearing staged
+// sessions over the SAME row universe as usageSum (active/finalizing/
+// finalized/deleting/expiring/claimed — including already-expired rows whose
+// physical bytes still occupy the spool; creating rows carry offset 0). A
+// query failure is returned so the metrics collector can retain its last
+// known values; the snapshot carries no identifiers.
+func (s *service) StagingStats(ctx context.Context) (int64, int64, error) {
+	conn, err := s.pool.acquire(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer s.pool.release(conn)
+	query := `select coalesce(sum(offset), 0), count(*) from upload_sessions where state in ('active','finalizing','finalized','deleting','expiring','claimed')`
+	var bytes, sessions int64
+	if err := conn.QueryRowContext(ctx, query).Scan(&bytes, &sessions); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, 0, cerr
+		}
+		return 0, 0, err
+	}
+	return bytes, sessions, nil
+}
+
+// CheckStagingRootAccess verifies the spool root is still PRESENT and is a
+// directory — the /readyz staging component (Task 23). A missing or
+// non-directory root fails the check; the error is FIXED and data-free and
+// never carries the root path.
+func (s *service) CheckStagingRootAccess(ctx context.Context) error {
+	if s == nil || s.spool == nil {
+		return errStagingRootInaccessible
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	info, err := os.Stat(s.spool.rootPath)
+	if err != nil {
+		return errStagingRootInaccessible
+	}
+	if !info.IsDir() {
+		return errStagingRootInaccessible
+	}
+	return nil
+}
+
+// errStagingRootInaccessible is the fixed data-free readiness classification
+// for a missing or unusable staging root.
+var errStagingRootInaccessible = errors.New("staging root is not accessible")
+
 // usageSum returns the total byte-bearing staged offset, optionally scoped to
 // one repository, counting every row whose physical bytes may still occupy
 // the spool: active and finalized sessions (including already-expired ones —

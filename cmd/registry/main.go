@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/config"
 	"github.com/uncloud-registry/registry/internal/credential"
+	"github.com/uncloud-registry/registry/internal/observability"
 	"github.com/uncloud-registry/registry/internal/policy"
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/registry"
@@ -83,8 +85,13 @@ func buildMemoryHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	metrics, logger := buildTelemetry()
+	store := staging.NewMemoryStore()
+	if err := metrics.RegisterStaging(store); err != nil {
+		return nil, fmt.Errorf("register staging metrics source: %w", err)
+	}
 
-	return registry.NewHandler(
+	handler := registry.NewHandler(
 		resolve.RegistryResolver{
 			Registries: resolve.StaticRegistryIdentityResolver{Hosts: map[string]resolve.RegistryIdentity{}},
 			Docs:       docs,
@@ -98,7 +105,7 @@ func buildMemoryHandler() (http.Handler, error) {
 			StampPolicies: policy.StampPolicyResolver{Docs: docs, Feeds: feeds},
 		},
 		authenticator,
-		staging.NewMemoryStore(),
+		store,
 		publish.Publisher{
 			Builder: publish.DefaultBuilder{},
 			Objects: docs,
@@ -106,18 +113,37 @@ func buildMemoryHandler() (http.Handler, error) {
 		},
 		nil,
 		authRealm,
-	), nil
+	)
+	// Task 23 telemetry: the request middleware and the operational endpoints
+	// (/livez, /readyz, /metrics) come from the handler itself.
+	if rh, ok := handler.(*registry.Handler); ok {
+		rh.Metrics = metrics
+		rh.Logger = logger
+	}
+	return handler, nil
+}
+
+// buildTelemetry constructs the process's OBSERVABILITY surface: one
+// instrumentation instance (registered at most once — the /metrics registry
+// is a fresh instance per process) and the JSON request logger. The logger
+// emits only the bounded request vocabulary; no handler ever writes request
+// bodies, tokens, digests, refs, or identifiers into it.
+func buildTelemetry() (*observability.Instrumentation, *slog.Logger) {
+	metrics := observability.New()
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	return metrics, logger
 }
 
 // buildStagingService constructs the durable Task 15 staging service from a
 // fully validated RegistryConfig, applies the atomic quota + stream buffer,
-// and returns it as the registry-facing RegistryStore. It is only called
-// AFTER every security-sensitive configuration and credential has validated,
-// so an invalid config can never open a database or sidecar.
-func buildStagingService(rc config.RegistryConfig) (staging.RegistryStore, error) {
+// and returns it as the registry-facing RegistryStore together with its
+// /metrics stats source (the same concrete service). It is only called AFTER
+// every security-sensitive configuration and credential has validated, so an
+// invalid config can never open a database or sidecar.
+func buildStagingService(rc config.RegistryConfig) (staging.RegistryStore, observability.StagingStatsSource, error) {
 	svc, err := staging.NewService(context.Background(), rc.StagingRoot, rc.StagingDB)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	svc.SetLimits(staging.Limits{
 		MaxUploadBytes:       rc.MaxUploadBytes,
@@ -125,7 +151,7 @@ func buildStagingService(rc config.RegistryConfig) (staging.RegistryStore, error
 		MaxTotalStagingBytes: rc.MaxTotalStagingBytes,
 	})
 	svc.SetStreamBuffer(rc.StreamBufferBytes)
-	return svc, nil
+	return svc, svc, nil
 }
 
 func buildBeeHandler() (http.Handler, error) {
@@ -138,6 +164,9 @@ func buildBeeHandler() (http.Handler, error) {
 	if err := validateBeeBaseURL(beeURL); err != nil {
 		return nil, fmt.Errorf("BEE_API_URL: %w", err)
 	}
+	// Task 23 telemetry is process-global: one instrumentation instance and
+	// one JSON request logger, wired to the handler and the cleanup loop.
+	metrics, logger := buildTelemetry()
 	// Task 22: ONE bounded dependency client is constructed for this process
 	// and injected into every Bee/ENS adapter — never the bare
 	// http.DefaultClient (its zero timeouts would let a stalled dependency
@@ -218,7 +247,7 @@ func buildBeeHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("registry staging config: %w", err)
 	}
-	stageStore, err := buildStagingService(stageCfg)
+	stageStore, stageStats, err := buildStagingService(stageCfg)
 	if err != nil {
 		return nil, fmt.Errorf("staging service: %w", err)
 	}
@@ -264,7 +293,16 @@ func buildBeeHandler() (http.Handler, error) {
 		return nil, err
 	}
 	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
-	cleanupDone := runCleanupLoop(cleanupCtx, cleanup, interval, batch)
+	cleanupDone := runCleanupLoop(cleanupCtx, cleanup, interval, batch, func(res staging.CleanupResult, passErr error) {
+		if metrics != nil {
+			if passErr != nil {
+				metrics.ObserveCleanupPass(false)
+				return
+			}
+			metrics.ObserveCleanupPass(true)
+			metrics.ObserveCleanupResult(res.Examined, res.Expired, res.Removed, res.Unpinned, res.Failed)
+		}
+	})
 	closeSvc := func() error { return nil }
 	if ic, ok := stageStore.(io.Closer); ok {
 		closeSvc = ic.Close
@@ -293,6 +331,16 @@ func buildBeeHandler() (http.Handler, error) {
 	if rh, ok := handler.(*registry.Handler); ok {
 		rh.MaxUploadBytes = stageCfg.MaxUploadBytes
 		rh.SessionTTL = stageCfg.UploadTTL
+		// Task 23 telemetry + readiness wiring: the request middleware, the
+		// operational endpoints, the staged-bytes/sessions gauges (durable
+		// staging source), and the Bee readiness probe. The Bee probe uses the
+		// bounded dependency client so readiness never hangs on a stalled node.
+		rh.Metrics = metrics
+		rh.Logger = logger
+		if err := metrics.RegisterStaging(stageStats); err != nil {
+			return nil, fmt.Errorf("register staging metrics source: %w", err)
+		}
+		rh.BeeProbe = swarm.ProbeHealth(beeURL, depClient)
 	}
 	// The handler now owns the (cancelOnCloseStore-wrapped) staging store via
 	// its Close; disable the startup-failure deferred close.
@@ -451,11 +499,17 @@ const cleanupPassAbortedClass = "staging cleanup: pass aborted (committed-state 
 // call once per process. It returns a channel closed exactly when the loop
 // goroutine has fully exited (no pass is still in flight), so a caller can
 // cancel and JOIN the loop before releasing the underlying staging store.
-func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time.Duration, batch int) <-chan struct{} {
+// An optional observer receives every pass result (or the pass error) for
+// metrics; it is invoked with a zero value only for nil passes.
+func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time.Duration, batch int, observe ...func(res staging.CleanupResult, passErr error)) <-chan struct{} {
 	done := make(chan struct{})
 	if cleanup == nil {
 		close(done)
 		return done
+	}
+	observer := func(staging.CleanupResult, error) {}
+	if len(observe) > 0 && observe[0] != nil {
+		observer = observe[0]
 	}
 	if interval <= 0 {
 		interval = defaultCleanupInterval
@@ -476,6 +530,7 @@ func runCleanupLoop(ctx context.Context, cleanup *staging.Cleanup, interval time
 				return
 			case <-ticker.C:
 				res, err := cleanup.RunOnce(ctx, time.Now(), batch)
+				observer(res, err)
 				if err != nil {
 					if ctx.Err() != nil {
 						return

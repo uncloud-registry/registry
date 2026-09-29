@@ -8,9 +8,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
 	"github.com/uncloud-registry/registry/internal/config"
+	"github.com/uncloud-registry/registry/internal/observability"
 )
 
 type HTTPServer struct {
@@ -18,8 +20,14 @@ type HTTPServer struct {
 	Subjects auth.SubjectResolver
 
 	// Logger receives component-tagged, safe internal log lines (request ID +
-	// cause classification on auth failures). Nil uses slog.Default().
+	// cause classification on auth failures) and the structured request log.
+	// Nil uses slog.Default().
 	Logger *slog.Logger
+
+	// Metrics owns the task 23 Prometheus instruments; /metrics serves its
+	// registry and the request middleware records count/latency/error class.
+	// Nil disables metrics; /metrics then answers 404.
+	Metrics *observability.Instrumentation
 
 	// security enforces the request-time controls (CSRF, rate limits, origin,
 	// client-IP resolution, headers). It is always present; development mode
@@ -60,11 +68,108 @@ func (s *HTTPServer) inviteFlash() *inviteFlashStore {
 }
 
 func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.security != nil {
-		s.security.wrap(http.HandlerFunc(s.route)).ServeHTTP(w, r)
+	// Task 23: the operational endpoints answer FIRST — outside the security
+	// wrap (unauthenticated by standard practice) and outside telemetry.
+	switch r.URL.Path {
+	case "/livez":
+		s.handleLivez(w, r)
+		return
+	case "/readyz":
+		s.handleReadyz(w, r)
+		return
+	case "/metrics":
+		s.handleMetrics(w, r)
 		return
 	}
-	s.route(w, r)
+
+	inner := http.Handler(http.HandlerFunc(s.route))
+	if s.security != nil {
+		inner = s.security.wrap(inner)
+	}
+	if s.Metrics != nil || s.Logger != nil {
+		s.serveWithTelemetry(w, r, inner)
+		return
+	}
+	inner.ServeHTTP(w, r)
+}
+
+// serveWithTelemetry runs one request under the response recorder, then
+// records the request metrics and emits the structured JSON request log. The
+// log fields are the bounded vocabulary (component, request ID, registry,
+// repository, action, result, duration, status, dependency); nothing derived
+// from request bodies, tokens, or path parameters ever reaches either sink.
+func (s *HTTPServer) serveWithTelemetry(w http.ResponseWriter, r *http.Request, inner http.Handler) {
+	rec := observability.NewResponseRecorder(w)
+	start := time.Now()
+	inner.ServeHTTP(rec, r)
+	status := rec.Status()
+	operation := controlplaneOperationLabel(r)
+	result := observability.ResultClass(status)
+	duration := time.Since(start)
+
+	if s.Metrics != nil {
+		// The controlplane has no per-request registry identity; the fixed
+		// label is the process-wide system value.
+		s.Metrics.ObserveRequest(observability.SystemRegistry, operation, result, duration)
+	}
+
+	logger := s.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	// The security policy owns correlation: it ALWAYS generates its own
+	// request ID (echoed in the response) and never trusts an inbound
+	// X-Request-Id. The request log must use that server-generated ID when
+	// the security wrap ran, falling back to a fresh bounded ID otherwise.
+	requestID := rec.Header().Get(requestIDHeader)
+	if requestID == "" {
+		requestID = observability.RequestID(r)
+	}
+	logger.LogAttrs(r.Context(), slog.LevelInfo, "controlplane request",
+		slog.String("component", "controlplane"),
+		slog.String("request_id", requestID),
+		slog.String("registry", observability.SystemRegistry),
+		slog.String("repository", ""),
+		slog.String("action", operation),
+		slog.String("result", result),
+		slog.Int("status", status),
+		slog.Duration("duration", duration),
+		slog.String("dependency", controlplaneLogDependency(status)),
+	)
+}
+
+// controlplaneLogDependency is the FIXED data-free dependency classification:
+// the dependency surface statuses map to the fixed "external" class, all
+// other requests log "none".
+func controlplaneLogDependency(status int) string {
+	if status == http.StatusBadGateway || status == http.StatusServiceUnavailable {
+		return observability.DependencyExternal
+	}
+	return observability.DependencyNone
+}
+
+// controlplaneOperationLabel classifies a controlplane path into the bounded
+// operation vocabulary used by metrics and logs. The set is fixed: root, UI
+// and API surface buckets, auth buckets, token issue, and unknown. It never
+// carries entities, IDs, or emails.
+func controlplaneOperationLabel(r *http.Request) string {
+	path := r.URL.Path
+	switch {
+	case path == "/":
+		return "root"
+	case path == "/ui/login", path == "/ui/register", path == "/ui/logout", path == "/ui/invites/accept":
+		return "ui_auth"
+	case strings.HasPrefix(path, "/ui/"):
+		return "ui"
+	case path == "/api/auth/login", path == "/api/users/register":
+		return "api_auth"
+	case strings.HasPrefix(path, "/api/"):
+		return "api"
+	case path == "/token":
+		return "token"
+	default:
+		return "unknown"
+	}
 }
 
 // route dispatches to the concrete handler for a path/method pair.

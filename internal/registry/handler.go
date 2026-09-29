@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/observability"
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/resolve"
 	"github.com/uncloud-registry/registry/internal/spec"
@@ -125,6 +127,23 @@ type Handler struct {
 	// files; empty uses the process temp directory. Test-only override for
 	// deterministic cleanup assertions; production always uses the default.
 	blobTempDir string
+
+	// Task 23 telemetry and health wiring. All fields are OPTIONAL and
+	// nil-safe: a zero-value Handler serves the registry API unchanged, and
+	// every telemetry method tolerates a nil Metrics.
+
+	// Metrics owns the Prometheus instruments; /metrics serves its registry
+	// and the request middleware records count/latency/error class plus the
+	// dedicated dependency and integrity counters. Nil disables all metrics.
+	Metrics *observability.Instrumentation
+	// Logger receives the structured request log lines (component, request
+	// ID, operation ID, registry, repository, action, duration, status,
+	// result, dependency). Nil uses slog.Default().
+	Logger *slog.Logger
+	// BeeProbe performs the bounded Bee reachability probe for /readyz. Nil
+	// means no Bee dependency is wired (in-memory/dev mode) and the bee
+	// readiness component is omitted.
+	BeeProbe observability.Probe
 }
 
 func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.RegistryStore, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
@@ -159,13 +178,147 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 	return h
 }
 
-// ServeHTTP authenticates every repo-scoped request BEFORE any policy
-// resolution, storage read, Bee call, or staging side effect. The service
-// bound into verification is the canonical host of the resolved registry
-// identity; repository and action come from the matched route. Only a missing
-// token on pull may degrade to the anonymous principal, and only so the auth
-// policy can then explicitly allow or deny it.
+// ServeHTTP dispatches with Task 23 telemetry: the operational endpoints
+// (/livez, /readyz, /metrics) are answered FIRST — outside registry API path
+// parsing, authentication, and telemetry — and every registry API request
+// runs under the request middleware (count/latency/error-class metrics and
+// the structured JSON request log). A zero-telemetry handler (nil Metrics AND
+// nil Logger) dispatches with zero overhead.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/livez":
+		h.handleLivez(w, r)
+		return
+	case "/readyz":
+		h.handleReadyz(w, r)
+		return
+	case "/metrics":
+		h.handleMetrics(w, r)
+		return
+	}
+	if h.Metrics != nil || h.Logger != nil {
+		h.serveWithTelemetry(w, r)
+		return
+	}
+	h.serveHTTP(w, r)
+}
+
+// serveWithTelemetry runs ONE registry API request under the response
+// recorder, then records the request metrics (bounded registry/operation/
+// result triple) and emits the structured JSON request log line. The log
+// line carries the bounded fields and the response's durable operation
+// identity when the request produced one; neither metrics nor logs ever
+// carry tokens, digests, refs, upload IDs, or per-request data.
+func (h *Handler) serveWithTelemetry(w http.ResponseWriter, r *http.Request) {
+	rec := observability.NewResponseRecorder(w)
+	start := time.Now()
+	h.serveHTTP(rec, r)
+	status := rec.Status()
+	registryLabel := requestRegistryLabel(r)
+	operation := requestOperationLabel(r)
+	result := observability.ResultClass(status)
+	duration := time.Since(start)
+
+	if h.Metrics != nil {
+		h.Metrics.ObserveRequest(registryLabel, operation, result, duration)
+	}
+
+	attrs := []slog.Attr{
+		slog.String("component", "registry"),
+		slog.String("request_id", sanitizedRequestID(r)),
+		slog.String("registry", registryLabel),
+		slog.String("repository", requestRepository(r)),
+		slog.String("action", operation),
+		slog.String("result", result),
+		slog.Int("status", status),
+		slog.Duration("duration", duration),
+		slog.String("dependency", logDependencyFor(status)),
+	}
+	if opID := rec.Header().Get(OperationIDHeader); opID != "" {
+		attrs = append(attrs, slog.String("operation_id", opID))
+	}
+	logger := h.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.LogAttrs(r.Context(), slog.LevelInfo, "registry request", attrs...)
+}
+
+// logDependencyFor is the FIXED, data-free dependency classification for the
+// request log: the dependency surface statuses (502 content unavailability,
+// 503 service unavailable) are logged as the fixed "external" class; every
+// other request logs "none". It never carries a host, ref, or identifier.
+func logDependencyFor(status int) string {
+	if status == http.StatusBadGateway || status == http.StatusServiceUnavailable {
+		return observability.DependencyExternal
+	}
+	return observability.DependencyNone
+}
+
+// requestRegistryLabel derives the BOUNDED registry label from the request
+// host: the canonical normalized host (a static map identity in production)
+// or the fixed "unknown" value when the host cannot be normalized. It is
+// never derived from repository, digest, or upload data.
+func requestRegistryLabel(r *http.Request) string {
+	normalized, err := resolve.NormalizeRegistryHost(r.Host)
+	if err != nil {
+		return observability.OperationUnknown
+	}
+	return normalized
+}
+
+// requestOperationLabel classifies the request into the fixed bounded
+// operation vocabulary used by metrics and logs.
+func requestOperationLabel(r *http.Request) string {
+	path := r.URL.Path
+	if path == "/v2" || path == "/v2/" {
+		return observability.OperationPing
+	}
+	if path == "/v2/_catalog" || path == "/v2/_catalog/" {
+		return observability.OperationCatalog
+	}
+	_, resource, reference, ok := parsePath(path)
+	if !ok {
+		return observability.OperationUnknown
+	}
+	switch resource {
+	case "manifests":
+		if r.Method == http.MethodPut {
+			return observability.OperationPushManifest
+		}
+		return observability.OperationPullManifest
+	case "blobs":
+		return observability.OperationPullBlob
+	case "uploads":
+		return observability.OperationUpload
+	default:
+		if resource == "uploads" && reference != "" {
+			return observability.OperationUpload
+		}
+		return observability.OperationUnknown
+	}
+}
+
+// requestRepository extracts the repository segment of the matched route for
+// the request LOG (logs may carry the repository; metrics never do). Empty
+// when the path carries no repository.
+func requestRepository(r *http.Request) string {
+	repo, _, _, ok := parsePath(r.URL.Path)
+	if !ok {
+		return ""
+	}
+	return repo
+}
+
+// sanitizedRequestID is the registry's bounded correlation identity for the
+// request log; the sanitizer lives in observability so both binaries share it.
+func sanitizedRequestID(r *http.Request) string {
+	return observability.RequestID(r)
+}
+
+// serveHTTP is the registry API dispatcher (see ServeHTTP for the telemetry
+// and ops-endpoint wrapper).
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// Base ping — the Docker/OCI API version handshake every client performs
 	// before any other request. GET/HEAD answer 200 with the Distribution API
 	// version header; any other method is an explicit documented 405
@@ -215,6 +368,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	registryIdentity, err := h.Resolver.ResolveRegistry(r.Context(), r.Host)
 	if err != nil {
+		if h.Metrics != nil {
+			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyIdentity)
+		}
 		// Fixed centralized classification: a raw identity-resolution failure
 		// (which can carry the host, repository, document references, decoder
 		// or topology detail) must never cross the HTTP boundary.
@@ -280,6 +436,9 @@ func routeAction(resource string, method string) (auth.Action, bool) {
 func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, reference string, principal auth.Principal) {
 	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
+		if h.Metrics != nil {
+			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyPolicy)
+		}
 		status, code, message := classifyRequestBoundaryError(err)
 		writeError(w, status, code, message)
 		return
@@ -355,6 +514,13 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 	// with no body leaked, and corrupt content is never returned as 200.
 	data, err := h.readVerifiedManifest(r.Context(), desc, digest)
 	if err != nil {
+		if h.Metrics != nil {
+			if errors.Is(err, errPullIntegrity) {
+				h.Metrics.ObserveIntegrityFailure(requestRegistryLabel(r), observability.OperationPullManifest)
+			} else {
+				h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyBee)
+			}
+		}
 		status, code, message := classifyPullContentFailure(pullKindManifest, err)
 		writeError(w, status, code, message)
 		return
@@ -370,6 +536,9 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registryIdentity resolve.RegistryIdentity, repo string, digest string, principal auth.Principal) {
 	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
+		if h.Metrics != nil {
+			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyPolicy)
+		}
 		status, code, message := classifyRequestBoundaryError(err)
 		writeError(w, status, code, message)
 		return
@@ -422,6 +591,13 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 	// file is always removed on success and failure paths.
 	verified, size, err := h.verifyBlobToTempFile(r.Context(), desc, digest)
 	if err != nil {
+		if h.Metrics != nil {
+			if errors.Is(err, errPullIntegrity) {
+				h.Metrics.ObserveIntegrityFailure(requestRegistryLabel(r), observability.OperationPullBlob)
+			} else {
+				h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyBee)
+			}
+		}
 		status, code, message := classifyPullContentFailure(pullKindBlob, err)
 		writeError(w, status, code, message)
 		return
@@ -572,6 +748,9 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 
 	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
+		if h.Metrics != nil {
+			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyPolicy)
+		}
 		status, code, message := classifyRequestBoundaryError(err)
 		writeError(w, status, code, message)
 		return
@@ -610,6 +789,9 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	// working — its idempotency is governed by the durable feed read-back
 	// gate below, never by a fabricated identity.
 	if clientOperationID != "" && h.Preflight == nil {
+		if h.Metrics != nil {
+			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyControlPlane)
+		}
 		writeError(w, http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable)
 		return
 	}
@@ -1012,8 +1194,43 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	})
 
 	if err != nil {
+		h.observePublicationFailure(r, err)
 		status, code, message := classifyPublicationError(err)
 		writeError(w, status, code, message)
+	}
+}
+
+// observePublicationFailure records the dedicated dependency/integrity
+// counters for a failed manifest publication, classified at the SAME fixed
+// boundary as classifyPublicationError: dependency-class outcomes (503, and
+// the retryable commit/verification classes) bump the dependency counter with
+// the FIXED most-likely dependency classification; the verified-integrity
+// surface (502 PUBLICATION_UNVERIFIED) bumps the integrity counter. The
+// publication conflict/rebuild series are recorded inside the commit path
+// itself (Publisher.Observer), never here.
+func (h *Handler) observePublicationFailure(r *http.Request, err error) {
+	if h.Metrics == nil {
+		return
+	}
+	registryLabel := requestRegistryLabel(r)
+	switch {
+	case errors.As(err, new(*IntegrityError)),
+		errors.Is(err, resolve.ErrFeedNotFound),
+		errors.Is(err, resolve.ErrDocumentNotFound):
+		h.Metrics.ObserveIntegrityFailure(registryLabel, observability.OperationPushManifest)
+	case errors.Is(err, staging.ErrDependency):
+		h.Metrics.ObserveDependencyFailure(registryLabel, observability.DependencyStaging)
+	case errors.Is(err, publish.ErrCommitBackend),
+		errors.Is(err, publish.ErrCommitUnauthorized),
+		errors.Is(err, publish.ErrCommitUnknownRegistry),
+		errors.Is(err, publish.ErrCommitMalformed),
+		errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, context.Canceled):
+		h.Metrics.ObserveDependencyFailure(registryLabel, observability.DependencyControlPlane)
+	default:
+		// Raw boundary/resolver failures in the publication path come back
+		// typed through the classes above; a raw unknown failure would map to
+		// a 500 (not a dependency) and stays uncounted here deliberately.
 	}
 }
 

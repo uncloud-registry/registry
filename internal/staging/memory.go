@@ -522,6 +522,22 @@ func (s *memorySession) stagedBlob() spec.StagedBlob {
 	}
 }
 
+// StagingStats returns the in-memory staged bytes/sessions snapshot for
+// /metrics (Task 23): total byte-bearing offsets and the count of sessions
+// with byte-bearing content, mirroring the durable service's universe.
+func (m *MemoryStore) StagingStats(_ context.Context) (int64, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var bytes, sessions int64
+	for _, s := range m.sessions {
+		if s.offset > 0 {
+			bytes += s.offset
+			sessions++
+		}
+	}
+	return bytes, sessions, nil
+}
+
 // nopCloser adapts a reader into an io.ReadCloser whose Close is a no-op.
 type nopCloser struct{ io.Reader }
 
