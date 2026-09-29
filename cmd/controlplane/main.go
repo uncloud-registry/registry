@@ -21,6 +21,7 @@ import (
 	"github.com/uncloud-registry/registry/internal/config"
 	"github.com/uncloud-registry/registry/internal/controlplane"
 	"github.com/uncloud-registry/registry/internal/credential"
+	"github.com/uncloud-registry/registry/internal/server"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
@@ -55,97 +56,189 @@ func main() {
 		}()
 	}
 
-	srv := &http.Server{Handler: comps.handler}
-	var listener net.Listener
+	// The public router is served through the bounded server lifecycle
+	// (Task 22): configured read-header/read/write/idle timeouts applied to
+	// the http.Server, graceful drain on context cancellation, forced close
+	// after the shutdown deadline. Direct TLS termination uses the already
+	// parsed certificate — never plaintext, never a deferred file read.
+	publicCfg, err := controlPlaneServerConfig(cfg.ListenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var publicOpts []server.Option
 	if comps.tlsCert != nil {
-		// Direct termination: serve TLS with the already-parsed certificate,
-		// never plaintext, never a deferred file read.
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{*comps.tlsCert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		ln, err := net.Listen("tcp", cfg.ListenAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		listener = tls.NewListener(ln, tlsConfig)
+		publicOpts = append(publicOpts, server.WithTLSConfig(tlsConfig))
 		log.Printf("control plane serving TLS (direct) on %s", cfg.ListenAddr)
 	} else {
 		// Trusted-proxy termination: a trusted reverse proxy terminates TLS
 		// and forwards to this internal plaintext listener.
-		ln, err := net.Listen("tcp", cfg.ListenAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		listener = ln
 		log.Printf("control plane serving internal HTTP behind trusted proxy on %s", cfg.ListenAddr)
 	}
 
 	// The internal feed-signing listener is served on its own dedicated
 	// socket, separate from the public router, so it can never inherit the
-	// public browser CSRF/session assumptions. It is stopped with the process,
-	// and a Serve error here enters the main select and aborts the whole
-	// process with a nonzero exit (never log-and-continue).
-	var internalSrv *http.Server
-	var serveErr chan error
+	// public browser CSRF/session assumptions. It runs through the same
+	// bounded lifecycle with its fixed strict timeouts, and is stopped
+	// gracefully with the process; a serve failure here aborts the whole
+	// process with a nonzero exit (never log-and-continue), while a forced
+	// close during shutdown is logged and joined without cutting the public
+	// drain short.
+	var internalDone chan struct{}
 	if comps.internalHandler != nil && comps.internalAddr != "" {
-		internalLn, err := net.Listen("tcp", comps.internalAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		internalSrv = &http.Server{
-			Handler:           comps.internalHandler,
+		internalCfg := server.Config{
+			Address:           comps.internalAddr,
 			ReadHeaderTimeout: 5 * time.Second,
 			ReadTimeout:       15 * time.Second,
 			WriteTimeout:      15 * time.Second,
 			IdleTimeout:       60 * time.Second,
+			ShutdownTimeout:   publicCfg.ShutdownTimeout,
 			MaxHeaderBytes:    64 * 1024,
 		}
-		serveErr = make(chan error, 2)
-		go func() {
-			var serr error
-			if comps.internalTLS != nil {
-				tlsConfig := &tls.Config{
-					Certificates: []tls.Certificate{*comps.internalTLS},
-					MinVersion:   tls.VersionTLS12,
-				}
-				serr = internalSrv.Serve(tls.NewListener(internalLn, tlsConfig))
-			} else {
-				serr = internalSrv.Serve(internalLn)
-			}
-			if serr != nil && !errors.Is(serr, http.ErrServerClosed) {
-				serveErr <- serr
-			}
-		}()
+		var internalOpts []server.Option
 		mode := "plaintext"
 		if comps.internalTLS != nil {
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{*comps.internalTLS},
+				MinVersion:   tls.VersionTLS12,
+			}
+			internalOpts = append(internalOpts, server.WithTLSConfig(tlsConfig))
 			mode = "TLS"
 		}
 		log.Printf("control plane internal feed signer (%s) listening on %s", mode, comps.internalAddr)
-	}
-	if serveErr == nil {
-		serveErr = make(chan error, 1)
-	}
-	go func() { serveErr <- srv.Serve(listener) }()
-
-	select {
-	case err := <-serveErr:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
-		}
-	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = srv.Shutdown(shutdownCtx)
-		if internalSrv != nil {
-			_ = internalSrv.Shutdown(shutdownCtx)
-		}
-		cancel()
-		<-serveErr
+		internalDone = make(chan struct{})
+		go func() {
+			defer close(internalDone)
+			if err := server.Run(ctx, internalCfg, comps.internalHandler, internalOpts...); err != nil {
+				if ctx.Err() != nil {
+					// Shutdown path: a forced-close deadline is a degraded but
+					// complete shutdown; log it and let the graceful exit
+					// finish instead of aborting mid-drain.
+					log.Printf("control plane internal feed signer shutdown: %v", err)
+					return
+				}
+				log.Fatal(err)
+			}
+		}()
 	}
 
-	// Graceful join: stop the reconciler loop and wait for it to exit.
+	if err := server.Run(ctx, publicCfg, comps.handler, publicOpts...); err != nil {
+		log.Fatal(err)
+	}
+
+	// Graceful join: stop the reconciler loop and wait for it to exit, and
+	// wait for the internal feed-signing listener to finish its own drain so
+	// no server socket or worker outlives main.
 	stop()
 	wg.Wait()
+	if internalDone != nil {
+		<-internalDone
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 22: bounded dependency client and bounded server lifecycle config.
+// ---------------------------------------------------------------------------
+
+// Dependency-client deadlines for the control plane's one outbound HTTP
+// client (Bee store/resolver adapters and the feed updater/signer): bounded
+// connect/TLS-handshake/response-header/idle transport plus an overall
+// per-request Timeout, never the bare http.DefaultClient. depRequestTimeout
+// exceeds the swarm layer's internal 30s per-request context deadlines so
+// those stay authoritative and keep their context.DeadlineExceeded signal.
+const (
+	depConnectTimeout        = 10 * time.Second
+	depTLSHandshakeTimeout   = 10 * time.Second
+	depResponseHeaderTimeout = 30 * time.Second
+	depIdleConnTimeout       = 90 * time.Second
+	depRequestTimeout        = 60 * time.Second
+)
+
+// buildDependencyHTTPClient constructs THE bounded HTTP client for this
+// process, built once and injected into every Bee adapter (never the bare
+// http.DefaultClient). The standard transport is cloned so Proxy and other Go
+// defaults are preserved.
+func buildDependencyHTTPClient() *http.Client {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.DialContext = (&net.Dialer{Timeout: depConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+	base.TLSHandshakeTimeout = depTLSHandshakeTimeout
+	base.ResponseHeaderTimeout = depResponseHeaderTimeout
+	base.IdleConnTimeout = depIdleConnTimeout
+	return &http.Client{Transport: base, Timeout: depRequestTimeout}
+}
+
+// Control-plane public server lifecycle defaults. These bound the browser/
+// API router: small JSON/HTML exchanges, so every timeout is positive and
+// strict; each is overridable with a CONTROLPLANE_*_TIMEOUT env. The internal
+// feed-signing listener keeps its own fixed strict timeouts.
+const (
+	defaultControlPlaneReadHeaderTimeout = 5 * time.Second
+	defaultControlPlaneReadTimeout       = 15 * time.Second
+	defaultControlPlaneWriteTimeout      = 30 * time.Second
+	defaultControlPlaneIdleTimeout       = 2 * time.Minute
+	defaultControlPlaneShutdownTimeout   = 5 * time.Second
+)
+
+const (
+	envControlPlaneReadHeaderTimeout = "CONTROLPLANE_READ_HEADER_TIMEOUT"
+	envControlPlaneReadTimeout       = "CONTROLPLANE_READ_TIMEOUT"
+	envControlPlaneWriteTimeout      = "CONTROLPLANE_WRITE_TIMEOUT"
+	envControlPlaneIdleTimeout       = "CONTROLPLANE_IDLE_TIMEOUT"
+	envControlPlaneShutdownTimeout   = "CONTROLPLANE_SHUTDOWN_TIMEOUT"
+)
+
+// controlPlaneServerConfig builds the bounded public-server configuration from
+// strict env parsing: malformed or non-positive values fail closed with a
+// data-free error naming only the variable, before any listener opens.
+func controlPlaneServerConfig(addr string) (server.Config, error) {
+	readHeader, err := serverTimeoutFromEnv(envControlPlaneReadHeaderTimeout, defaultControlPlaneReadHeaderTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	read, err := serverTimeoutFromEnv(envControlPlaneReadTimeout, defaultControlPlaneReadTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	write, err := serverTimeoutFromEnv(envControlPlaneWriteTimeout, defaultControlPlaneWriteTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	idle, err := serverTimeoutFromEnv(envControlPlaneIdleTimeout, defaultControlPlaneIdleTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	shutdown, err := serverTimeoutFromEnv(envControlPlaneShutdownTimeout, defaultControlPlaneShutdownTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	return server.Config{
+		Address:           addr,
+		ReadHeaderTimeout: readHeader,
+		ReadTimeout:       read,
+		WriteTimeout:      write,
+		IdleTimeout:       idle,
+		ShutdownTimeout:   shutdown,
+	}, nil
+}
+
+// serverTimeoutFromEnv parses an optional duration env value strictly: an
+// unset variable yields def, a malformed or non-positive value fails closed.
+func serverTimeoutFromEnv(name string, def time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration", name)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return d, nil
 }
 
 // controlPlaneDeps captures every external side-effect the startup assembler
@@ -298,22 +391,27 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 
 	// The Bee object store is shared by the reconciler/publisher (immutable
 	// document writes) and the internal feed signer (the bounded /bytes
-	// artifact reader); it exists only in Bee mode and is nil otherwise.
+	// artifact reader); it exists only in Bee mode and is nil otherwise. All
+	// Bee adapters share ONE bounded HTTP client built once for this process
+	// (Task 22): never the bare http.DefaultClient, so a stalled Bee node can
+	// never block reconciliation, signing, or publication indefinitely.
 	var objectStore *swarm.BeeObjectStore
 	if cfg.BeeAPIURL != nil {
-		objectStore = swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), nil)
+		beeHTTPClient := buildDependencyHTTPClient()
+		objectStore = swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), beeHTTPClient)
 		service.Publisher = &controlplane.Publisher{
 			Documents: objectStore,
 			Feeds: controlplane.BeeRegistryFeedUpdater{
-				BaseURL: cfg.BeeAPIURL.String(),
-				Keys:    service,
+				BaseURL:    cfg.BeeAPIURL.String(),
+				HTTPClient: beeHTTPClient,
+				Keys:       service,
 			},
 			// Feed read-back resolution: the reconciler proves a policy feed
 			// points at the uploaded object by resolving it back to its ref.
 			// The constructor normalizes the base URL and guarantees a non-nil
 			// HTTP client plus the per-request context timeout, so a direct
 			// zero-value struct (with no base URL) is never used in production.
-			FeedsReader: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), nil),
+			FeedsReader: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), beeHTTPClient),
 		}
 	}
 
@@ -346,11 +444,12 @@ func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) 
 		if cfg.InternalAddr == "" || len(internalSecret) == 0 {
 			return nil, errors.New("control-plane Bee feed signing requires CONTROLPLANE_INTERNAL_ADDR and CONTROLPLANE_INTERNAL_SECRET_FILE")
 		}
+		beeHTTPClient := buildDependencyHTTPClient()
 		signer := &controlplane.FeedSigner{
 			Store:        store,
-			Feeds:        controlplane.BeeRegistryFeedUpdater{BaseURL: cfg.BeeAPIURL.String(), Keys: service},
-			ResolveFeeds: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), nil),
-			Docs:         swarm.NewBeeDocumentStore(cfg.BeeAPIURL.String(), nil),
+			Feeds:        controlplane.BeeRegistryFeedUpdater{BaseURL: cfg.BeeAPIURL.String(), HTTPClient: beeHTTPClient, Keys: service},
+			ResolveFeeds: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), beeHTTPClient),
+			Docs:         swarm.NewBeeDocumentStore(cfg.BeeAPIURL.String(), beeHTTPClient),
 			// The bounded /bytes reader for the artifact-proven blob
 			// transition: the signer INDEPENDENTLY re-reads the operated
 			// manifest body (bounded, data-free) through the SAME object

@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
@@ -155,10 +156,11 @@ type BeeFeedResolver struct {
 }
 
 // NewBeeFeedResolver returns a production BeeFeedResolver over baseURL with a
-// normalized base URL and a guaranteed non-nil HTTP client (http.DefaultClient
-// when none is supplied; the per-request context timeout still protects it).
-// It performs no I/O. A direct zero-value struct has an empty base URL, which
-// ResolveFeed rejects with an error rather than panicking.
+// normalized base URL and a guaranteed non-nil HTTP client (a bounded default
+// client with sane timeouts when none is supplied — never the bare
+// http.DefaultClient; the per-request context deadline additionally protects
+// reads). It performs no I/O. A direct zero-value struct has an empty base
+// URL, which ResolveFeed rejects with an error rather than panicking.
 func NewBeeFeedResolver(baseURL string, client *http.Client) *BeeFeedResolver {
 	return &BeeFeedResolver{
 		BaseURL:    strings.TrimRight(baseURL, "/"),
@@ -746,11 +748,59 @@ const beeFeedCreateVerifyBackoff = 200 * time.Millisecond
 // this update is not (and cannot become) the zero-index creation.
 const beeFeedCreateZeroIndex = "0000000000000000"
 
+// ---------- bounded default HTTP client ----------
+//
+// Bee interactions MUST never fall back to the bare process-global
+// http.DefaultClient: its zero timeouts would let a stalled or hung Bee node
+// block a request forever. defaultHTTPClient therefore substitutes a
+// process-wide bounded client (connect/TLS-handshake/response-header/idle
+// transport deadlines plus an overall per-request Timeout) whenever a caller
+// supplies none. Production binaries construct their own configured client
+// once and inject it explicitly through the constructors; this default exists
+// so a zero-value or directly-constructed struct can never hang unbounded.
+//
+// Timeout is set LARGER than the per-request context deadlines the writer and
+// bounded-reader paths already impose (beeFeedResolveTimeout /
+// beeFeedWriteTimeout), so on those paths the request-context deadline fires
+// first and its errors.Is(context.DeadlineExceeded) signal is preserved by the
+// sanitizer; paths without an internal deadline (document/object reads) are
+// bounded by the transport response-header timeout and Timeout instead.
+const (
+	beeDefaultConnectTimeout        = 10 * time.Second
+	beeDefaultTLSHandshakeTimeout   = 10 * time.Second
+	beeDefaultResponseHeaderTimeout = 30 * time.Second
+	beeDefaultIdleConnTimeout       = 90 * time.Second
+	beeDefaultRequestTimeout        = 60 * time.Second
+)
+
+var (
+	beeBoundedClientOnce sync.Once
+	beeBoundedClient     *http.Client
+)
+
+// boundedHTTPClient builds (once) the bounded default client. It clones the
+// standard transport so Proxy, keep-alive, and other Go defaults are
+// preserved, then applies the explicit deadlines.
+func boundedHTTPClient() *http.Client {
+	beeBoundedClientOnce.Do(func() {
+		base := http.DefaultTransport.(*http.Transport).Clone()
+		base.DialContext = (&net.Dialer{Timeout: beeDefaultConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+		base.TLSHandshakeTimeout = beeDefaultTLSHandshakeTimeout
+		base.ResponseHeaderTimeout = beeDefaultResponseHeaderTimeout
+		base.IdleConnTimeout = beeDefaultIdleConnTimeout
+		beeBoundedClient = &http.Client{Transport: base, Timeout: beeDefaultRequestTimeout}
+	})
+	return beeBoundedClient
+}
+
+// defaultHTTPClient returns client, or when nil the process-wide bounded
+// default (never http.DefaultClient) so a zero-value store still has sane
+// timeouts on every Bee call.
 func defaultHTTPClient(client *http.Client) *http.Client {
 	if client != nil {
 		return client
 	}
-	return http.DefaultClient
+	return boundedHTTPClient()
 }
 
 // sanitizeBeeTransportError converts a transport failure (request creation,
@@ -815,8 +865,9 @@ func stripPort(host string) string {
 }
 
 // writerClient returns a guaranteed non-nil *http.Client for writer requests
-// (http.DefaultClient when the updater's client is nil) so a zero-value or
-// under-configured updater never panics on a nil receiver client.
+// (a bounded default client when the updater's client is nil — never the bare
+// http.DefaultClient) so a zero-value or under-configured updater never panics
+// on a nil receiver client.
 func (u *BeeSequenceFeedUpdater) writerClient() *http.Client {
 	return defaultHTTPClient(u.HTTPClient)
 }

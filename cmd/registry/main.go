@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -23,28 +26,41 @@ import (
 	"github.com/uncloud-registry/registry/internal/publish"
 	"github.com/uncloud-registry/registry/internal/registry"
 	"github.com/uncloud-registry/registry/internal/resolve"
+	"github.com/uncloud-registry/registry/internal/server"
 	"github.com/uncloud-registry/registry/internal/staging"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
 func main() {
 	addr := envOrDefault("REGISTRY_ADDR", ":8080")
+	// The bounded server configuration is validated BEFORE any security-
+	// sensitive config or durable side effect: a malformed timeout must fail
+	// startup before the handler (and its staging store) is constructed.
+	srvCfg, err := registryServerConfig(addr)
+	if err != nil {
+		log.Fatal(err)
+	}
 	handler, err := buildHandler()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	log.Printf("registry listening on %s", addr)
-	serveErr := http.ListenAndServe(addr, handler)
-	// Close durable staging (spool root + SQLite) on shutdown; never leak the
-	// handle. Drivers that didn't open real state (in-memory) close as a no-op.
+	// The server lifecycle owns the listener and the graceful shutdown: on
+	// signal it drains in-flight requests (bounded by the configured
+	// ShutdownTimeout) and THEN runs this cleanup, which closes the durable
+	// staging (spool root + SQLite) — joining the Task 18 staging cleanup
+	// worker first (the handler's Close cancels and joins the loop before
+	// releasing the shared store), so no cleanup pass can race the close.
+	closeHandler := func() error { return nil }
 	if c, ok := handler.(io.Closer); ok {
-		if closeErr := c.Close(); closeErr != nil {
-			log.Printf("registry close: %v", closeErr)
-		}
+		closeHandler = c.Close
 	}
-	if serveErr != nil {
-		log.Fatal(serveErr)
+	if err := server.Run(ctx, srvCfg, handler, server.WithCleanup(closeHandler)); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -122,8 +138,13 @@ func buildBeeHandler() (http.Handler, error) {
 	if err := validateBeeBaseURL(beeURL); err != nil {
 		return nil, fmt.Errorf("BEE_API_URL: %w", err)
 	}
-	docs := swarm.NewBeeDocumentStore(beeURL, http.DefaultClient)
-	objects := swarm.NewBeeObjectStore(beeURL, http.DefaultClient)
+	// Task 22: ONE bounded dependency client is constructed for this process
+	// and injected into every Bee/ENS adapter — never the bare
+	// http.DefaultClient (its zero timeouts would let a stalled dependency
+	// block a request forever).
+	depClient := buildDependencyHTTPClient()
+	docs := swarm.NewBeeDocumentStore(beeURL, depClient)
+	objects := swarm.NewBeeObjectStore(beeURL, depClient)
 	// The post-commit verification reads artifact BODIES through an explicit
 	// bounded byte reader (the /bytes object path); it never falls back to an
 	// unbounded read. The compile-time assertion pins the object store to that
@@ -138,13 +159,13 @@ func buildBeeHandler() (http.Handler, error) {
 	// and BeeObjectStore serves objects. IdentityFeedResolver is NEVER used in
 	// Bee mode: its in-memory identity pairing exists for identity mode and
 	// would mis-decode binary feed payloads.
-	feeds := swarm.NewBeeFeedResolver(beeURL, http.DefaultClient)
+	feeds := swarm.NewBeeFeedResolver(beeURL, depClient)
 	authRealm := envOrDefault("REGISTRY_AUTH_REALM", "https://auth.uncloud-registry.com/token")
 	authenticator, err := buildAuthenticator()
 	if err != nil {
 		return nil, err
 	}
-	registryResolver, err := buildRegistryIdentityResolver()
+	registryResolver, err := buildRegistryIdentityResolver(depClient)
 	if err != nil {
 		return nil, err
 	}
@@ -577,6 +598,11 @@ func buildControlPlaneHTTPClient(cpURL string) (*http.Client, error) {
 	}
 
 	base := http.DefaultTransport.(*http.Transport).Clone()
+	// The control-plane client carries the SAME bounded deadlines as every
+	// other dependency client in this process (connect/TLS-handshake/
+	// response-header/idle plus an overall per-request timeout), so a stalled
+	// control plane can never block a registry operation forever.
+	applyDependencyTimeouts(base)
 
 	caBundle := strings.TrimSpace(os.Getenv("CONTROLPLANE_CA_BUNDLE_FILE"))
 	useSystemRoots, boolErr := parseSystemRootsEnv()
@@ -591,7 +617,7 @@ func buildControlPlaneHTTPClient(cpURL string) (*http.Client, error) {
 		if caBundle != "" || useSystemRoots {
 			return nil, errors.New("CONTROLPLANE_CA_BUNDLE_FILE and CONTROLPLANE_USE_SYSTEM_ROOTS are HTTPS-only settings and are rejected on a plaintext http control-plane URL")
 		}
-		return &http.Client{Transport: base}, nil
+		return &http.Client{Transport: base, Timeout: depRequestTimeout}, nil
 	}
 
 	// An https origin requires EXACTLY ONE explicit trust mode.
@@ -621,7 +647,7 @@ func buildControlPlaneHTTPClient(cpURL string) (*http.Client, error) {
 		tlsConfig.RootCAs = pool
 	}
 	base.TLSClientConfig = tlsConfig
-	return &http.Client{Transport: base}, nil
+	return &http.Client{Transport: base, Timeout: depRequestTimeout}, nil
 }
 
 // parseSystemRootsEnv reads CONTROLPLANE_USE_SYSTEM_ROOTS into a strict boolean.
@@ -660,6 +686,128 @@ func requireRegistryIDs(resolver resolve.RegistryIdentityResolver) error {
 		return fmt.Errorf("Bee-mode repository feed commits require at least one host mapped to a registryID (REGISTRY_ID_MAP)")
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Task 22: bounded dependency clients and bounded server lifecycle config.
+// ---------------------------------------------------------------------------
+
+// Dependency-client deadlines shared by EVERY outbound dependency client this
+// process builds (Bee store/resolver adapters, ENS RPC, and the control-plane
+// signer client): connect/TLS-handshake/response-header/idle transport bounds
+// plus an overall per-request Timeout. depRequestTimeout deliberately EXCEEDS
+// the per-request context deadlines the swarm layer imposes internally (30s),
+// so those deadlines stay authoritative and keep their
+// context.DeadlineExceeded signal; paths without an internal deadline are
+// bounded by the transport response-header timeout and Timeout instead.
+const (
+	depConnectTimeout        = 10 * time.Second
+	depTLSHandshakeTimeout   = 10 * time.Second
+	depResponseHeaderTimeout = 30 * time.Second
+	depIdleConnTimeout       = 90 * time.Second
+	depRequestTimeout        = 60 * time.Second
+)
+
+// buildDependencyHTTPClient constructs THE bounded HTTP client for this
+// process, used by every Bee and ENS adapter (and as the base for the
+// control-plane client). It is built ONCE per process — never the bare
+// http.DefaultClient, whose zero timeouts would let a stalled dependency block
+// a request forever. The standard transport is cloned so Proxy and other Go
+// defaults are preserved.
+func buildDependencyHTTPClient() *http.Client {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	applyDependencyTimeouts(base)
+	return &http.Client{Transport: base, Timeout: depRequestTimeout}
+}
+
+// applyDependencyTimeouts sets the bounded transport deadlines on an already
+// cloned transport.
+func applyDependencyTimeouts(t *http.Transport) {
+	t.DialContext = (&net.Dialer{Timeout: depConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = depTLSHandshakeTimeout
+	t.ResponseHeaderTimeout = depResponseHeaderTimeout
+	t.IdleConnTimeout = depIdleConnTimeout
+}
+
+// Registry server lifecycle defaults. Read and Write timeouts default to ZERO
+// (Go's no-deadline semantics) deliberately: registry blob uploads and
+// downloads stream for minutes on slow links, and bodies are bounded by the
+// staging quotas and verified descriptor sizes rather than a wall-clock
+// deadline; ReadHeaderTimeout, IdleTimeout, and ShutdownTimeout stay bounded
+// and positive. Every value is overridable with a REGISTRY_*_TIMEOUT env.
+const (
+	defaultRegistryReadHeaderTimeout = 5 * time.Second
+	defaultRegistryReadTimeout       = 0
+	defaultRegistryWriteTimeout      = 0
+	defaultRegistryIdleTimeout       = 2 * time.Minute
+	defaultRegistryShutdownTimeout   = 30 * time.Second
+)
+
+const (
+	envRegistryReadHeaderTimeout = "REGISTRY_READ_HEADER_TIMEOUT"
+	envRegistryReadTimeout       = "REGISTRY_READ_TIMEOUT"
+	envRegistryWriteTimeout      = "REGISTRY_WRITE_TIMEOUT"
+	envRegistryIdleTimeout       = "REGISTRY_IDLE_TIMEOUT"
+	envRegistryShutdownTimeout   = "REGISTRY_SHUTDOWN_TIMEOUT"
+)
+
+// registryServerConfig builds the bounded server configuration from strict
+// env parsing: malformed or (where required) non-positive values fail closed
+// with a data-free error naming only the variable. It runs BEFORE any
+// security-sensitive configuration or durable side effect, so a bad timeout
+// can never open a database or a listener.
+func registryServerConfig(addr string) (server.Config, error) {
+	readHeader, err := serverTimeoutFromEnv(envRegistryReadHeaderTimeout, defaultRegistryReadHeaderTimeout, true)
+	if err != nil {
+		return server.Config{}, err
+	}
+	read, err := serverTimeoutFromEnv(envRegistryReadTimeout, defaultRegistryReadTimeout, false)
+	if err != nil {
+		return server.Config{}, err
+	}
+	write, err := serverTimeoutFromEnv(envRegistryWriteTimeout, defaultRegistryWriteTimeout, false)
+	if err != nil {
+		return server.Config{}, err
+	}
+	idle, err := serverTimeoutFromEnv(envRegistryIdleTimeout, defaultRegistryIdleTimeout, true)
+	if err != nil {
+		return server.Config{}, err
+	}
+	shutdown, err := serverTimeoutFromEnv(envRegistryShutdownTimeout, defaultRegistryShutdownTimeout, true)
+	if err != nil {
+		return server.Config{}, err
+	}
+	return server.Config{
+		Address:           addr,
+		ReadHeaderTimeout: readHeader,
+		ReadTimeout:       read,
+		WriteTimeout:      write,
+		IdleTimeout:       idle,
+		ShutdownTimeout:   shutdown,
+	}, nil
+}
+
+// serverTimeoutFromEnv parses an optional duration env value strictly. An
+// unset variable yields def; a malformed value fails closed; a negative value
+// always fails closed; and requirePositive additionally rejects zero (used
+// for the fields that must stay bounded, while read/write timeouts may be
+// explicitly disabled with zero).
+func serverTimeoutFromEnv(name string, def time.Duration, requirePositive bool) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration", name)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s must not be negative", name)
+	}
+	if requirePositive && d == 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return d, nil
 }
 
 func envOrDefault(name string, fallback string) string {
@@ -753,7 +901,7 @@ func parseRegistryOwners(raw string) map[string]string {
 	return owners
 }
 
-func buildRegistryIdentityResolver() (resolve.RegistryIdentityResolver, error) {
+func buildRegistryIdentityResolver(depClient *http.Client) (resolve.RegistryIdentityResolver, error) {
 	switch envOrDefault("REGISTRY_RESOLUTION_MODE", "static") {
 	case "static":
 		return staticRegistryIdentityResolverFromEnv(), nil
@@ -769,7 +917,7 @@ func buildRegistryIdentityResolver() (resolve.RegistryIdentityResolver, error) {
 		resolver := resolve.ENSRegistryIdentityResolver{
 			DomainSuffix: suffix,
 			RPCURL:       rpcURL,
-			HTTPClient:   http.DefaultClient,
+			HTTPClient:   depClient,
 		}
 		if addr := strings.TrimSpace(os.Getenv("ENS_REGISTRY_ADDRESS")); addr != "" {
 			resolver.ENSRegistryAddr = common.HexToAddress(addr)

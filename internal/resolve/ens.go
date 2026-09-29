@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
@@ -102,6 +104,43 @@ func (r ENSRegistryIdentityResolver) resolveENSAddress(ctx context.Context, name
 	return owner, nil
 }
 
+// ---------- bounded default HTTP client ----------
+//
+// The ENS resolver talks to the configured RPC endpoint, so its fallback
+// client must never be the bare process-global http.DefaultClient (zero
+// timeouts let a stalled RPC node block resolution forever). fallbackENSHClient
+// returns a process-wide bounded client (connect/TLS-handshake/
+// response-header/idle transport deadlines plus an overall per-request
+// Timeout). Production binaries construct their own configured client once and
+// inject it through the HTTPClient field; this fallback exists so a resolver
+// with a nil client can never hang unbounded. Timeout deliberately exceeds the
+// per-request horizon used by every internal context deadline so a caller's
+// own deadline stays the authority when one is set.
+const (
+	ensDefaultConnectTimeout        = 10 * time.Second
+	ensDefaultTLSHandshakeTimeout   = 10 * time.Second
+	ensDefaultResponseHeaderTimeout = 30 * time.Second
+	ensDefaultIdleConnTimeout       = 90 * time.Second
+	ensDefaultRequestTimeout        = 60 * time.Second
+)
+
+var (
+	ensBoundedClientOnce sync.Once
+	ensBoundedClient     *http.Client
+)
+
+func boundedENSHClient() *http.Client {
+	ensBoundedClientOnce.Do(func() {
+		base := http.DefaultTransport.(*http.Transport).Clone()
+		base.DialContext = (&net.Dialer{Timeout: ensDefaultConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+		base.TLSHandshakeTimeout = ensDefaultTLSHandshakeTimeout
+		base.ResponseHeaderTimeout = ensDefaultResponseHeaderTimeout
+		base.IdleConnTimeout = ensDefaultIdleConnTimeout
+		ensBoundedClient = &http.Client{Transport: base, Timeout: ensDefaultRequestTimeout}
+	})
+	return ensBoundedClient
+}
+
 func (r ENSRegistryIdentityResolver) ethCall(ctx context.Context, to common.Address, data []byte) ([]byte, error) {
 	reqBody := rpcRequest{
 		JSONRPC: "2.0",
@@ -127,7 +166,7 @@ func (r ENSRegistryIdentityResolver) ethCall(ctx context.Context, to common.Addr
 
 	client := r.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = boundedENSHClient()
 	}
 	resp, err := client.Do(req)
 	if err != nil {
