@@ -144,6 +144,14 @@ type Handler struct {
 	// means no Bee dependency is wired (in-memory/dev mode) and the bee
 	// readiness component is omitted.
 	BeeProbe observability.Probe
+	// registryHosts is the precomputed, BOUNDED canonical-host set for the
+	// registry metric label: every configured static registry identity host,
+	// normalized (see canonicalRegistryHostLabels). Built once in NewHandler;
+	// a resolver without a static identity map (in-memory/dev mode) leaves it
+	// empty and the registry label FAILS CLOSED to observability.SystemRegistry
+	// — the label is drawn from configuration, never from a per-request,
+	// attacker-controlled Host value.
+	registryHosts map[string]struct{}
 }
 
 func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader ObjectUploader, pullAuthorizer PullAuthorizer, pushAuthorizer PushAuthorizer, authenticator Authenticator, stageStore staging.RegistryStore, publisher publish.Publisher, preflight publish.OperationBinder, authRealm string) http.Handler {
@@ -175,6 +183,11 @@ func NewHandler(resolver resolve.RegistryResolver, objects ObjectStore, uploader
 	if os, ok := objects.(BoundedObjectStreamer); ok {
 		h.ObjectStream = os
 	}
+	// Precompute the BOUNDED canonical-host set for the registry metric
+	// label from the resolver's configured static identities (see
+	// canonicalRegistryHostLabels). This makes the per-request label
+	// lookup O(1) against configuration — never against a request host.
+	h.registryHosts = canonicalRegistryHostLabels(resolver)
 	return h
 }
 
@@ -214,7 +227,7 @@ func (h *Handler) serveWithTelemetry(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	h.serveHTTP(rec, r)
 	status := rec.Status()
-	registryLabel := requestRegistryLabel(r)
+	registryLabel := h.requestRegistryLabel(r)
 	operation := requestOperationLabel(r)
 	result := observability.ResultClass(status)
 	duration := time.Since(start)
@@ -256,15 +269,54 @@ func logDependencyFor(status int) string {
 }
 
 // requestRegistryLabel derives the BOUNDED registry label from the request
-// host: the canonical normalized host (a static map identity in production)
-// or the fixed "unknown" value when the host cannot be normalized. It is
-// never derived from repository, digest, or upload data.
-func requestRegistryLabel(r *http.Request) string {
+// host: the host is normalized and matched against the handler's precomputed
+// canonical-host set (the resolver's configured static identities — see
+// canonicalRegistryHostLabels) in O(1). Only a MATCHED canonical host is
+// ever returned; an unnormalizable host, a host outside the configured set,
+// or a handler without a static identity set (in-memory/dev mode) FAILS
+// CLOSED to the fixed observability.SystemRegistry placeholder. The registry
+// label is therefore drawn from configuration (bounded), never from a
+// per-request, attacker-controlled Host value, and never from repository,
+// digest, or upload data.
+func (h *Handler) requestRegistryLabel(r *http.Request) string {
+	if len(h.registryHosts) == 0 {
+		return observability.SystemRegistry
+	}
 	normalized, err := resolve.NormalizeRegistryHost(r.Host)
 	if err != nil {
-		return observability.OperationUnknown
+		return observability.SystemRegistry
 	}
-	return normalized
+	if _, ok := h.registryHosts[normalized]; ok {
+		return normalized
+	}
+	return observability.SystemRegistry
+}
+
+// canonicalRegistryHostLabels precomputes the BOUNDED canonical-host set for
+// the registry metric label from a resolver's configured identities: every
+// static identity map key and every identity Host, normalized, is a
+// permitted label value. Only a static identity map contributes (production
+// Bee mode requires one — see requireRegistryIDs in cmd/registry); any other
+// resolver shape yields an empty set and the label fails closed to the fixed
+// placeholder, so cardinality is bounded by configuration, never by request
+// hosts.
+func canonicalRegistryHostLabels(resolver resolve.RegistryResolver) map[string]struct{} {
+	static, ok := resolver.Registries.(resolve.StaticRegistryIdentityResolver)
+	if !ok || len(static.Hosts) == 0 {
+		return nil
+	}
+	labels := make(map[string]struct{}, 2*len(static.Hosts))
+	for host, id := range static.Hosts {
+		if normalized, err := resolve.NormalizeRegistryHost(host); err == nil {
+			labels[normalized] = struct{}{}
+		}
+		if id.Host != "" {
+			if normalized, err := resolve.NormalizeRegistryHost(id.Host); err == nil {
+				labels[normalized] = struct{}{}
+			}
+		}
+	}
+	return labels
 }
 
 // requestOperationLabel classifies the request into the fixed bounded
@@ -369,7 +421,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	registryIdentity, err := h.Resolver.ResolveRegistry(r.Context(), r.Host)
 	if err != nil {
 		if h.Metrics != nil {
-			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyIdentity)
+			h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyIdentity)
 		}
 		// Fixed centralized classification: a raw identity-resolution failure
 		// (which can carry the host, repository, document references, decoder
@@ -437,7 +489,7 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		if h.Metrics != nil {
-			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyPolicy)
+			h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyPolicy)
 		}
 		status, code, message := classifyRequestBoundaryError(err)
 		writeError(w, status, code, message)
@@ -516,9 +568,9 @@ func (h *Handler) handlePullManifest(w http.ResponseWriter, r *http.Request, reg
 	if err != nil {
 		if h.Metrics != nil {
 			if errors.Is(err, errPullIntegrity) {
-				h.Metrics.ObserveIntegrityFailure(requestRegistryLabel(r), observability.OperationPullManifest)
+				h.Metrics.ObserveIntegrityFailure(h.requestRegistryLabel(r), observability.OperationPullManifest)
 			} else {
-				h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyBee)
+				h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyBee)
 			}
 		}
 		status, code, message := classifyPullContentFailure(pullKindManifest, err)
@@ -537,7 +589,7 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 	authorized, err := h.PullAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		if h.Metrics != nil {
-			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyPolicy)
+			h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyPolicy)
 		}
 		status, code, message := classifyRequestBoundaryError(err)
 		writeError(w, status, code, message)
@@ -593,9 +645,9 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 	if err != nil {
 		if h.Metrics != nil {
 			if errors.Is(err, errPullIntegrity) {
-				h.Metrics.ObserveIntegrityFailure(requestRegistryLabel(r), observability.OperationPullBlob)
+				h.Metrics.ObserveIntegrityFailure(h.requestRegistryLabel(r), observability.OperationPullBlob)
 			} else {
-				h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyBee)
+				h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyBee)
 			}
 		}
 		status, code, message := classifyPullContentFailure(pullKindBlob, err)
@@ -749,7 +801,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	batchID, authorized, err := h.PushAuthorizer.Authorize(r.Context(), registryIdentity, repo, principal)
 	if err != nil {
 		if h.Metrics != nil {
-			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyPolicy)
+			h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyPolicy)
 		}
 		status, code, message := classifyRequestBoundaryError(err)
 		writeError(w, status, code, message)
@@ -790,7 +842,7 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 	// gate below, never by a fabricated identity.
 	if clientOperationID != "" && h.Preflight == nil {
 		if h.Metrics != nil {
-			h.Metrics.ObserveDependencyFailure(requestRegistryLabel(r), observability.DependencyControlPlane)
+			h.Metrics.ObserveDependencyFailure(h.requestRegistryLabel(r), observability.DependencyControlPlane)
 		}
 		writeError(w, http.StatusServiceUnavailable, ErrorCodeDependencyUnavailable, messageDependencyUnavailable)
 		return
@@ -1212,7 +1264,7 @@ func (h *Handler) observePublicationFailure(r *http.Request, err error) {
 	if h.Metrics == nil {
 		return
 	}
-	registryLabel := requestRegistryLabel(r)
+	registryLabel := h.requestRegistryLabel(r)
 	switch {
 	case errors.As(err, new(*IntegrityError)),
 		errors.Is(err, resolve.ErrFeedNotFound),

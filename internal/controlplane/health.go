@@ -45,15 +45,16 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 // handleReadyz runs the controlplane readiness components under the short
 // per-probe deadline and answers 200 (ready) or 503 (not ready) with the
-// structured, non-secret component summary.
+// structured, non-secret component summary. Each probe is bounded by
+// RunReadiness's per-probe deadline (ReadinessProbeTimeout); there is no
+// outer whole-run wrapper, matching the registry data plane (health.go), so
+// both binaries rely only on per-probe timeouts.
 func (s *HTTPServer) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), observability.ReadinessProbeTimeout)
-	defer cancel()
-	res := observability.RunReadiness(ctx, []observability.Component{
+	res := observability.RunReadiness(r.Context(), []observability.Component{
 		{Name: observability.ComponentDatabase, Probe: s.Service.CheckDatabase},
 		{Name: observability.ComponentMasterKey, Probe: s.Service.CheckMasterKey},
 		{Name: observability.ComponentSigningKey, Probe: s.Service.CheckSigningKey},
@@ -163,6 +164,18 @@ func (s *Service) CheckSigningKey(ctx context.Context) error {
 // controlplane is not ready. With nothing outstanding the check passes. The
 // drain is transactional (lease-based claim) so a readiness probe can never
 // corrupt worker state; the whole run is bounded by the probe context.
+//
+// DELIBERATE DESIGN (Task 23 round 1): the probe deliberately keeps the real
+// drain. It is the only way to prove the publication pipeline (Bee upload,
+// feed update, verified read-back) is actually live, and it doubles as an
+// additional bounded progress pump alongside the background reconciler loop.
+// A read-only outstanding-count query would report false not-ready for jobs
+// the background worker is about to deliver, and an age-thresholded variant
+// would gate readiness on time rather than on true pipeline state — both
+// weaken the required-publication signal. The drain costs nothing at steady
+// state (the outbox is empty: one claim query, zero publication work), is
+// bounded per pass (default batch 50) and by the probe deadline, and is
+// lease-guarded so concurrent probes cannot double-complete or corrupt jobs.
 func (s *Service) CheckRequiredBeePublication(ctx context.Context) error {
 	if s == nil || s.Publisher == nil {
 		return errControlplaneBeePublicationUnavailable

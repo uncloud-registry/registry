@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -570,4 +571,102 @@ func clamp(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+// ---------------------------------------------------------------------------
+// Task 23 round 1: the registry metric label must be BOUNDED to the
+// configured identity host set plus the fixed placeholder — never a raw
+// per-request host (unbounded attacker-controlled cardinality).
+// ---------------------------------------------------------------------------
+
+// TestRegistryLabelBoundedToConfiguredHosts drives the REAL handler over many
+// distinct unmapped Host values (plus a bare /v2 with the default request
+// host and syntactically exotic normalized variants) and asserts every
+// emitted registry label value is drawn only from the resolver's configured
+// canonical hosts union {SystemRegistry placeholder}. A matched canonical
+// host keeps its configured value; every unmapped host must collapse to the
+// fixed placeholder, so cardinality is bounded by configuration, never by
+// request hosts.
+func TestRegistryLabelBoundedToConfiguredHosts(t *testing.T) {
+	h, _ := newTestHandler(t, nil, nil)
+	handler := h.(*Handler)
+	obs := observability.New()
+	handler.Metrics = obs
+
+	allowed := map[string]bool{
+		testServiceHost:              true,
+		"evil.example.test":          true,
+		observability.SystemRegistry: true,
+	}
+
+	// Configured canonical hosts keep their own label value.
+	for _, host := range []string{testServiceHost, "evil.example.test"} {
+		status, _, _ := requestOps(t, handler, http.MethodGet, "/v2", host)
+		if status != http.StatusOK {
+			t.Fatalf("ping for configured host %s = %d, want 200", host, status)
+		}
+	}
+
+	// A bare /v2 (httptest's default request host, unmapped) plus MANY
+	// distinct unmapped hosts. None are configured identities, so every one
+	// must collapse to the fixed placeholder.
+	status, _, _ := requestOps(t, handler, http.MethodGet, "/v2", "")
+	if status != http.StatusOK {
+		t.Fatalf("bare /v2 ping = %d, want 200", status)
+	}
+	for i := 0; i < 200; i++ {
+		host := fmt.Sprintf("unmapped-%03d.example.test", i)
+		status, _, _ := requestOps(t, handler, http.MethodGet, "/v2", host)
+		if status != http.StatusOK {
+			t.Fatalf("ping for %s = %d, want 200", host, status)
+		}
+	}
+	// Syntactically exotic unmapped hosts that normalize cleanly (case,
+	// trailing root dot, explicit port, IP literals) must likewise collapse.
+	for _, host := range []string{
+		"UNMAPPED.CASE.EXAMPLE.TEST.",
+		"unmapped-port.example.test:9999",
+		"[2001:db8::1]:5000",
+		"192.168.77.1:5000",
+	} {
+		status, _, _ := requestOps(t, handler, http.MethodGet, "/v2", host)
+		if status != http.StatusOK {
+			t.Fatalf("ping for %s = %d, want 200", host, status)
+		}
+	}
+
+	mfs, err := obs.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	observed := map[string]bool{}
+	for _, mf := range mfs {
+		if mf.GetName() != observability.MetricRequestsTotal {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == observability.LabelRegistry {
+					observed[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	if len(observed) == 0 {
+		t.Fatal("no registry label values observed")
+	}
+	for value := range observed {
+		if !allowed[value] {
+			t.Fatalf("registry label value %q is outside the configured host set union {placeholder} (%d distinct values observed)", value, len(observed))
+		}
+	}
+	if !observed[testServiceHost] {
+		t.Fatal("a matched canonical host must keep its configured label value")
+	}
+	if !observed[observability.SystemRegistry] {
+		t.Fatal("unmapped request hosts must collapse to the fixed placeholder label")
+	}
+	if len(observed) > len(allowed) {
+		t.Fatalf("registry label cardinality is not bounded: %d distinct values observed", len(observed))
+	}
 }
