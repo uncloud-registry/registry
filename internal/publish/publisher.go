@@ -325,18 +325,28 @@ func (DefaultBuilder) BuildNext(current spec.RepoStateDocument, input BuildInput
 	// already present in current state, because current is the authoritative,
 	// richer record and a generic staged placeholder (empty or
 	// application/octet-stream) would otherwise degrade it.
+	//
+	// This copy is KIND-AWARE. An image index / manifest list references child
+	// MANIFESTS, never blobs, so for an index kind NO staged blob is ever copied
+	// into next.Blobs — otherwise a direct caller whose StagedBlobs map
+	// contained a blob whose digest merely collides with a committed child
+	// manifest digest would fabricate a bogus blob record for a manifest digest
+	// (and, in the handler path, could create an orphan upload). Only the
+	// manifest kind copies staged blobs into state.
 	referenced := make(map[string]struct{}, len(artifact.References()))
-	for _, ref := range artifact.References() {
-		referenced[ref.Digest] = struct{}{}
-	}
-	for digest, desc := range input.StagedBlobs {
-		if _, exists := current.Blobs[digest]; exists {
-			continue
+	if artifact.Kind == ArtifactKindManifest {
+		for _, ref := range artifact.References() {
+			referenced[ref.Digest] = struct{}{}
 		}
-		if _, isRef := referenced[digest]; !isRef {
-			continue
+		for digest, desc := range input.StagedBlobs {
+			if _, exists := current.Blobs[digest]; exists {
+				continue
+			}
+			if _, isRef := referenced[digest]; !isRef {
+				continue
+			}
+			next.Blobs[digest] = desc
 		}
-		next.Blobs[digest] = desc
 	}
 	next.Manifests[input.ManifestDigest] = input.Manifest
 	next.Tags[input.Tag] = input.ManifestDigest

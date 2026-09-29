@@ -4,17 +4,20 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/uncloud-registry/registry/internal/resolve"
 )
 
 // TestAcceptAccepts is the unit-level matrix for the Distribution Accept
-// negotiation. It exercises the most-specific-range precedence rule and the
-// valid-q parsing contract directly on acceptAccepts, independently of the
-// HTTP layer.
+// negotiation. It exercises the most-specific-range precedence rule, the
+// strict RFC 9110 §12.5.1 media-range grammar (quoted strings, escapes,
+// parameters), the parameter-matching rule, and the present-empty/all-malformed
+// refusal contract directly on acceptAccepts, independently of the HTTP layer.
 func TestAcceptAccepts(t *testing.T) {
-	// stored is the exact representation we would serve for a request.
+	// stored is the exact representation we would serve for a request. It is
+	// UNPARAMETERIZED, so a media range carrying a non-q parameter never matches.
 	const stored = "application/vnd.oci.image.index.v1+json"
 
 	cases := []struct {
@@ -22,15 +25,18 @@ func TestAcceptAccepts(t *testing.T) {
 		accept string
 		want   bool
 	}{
-		{"absent accepts anything", "", true},
-		{"blank accepts anything", "   ", true},
+		// present-empty / all-malformed MUST NOT serve.
+		{"present-empty accepts nothing", "", false},
+		{"whitespace-only accepts nothing", "   ", false},
+
+		// Exact type / wildcards.
 		{"exact match", stored, true},
 		{"exact non-match rejected", "application/vnd.oci.image.manifest.v1+json", false},
 		{"type wildcard matches", "application/*", true},
 		{"other type wildcard rejected", "text/*", false},
 		{"global wildcard matches", "*/*", true},
 
-		// q=0 semantics
+		// q=0 semantics.
 		{"exact q=0 refused", stored + ";q=0", false},
 		{"exact q=0.0 refused", stored + "; q=0.0", false},
 		{"global q=0 alone refused", "*/*;q=0", false},
@@ -45,45 +51,54 @@ func TestAcceptAccepts(t *testing.T) {
 		{"exact positive overrides global q=0", "*/*;q=0, " + stored + ";q=1", true},
 		{"global q=0 then exact positive (order independence)", stored + ";q=1, */*;q=0", true},
 		{"exact q=0 overrides type-wildcard positive", stored + ";q=0, application/*;q=1", false},
-		{"type-wildcard positive loses to exact q=1 and gains nothing", "text/*;q=1, application/*;q=1, " + stored + ";q=1", true},
 
 		// Duplicates at the same specificity: a q=0 excludes even if another
 		// duplicate carries q=1.
 		{"duplicate exact one q=0 refused", stored + ";q=0, " + stored + ";q=1", false},
 		{"duplicate exact both positive accepted", stored + ";q=1, " + stored + ";q=0.5", true},
 
-		// Parameters other than q are ignored for matching.
-		{"exact with extra param accepted", stored + ";profile=v1;q=1", true},
-		{"exact with params and q=0 refused", stored + ";profile=v1;q=0", false},
+		// Non-q media-range parameters must be present in the stored type. The
+		// stored representation is unparameterized, so a range carrying any
+		// non-q parameter does NOT match (RFC 9110 §12.5.1).
+		{"non-q param not in unparameterized stored rejected", stored + ";profile=v1", false},
+		{"non-q param with q=1 still rejected", stored + ";profile=v1;q=1", false},
+		{"non-q param any case rejected", stored + ";Charset=UTF-8;q=1", false},
 
-		// Malformed / out-of-range q values skip the item (do not poison).
-		{"malformed q skipped with other match", stored + ";q=abc, */*;q=1", true},
+		// Malformed parameter entries are REJECTED (never dropped to broaden
+		// the match into a bare type).
+		{"malformed param without value rejected", stored + ";profile", false},
+		{"malformed param empty name rejected", stored + ";=v", false},
+		{"malformed duplicate param rejected", stored + ";profile=a;profile=b;q=1", false},
+
+		// A malformed q makes only that entry malformed; a valid wildcard
+		// entry still serves. All-malformed refuses.
+		{"malformed q skipped, valid wildcard serves", stored + ";q=abc, */*;q=1", true},
 		{"malformed q only match refused", stored + ";q=abc", false},
-		{"out-of-range q=2 skipped only match refused", stored + ";q=2", false},
-		{"out-of-range q=-1 skipped", "*/*;q=-1", false},
+		{"out-of-range q=2 only match refused", stored + ";q=2", false},
 
-		// Strict RFC 9110 qvalue grammar: NaN, partial/non-digit forms, signs,
-		// exponents, and excess fractional precision are ALL rejected (each
-		// skips its item rather than poisoning a matching sibling).
-		{"q=NaN skipped only match refused", stored + ";q=NaN", false},
-		{"q=.5 skipped only match refused", stored + ";q=.5", false},
-		{"q=+0.5 skipped only match refused", stored + ";q=+0.5", false},
-		{"q=+1 skipped only match refused", stored + ";q=+1", false},
-		{"q=1e0 skipped only match refused", stored + ";q=1e0", false},
-		{"q=2.0 skipped only match refused", stored + ";q=2.0", false},
-		{"q=1.0000 excess precision skipped with positive wildcard", stored + ";q=1.0000, */*;q=1", true},
-		{"q=1.0000 excess precision only match refused", stored + ";q=1.0000", false},
-		{"q=0.1234 excess precision skipped only match refused", stored + ";q=0.1234", false},
+		// Quoted strings: a comma inside a quoted parameter value is NOT a
+		// list separator, and an escaped quote is honored.
+		{"quoted comma is not a separator", stored + `;note="a,b"` + ", */*;q=1", true},
+		{"escaped quote honored in quoted value", stored + `;note="a\"b"` + ", */*;q=1", true},
+		{"unterminated quoted value rejected", stored + `;note="a` + ", */*;q=1", false},
+
+		// Strict RFC 9110 §12.4.2 qvalue grammar.
 		{"q=1. trailing dot valid", stored + ";q=1.", true},
 		{"q=1.000 exact three zeros valid", stored + ";q=1.000", true},
 		{"q=0.5 valid", stored + ";q=0.5", true},
 		{"q= 0.001 valid", stored + "; q=0.001", true},
 		{"q=0.999 valid", stored + ";q=0.999", true},
+		{"q=NaN skipped only match refused", stored + ";q=NaN", false},
+		{"q=.5 skipped only match refused", stored + ";q=.5", false},
+		{"q=+0.5 skipped only match refused", stored + ";q=+0.5", false},
+		{"q=1e0 skipped only match refused", stored + ";q=1e0", false},
+		{"q=1.0000 excess precision skipped with wildcard", stored + ";q=1.0000, */*;q=1", true},
+		{"q=1.0000 excess precision only match refused", stored + ";q=1.0000", false},
 
 		// Malformed media ranges are skipped.
 		{"malformed type-only range skipped", "application", false},
-		{"malformed subtype-only range skipped regardless", "*;q=1", false},
-		{"concrete subtype under wildcard type skipped", "application/vnd.oci.image.index.v1+json, */vnd.oci.image.index.v1+json", true},
+		{"malformed subtype-only range skipped", "*;q=1", false},
+		{"concrete plus malformed wildcard-subtype", stored + ", */vnd.oci.image.index.v1+json", true},
 
 		// Non-matching concrete quieted by matching wildcard.
 		{"non-matching concrete plus matching wildcard", "text/plain, application/*", true},
@@ -98,7 +113,7 @@ func TestAcceptAccepts(t *testing.T) {
 	}
 }
 
-// TestParseQvalue pins the exact RFC 9110 §14.8.1 qvalue grammar. The parser
+// TestParseQvalue pins the exact RFC 9110 §12.4.2 qvalue grammar. The parser
 // must reject NaN, ".5", "+0.5", "-1", "2", exponents, a fourth fractional
 // digit, surplus precision, empty/malformed tokens, and any trailing garbage —
 // and accept "0", "1", and their bounded fractional forms.
@@ -196,6 +211,108 @@ func TestHandlerManifestAcceptOnWire(t *testing.T) {
 	if status := manifestGetStatus(t, server.URL, "text/plain"); status != http.StatusNotFound {
 		t.Fatalf("single non-matching Accept must refuse, got %d", status)
 	}
+	// A MANDATORY present-but-empty Accept field insists on a representation
+	// that no media range expresses, so it refuses (unlike an ABSENT Accept).
+	if status := manifestGetStatus(t, server.URL, ""); status != http.StatusNotFound {
+		t.Fatalf("present-empty Accept must refuse, got %d", status)
+	}
+	// A comma inside a QUOTED parameter value is not a list separator: the
+	// range stays intact, its non-q parameter fails to match the
+	// unparameterized stored type, and only the wildcard serves.
+	if status := manifestGetStatus(t, server.URL, `application/vnd.oci.image.manifest.v1+json;note="a,b"`, "*/*;q=1"); status != http.StatusOK {
+		t.Fatalf("quoted comma must not split the list, got %d", status)
+	}
+	// A non-q media-range parameter cannot match the unparameterized stored
+	// representation, so the exact type WITH the extra parameter is refused.
+	if status := manifestGetStatus(t, server.URL, "application/vnd.oci.image.manifest.v1+json;profile=v1;q=1"); status != http.StatusNotFound {
+		t.Fatalf("param-carrying exact range must refuse unparameterized stored type, got %d", status)
+	}
+	// q=0 on the only matching range refuses.
+	if status := manifestGetStatus(t, server.URL, "application/vnd.oci.image.manifest.v1+json;q=0"); status != http.StatusNotFound {
+		t.Fatalf("q=0 must refuse, got %d", status)
+	}
+}
+
+// TestHandlerManifestVaryHeader proves the manifest GET path sets
+// `Vary: Accept` so shared caches key on the negotiated representation for
+// both successful serves and 404 refusals.
+func TestHandlerManifestVaryHeader(t *testing.T) {
+	t.Parallel()
+	docs := resolve.NewMemoryDocumentStore()
+	feeds := resolve.NewMemoryFeedStore()
+	seedRegistryDocuments(t, docs, feeds)
+	handler, _ := newTestHandler(t, docs, feeds)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	vary := func(acceptLines ...string) string {
+		resp := manifestGet(t, server.URL, acceptLines...)
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return strings.Join(resp.Header.Values("Vary"), ",")
+	}
+	if v := vary("*/*"); !strings.Contains(v, "Accept") {
+		t.Fatalf("existing manifest Vary=%q must contain Accept", v)
+	}
+	if v := vary("application/vnd.oci.image.manifest.v1+json"); !strings.Contains(v, "Accept") {
+		t.Fatalf("exact-match manifest Vary=%q must contain Accept", v)
+	}
+	if status, v := func() (int, string) {
+		resp := manifestGet(t, server.URL, "text/plain")
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode, strings.Join(resp.Header.Values("Vary"), ",")
+	}(); status != http.StatusNotFound || !strings.Contains(v, "Accept") {
+		t.Fatalf("refusal path must still send Vary: Accept (status=%d Vary=%q)", status, v)
+	}
+	// HEAD inherits the same Vary behavior.
+	if v := func() string {
+		resp := manifestHead(t, server.URL, "application/vnd.oci.image.manifest.v1+json")
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return strings.Join(resp.Header.Values("Vary"), ",")
+	}(); !strings.Contains(v, "Accept") {
+		t.Fatalf("HEAD manifest Vary=%q must contain Accept", v)
+	}
+}
+
+// manifestGet issues a GET for the seeded `latest` manifest with the given
+// Accept header values as SEPARATE header field lines and returns the full
+// response (headers intact).
+func manifestGet(t *testing.T, baseURL string, acceptLines ...string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v2/backend/api/manifests/latest", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Host = testServiceHost
+	for _, line := range acceptLines {
+		req.Header.Add("Accept", line)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	return resp
+}
+
+// manifestHead issues a HEAD for the seeded `latest` manifest with the given
+// Accept header values and returns the full response (headers intact).
+func manifestHead(t *testing.T, baseURL string, acceptLines ...string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodHead, baseURL+"/v2/backend/api/manifests/latest", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Host = testServiceHost
+	for _, line := range acceptLines {
+		req.Header.Add("Accept", line)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	return resp
 }
 
 // manifestGetStatus issues a GET for the seeded `latest` manifest with the

@@ -315,11 +315,20 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 	}
 	switch artifact.Kind {
 	case publish.ArtifactKindIndex:
-		// An index's READ-ONLY operands are its child MANIFESTS, recorded as
-		// their own entries in the state manifests map (not blobs). Every child
-		// must be durably present with EXACT media type and size and its object
-		// bytes must hash to the referenced digest.
+		// Apply the shared index-size policy fail-closed, and reduce the child
+		// descriptor set to DISTINCT digests (first-seen document order). Every
+		// descriptor — including identical duplicates — is still semantically
+		// validated against the committed record in order, but each DISTINCT
+		// child body is READ and HASHED exactly once, so duplicate descriptors
+		// can never amplify the verification read.
+		unique, err := publish.UniqueIndexChildren(artifact.Manifests)
+		if err != nil {
+			return newIntegrityError(fmt.Errorf("verify publication: index child set exceeds the shared index bounds: %w", err))
+		}
 		for _, ref := range artifact.Manifests {
+			if !publish.IsSupportedChildManifestMediaType(ref.MediaType) {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child media type is not a supported single-platform manifest"))
+			}
 			child, ok := doc.Manifests[ref.Digest]
 			if !ok {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest is missing from published state"))
@@ -327,9 +336,16 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 			if child.Size != ref.Size || child.MediaType != ref.MediaType {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest descriptor disagrees with the index reference"))
 			}
+		}
+		var verifiedBytes int64
+		for _, ref := range unique {
+			child := doc.Manifests[ref.Digest]
 			childRaw, err := docs.Read(ctx, child.SwarmRef)
 			if err != nil {
 				return classifyResolverFailure(fmt.Sprintf("verify publication: read child manifest %q", child.SwarmRef), err)
+			}
+			if int64(len(childRaw)) > publish.MaxArtifactBodyBytes {
+				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body exceeds the artifact size bound"))
 			}
 			if publish.ComputeDigest(childRaw) != ref.Digest {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body does not match its digest"))
@@ -340,6 +356,12 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, doc sp
 				// prove the byte length claimed by the descriptor.
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced child manifest body length disagrees with its declared size"))
 			}
+			// Enforce the shared AGGREGATE verified-byte bound (overflow-safe) so
+			// the total verification read across DISTINCT children stays bounded.
+			if int64(len(childRaw)) > publish.MaxAggregateIndexChildBytes-verifiedBytes {
+				return newIntegrityError(fmt.Errorf("verify publication: aggregate verified child bytes exceed the shared index bound"))
+			}
+			verifiedBytes += int64(len(childRaw))
 			// Independently parse the child under its DECLARED media type: it must
 			// decode as a coherent single-platform manifest, never as a nested
 			// index (recursive index levels are not supported) and never as an

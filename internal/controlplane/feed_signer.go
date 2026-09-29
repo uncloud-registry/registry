@@ -1650,10 +1650,16 @@ func (s *FeedSigner) validateArtifactTransition(ctx context.Context, cur, target
 		}
 
 	default: // ArtifactKindIndex
-		// Every child is a supported NON-INDEX manifest, present in the target
-		// MANIFEST map with EXACT descriptor media/size, and its immutable body
-		// independently verified (bounded read, digest AND byte-length proof,
-		// coherent single-platform parse).
+		// Apply the shared index-size policy fail-closed, and reduce the child
+		// descriptor set to DISTINCT digests (first-seen order). Every descriptor
+		// — including identical duplicates — is still semantically validated
+		// against the committed manifest map in order, but each DISTINCT child
+		// body is read and hashed exactly once, so duplicate descriptors can
+		// never amplify the signer's verification read.
+		unique, err := publish.UniqueIndexChildren(artifact.Manifests)
+		if err != nil {
+			return fmt.Errorf("%w: operated index child set exceeds the shared index bounds: %v", errFeedSignerMalformed, err)
+		}
 		for _, ref := range artifact.Manifests {
 			if !publish.IsSupportedChildManifestMediaType(ref.MediaType) {
 				return fmt.Errorf("%w: operated index references a child media type that is not a supported single-platform manifest", errFeedSignerMalformed)
@@ -1665,10 +1671,18 @@ func (s *FeedSigner) validateArtifactTransition(ctx context.Context, cur, target
 			if child.Size != ref.Size || child.MediaType != ref.MediaType {
 				return fmt.Errorf("%w: operated index child manifest descriptor disagrees with the index reference", errFeedSignerMalformed)
 			}
+		}
+		var verifiedBytes int64
+		for _, ref := range unique {
+			child := target.Manifests[ref.Digest]
 			childRaw, err := s.Bytes.ReadBounded(ctx, child.SwarmRef, publish.MaxArtifactBodyBytes)
 			if err != nil {
 				return fmt.Errorf("%w: operated index child manifest object: %v", errFeedSignerBackend, err)
 			}
+			if int64(len(childRaw)) > publish.MaxAggregateIndexChildBytes-verifiedBytes {
+				return fmt.Errorf("%w: aggregate verified child bytes exceed the shared index bound", errFeedSignerMalformed)
+			}
+			verifiedBytes += int64(len(childRaw))
 			if publish.ComputeDigest(childRaw) != ref.Digest {
 				return fmt.Errorf("%w: operated index child manifest body does not match its digest", errFeedSignerMalformed)
 			}

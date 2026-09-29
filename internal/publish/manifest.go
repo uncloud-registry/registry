@@ -2,6 +2,7 @@ package publish
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,13 +27,44 @@ const (
 // bounding memory and CPU per publication.
 const MaxArtifactBodyBytes = 4 << 20
 
-// Metadata string bounds for accepted descriptor/platform fields. annotations
-// and urls are NOT accepted in v1 descriptors (unknown-member rejection), so
-// only mediaType and platform strings need bounds here.
+// Metadata string bounds for accepted descriptor/platform fields. annotations,
+// urls, and data are now accepted on OCI descriptors (see descriptorPolicy);
+// every string and collection is bounded here.
 const (
 	maxDescriptorMediaTypeLen = 4096
 	maxPlatformStringLen      = 1024
 	maxPlatformFeatures       = 64
+	maxArtifactTypeLen        = 4096
+	maxAnnotationsCount       = 1024
+	maxAnnotationKeyLen       = 4096
+	maxAnnotationValueLen     = 4096
+	maxDescriptorURLsCount    = 256
+	maxDescriptorURLLen       = 4096
+)
+
+// Shared index-size policy. These maxima are the SINGLE authority used by the
+// artifact parser (fail-before-upload), the registry read-after-write
+// verification, and the control-plane feed signer (fail-closed) so an image
+// index / manifest list can never drive an unbounded verification read and one
+// digest is never read more than once.
+//
+//   - MaxIndexChildDescriptors bounds the number of child descriptors an index
+//     may DECLARE (including identical duplicates). A list body is already
+//     bounded by MaxArtifactBodyBytes, but this makes the count burden explicit
+//     and independent of the body-size cap.
+//   - MaxUniqueIndexChildManifests bounds the number of DISTINCT child digests
+//     after digest deduplication — the number of child bodies verification will
+//     ever read.
+//   - MaxAggregateIndexChildBytes bounds the aggregate of the DECLARED sizes of
+//     the DISTINCT children. Verification reads each distinct child body
+//     exactly once and rejects the set when the sum of the ACTUAL read bytes
+//     exceeds this bound too, so the aggregate verification read is bounded
+//     within the same artifact size regime (each child is itself capped at
+//     MaxArtifactBodyBytes).
+const (
+	MaxIndexChildDescriptors    = 10000
+	MaxUniqueIndexChildManifests = 4096
+	MaxAggregateIndexChildBytes  = 256 << 20 // 256 MiB
 )
 
 // supportedChildManifestMediaTypes are the ONLY media types an index child
@@ -72,13 +104,59 @@ const (
 
 // Descriptor is a validated OCI descriptor as referenced by a manifest or
 // index. It is the metadata Tasks 13/19 consume: digest, size, media type,
-// and (index children only) an optional platform.
+// platform (index children only), and — for OCI descriptors — the optional
+// urls / annotations / data members that are validated for type, boundedness,
+// and (for data) base64/size/digest coherence. Parsing is validation, never
+// transcoding: the original artifact body is retained byte-identically, so
+// these fields are introspection only and never re-emitted.
 type Descriptor struct {
-	MediaType string    `json:"mediaType"`
-	Digest    string    `json:"digest"`
-	Size      int64     `json:"size"`
-	Platform  *Platform `json:"platform,omitempty"`
+	MediaType   string            `json:"mediaType"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size"`
+	Platform    *Platform         `json:"platform,omitempty"`
+	URLs        []string          `json:"urls,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+	Data        []byte            `json:"data,omitempty"`
 }
+
+// descriptorPolicy controls which OPTIONAL descriptor members are valid in a
+// given structural position, so descriptor schema validation is
+// media-type-and-position specific. All OCI descriptors accept the OCI 1.1
+// optional urls / annotations / data members; Docker descriptors reject the
+// OCI-only annotations/data, and a Docker manifest-list child additionally
+// REQUIRES a platform object while an OCI image-index child keeps platform
+// optional.
+type descriptorPolicy struct {
+	allowPlatform    bool
+	requirePlatform  bool // Docker manifest-list children only
+	allowURLs        bool
+	allowAnnotations bool
+	allowData        bool
+}
+
+var (
+	// ociDescriptorPolicy applies to OCI descriptors: manifest config, manifest
+	// layer, and any subject descriptor. All OCI 1.1 optional descriptor
+	// members (urls, annotations, data) are valid; platform is not (platform is
+	// only meaningful on index children).
+	ociDescriptorPolicy = descriptorPolicy{allowURLs: true, allowAnnotations: true, allowData: true}
+	// ociIndexChildPolicy applies to an OCI image-index child descriptor:
+	// platform is additional and OPTIONAL, and OCI optional members are valid.
+	ociIndexChildPolicy = descriptorPolicy{allowPlatform: true, allowURLs: true, allowAnnotations: true, allowData: true}
+	// dockerManifestConfigPolicy applies to a Docker schema-2 config
+	// descriptor: its spec surface is exactly mediaType / size / digest, with
+	// no optional members.
+	dockerManifestConfigPolicy = descriptorPolicy{}
+	// dockerManifestLayerPolicy applies to a Docker schema-2 layer descriptor:
+	// urls is allowed per the Docker Distribution manifest-v2-2 descriptor;
+	// annotations and data are OCI-only and rejected.
+	dockerManifestLayerPolicy = descriptorPolicy{allowURLs: true}
+	// dockerManifestListChildPolicy applies to a Docker manifest-list child:
+	// platform is REQUIRED per the Docker Distribution manifest-v2-2 schema,
+	// and no OCI-only member (urls is also not part of the manifest-list child
+	// schema) is accepted.
+	dockerManifestListChildPolicy = descriptorPolicy{requirePlatform: true}
+)
 
 // Platform is a validated index-child platform. architecture and os are
 // required; every string is bounded. os.features lists mandatory OS features
@@ -96,13 +174,20 @@ type Platform struct {
 
 // Artifact is the validated parse result. Exactly one of Config+Layers
 // (manifest) or Manifests (index) is populated; MediaType echoes the exact
-// validated top-level media type.
+// validated top-level media type. The OCI 1.1 optional top-level members
+// (artifactType, subject, annotations) are validated and reflected here for
+// OCI manifests and OCI image indexes; Docker types reject them as
+// unknown-member (they are not part of the Docker schema-2 / manifest-list
+// surface).
 type Artifact struct {
-	MediaType string
-	Kind      ArtifactKind
-	Config    *Descriptor
-	Layers    []Descriptor
-	Manifests []Descriptor
+	MediaType    string
+	Kind         ArtifactKind
+	Config       *Descriptor
+	Layers       []Descriptor
+	Manifests    []Descriptor
+	ArtifactType string
+	Subject      *Descriptor
+	Annotations  map[string]string
 }
 
 // References returns exactly the descriptors this artifact depends on —
@@ -162,6 +247,14 @@ const (
 	// media type that is not a supported single-platform child manifest.
 	// Recursive nested indexes are not supported in v1.
 	ErrKindUnsupportedNestedMediaType ValidationErrorKind = "unsupported_nested_media_type"
+	// ErrKindIndexTooLarge rejects an image index / manifest list whose child
+	// descriptor set exceeds one of the shared aggregate bounds
+	// (MaxIndexChildDescriptors, MaxUniqueIndexChildManifests, or
+	// MaxAggregateIndexChildBytes). The parser enforces it before any upload;
+	// the registry verification and control-plane feed signer re-enforce it
+	// fail-closed so an oversized index can never drive an unbounded
+	// verification read.
+	ErrKindIndexTooLarge ValidationErrorKind = "index_too_large"
 	// ErrKindUnsupportedPublication is a retained, stable validation kind that
 	// was the pre-Task-19 gate rejecting index publication. Task 19 enabled
 	// index publication, so this kind is no longer emitted; it is preserved in
@@ -221,19 +314,33 @@ const conflictMarker = "<conflicting-digest>"
 // matches and is rejected as an unknown member, and a null value arrives as
 // the raw token "null" and is rejected as the wrong type (never silently
 // coerced to a zero value).
+//
+// The ENVELOPE vocabulary is media-type specific: OCI manifests and OCI image
+// indexes additionally accept the OCI 1.1 optional top-level members
+// artifactType, subject, and annotations, while Docker schema-2 manifests and
+// Docker manifest lists must keep rejecting those OCI-only members. Both OCI
+// types and both Docker types share one envelope surface each. config /
+// layers / manifests are kept KNOWN on every type so the cross-kind SHAPE
+// checks (an index must not carry config/layers; a manifest must not carry a
+// manifests array) still fire with the dedicated invalid_shape kind instead of
+// degrading to a generic unknown-member rejection.
 var (
-	envelopeKnownKeys = map[string]struct{}{
+	ociEnvelopeKeys = map[string]struct{}{
+		"schemaVersion": {},
+		"mediaType":     {},
+		"artifactType":  {},
+		"config":        {},
+		"layers":        {},
+		"manifests":     {},
+		"subject":       {},
+		"annotations":   {},
+	}
+	dockerEnvelopeKeys = map[string]struct{}{
 		"schemaVersion": {},
 		"mediaType":     {},
 		"config":        {},
 		"layers":        {},
 		"manifests":     {},
-	}
-	descriptorKnownKeys = map[string]struct{}{
-		"mediaType": {},
-		"digest":    {},
-		"size":      {},
-		"platform":  {},
 	}
 	platformKnownKeys = map[string]struct{}{
 		"architecture": {},
@@ -244,6 +351,32 @@ var (
 		"variant":      {},
 	}
 )
+
+// descriptorKnownKeys returns the exact descriptor key vocabulary for a
+// descriptorPolicy. mediaType / digest / size are always present; platform is
+// always present too so a present-but-disallowed platform is rejected with the
+// dedicated invalid_shape kind rather than a generic unknown-member; the OCI
+// optional members (urls, annotations, data) are added only when the policy
+// allows them. Docker descriptors therefore reject annotations/data as
+// OCI-only members while OCI descriptors accept them.
+func descriptorKnownKeys(policy descriptorPolicy) map[string]struct{} {
+	keys := map[string]struct{}{
+		"mediaType": {},
+		"digest":    {},
+		"size":      {},
+		"platform":  {},
+	}
+	if policy.allowURLs {
+		keys["urls"] = struct{}{}
+	}
+	if policy.allowAnnotations {
+		keys["annotations"] = struct{}{}
+	}
+	if policy.allowData {
+		keys["data"] = struct{}{}
+	}
+	return keys
+}
 
 func joinPath(base, part string) string {
 	if base == "" {
@@ -379,7 +512,19 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 			"exactly one JSON document is allowed (trailing content rejected)")
 	}
 
-	env, err := decodeObjectMembers(first, "", envelopeKnownKeys)
+	// The ENVELOPE key vocabulary is media-type specific: OCI manifests and OCI
+	// image indexes accept the OCI 1.1 optional top-level members (artifactType,
+	// subject, annotations) while Docker schema-2 manifests and Docker manifest
+	// lists must reject those OCI-only members as unknown.
+	var envelopeKeys map[string]struct{}
+	oci := false
+	switch {
+	case mediaType == MediaTypeOCIManifest, mediaType == MediaTypeOCIIndex:
+		envelopeKeys, oci = ociEnvelopeKeys, true
+	case mediaType == MediaTypeDockerManifest, mediaType == MediaTypeDockerManifestList:
+		envelopeKeys = dockerEnvelopeKeys
+	}
+	env, err := decodeObjectMembers(first, "", envelopeKeys)
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -397,27 +542,76 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 		return Artifact{}, newValidationError(ErrKindSchemaVersion, "schemaVersion", "schemaVersion must be exactly 2")
 	}
 
-	// Embedded mediaType: optional, but present-null or non-string is wrong
-	// type, and a non-empty value must agree with the top-level media type.
+	// Embedded mediaType: optional in presence, but a PRESENT value must be a
+	// non-empty string that EXACTLY equals the top-level media type. A present
+	// empty string is rejected (never equated with an absent member). Docker
+	// schema-2 requires it; when present on any type it must agree.
 	if mtRaw, present := env["mediaType"]; present {
 		mt, err := decodeRequiredString(mtRaw, "mediaType")
 		if err != nil {
 			return Artifact{}, err
 		}
-		if mt != "" && mt != mediaType {
+		if mt == "" {
+			return Artifact{}, newValidationError(ErrKindMediaTypeMismatch, "mediaType",
+				"a present embedded mediaType must be non-empty")
+		}
+		if mt != mediaType {
 			return Artifact{}, newValidationError(ErrKindMediaTypeMismatch, "mediaType",
 				"embedded mediaType disagrees with the top-level media type")
 		}
 	}
 
 	a := Artifact{MediaType: mediaType, Kind: kind}
+
+	// The OCI 1.1 optional top-level members are validated only for the OCI
+	// media types; Docker types reject them as unknown-member because they are
+	// not part of the Docker schema-2 / manifest-list envelope (the envelope
+	// key map already excludes them).
+	if artifactTypeRaw, present := env["artifactType"]; present {
+		s, err := decodeRequiredString(artifactTypeRaw, "artifactType")
+		if err != nil {
+			return Artifact{}, err
+		}
+		if s == "" {
+			return Artifact{}, newValidationError(ErrKindInvalidShape, "artifactType",
+				"a present artifactType must be non-empty")
+		}
+		if len(s) > maxArtifactTypeLen {
+			return Artifact{}, newValidationError(ErrKindInvalidShape, "artifactType",
+				fmt.Sprintf("artifactType exceeds the %d-byte bound", maxArtifactTypeLen))
+		}
+		a.ArtifactType = s
+	}
+	if subjectRaw, present := env["subject"]; present {
+		subject, err := decodeDescriptor(subjectRaw, "subject", ociDescriptorPolicy)
+		if err != nil {
+			return Artifact{}, err
+		}
+		a.Subject = &subject
+	}
+	if annotationsRaw, present := env["annotations"]; present {
+		ann, err := decodeAnnotations(annotationsRaw, "annotations")
+		if err != nil {
+			return Artifact{}, err
+		}
+		a.Annotations = ann
+	}
+
 	switch kind {
 	case ArtifactKindManifest:
+		// Descriptor schemas differ by media type: OCI descriptors accept the
+		// OCI 1.1 optional url/annotations/data members; Docker schema-2
+		// config descriptors accept none and Docker layer descriptors accept
+		// only urls — Docker descriptors never accept annotations/data (OCI-only).
+		configPolicy, layerPolicy := ociDescriptorPolicy, ociDescriptorPolicy
+		if !oci {
+			configPolicy, layerPolicy = dockerManifestConfigPolicy, dockerManifestLayerPolicy
+		}
 		cRaw, present := env["config"]
 		if !present {
 			return Artifact{}, newValidationError(ErrKindMissingField, "config", "manifest requires a config descriptor")
 		}
-		config, err := decodeDescriptor(cRaw, "config", false)
+		config, err := decodeDescriptor(cRaw, "config", configPolicy)
 		if err != nil {
 			return Artifact{}, err
 		}
@@ -426,7 +620,7 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 		if !present {
 			return Artifact{}, newValidationError(ErrKindMissingField, "layers", "manifest requires a layers array")
 		}
-		layers, err := decodeDescriptorArray(lRaw, "layers", false)
+		layers, err := decodeDescriptorArray(lRaw, "layers", layerPolicy)
 		if err != nil {
 			return Artifact{}, err
 		}
@@ -436,6 +630,14 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 				"an image manifest must not contain a manifests array (index-only shape)")
 		}
 	case ArtifactKindIndex:
+		// Child descriptor schema differs by media type: an OCI image-index
+		// child keeps platform OPTIONAL and accepts OCI optional members; a
+		// Docker manifest-list child REQUIRES a valid platform object and
+		// rejects OCI-only members.
+		childPolicy := ociIndexChildPolicy
+		if !oci {
+			childPolicy = dockerManifestListChildPolicy
+		}
 		mRaw, present := env["manifests"]
 		if !present {
 			return Artifact{}, newValidationError(ErrKindMissingField, "manifests", "index requires a manifests array")
@@ -443,11 +645,16 @@ func ParseArtifact(mediaType string, body []byte) (Artifact, error) {
 		// manifests is REQUIRED to be present but MAY be an empty array: both
 		// the OCI image-index spec ("the size of the array MAY be zero") and
 		// the Docker manifest-list spec (no non-empty minimum) permit it.
-		manifests, err := decodeDescriptorArray(mRaw, "manifests", true)
+		manifests, err := decodeDescriptorArray(mRaw, "manifests", childPolicy)
 		if err != nil {
 			return Artifact{}, err
 		}
 		a.Manifests = manifests
+		// Enforce the shared index-size policy BEFORE returning so an
+		// oversized child set is rejected at parse — before any upload.
+		if err := ValidateIndexAggregateBounds(a.Manifests); err != nil {
+			return Artifact{}, err
+		}
 		if _, present := env["config"]; present {
 			return Artifact{}, newValidationError(ErrKindInvalidShape, "config",
 				"an index must not contain config (manifest-only shape)")
@@ -474,7 +681,7 @@ var supportedArtifactMediaTypes = map[string]ArtifactKind{
 // decodeDescriptorArray decodes a descriptor array. A present null or any
 // non-array is the wrong type; each element must itself be an object
 // descriptor (never null).
-func decodeDescriptorArray(raw json.RawMessage, field string, allowPlatform bool) ([]Descriptor, error) {
+func decodeDescriptorArray(raw json.RawMessage, field string, policy descriptorPolicy) ([]Descriptor, error) {
 	if isNullRaw(raw) {
 		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array, not null")
 	}
@@ -488,7 +695,7 @@ func decodeDescriptorArray(raw json.RawMessage, field string, allowPlatform bool
 		if isNullRaw(item) || len(item) == 0 || item[0] != '{' {
 			return nil, newValidationError(ErrKindWrongType, itemField, "descriptor must be a JSON object, not null")
 		}
-		d, err := decodeDescriptor(item, itemField, allowPlatform)
+		d, err := decodeDescriptor(item, itemField, policy)
 		if err != nil {
 			return nil, err
 		}
@@ -498,9 +705,9 @@ func decodeDescriptorArray(raw json.RawMessage, field string, allowPlatform bool
 }
 
 // decodeDescriptor applies the strict descriptor contract with exact key and
-// type enforcement.
-func decodeDescriptor(raw json.RawMessage, field string, allowPlatform bool) (Descriptor, error) {
-	members, err := decodeObjectMembers(raw, field, descriptorKnownKeys)
+// type enforcement, using the media-type/position specific descriptorPolicy.
+func decodeDescriptor(raw json.RawMessage, field string, policy descriptorPolicy) (Descriptor, error) {
+	members, err := decodeObjectMembers(raw, field, descriptorKnownKeys(policy))
 	if err != nil {
 		return Descriptor{}, err
 	}
@@ -548,11 +755,52 @@ func decodeDescriptor(raw json.RawMessage, field string, allowPlatform bool) (De
 
 	d := Descriptor{MediaType: mediaType, Digest: digest, Size: size}
 
+	// Optional OCI descriptor members — urls / annotations / data — are valid
+	// only where the policy allows them (OCI descriptors). Each member must be
+	// the correct JSON type and bounded.
+	if uRaw, present := members["urls"]; present {
+		if !policy.allowURLs {
+			return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "urls"),
+				"urls is not accepted on this descriptor")
+		}
+		urls, err := decodeDescriptorURLs(uRaw, joinPath(field, "urls"))
+		if err != nil {
+			return Descriptor{}, err
+		}
+		d.URLs = urls
+	}
+	if anRaw, present := members["annotations"]; present {
+		if !policy.allowAnnotations {
+			return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "annotations"),
+				"annotations is not accepted on this descriptor")
+		}
+		ann, err := decodeAnnotations(anRaw, joinPath(field, "annotations"))
+		if err != nil {
+			return Descriptor{}, err
+		}
+		d.Annotations = ann
+	}
+	if dataRaw, present := members["data"]; present {
+		if !policy.allowData {
+			return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "data"),
+				"data is not accepted on this descriptor")
+		}
+		data, err := decodeDescriptorData(dataRaw, joinPath(field, "data"), digest, size)
+		if err != nil {
+			return Descriptor{}, err
+		}
+		d.Data = data
+	}
+
 	pRaw, present := members["platform"]
 	if !present {
+		if policy.requirePlatform {
+			return Descriptor{}, newValidationError(ErrKindMissingField, joinPath(field, "platform"),
+				"a Docker manifest-list child requires a valid platform object")
+		}
 		return d, nil
 	}
-	if !allowPlatform {
+	if !policy.allowPlatform && !policy.requirePlatform {
 		return Descriptor{}, newValidationError(ErrKindInvalidShape, joinPath(field, "platform"),
 			"platform is only valid on index child manifests")
 	}
@@ -562,6 +810,112 @@ func decodeDescriptor(raw json.RawMessage, field string, allowPlatform bool) (De
 	}
 	d.Platform = p
 	return d, nil
+}
+
+// decodeAnnotations strictly decodes a bounded string→string annotation map. A
+// present null or any non-object is the wrong type; duplicate keys were
+// already rejected by the global walkStrict, so this map decode is safe. Every
+// key is required non-empty and every key/value length is bounded, and errors
+// never echo an annotation key/value (the field path stays a fixed placeholder
+// for values; the key is attacker-controlled and never rendered).
+func decodeAnnotations(raw json.RawMessage, field string) (map[string]string, error) {
+	if isNullRaw(raw) {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON object of string-to-string annotations, not null")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		// A non-object value (array or scalar) is the wrong type; a present
+		// null was already rejected above. An empty object {} is a valid empty
+		// annotation map (m is non-nil, len zero).
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON object of string-to-string annotations")
+	}
+	if len(m) > maxAnnotationsCount {
+		return nil, newValidationError(ErrKindInvalidShape, field,
+			fmt.Sprintf("annotation map exceeds %d entries", maxAnnotationsCount))
+	}
+	out := make(map[string]string, len(m))
+	for k, vRaw := range m {
+		if k == "" {
+			return nil, newValidationError(ErrKindInvalidShape, field, "an annotation key must be non-empty")
+		}
+		if len(k) > maxAnnotationKeyLen {
+			return nil, newValidationError(ErrKindInvalidShape, field,
+				fmt.Sprintf("annotation key exceeds the %d-byte bound", maxAnnotationKeyLen))
+		}
+		// The value field path uses the fixed unknownMemberMarker placeholder —
+		// the annotation KEY is attacker-controlled and must never become part
+		// of the public structural path.
+		v, err := decodeRequiredString(vRaw, joinPath(field, unknownMemberMarker))
+		if err != nil {
+			return nil, err
+		}
+		if len(v) > maxAnnotationValueLen {
+			return nil, newValidationError(ErrKindInvalidShape, field,
+				fmt.Sprintf("annotation value exceeds the %d-byte bound", maxAnnotationValueLen))
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// decodeDescriptorURLs strictly decodes a bounded array of non-empty URL
+// strings. Errors never echo a URL value.
+func decodeDescriptorURLs(raw json.RawMessage, field string) ([]string, error) {
+	if isNullRaw(raw) {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array of URL strings, not null")
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, newValidationError(ErrKindWrongType, field, "value must be a JSON array of URL strings")
+	}
+	if len(items) > maxDescriptorURLsCount {
+		return nil, newValidationError(ErrKindInvalidShape, field,
+			fmt.Sprintf("descriptor urls list exceeds %d entries", maxDescriptorURLsCount))
+	}
+	out := make([]string, 0, len(items))
+	for i, item := range items {
+		u, err := decodeRequiredString(item, fmt.Sprintf("%s[%d]", field, i))
+		if err != nil {
+			return nil, err
+		}
+		if u == "" {
+			return nil, newValidationError(ErrKindInvalidShape, fmt.Sprintf("%s[%d]", field, i), "a descriptor url must be non-empty")
+		}
+		if len(u) > maxDescriptorURLLen {
+			return nil, newValidationError(ErrKindInvalidShape, fmt.Sprintf("%s[%d]", field, i),
+				fmt.Sprintf("descriptor url exceeds the %d-byte bound", maxDescriptorURLLen))
+		}
+		out = append(out, u)
+	}
+	return out, nil
+}
+
+// decodeDescriptorData strictly decodes and verifies a descriptor's embedded
+// `data` member: it must be a valid base64 (RFC 4648 section 4) string whose
+// decoded bytes are byte-identical to the referenced content — i.e. the
+// decoded length equals the declared size and the SHA-256 digest of the decoded
+// bytes equals the declared digest. This is the OCI "base64/size coherence"
+// contract; any mismatch is rejected (fail closed). The decoded bytes are
+// bounded by the artifact body bound, so this decode is always bounded.
+func decodeDescriptorData(raw json.RawMessage, field string, digest string, size int64) ([]byte, error) {
+	s, err := decodeRequiredString(raw, field)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, newValidationError(ErrKindInvalidSize, field,
+			"descriptor data must be a valid base64 encoding")
+	}
+	if int64(len(decoded)) != size {
+		return nil, newValidationError(ErrKindInvalidSize, field,
+			"descriptor data decodes to a byte length that disagrees with the declared size")
+	}
+	if ComputeDigest(decoded) != digest {
+		return nil, newValidationError(ErrKindInvalidDigest, field,
+			"descriptor data does not hash to the declared digest")
+	}
+	return decoded, nil
 }
 
 // decodePlatform strictly decodes and bounds an index-child platform.
@@ -725,6 +1079,77 @@ func rejectConflictingDescriptors(a Artifact) error {
 		}
 	}
 	return nil
+}
+
+// ValidateIndexAggregateBounds enforces the shared index-size policy over an
+// index / manifest-list child descriptor set (the RAW list, including identical
+// duplicates):
+//
+//   - total declared descriptor count <= MaxIndexChildDescriptors;
+//   - distinct child digest count <= MaxUniqueIndexChildManifests;
+//   - sum of the DECLARED sizes of the distinct children <=
+//     MaxAggregateIndexChildBytes.
+//
+// It is the SINGLE authority used by the artifact parser (fail-before-upload),
+// the registry read-after-write verification, and the control-plane feed
+// signer (fail-closed). It is overflow-safe: a single size larger than the
+// aggregate bound or an aggregate sum that would exceed the bound fails
+// before it can overflow int64. Errors are typed and data-free.
+func ValidateIndexAggregateBounds(manifests []Descriptor) error {
+	if len(manifests) > MaxIndexChildDescriptors {
+		return newValidationError(ErrKindIndexTooLarge, "manifests",
+			fmt.Sprintf("index child descriptor count exceeds %d", MaxIndexChildDescriptors))
+	}
+	if len(manifests) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(manifests))
+	var distinct int
+	var aggregate int64
+	for _, d := range manifests {
+		if _, dup := seen[d.Digest]; dup {
+			continue
+		}
+		seen[d.Digest] = struct{}{}
+		distinct++
+		if d.Size > MaxAggregateIndexChildBytes {
+			return newValidationError(ErrKindIndexTooLarge, "manifests",
+				fmt.Sprintf("index child aggregate declared bytes exceed %d", MaxAggregateIndexChildBytes))
+		}
+		if aggregate > MaxAggregateIndexChildBytes-d.Size {
+			return newValidationError(ErrKindIndexTooLarge, "manifests",
+				fmt.Sprintf("index child aggregate declared bytes exceed %d", MaxAggregateIndexChildBytes))
+		}
+		aggregate += d.Size
+	}
+	if distinct > MaxUniqueIndexChildManifests {
+		return newValidationError(ErrKindIndexTooLarge, "manifests",
+			fmt.Sprintf("index references more than %d distinct child manifests", MaxUniqueIndexChildManifests))
+	}
+	return nil
+}
+
+// UniqueIndexChildren reduces an index / manifest-list child descriptor list to
+// the DISTINCT child digests, preserving first-seen document order, after
+// enforcing ValidateIndexAggregateBounds. Verification paths iterate this set
+// to READ and HASH each distinct child body exactly once — a digest that
+// appears multiple times is never read more than once — while still running
+// per-descriptor semantic validation over every descriptor (including
+// duplicates) in document order.
+func UniqueIndexChildren(manifests []Descriptor) ([]Descriptor, error) {
+	if err := ValidateIndexAggregateBounds(manifests); err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(manifests))
+	out := make([]Descriptor, 0, len(manifests))
+	for _, d := range manifests {
+		if _, dup := seen[d.Digest]; dup {
+			continue
+		}
+		seen[d.Digest] = struct{}{}
+		out = append(out, d)
+	}
+	return out, nil
 }
 
 // walkStrict validates the whole body token stream: well-formed JSON with no
