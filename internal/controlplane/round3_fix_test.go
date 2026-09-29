@@ -58,7 +58,7 @@ func buildAnnotatedIndex(t *testing.T, children ...indexChildFixture) indexFixtu
 			"digest":    children[0].ref.Digest,
 			"size":      children[0].ref.Size,
 		},
-		"annotations": map[string]any{"com.example":"1"},
+		"annotations": map[string]any{"com.example": "1"},
 		"manifests":   childJSON,
 	}
 	body, err := json.Marshal(idx)
