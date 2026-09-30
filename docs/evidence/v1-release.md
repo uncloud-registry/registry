@@ -1,7 +1,8 @@
 # v1 release decision record
 
 Date: 2026-09-30 (UTC)
-Source SHA: `9bc3f22ab5b291979c9e9f3cc7b642c7638c4c03` (branch `feat/v1-completion`)
+Code SHA (Go source state): `9bc3f22ab5b291979c9e9f3cc7b642c7638c4c03` (branch `feat/v1-completion`)
+Release-record SHA (docs/evidence + traceability checker state): `d266277301c5078adc8fd30714b7e4d4738a2875` (branch `feat/v1-completion`)
 
 ## Decision (honest)
 
@@ -41,8 +42,8 @@ What is **deferred to Phase 4** (Bee full node):
 
 ## Container images
 
-The v1 reference deployment builds its two binaries locally from this source
-commit; no signed registry digests exist yet (the release workflow that would
+The v1 reference deployment builds its two binaries locally from the code
+SHA above; no signed registry digests exist yet (the release workflow that would
 pin them is not executed in this phase). Image references are therefore the
 Dockerfile + tag, not digests.
 

@@ -1,5 +1,6 @@
 {
-  "source_sha": "9bc3f22ab5b291979c9e9f3cc7b642c7638c4c03",
+  "source_sha": "d266277301c5078adc8fd30714b7e4d4738a2875",
+  "code_sha": "9bc3f22ab5b291979c9e9f3cc7b642c7638c4c03",
   "schema": "uncloud-registry/release-index/v1",
   "generated_from": "PRD docs/superpowers/specs/2026-09-16-uncloud-registry-v1-completion-design.md + git log (feat/v1-completion) + existing docs/evidence/*.md",
   "status_vocabulary": [
@@ -795,7 +796,7 @@
     },
     {
       "id": "AUD-024",
-      "commit": "0d8b7f4",
+      "commit": "69b6418",
       "test_command": "bash scripts/security/check-repository-secrets.sh",
       "evidence": "docs/evidence/phase-1-security.md",
       "status": "implemented",

@@ -200,8 +200,8 @@ Pull content is **pre-verified before any success byte leaves the handler**:
 - One active writer per repository (in-process serialization plus an
   authoritative control-plane generation fence for cross-process safety);
   no active-active writers.
-- Staging is process-local (SQLite-ish spool or in-memory); in Bee-backed
-  development mode it is still in-memory.
+- Staging is durable (SQLite metadata + filesystem spool) in Bee-backed
+  mode; it is in-memory only under `REGISTRY_BACKEND=memory`.
 - Secure JWKS keys-file loading is implemented on macOS and Linux only; other
   platforms fail closed at startup.
 - ENS ownership resolution follows the subdomain-to-ENS naming convention and

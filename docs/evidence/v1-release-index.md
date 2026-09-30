@@ -44,7 +44,7 @@
 | AUD-021 | implemented | `7242903` | scripts/ci/check.sh |
 | AUD-022 | implemented | `7242903` | scripts/ci/release-artifacts.sh |
 | AUD-023 | implemented | `c46af1a` | docs/compatibility.md |
-| AUD-024 | implemented | `0d8b7f4` | docs/evidence/phase-1-security.md |
+| AUD-024 | implemented | `69b6418` | docs/evidence/phase-1-security.md |
 | AUD-025 | implemented | `31bafc2` | docs/evidence/phase-1-security.md |
 | AUD-026 | implemented | `346a963` | docs/evidence/phase-1-security.md |
 | COMP-001 | implemented | `c46af1a` | docs/compatibility.md |
