@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -120,17 +120,17 @@ func (c *contentAddressedStore) Get(ctx context.Context, ref string) ([]byte, er
 // durableTempDir returns a private 0700 directory on the real (symlink-free)
 // path — the staging service fail-closes on anything looser or on symlink
 // components, and t.TempDir() may be 0755 and sit behind /var on darwin.
+// EvalSymlinks resolves the /var -> /private/var (or /tmp -> /private/tmp)
+// symlink prefix on darwin and returns the path unchanged on Linux, where
+// /var and /tmp are real directories.
 func durableTempDir(t *testing.T) string {
 	t.Helper()
 	d := t.TempDir()
 	if err := os.Chmod(d, 0o700); err != nil {
 		t.Fatalf("chmod tempdir: %v", err)
 	}
-	switch {
-	case strings.HasPrefix(d, "/var/"):
-		return "/private" + d
-	case strings.HasPrefix(d, "/tmp/"):
-		return "/private" + d
+	if r, err := filepath.EvalSymlinks(d); err == nil {
+		return r
 	}
 	return d
 }

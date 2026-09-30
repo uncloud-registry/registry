@@ -101,13 +101,13 @@ func privateDir(t *testing.T) string {
 		t.Fatalf("chmod tempdir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(d) })
-	// The staging service fail-closes on any looser/symlinked path; t.TempDir()
-	// may sit behind /var on darwin, so expose the real /private path.
-	switch {
-	case strings.HasPrefix(d, "/var/"):
-		return filepath.Clean("/private" + d)
-	case strings.HasPrefix(d, "/tmp/"):
-		return filepath.Clean("/private" + d)
+	// The staging service fail-closes on any looser/symlinked path. On darwin
+	// os.MkdirTemp may sit behind the /var -> /private/var (or /tmp ->
+	// /private/tmp) symlink; resolve symlinks so the strict component walk
+	// from "/" never trips on a symlink prefix. On Linux /tmp and /var are
+	// real directories, so EvalSymlinks returns the path unchanged.
+	if r, err := filepath.EvalSymlinks(d); err == nil {
+		return r
 	}
 	return filepath.Clean(d)
 }

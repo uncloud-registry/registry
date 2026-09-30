@@ -101,14 +101,16 @@ func durableTestStaging(t *testing.T) (staging.RegistryStore, string) {
 	return svc, root
 }
 
-// symlinkFreeBase rewrites the OS-standard /var and /tmp symlink prefixes to
-// their real directories so the strict component walk never trips on them
-// (same contract as the staging package's own test helper).
+// symlinkFreeBase resolves any symlink components in the OS temp path so the
+// strict component walk from "/" never trips on them. On darwin /var and
+// /tmp are symlinks to /private/var and /private/tmp, so EvalSymlinks yields
+// the real directory; on Linux /tmp and /var are real directories and the
+// path is returned unchanged. This keeps the fixture portable across both.
 func symlinkFreeBase(p string) string {
-	if !strings.HasPrefix(p, "/var/") && !strings.HasPrefix(p, "/tmp/") && p != "/var" && p != "/tmp" {
-		return p
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
 	}
-	return "/private" + p
+	return p
 }
 
 // TestReadyzFailsOnInaccessibleStagingRoot proves an inaccessible staging
