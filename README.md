@@ -585,6 +585,33 @@ The intended setup flow is:
 6. Run the registry server in `ens` resolution mode.
 7. Push and pull using the registry host.
 
+## Operations
+
+Production runbooks for the reference deployment (Task 24 `compose.yaml`),
+grounded in the actual binaries:
+
+- [docs/operations/install.md](docs/operations/install.md) — secrets layout,
+  key/JWKS generation, `.env`, start and readiness verification.
+- [docs/operations/backup-restore.md](docs/operations/backup-restore.md) —
+  `scripts/operations/backup.sh`, `verify-backup.sh`, `restore.sh`; archive
+  contents, what is deliberately excluded (master key, credential files,
+  `.env`), restore safety gates, and the honest status of the deferred
+  push/pull stack drill (Phase 4).
+- [docs/operations/key-rotation.md](docs/operations/key-rotation.md) —
+  registry-token signing key rotation by `kid` overlap, session-key
+  rotation, master-key rotation + feed-key re-encryption, feed-owner
+  rotation limitations, verification and rollback.
+- [docs/operations/upgrade-rollback.md](docs/operations/upgrade-rollback.md) —
+  migration order (control plane v17 / staging v11), the backup gate,
+  compatibility window, and rollback-by-restore restrictions.
+- [docs/operations/incidents.md](docs/operations/incidents.md) — integrity
+  incidents, postage exhaustion, Bee outage, signer outage, staging disk
+  pressure, credential exposure.
+- [docs/evidence/phase-5-recovery.md](docs/evidence/phase-5-recovery.md) —
+  the executed backup/restore drill against the real SQLite databases
+  (fixture → backup → verify → tamper/determinism checks → restore →
+  schema/data equivalence → re-open + decrypt with the real constructors).
+
 ## Suggested Reading Order
 
 If you are new to the codebase, read in this order:
