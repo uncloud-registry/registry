@@ -267,7 +267,7 @@ This mode uses Bee for:
 - blob/manifest upload via `/bytes`
 - feed publication via `/chunks` and `/soc`
 
-Bee mode still uses in-memory upload staging right now. Published state and content are Swarm-backed, but staging is ephemeral inside the registry process.
+Bee mode uses durable upload staging (SQLite metadata + filesystem spool) and Swarm-backed published state and content.
 
 ## Feed Update Design
 
@@ -282,7 +282,7 @@ It works by:
 5. signing `identifier || wrappedChunkAddress`
 6. uploading the SOC to `/soc/{owner}/{identifier}?sig=...`
 
-This is why Bee-backed publish needs a signer private key.
+The feed-owner private key lives in the control plane; the registry data plane requests each feed commit through the constrained control-plane signing service (`CONTROLPLANE_URL`) and never holds or reads a feed private key.
 
 ## Current Limitations
 
@@ -299,11 +299,11 @@ Important current limitations:
 - concurrent multi-writer publish is handled by per-repository serialization
   plus an authoritative control-plane generation fence — no active-active
   writers
-- staging is still in-memory even in Bee mode
+- staging is process-local durable (SQLite metadata + filesystem spool); publication is serialized in-process plus a control-plane generation fence
 - secure JWKS key-file loading for registry token verification (kernel `O_NOFOLLOW`/`O_NONBLOCK` single-descriptor open) is implemented on macOS and Linux only; on any other platform the registry fails closed at startup rather than loading keys through a weaker fallback — there is no Windows (or other non-macOS/Linux) keys-file loading support
 - ENS resolution is currently subdomain-to-ENS naming convention, not a full external ENS resolver integration
 - no GC or retention policy yet
-- no Redis-backed staging or repo locking yet
+- no Redis-backed distributed staging/locking
 
 ## Repository Walkthrough
 
@@ -451,7 +451,7 @@ REGISTRY_BACKEND=bee \
 REGISTRY_RESOLUTION_MODE=static \
 BEE_API_URL=http://localhost:1633 \
 REGISTRY_OWNER_MAP=alice.uncloud-registry.com=0xfeedowner \
-BEE_FEED_SIGNER_PRIVATE_KEY=<hex-private-key> \
+CONTROLPLANE_URL=http://localhost:8081 \
 go run ./cmd/registry
 ```
 
@@ -459,24 +459,28 @@ Required variables in Bee mode:
 
 - `BEE_API_URL`
 - `REGISTRY_RESOLUTION_MODE`
+- `CONTROLPLANE_URL` (repository feed commits are signed by the control plane)
 
 Resolution-specific variables:
 
 - when `REGISTRY_RESOLUTION_MODE=static`:
-  - `REGISTRY_OWNER_MAP`
+  - `REGISTRY_OWNER_MAP` (host → feed-owner address)
+  - `REGISTRY_ID_MAP` (host → registry id)
 - when `REGISTRY_RESOLUTION_MODE=ens`:
   - `ETH_RPC_URL`
   - `REGISTRY_ENS_SUFFIX`
   - optional `ENS_REGISTRY_ADDRESS`
 
-Optional but required for publish:
-
-- `BEE_FEED_SIGNER_PRIVATE_KEY`
-
 Behavior:
 
-- without `BEE_FEED_SIGNER_PRIVATE_KEY`, Bee mode can read documents and upload objects but cannot publish repo state
-- with `BEE_FEED_SIGNER_PRIVATE_KEY`, Bee mode can also update repo `stateFeed`
+- without `CONTROLPLANE_URL`, Bee mode can read documents and upload objects but cannot publish repo state (repository feed commits are refused)
+- with `CONTROLPLANE_URL`, the registry requests each feed commit from the control-plane constrained signer
+
+> **Canonical deployment:** the reference `compose.yaml` stack is the
+> supported way to run the two services together (see
+> [docs/operations/install.md](docs/operations/install.md) for the secrets
+> layout, config, and readiness checks). The standalone `go run` examples
+> below are for local development only.
 
 `REGISTRY_OWNER_MAP` is a comma-separated host-to-owner mapping:
 
@@ -492,7 +496,7 @@ REGISTRY_RESOLUTION_MODE=ens \
 BEE_API_URL=http://localhost:1633 \
 ETH_RPC_URL=https://your-ethereum-rpc \
 REGISTRY_ENS_SUFFIX=registry.eth \
-BEE_FEED_SIGNER_PRIVATE_KEY=<hex-private-key> \
+CONTROLPLANE_URL=http://localhost:8081 \
 go run ./cmd/registry
 ```
 
@@ -511,7 +515,7 @@ REGISTRY_ADDR=:5000 \
 BEE_API_URL=http://localhost:1633 \
 REGISTRY_RESOLUTION_MODE=static \
 REGISTRY_OWNER_MAP=alice.uncloud-registry.com=0xfeedowner \
-BEE_FEED_SIGNER_PRIVATE_KEY=<hex-private-key> \
+CONTROLPLANE_URL=http://localhost:8081 \
 go run ./cmd/registry
 ```
 
@@ -611,6 +615,12 @@ grounded in the actual binaries:
   the executed backup/restore drill against the real SQLite databases
   (fixture → backup → verify → tamper/determinism checks → restore →
   schema/data equivalence → re-open + decrypt with the real constructors).
+- [docs/release-checklist.md](docs/release-checklist.md) — the operator/CI
+  release checklist (check.sh, traceability checker, secret scan, E2E,
+  operational drills, sign-off record).
+- [docs/evidence/v1-release.md](docs/evidence/v1-release.md) — the v1 release
+  decision record (source SHA, images, migration/Bee versions, client matrix,
+  backup drill result, honest deferral statement).
 
 ## Suggested Reading Order
 
@@ -640,10 +650,12 @@ These are the main choices made so far:
 
 ## Near-Term Next Steps
 
-The most practical next steps are:
+v1 is feature-complete for its documented scope; the remaining work is the
+deferred Phase 4 / real-Bee E2E gate, then the production release sign-off:
 
-- seedable memory-mode configuration
-- stronger OCI manifest validation
-- Redis-backed staging
-- repo locking for concurrent push
-- cleanup/retention policy for staged uploads and old metadata
+- run the real-Bee feed-publication and Docker/Podman round-trip gates
+  (deferred pending a Bee full node — see [docs/compatibility.md](docs/compatibility.md) §8)
+- pin container image digests and produce release SBOMs/checksums
+- execute the full push/backup/restore/pull and live upgrade/rollback drills
+- complete the operator release checklist ([docs/release-checklist.md](docs/release-checklist.md))
+- record the final release decision in [docs/evidence/v1-release.md](docs/evidence/v1-release.md)

@@ -1,0 +1,821 @@
+{
+  "source_sha": "9bc3f22ab5b291979c9e9f3cc7b642c7638c4c03",
+  "schema": "uncloud-registry/release-index/v1",
+  "generated_from": "PRD docs/superpowers/specs/2026-09-16-uncloud-registry-v1-completion-design.md + git log (feat/v1-completion) + existing docs/evidence/*.md",
+  "status_vocabulary": [
+    "implemented",
+    "accepted-carryover",
+    "deferred",
+    "deferred-phase4"
+  ],
+  "entries": [
+    {
+      "id": "SEC-001",
+      "commit": "8ff3369",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "fail-closed bearer handling (Task 5)"
+    },
+    {
+      "id": "AC-001",
+      "commit": "8ff3369",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "fail-closed bearer handling (Task 5)"
+    },
+    {
+      "id": "SEC-002",
+      "commit": "7c437d7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "asymmetric scoped registry tokens (Task 4)"
+    },
+    {
+      "id": "SEC-003",
+      "commit": "7c437d7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "asymmetric scoped registry tokens (Task 4)"
+    },
+    {
+      "id": "SEC-004",
+      "commit": "8ff3369",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "exact repo/action scope matching (Task 5)"
+    },
+    {
+      "id": "SEC-005",
+      "commit": "8ff3369",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "published policy enforcement (Task 5)"
+    },
+    {
+      "id": "SEC-006",
+      "commit": "40a2bb9",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "public DTO isolation (Tasks 1,3)"
+    },
+    {
+      "id": "AC-003",
+      "commit": "40a2bb9",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "public DTO isolation (Tasks 1,3)"
+    },
+    {
+      "id": "SEC-007",
+      "commit": "c94aff7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "AES-GCM feed-key envelope + rotation (Task 6)"
+    },
+    {
+      "id": "SEC-008",
+      "commit": "c94aff7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "AES-GCM feed-key envelope + rotation (Task 6)"
+    },
+    {
+      "id": "SEC-009",
+      "commit": "31bafc2",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "one-way recipient-bound invites (Task 7)"
+    },
+    {
+      "id": "AC-004",
+      "commit": "31bafc2",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "one-way recipient-bound invites (Task 7)"
+    },
+    {
+      "id": "SEC-010",
+      "commit": "aa0a998",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "CSRF/secure cookies/rate limits + prod config (Task 8)"
+    },
+    {
+      "id": "SEC-011",
+      "commit": "aa0a998",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "CSRF/secure cookies/rate limits + prod config (Task 8)"
+    },
+    {
+      "id": "CP-001",
+      "commit": "346a963",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "versioned migrations + FK constraints (Task 2)"
+    },
+    {
+      "id": "CP-004",
+      "commit": "346a963",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "versioned migrations + FK constraints (Task 2)"
+    },
+    {
+      "id": "CP-002",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "provisioning outbox + reconciliation (Task 9)"
+    },
+    {
+      "id": "CP-003",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "provisioning outbox + reconciliation (Task 9)"
+    },
+    {
+      "id": "CP-006",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "provisioning outbox + reconciliation (Task 9)"
+    },
+    {
+      "id": "AC-005",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "provisioning outbox + reconciliation (Task 9)"
+    },
+    {
+      "id": "CP-005",
+      "commit": "7c437d7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "input/scope/host normalization (Tasks 4,8,20)"
+    },
+    {
+      "id": "AC-002",
+      "commit": "8ff3369",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "wrong-scope push rejection (Task 5)"
+    },
+    {
+      "id": "AC-010",
+      "commit": "1e91614",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "constrained signer rejection matrix (Task 10)"
+    },
+    {
+      "id": "AC-015",
+      "commit": "1e91614",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "control-plane outage fail-closed (Tasks 10,23)"
+    },
+    {
+      "id": "STAMP-001",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/controlplane/reconciler_test.go",
+      "status": "implemented",
+      "note": "bootstrap + batch selection (Tasks 9,10,13)"
+    },
+    {
+      "id": "STAMP-002",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/controlplane/reconciler_test.go",
+      "status": "implemented",
+      "note": "bootstrap + batch selection (Tasks 9,10,13)"
+    },
+    {
+      "id": "STAMP-003",
+      "commit": "9fdffdc",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/swarm/bee_test.go",
+      "status": "implemented",
+      "note": "explicit postage batch propagation (Task 11)"
+    },
+    {
+      "id": "AC-009",
+      "commit": "9fdffdc",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/swarm/bee_test.go",
+      "status": "implemented",
+      "note": "explicit postage batch propagation (Task 11)"
+    },
+    {
+      "id": "STAMP-004",
+      "commit": "1e91614",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/controlplane/feed_signer_test.go",
+      "status": "implemented",
+      "note": "constrained signer (Task 10)"
+    },
+    {
+      "id": "PUB-007",
+      "commit": "1e91614",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/controlplane/feed_signer_test.go",
+      "status": "implemented",
+      "note": "constrained signer (Task 10)"
+    },
+    {
+      "id": "STAMP-005",
+      "commit": "9fdffdc",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/swarm/bee_test.go",
+      "status": "implemented",
+      "note": "postage failure classification (Task 11)"
+    },
+    {
+      "id": "PUB-001",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "generation-zero first publish + referenced blobs (Task 13)"
+    },
+    {
+      "id": "PUB-004",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "generation-zero first publish + referenced blobs (Task 13)"
+    },
+    {
+      "id": "AC-008",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "generation-zero first publish + referenced blobs (Task 13)"
+    },
+    {
+      "id": "PUB-002",
+      "commit": "68cb13a",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/publish/manifest_test.go",
+      "status": "implemented",
+      "note": "validate before immutable upload (Task 12)"
+    },
+    {
+      "id": "AC-007",
+      "commit": "68cb13a",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/publish/manifest_test.go",
+      "status": "implemented",
+      "note": "validate before immutable upload (Task 12)"
+    },
+    {
+      "id": "PUB-003",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "referenced blobs only (Task 13)"
+    },
+    {
+      "id": "PUB-005",
+      "commit": "fac46f2",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/concurrency_test.go",
+      "status": "implemented",
+      "note": "per-repo serialization + conflict (Task 17)"
+    },
+    {
+      "id": "PUB-006",
+      "commit": "fac46f2",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/concurrency_test.go",
+      "status": "implemented",
+      "note": "per-repo serialization + conflict (Task 17)"
+    },
+    {
+      "id": "AC-011",
+      "commit": "fac46f2",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/concurrency_test.go",
+      "status": "implemented",
+      "note": "per-repo serialization + conflict (Task 17)"
+    },
+    {
+      "id": "PUB-008",
+      "commit": "777093f",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/task14_publication_test.go",
+      "status": "implemented",
+      "note": "read-after-write + idempotency (Task 14)"
+    },
+    {
+      "id": "PUB-010",
+      "commit": "777093f",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/task14_publication_test.go",
+      "status": "implemented",
+      "note": "read-after-write + idempotency (Task 14)"
+    },
+    {
+      "id": "PUB-009",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "cleanup after verified commit (Tasks 13,18)"
+    },
+    {
+      "id": "AC-006",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "deferred-phase4",
+      "note": "unit-verified (TestFirstPush) against fake Bee; real-Bee push->pull round trip deferred to Phase 4 full node"
+    },
+    {
+      "id": "STAGE-001",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable spool+SQLite, ownership, restart (Task 15)"
+    },
+    {
+      "id": "STAGE-002",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable spool+SQLite, ownership, restart (Task 15)"
+    },
+    {
+      "id": "STAGE-003",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable spool+SQLite, ownership, restart (Task 15)"
+    },
+    {
+      "id": "STAGE-006",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable spool+SQLite, ownership, restart (Task 15)"
+    },
+    {
+      "id": "STAGE-009",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable spool+SQLite, ownership, restart (Task 15)"
+    },
+    {
+      "id": "AC-012",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable spool+SQLite, ownership, restart (Task 15)"
+    },
+    {
+      "id": "STAGE-004",
+      "commit": "5f66423",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/upload_test.go",
+      "status": "implemented",
+      "note": "range/digest/quotas streaming uploads (Task 16)"
+    },
+    {
+      "id": "STAGE-005",
+      "commit": "5f66423",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/upload_test.go",
+      "status": "implemented",
+      "note": "range/digest/quotas streaming uploads (Task 16)"
+    },
+    {
+      "id": "STAGE-008",
+      "commit": "5f66423",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/upload_test.go",
+      "status": "implemented",
+      "note": "range/digest/quotas streaming uploads (Task 16)"
+    },
+    {
+      "id": "STAGE-007",
+      "commit": "b13d09d",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/cleanup_test.go",
+      "status": "implemented",
+      "note": "expiry + idempotent cleanup/unpin (Task 18)"
+    },
+    {
+      "id": "COMP-001",
+      "commit": "c46af1a",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "docs/compatibility.md",
+      "status": "implemented",
+      "note": "pinned matrix + deferred ops (Task 21)"
+    },
+    {
+      "id": "COMP-002",
+      "commit": "c46af1a",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "docs/compatibility.md",
+      "status": "implemented",
+      "note": "pinned matrix + deferred ops (Task 21)"
+    },
+    {
+      "id": "COMP-005",
+      "commit": "c46af1a",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "docs/compatibility.md",
+      "status": "implemented",
+      "note": "pinned matrix + deferred ops (Task 21)"
+    },
+    {
+      "id": "COMP-003",
+      "commit": "68cb13a",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "internal/publish/manifest_test.go",
+      "status": "implemented",
+      "note": "strict descriptors (Tasks 12,19)"
+    },
+    {
+      "id": "COMP-004",
+      "commit": "46a1900",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "internal/registry/pull_test.go",
+      "status": "implemented",
+      "note": "pull integrity (Task 20)"
+    },
+    {
+      "id": "AC-013",
+      "commit": "46a1900",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "internal/registry/pull_test.go",
+      "status": "implemented",
+      "note": "pull integrity (Task 20)"
+    },
+    {
+      "id": "COMP-006",
+      "commit": "a164a6d",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "docs/compatibility.md",
+      "status": "deferred-phase4",
+      "note": "pinned Docker/Podman versions need a successful real end-to-end push+pull; blocked pending Bee full node (compatibility.md \u00a78)"
+    },
+    {
+      "id": "AC-014",
+      "commit": "59bf9cd",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "internal/registry/index_test.go",
+      "status": "deferred-phase4",
+      "note": "OCI index logic unit-verified; real Docker client multi-platform round trip deferred to Phase 4"
+    },
+    {
+      "id": "OPS-001",
+      "commit": "a164a6d",
+      "test_command": "bash scripts/e2e/compose-smoke.sh",
+      "evidence": "compose.yaml",
+      "status": "implemented",
+      "note": "reference Compose stack (Task 24; feed stage SKIP per \u00a78)"
+    },
+    {
+      "id": "OPS-002",
+      "commit": "345b876",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/server/server_test.go",
+      "status": "implemented",
+      "note": "bounded lifecycle + timeouts (Task 22)"
+    },
+    {
+      "id": "OPS-003",
+      "commit": "345b876",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/server/server_test.go",
+      "status": "implemented",
+      "note": "bounded lifecycle + timeouts (Task 22)"
+    },
+    {
+      "id": "OPS-004",
+      "commit": "f4d0071",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/observability/metrics_test.go",
+      "status": "implemented",
+      "note": "health/readiness/logs/metrics (Task 23)"
+    },
+    {
+      "id": "OPS-005",
+      "commit": "f4d0071",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/observability/metrics_test.go",
+      "status": "implemented",
+      "note": "health/readiness/logs/metrics (Task 23)"
+    },
+    {
+      "id": "OPS-006",
+      "commit": "f4d0071",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/observability/metrics_test.go",
+      "status": "implemented",
+      "note": "health/readiness/logs/metrics (Task 23)"
+    },
+    {
+      "id": "OPS-007",
+      "commit": "6ce801b",
+      "test_command": "bash scripts/operations/backup.sh && bash scripts/operations/verify-backup.sh && bash scripts/operations/restore.sh",
+      "evidence": "docs/evidence/phase-5-recovery.md",
+      "status": "implemented",
+      "note": "backup/restore drill vs real SQLite (Task 26; full push/pull drill deferred)"
+    },
+    {
+      "id": "OPS-008",
+      "commit": "6ce801b",
+      "test_command": "go test -race -count=1 ./internal/controlplane ./internal/staging",
+      "evidence": "docs/operations/upgrade-rollback.md",
+      "status": "implemented",
+      "note": "migration order v17/v11 + rollback-by-restore (Task 26)"
+    },
+    {
+      "id": "OPS-009",
+      "commit": "7242903",
+      "test_command": "bash scripts/ci/release-artifacts.sh",
+      "evidence": "scripts/ci/release-artifacts.sh",
+      "status": "implemented",
+      "note": "checksums/SBOM/vuln/license (Task 25)"
+    },
+    {
+      "id": "PERF-001",
+      "commit": "5f66423",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/upload_test.go",
+      "status": "implemented",
+      "note": "bounded memory streaming (Tasks 15,16)"
+    },
+    {
+      "id": "PERF-002",
+      "commit": "a164a6d",
+      "test_command": "bash scripts/e2e/docker-roundtrip.sh",
+      "evidence": "docs/compatibility.md",
+      "status": "deferred-phase4",
+      "note": "Compose reference workload (small + >=1 GiB layer + multi-platform) push/pull needs real Bee; deferred to Phase 4"
+    },
+    {
+      "id": "PERF-003",
+      "commit": "f4d0071",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/observability/metrics_test.go",
+      "status": "deferred-phase4",
+      "note": "p95 <500ms target must be measured on the running reference environment; instrumentation exists, benchmark deferred to Phase 4"
+    },
+    {
+      "id": "PERF-004",
+      "commit": "5f66423",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/task16_quota_test.go",
+      "status": "implemented",
+      "note": "quotas + backpressure (Tasks 16,23,24)"
+    },
+    {
+      "id": "AUD-001",
+      "commit": "8ff3369",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "raw bearer subject closed (SEC-001/004)"
+    },
+    {
+      "id": "AUD-002",
+      "commit": "7c437d7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "token type/service/repo/action enforcement (SEC-002..005)"
+    },
+    {
+      "id": "AUD-003",
+      "commit": "40a2bb9",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "no serialized hashes/keys (SEC-006)"
+    },
+    {
+      "id": "AUD-004",
+      "commit": "c94aff7",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "feed keys encrypted at rest (SEC-007/008)"
+    },
+    {
+      "id": "AUD-005",
+      "commit": "31bafc2",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "one-way recipient-bound invites (SEC-009)"
+    },
+    {
+      "id": "AUD-006",
+      "commit": "aa0a998",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "prod config + browser security (SEC-010/011)"
+    },
+    {
+      "id": "AUD-007",
+      "commit": "0077162",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "atomic provisioning (CP-001..003,006)"
+    },
+    {
+      "id": "AUD-008",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "first repo from generation zero (PUB-001/004)"
+    },
+    {
+      "id": "AUD-009",
+      "commit": "9fdffdc",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/swarm/bee_test.go",
+      "status": "implemented",
+      "note": "batch never a content ref (STAMP-002..005)"
+    },
+    {
+      "id": "AUD-010",
+      "commit": "68cb13a",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/publish/manifest_test.go",
+      "status": "implemented",
+      "note": "manifest validated before upload (PUB-002)"
+    },
+    {
+      "id": "AUD-011",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "only referenced blobs enter state (PUB-003/009)"
+    },
+    {
+      "id": "AUD-012",
+      "commit": "fac46f2",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/concurrency_test.go",
+      "status": "implemented",
+      "note": "no lost updates (PUB-005/006/010)"
+    },
+    {
+      "id": "AUD-013",
+      "commit": "54bcb33",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/staging/sqlite_test.go",
+      "status": "implemented",
+      "note": "durable staging + expiry (STAGE-001..007)"
+    },
+    {
+      "id": "AUD-014",
+      "commit": "5f66423",
+      "test_command": "go test -race -count=1 ./internal/staging ./internal/publish ./internal/registry",
+      "evidence": "internal/registry/upload_test.go",
+      "status": "implemented",
+      "note": "bounded bodies + quotas (STAGE-001/008, PERF-001/004)"
+    },
+    {
+      "id": "AUD-015",
+      "commit": "1e91614",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/controlplane/feed_signer_test.go",
+      "status": "implemented",
+      "note": "per-owner constrained signer (SEC-007, STAMP-004, PUB-007)"
+    },
+    {
+      "id": "AUD-016",
+      "commit": "23cc82d",
+      "test_command": "go test -race -count=1 ./internal/swarm ./internal/publish ./internal/controlplane ./internal/registry",
+      "evidence": "internal/registry/first_push_test.go",
+      "status": "implemented",
+      "note": "no pre-seeded state needed (PUB-001, OPS-001)"
+    },
+    {
+      "id": "AUD-017",
+      "commit": "46a1900",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "internal/resolve/host_test.go",
+      "status": "implemented",
+      "note": "host normalization with ports (COMP-001, CP-005)"
+    },
+    {
+      "id": "AUD-018",
+      "commit": "345b876",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/server/server_test.go",
+      "status": "implemented",
+      "note": "timeouts + graceful shutdown (OPS-002/003)"
+    },
+    {
+      "id": "AUD-019",
+      "commit": "f4d0071",
+      "test_command": "go test -race -count=1 ./internal/server ./internal/observability ./internal/registry ./internal/controlplane",
+      "evidence": "internal/observability/metrics_test.go",
+      "status": "implemented",
+      "note": "health/metrics/logs (OPS-004..006)"
+    },
+    {
+      "id": "AUD-020",
+      "commit": "7242903",
+      "test_command": "bash scripts/ci/check.sh",
+      "evidence": "docs/compatibility.md",
+      "status": "deferred-phase4",
+      "note": "CI/release E2E jobs exist but are disabled pending a Bee full node (compatibility.md \u00a78)"
+    },
+    {
+      "id": "AUD-021",
+      "commit": "7242903",
+      "test_command": "bash scripts/ci/check.sh",
+      "evidence": "scripts/ci/check.sh",
+      "status": "implemented",
+      "note": "risk-based coverage gates (all phases)"
+    },
+    {
+      "id": "AUD-022",
+      "commit": "7242903",
+      "test_command": "bash scripts/ci/check.sh",
+      "evidence": "scripts/ci/release-artifacts.sh",
+      "status": "implemented",
+      "note": "CI/SBOM/release evidence (OPS-001/009)"
+    },
+    {
+      "id": "AUD-023",
+      "commit": "c46af1a",
+      "test_command": "go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v",
+      "evidence": "docs/compatibility.md",
+      "status": "implemented",
+      "note": "compatibility claims scoped (COMP-001/005)"
+    },
+    {
+      "id": "AUD-024",
+      "commit": "0d8b7f4",
+      "test_command": "bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "rotation + secret scan (SEC-006..009, Phase 0)"
+    },
+    {
+      "id": "AUD-025",
+      "commit": "31bafc2",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "expired invite rejection tested (SEC-009)"
+    },
+    {
+      "id": "AUD-026",
+      "commit": "346a963",
+      "test_command": "go test -race -count=1 ./internal/auth ./internal/config ./internal/controlplane ./internal/policy ./internal/registry && bash scripts/security/check-repository-secrets.sh",
+      "evidence": "docs/evidence/phase-1-security.md",
+      "status": "implemented",
+      "note": "FK constraints declared (CP-004)"
+    }
+  ]
+}
