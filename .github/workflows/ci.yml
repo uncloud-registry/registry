@@ -1,9 +1,27 @@
 name: ci
 
+# PHASE 4 REAL-BEE GATE (disabled by default): the bee-integration,
+# docker-compat, and podman-compat jobs below are NOT run on push/PR. They
+# depend on Bee full-node feed publication, which the reference stack's
+# isolated light node cannot perform (docs/compatibility.md §8), so they
+# would FAIL once genuinely exercised; podman-compat would additionally have
+# been a silent no-op on runners without podman (the round-trip script now
+# fails closed under CI=true). They become live only when this
+# workflow is dispatched with enable_phase4_e2e=true against a runner that
+# carries docker, podman, and a real Bee full node (the Phase 4 gate).
 "on":
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      enable_phase4_e2e:
+        description: >-
+          Run the Phase 4 real-Bee E2E jobs (bee-integration, docker-compat,
+          podman-compat). Requires a runner with a real Bee full node and
+          (for podman-compat) the podman CLI installed.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,8 +52,16 @@ jobs:
         run: go vet ./...
       - name: go test -race
         run: go test -race -count=1 ./...
-      - name: whitespace check
-        run: git diff --check
+      # git diff --check would be vacuous on a clean checkout; scan tracked
+      # files for trailing whitespace instead (gofmt -l above already covers
+      # Go sources).
+      - name: whitespace check (trailing whitespace, tracked files)
+        run: |
+          if git grep -nE '[[:blank:]]+$' -- .; then
+            echo "error: trailing whitespace found on tracked files (listed above)" >&2
+            exit 1
+          fi
+          echo "no trailing whitespace in tracked files"
 
   secrets:
     name: Secret scan
@@ -98,36 +124,46 @@ jobs:
           push: false
           tags: uncloud-registry/controlplane:ci
 
-  # Reference-stack integration: starts Bee + localchain + control plane +
-  # registry from compose.yaml and exercises registration, token issuance,
-  # liveness, and feed provisioning. Feed *publication* verification is a
-  # documented SKIP until a Bee full node is available (docs/compatibility.md
-  # §8); the smoke script reports that stage honestly rather than faking it.
+  # ---------------------------------------------------------------------------
+  # PHASE 4 GATE (disabled by default, TODO(phase4): remove the `if` and
+  # enable once a real-Bee full-node runner exists). These three jobs must
+  # NOT run on push/PR today:
+  #   * bee-integration runs compose-smoke.sh, whose feed-publication stage is
+  #     an explicit SKIP (the reference stack pins Bee 2.8.2 as an isolated
+  #     light node that cannot pushsync chunks);
+  #   * docker-compat / podman-compat round trips are blocked at their
+  #     first-push stage until a full node makes feed updates retrievable
+  #     (docs/compatibility.md §8: the docker/podman round-trip scripts are
+  #     "blocked at their first-push stage until a full node is available");
+  #   * podman-compat would additionally be a silent no-op on ubuntu-latest,
+  #     which ships no podman (the script now FAILS under CI=true when podman
+  #     is absent instead of exiting 0 SKIP).
+  # Wired to the workflow_dispatch input enable_phase4_e2e so the Phase 4
+  # gate can flip them on without editing this file; the dispatch runner must
+  # carry docker, podman, and a real Bee full node.
+  # ---------------------------------------------------------------------------
   bee-integration:
-    name: Real Bee integration (reference stack)
+    name: Real Bee integration (reference stack) [phase4]
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_phase4_e2e == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Reference stack smoke (compose.yaml)
         run: bash scripts/e2e/compose-smoke.sh
 
-  # Docker and Podman real-client compatibility round trips. These drive a
-  # pinned docker:dind client against the reference stack (login, push,
-  # inspect, restart, pull, digest comparison). They fail closed and are
-  # deferred in practice until the Phase 4 full-node Bee gate lands
-  # (docs/compatibility.md §8); wired here so a regression cannot slip through
-  # silently once that gate is executed.
   docker-compat:
-    name: Docker compatibility round trip
+    name: Docker compatibility round trip [phase4]
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_phase4_e2e == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Docker round trip
         run: bash scripts/e2e/docker-roundtrip.sh
 
   podman-compat:
-    name: Podman compatibility round trip
+    name: Podman compatibility round trip [phase4]
     runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_phase4_e2e == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Podman round trip

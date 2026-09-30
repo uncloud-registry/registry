@@ -1,11 +1,16 @@
 name: release
 
-# Triggered by signed version tags. Tags are expected to be created with a
-# signed, annotated tag (git tag -s -a vX.Y.Z). The workflow rebuilds from a
-# clean checkout, re-runs every gate, then produces binaries, containers,
-# checksums, SBOMs, and vulnerability + license reports. No secrets are
-# hardcoded: container publication uses the built-in GITHUB_TOKEN (packages
-# permission below), and any image signing would use a signing secret by name.
+# Triggered by version tags (v*). This workflow does NOT verify tag
+# signatures: GitHub Actions does not expose tag-signature state to
+# workflows, so any v* tag triggers it regardless of how it was signed;
+# release integrity relies on branch protection and the gate job below, not
+# on tag-signature enforcement. The workflow rebuilds from a clean checkout,
+# re-runs every NON-deferred gate (the Docker/Podman/Bee E2E jobs are
+# disabled until the Phase 4 real-Bee gate — docs/compatibility.md §8 and
+# ci.yml), then produces binaries, containers, checksums, SBOMs, and
+# vulnerability + license reports. No secrets are hardcoded: container
+# publication uses the built-in GITHUB_TOKEN (packages permission below), and
+# any image signing would use a signing secret by name.
 "on":
   push:
     tags:
@@ -29,7 +34,11 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Install go-licenses
         run: go install github.com/google/go-licenses@latest
-      - name: Run every gate
+      # check.sh runs every non-deferred gate. The Docker/Podman/Bee E2E
+      # suite is opt-in (RUN_E2E=1) and deliberately NOT set here: those
+      # jobs are Phase-4-deferred (docs/compatibility.md §8) and disabled in
+      # ci.yml until the real-Bee full-node gate lands.
+      - name: Run every non-deferred gate
         run: |
           export PATH="$(go env GOPATH)/bin:$PATH"
           bash scripts/ci/check.sh

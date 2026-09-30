@@ -2,11 +2,12 @@
 # Task 24 Podman round-trip E2E (scripts/e2e/podman-roundtrip.sh).
 #
 # Local development machines do not all carry podman; when it is absent this
-# script SKIPS with a clear message (exit 0) so CI can run it on a podman
-# runner instead. When podman IS present it performs the same round trip as
-# docker-roundtrip.sh against the reference stack, using podman's
-# --tls-verify=false (podman has no insecure-registries config file) and
-# --add-host for the registry host.
+# script SKIPS with a clear message (exit 0) on a dev box, but FAILS under
+# CI=true: a CI job that runs the podman round trip is responsible for
+# provisioning podman, so a silent no-op "pass" is impossible. When podman IS
+# present it performs the same round trip as docker-roundtrip.sh against the
+# reference stack, using podman's --tls-verify=false (podman has no
+# insecure-registries config file) and --add-host for the registry host.
 #
 # Run: bash scripts/e2e/podman-roundtrip.sh   (from the repository root)
 set -euo pipefail
@@ -17,8 +18,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 if ! command -v podman >/dev/null 2>&1; then
+  if [ "${CI:-}" = "true" ]; then
+    echo "error: podman is required for the podman round trip but is not installed." >&2
+    echo "      A CI job that runs this script must provision podman (Phase 4 gate);" >&2
+    echo "      exiting non-zero instead of silently no-op'ing." >&2
+    exit 1
+  fi
   echo "SKIP: podman is not installed on this host."
-  echo "      The podman round trip is exercised on CI runners that carry podman;"
+  echo "      Run the podman round trip on a machine that carries podman;"
   echo "      local Docker coverage is provided by scripts/e2e/docker-roundtrip.sh."
   exit 0
 fi

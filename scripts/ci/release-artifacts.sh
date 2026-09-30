@@ -13,8 +13,12 @@
 #   <name>.cdx.json    CycloneDX SBOM per binary (via syft)
 #
 # Determinism: checksum entries are sorted by filename, the checksum text uses
-# the standard two-column "<hex>  <name>" form, and syft output is byte-stable
-# for identical binaries (it reads the embedded Go build metadata).
+# the standard two-column "<hex>  <name>" form, so checksums.txt is byte-stable
+# across regenerations for identical binaries. The per-binary CycloneDX SBOMs
+# are NOT byte-identical across runs: syft embeds a generation timestamp, so
+# *.cdx.json differs run to run even for identical inputs (component content is
+# reproducible, byte output is not). Treat the SBOMs as reproducible-content
+# artifacts, never as byte-stable ones.
 set -euo pipefail
 
 usage() {

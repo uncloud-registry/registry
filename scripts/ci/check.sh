@@ -3,19 +3,24 @@
 #
 # Runs every gate the CI and release pipelines enforce, in the same order a
 # clean-clone CI runner would. The core gates are unconditional and fail the
-# build on any violation. Three gates need an external tool that is NOT
-# guaranteed on a developer machine — govulncheck (vulnerability scan),
-# go-licenses (dependency license check), and the Docker/Podman E2E suite —
-# and behave as follows:
+# build on any violation. Two gates need an external tool that is NOT
+# guaranteed on a developer machine — govulncheck (vulnerability scan) and
+# go-licenses (dependency license check) — and behave as follows:
 #
-#   * locally (CI unset): SKIP with a clear message when the tool/runner is
-#     absent, so `bash scripts/ci/check.sh` stays green on a plain dev box;
-#   * in CI (CI=true, as GitHub Actions sets): FAIL when the tool/runner is
-#     absent, because the workflow is responsible for installing/provisioning
-#     it. A silently missing scanner can therefore never no-op on CI.
+#   * locally (CI unset): SKIP with a clear message when the tool is absent,
+#     so `bash scripts/ci/check.sh` stays green on a plain dev box;
+#   * in CI (CI=true, as GitHub Actions sets): FAIL when the tool is absent,
+#     because the workflow is responsible for installing it. A silently
+#     missing scanner can therefore never no-op on CI.
 #
-# E2E is opt-in locally via RUN_E2E=1 (it needs a full Docker/Podman engine
-# plus the reference Bee stack and is exercised on dedicated CI runners).
+# E2E (compose-smoke + Docker/Podman round trips) is OPT-IN in ALL
+# environments via RUN_E2E=1, including CI: it needs a Docker/Podman engine
+# plus the reference Bee stack, and feed-publication verification is deferred
+# to the Phase 4 real-Bee full-node gate (docs/compatibility.md §8). The CI
+# and release workflows keep the E2E jobs disabled until that gate lands
+# (ci.yml workflow_dispatch input enable_phase4_e2e), so a plain
+# `bash scripts/ci/check.sh` under CI=true does NOT run E2E; it will once the
+# Phase 4 gate wires RUN_E2E=1 into those jobs.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -41,6 +46,12 @@ require_tool() {
 
 say "gofmt (cmd, internal)"
 test -z "$(gofmt -l cmd internal)"
+
+say "trailing whitespace (all tracked files)"
+if git grep -nE '[[:blank:]]+$' -- .; then
+  echo "error: trailing whitespace found on tracked files (listed above)" >&2
+  exit 1
+fi
 
 say "go mod tidy -diff"
 go mod tidy -diff
@@ -76,8 +87,10 @@ if [ "${RUN_E2E:-}" != "" ]; then
   bash scripts/e2e/docker-roundtrip.sh
   bash scripts/e2e/podman-roundtrip.sh
 else
-  echo "SKIP: E2E — opt-in locally with RUN_E2E=1 (needs a Docker/Podman engine plus"
-  echo "      the reference Bee stack); CI runs these on dedicated docker/podman runners."
+  echo "SKIP: E2E — opt-in in ALL environments with RUN_E2E=1 (needs a Docker/Podman"
+  echo "      engine plus the reference Bee stack). Feed-publication stages are"
+  echo "      deferred to the Phase 4 real-Bee gate, and the CI/release workflows"
+  echo "      keep the E2E jobs disabled until then, so CI does not run them yet."
 fi
 
 echo
