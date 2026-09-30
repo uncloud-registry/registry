@@ -3,11 +3,13 @@ package controlplane
 import (
 	"bytes"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/uncloud-registry/registry/internal/publish"
 )
@@ -32,6 +34,11 @@ type InternalFeedServer struct {
 	Binder *PublicationBinder
 	Secret []byte
 	Logger *slog.Logger
+	// Store resolves a registry identity by host for the dynamic-resolution
+	// route. It is the same durable store the signer uses, and is populated
+	// from signer.Store at construction so the resolve endpoint can never
+	// drift onto a different database than feed signing.
+	Store *Store
 }
 
 // NewInternalFeedServer returns the internal feed server, failing closed on a
@@ -46,7 +53,7 @@ func NewInternalFeedServer(signer *FeedSigner, binder *PublicationBinder, secret
 	if len(secret) == 0 {
 		return nil, errors.New("internal feed server requires the internal service credential")
 	}
-	return &InternalFeedServer{Signer: signer, Binder: binder, Secret: append([]byte(nil), secret...), Logger: logger}, nil
+	return &InternalFeedServer{Signer: signer, Binder: binder, Secret: append([]byte(nil), secret...), Logger: logger, Store: signer.Store}, nil
 }
 
 func (s *InternalFeedServer) logger() *slog.Logger {
@@ -67,6 +74,19 @@ func (s *InternalFeedServer) logger() *slog.Logger {
 // second active identity mode to isolate or namespace, because the legacy
 // route simply no longer exists on this server.
 func (s *InternalFeedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Dynamic resolution is a GET on the resolve prefix. It must be handled
+	// BEFORE the POST-only switch below: any method on the resolve prefix is a
+	// recognized route, so a non-GET method is a 405 rather than the generic
+	// 404 the POST-only routes give to unknown paths.
+	if strings.HasPrefix(r.URL.Path, publish.InternalResolvePath) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleResolveRegistry(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		switch r.URL.Path {
 		case publish.InternalFeedUpdatePathV2, publish.InternalOperationBindingPath:
@@ -85,6 +105,38 @@ func (s *InternalFeedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleResolveRegistry serves GET /internal/v1/resolve/{host}: the dynamic
+// registry-identity lookup for the data plane. It shares the exact internal
+// credential check, returns only the registry's feed-owner address and
+// RegistryID (never the feed key, owner user, or any other column), and maps a
+// missing host to 404, a backend failure to 503, and an empty host to 400.
+func (s *InternalFeedServer) handleResolveRegistry(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCredential(r) {
+		s.logger().Warn("internal credential rejected", "component", "controlplane-internal", "path", publish.InternalResolvePath)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	host := strings.TrimPrefix(r.URL.Path, publish.InternalResolvePath)
+	if host == "" || strings.ContainsAny(host, "/\\") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+
+	registry, err := s.Store.FindRegistryByHost(r.Context(), host)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "registry not found"})
+			return
+		}
+		s.logger().Warn("internal resolve backend failure", "component", "controlplane-internal", "class", "backend")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "temporary service failure"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, publish.ResolveResponse{Owner: registry.FeedOwnerAddress, RegistryID: registry.ID})
 }
 
 // checkCredential verifies the request's dedicated internal credential header
