@@ -1,0 +1,206 @@
+name: release
+
+# Triggered by signed version tags. Tags are expected to be created with a
+# signed, annotated tag (git tag -s -a vX.Y.Z). The workflow rebuilds from a
+# clean checkout, re-runs every gate, then produces binaries, containers,
+# checksums, SBOMs, and vulnerability + license reports. No secrets are
+# hardcoded: container publication uses the built-in GITHUB_TOKEN (packages
+# permission below), and any image signing would use a signing secret by name.
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # attach release artifacts
+  packages: write # push container images to GHCR via GITHUB_TOKEN
+
+jobs:
+  gate:
+    name: Full gate (every check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@latest
+      - name: Run every gate
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          bash scripts/ci/check.sh
+
+  build:
+    name: Build binaries
+    needs: gate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w" \
+            -o "dist/registry-${{ matrix.goos }}-${{ matrix.goarch }}" ./cmd/registry
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w" \
+            -o "dist/controlplane-${{ matrix.goos }}-${{ matrix.goarch }}" ./cmd/controlplane
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  containers:
+    name: Build + push containers
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Metadata (registry)
+        id: meta-registry
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/registry
+          tags: |
+            type=ref,event=tag
+            type=sha
+      - name: Build + push registry
+        id: build-registry
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.registry
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta-registry.outputs.tags }}
+          labels: ${{ steps.meta-registry.outputs.labels }}
+      - name: Metadata (controlplane)
+        id: meta-controlplane
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/controlplane
+          tags: |
+            type=ref,event=tag
+            type=sha
+      - name: Build + push controlplane
+        id: build-controlplane
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.controlplane
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta-controlplane.outputs.tags }}
+          labels: ${{ steps.meta-controlplane.outputs.labels }}
+      - name: Record image digests
+        run: |
+          {
+            echo "registry:     ghcr.io/${{ github.repository_owner }}/registry@${{ steps.build-registry.outputs.digest }}"
+            echo "controlplane: ghcr.io/${{ github.repository_owner }}/controlplane@${{ steps.build-controlplane.outputs.digest }}"
+          } > image-digests.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-digests
+          path: image-digests.txt
+          if-no-files-found: error
+
+  artifacts:
+    name: Checksums, SBOM, vulnerability + license reports
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b "$HOME/.local/bin"
+      - name: Generate checksums + SBOMs
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          bash scripts/ci/release-artifacts.sh dist dist/registry-* dist/controlplane-*
+      - name: Vulnerability report (govulncheck JSON)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" -json ./... > dist/vuln-report.json || true
+      - name: License report (go-licenses)
+        run: |
+          go install github.com/google/go-licenses@latest
+          "$(go env GOPATH)/bin/go-licenses" report ./... > dist/licenses.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [containers, artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-digests
+          path: digest/
+      - name: Release notes (source commit + image digests)
+        run: |
+          {
+            echo "Source commit: \`${{ github.sha }}\`"
+            echo
+            echo "Container image digests (multi-arch, pushed to GHCR):"
+            echo '```'
+            cat digest/image-digests.txt
+            echo '```'
+            echo
+            echo "Integrity + provenance artifacts attached below:"
+            echo "- \`checksums.txt\` (SHA-256 of every binary)"
+            echo "- CycloneDX SBOMs (\`*.cdx.json\`)"
+            echo "- \`vuln-report.json\` (govulncheck)"
+            echo "- \`licenses.csv\` (go-licenses)"
+          } > dist/release-notes.md
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: dist/release-notes.md
+          files: |
+            dist/checksums.txt
+            dist/*.cdx.json
+            dist/vuln-report.json
+            dist/licenses.csv

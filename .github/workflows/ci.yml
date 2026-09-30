@@ -1,0 +1,152 @@
+name: ci
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go quality + race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: go mod tidy -diff
+        run: go mod tidy -diff
+      - name: go mod verify
+        run: go mod verify
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race -count=1 ./...
+      - name: whitespace check
+        run: git diff --check
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Deterministic repository secret gate
+        run: bash scripts/security/check-repository-secrets.sh
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+
+  govulncheck:
+    name: Vulnerability scan (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        run: "$(go env GOPATH)/bin/govulncheck ./..."
+
+  licenses:
+    name: Dependency license check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@latest
+      - name: Run go-licenses check
+        run: "$(go env GOPATH)/bin/go-licenses check ./..."
+
+  container-build:
+    name: Container build (registry + controlplane)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build registry image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.registry
+          push: false
+          tags: uncloud-registry/registry:ci
+      - name: Build controlplane image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.controlplane
+          push: false
+          tags: uncloud-registry/controlplane:ci
+
+  # Reference-stack integration: starts Bee + localchain + control plane +
+  # registry from compose.yaml and exercises registration, token issuance,
+  # liveness, and feed provisioning. Feed *publication* verification is a
+  # documented SKIP until a Bee full node is available (docs/compatibility.md
+  # §8); the smoke script reports that stage honestly rather than faking it.
+  bee-integration:
+    name: Real Bee integration (reference stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reference stack smoke (compose.yaml)
+        run: bash scripts/e2e/compose-smoke.sh
+
+  # Docker and Podman real-client compatibility round trips. These drive a
+  # pinned docker:dind client against the reference stack (login, push,
+  # inspect, restart, pull, digest comparison). They fail closed and are
+  # deferred in practice until the Phase 4 full-node Bee gate lands
+  # (docs/compatibility.md §8); wired here so a regression cannot slip through
+  # silently once that gate is executed.
+  docker-compat:
+    name: Docker compatibility round trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker round trip
+        run: bash scripts/e2e/docker-roundtrip.sh
+
+  podman-compat:
+    name: Podman compatibility round trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Podman round trip
+        run: bash scripts/e2e/podman-roundtrip.sh
+
+  docs:
+    name: Documentation checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No machine-local paths / required references
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('README.md').read_text()
+          assert '/Users/' not in s, 'machine-local path found in README.md'
+          assert 'docs/compatibility.md' in s, 'README must reference docs/compatibility.md'
+          print('README path/reference assertions OK')
+          PY
+      - name: Shell syntax check (bash -n)
+        run: |
+          find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n

@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Go module dependencies (go.mod / go.sum).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  # GitHub Actions used by the CI and release workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  # Docker base images (Task 24): golang:1.25-alpine and alpine:3.21 in the
+  # two Dockerfiles. The compose.yaml service images (caddy:2.11.4,
+  # ethersphere/bee:2.8.2, ethersphere/bee-localchain:0.9.4,
+  # python:3.12-alpine) are pinned in compose.yaml; Dependabot's docker
+  # ecosystem checks Dockerfiles (and compose files where supported), so those
+  # compose image pins are reviewed manually alongside the reference stack.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
