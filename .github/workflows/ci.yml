@@ -65,6 +65,11 @@ jobs:
 
   secrets:
     name: Secret scan
+    # gitleaks/gitleaks-action@v2 is intentionally NOT used here: it requires
+    # a GITLEAKS_LICENSE key for organization-owned repositories and fails on
+    # this repo with "missing gitleaks license". The deterministic gate below
+    # is the enforced, fail-closed secret check and needs no external engine
+    # or license key.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,8 +77,6 @@ jobs:
           fetch-depth: 0
       - name: Deterministic repository secret gate
         run: bash scripts/security/check-repository-secrets.sh
-      - name: Gitleaks scan
-        uses: gitleaks/gitleaks-action@v2
 
   govulncheck:
     name: Vulnerability scan (govulncheck)
@@ -100,8 +103,8 @@ jobs:
           cache: true
       - name: Install go-licenses
         run: go install github.com/google/go-licenses@latest
-      - name: Run go-licenses check
-        run: "$(go env GOPATH)/bin/go-licenses check ./..."
+      - name: Run dependency license gate
+        run: python3 scripts/ci/check-licenses.py --go-licenses "$(go env GOPATH)/bin/go-licenses"
 
   container-build:
     name: Container build (registry + controlplane)

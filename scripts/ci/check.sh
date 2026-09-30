@@ -78,7 +78,7 @@ fi
 
 say "dependency license check (go-licenses)"
 if require_tool go-licenses "dependency license check" "go install github.com/google/go-licenses@latest"; then
-  go-licenses check ./...
+  python3 scripts/ci/check-licenses.py --go-licenses "$(command -v go-licenses)"
 fi
 
 say "E2E (compose-smoke / docker-roundtrip / podman-roundtrip)"

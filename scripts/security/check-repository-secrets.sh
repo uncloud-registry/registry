@@ -2,9 +2,9 @@
 # Deterministic fail-closed secret gate for this repository.
 #
 # This is the *enforced* local gate: it runs purely on git and grep, with no
-# external binary dependency (Gitleaks is *not* assumed to be installed; the
-# .gitleaks.toml config targets the Gitleaks engine when CI runs it). A real
-# Gitleaks invocation is never part of this gate, so it cannot silently no-op.
+# external binary dependency (Gitleaks is *not* assumed to be installed, and
+# the CI workflow does not run a Gitleaks engine at all). A real Gitleaks
+# invocation is never part of this gate, so it cannot silently no-op.
 set -euo pipefail
 
 # Fail closed: there is no meaningful scan outside a git work tree.

@@ -1,6 +1,6 @@
 module github.com/uncloud-registry/registry
 
-go 1.25.0
+go 1.25.13
 
 require (
 	github.com/ethereum/go-ethereum v1.12.2
