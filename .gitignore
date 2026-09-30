@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Local secrets directory used by the reference deployment
+/.secrets/
 
 # Local databases
 *.db

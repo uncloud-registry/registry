@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+# Reference control-plane image (Task 24).
+#
+# Multi-stage build using the module's Go version (see go.mod: go 1.25).
+# The final image runs as a NON-ROOT numeric user (65532:65532), contains only
+# the compiled binary plus the operating-system CA bundle, and exposes the
+# documented control-plane ports (public API 8081, internal feed-signing 8089).
+# No secrets are baked: every credential is mounted at runtime from the
+# compose secrets bind (${SECRETS_DIR}).
+
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+
+# Dependency layer first: changes to go.mod/go.sum invalidate only this layer.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Source: only the packages the binaries link against (no scripts/docs/tests).
+COPY cmd ./cmd
+COPY internal ./internal
+
+# modernc.org/sqlite (the control-plane store) is pure Go: no cgo or
+# cross-toolchain needed. -trimpath keeps build paths out of the binary.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+    -o /out/controlplane ./cmd/controlplane
+
+FROM alpine:3.21
+# Required operating-system certificates for outbound TLS. util-linux provides
+# setpriv, which the compose entrypoint uses to drop from the secret-staging
+# root to the non-root runtime uid. busybox wget ships with alpine and is what
+# the compose healthcheck uses. The uncloud user owns the control-plane's
+# writable home (SQLite DB is composed onto it).
+RUN apk add --no-cache ca-certificates util-linux \
+    && addgroup -g 65532 -S uncloud \
+    && adduser -u 65532 -G uncloud -S -h /var/lib/uncloud-registry -s /sbin/nologin uncloud
+
+COPY --from=build /out/controlplane /usr/local/bin/controlplane
+
+USER 65532:65532
+EXPOSE 8081 8089
+
+ENTRYPOINT ["/usr/local/bin/controlplane"]

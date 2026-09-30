@@ -206,6 +206,18 @@ Pull content is **pre-verified before any success byte leaves the handler**:
   platforms fail closed at startup.
 - ENS ownership resolution follows the subdomain-to-ENS naming convention and
   is not a general external ENS resolver integration.
+- In the localchain reference deployment (Task 24), feed **publication**
+  requires a Bee **full node** (or peers): the stack pins Bee 2.8.2 as an
+  isolated light node (`--full-node=false`, no bootnodes/peers), and a light
+  node cannot pushsync chunks, so the control-plane reconciler's feed updates
+  never become retrievable and feed-dependent requests answer retryable
+  dependency errors. Feed-dependent E2E verification (feed readability via
+  Bee, and the registry auth path whose pull-policy decisions resolve the
+  auth policy feed) is therefore deferred to the Phase 4 / real-Bee E2E gate;
+  the Docker/Podman round-trip scripts (`docker-roundtrip.sh`,
+  `podman-roundtrip.sh`) are likewise blocked at their first-push stage until
+  a full node is available. `scripts/e2e/compose-smoke.sh` reports this stage
+  as an explicit SKIP (exit 0) rather than asserting it green.
 
 ## 9. Error codes
 

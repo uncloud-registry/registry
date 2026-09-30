@@ -1,0 +1,40 @@
+# Reference TLS routing for the uncloud-registry reference deployment
+# (Task 24). Hostnames are placeholders substituted from compose environment:
+#   {$CONTROLPLANE_HOST}  control-plane dashboard + /token endpoint
+#   {$REGISTRY_HOST_GLOB} registry data-plane hosts (a glob; each created
+#                         registry is <slug>.<CONTROLPLANE_REGISTRY_DOMAIN>)
+#
+# TLS uses Caddy's internal CA so the stack is fully functional without public
+# DNS: real deployments replace `tls internal` with `tls` + a public hostname
+# (automatic ACME) or `tls { cert_file; key_file; }` for a pinned certificate.
+
+# Control plane: dashboard/UI, API, and Docker token issuance.
+{$CONTROLPLANE_HOST} {
+	encode gzip
+	reverse_proxy controlplane:8081 {
+		# Task 23 readiness endpoint drives Caddy's upstream health checks.
+		health_uri /readyz
+		health_interval 10s
+		health_timeout 3s
+		health_fails 3
+	}
+}
+
+# Registry data plane: any <slug>.<DOMAIN> host created in the control plane.
+{$REGISTRY_HOST_GLOB} {
+	tls internal
+
+	# Docker token issuance: the registry's 401 challenge realm can be served
+	# on the same public host (REGISTRY_AUTH_REALM may point here).
+	handle /token* {
+		reverse_proxy controlplane:8081
+	}
+
+	reverse_proxy registry:80 {
+		# Task 23 readiness endpoint drives Caddy's upstream health checks.
+		health_uri /readyz
+		health_interval 10s
+		health_timeout 3s
+		health_fails 3
+	}
+}
