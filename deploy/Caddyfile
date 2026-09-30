@@ -10,6 +10,8 @@
 
 # Control plane: dashboard/UI, API, and Docker token issuance.
 {$CONTROLPLANE_HOST} {
+	tls internal
+
 	encode gzip
 	reverse_proxy controlplane:8081 {
 		# Task 23 readiness endpoint drives Caddy's upstream health checks.

@@ -86,34 +86,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# e2e_wait_service_running <service>: poll `docker compose ps` JSON until the
-# service container reports State=running. Used where a container healthcheck
-# is not a reliable signal in the reference environment (see section 3c).
-e2e_wait_service_running() {
-  local service="$1" waited=0 state
-  while [ "$waited" -lt "$E2E_WAIT_TIMEOUT" ]; do
-    state="$(e2e_compose ps --format json "$service" 2>/dev/null | python3 -c '
-import sys, json
-try:
-    rows = json.load(sys.stdin)
-    rows = rows if isinstance(rows, list) else [rows]
-    for r in rows:
-        if r.get("Service") == "'"$service"'":
-            print(r.get("State") or "")
-except Exception:
-    pass
-')"
-    if [ "$state" = "running" ]; then
-      echo "$service: container running"
-      return 0
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  echo "error: service $service did not reach running within ${E2E_WAIT_TIMEOUT}s (last state: ${state:-unknown})" >&2
-  return 1
-}
-
 # ---------------------------------------------------------------------------
 # 2. Generate secrets (temp dir, restrictive perms)
 # ---------------------------------------------------------------------------
@@ -213,12 +185,11 @@ e2e_compose up -d
 e2e_wait_http "controlplane /livez" "$CP_ADDR/livez" "200"
 e2e_compose_ps_healthy registry
 e2e_compose_ps_healthy bee
-# caddy: the container's own healthcheck targets /, which Caddy 308-redirects
-# to its internal-CA HTTPS (untrusted to the image's busybox wget), so it
-# never reports healthy here; "container running" is the honest verified scope
-# ("caddy started"), and its TLS routing is exercised by the /livez-through-
-# Caddy assertion in section 4.
-e2e_wait_service_running caddy
+# caddy: its healthcheck probes Caddy's admin API (localhost:2019) - / would
+# 308-redirect to internal-CA HTTPS, untrusted to the image's busybox wget -
+# so "healthy" is the verified scope here; TLS routing is exercised by the
+# /livez-through-Caddy assertion in section 4.
+e2e_compose_ps_healthy caddy
 
 # ---------------------------------------------------------------------------
 # 4. Verify: session auth, token issuance, /livez (control-plane only + TLS

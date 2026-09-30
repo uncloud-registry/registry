@@ -148,10 +148,12 @@ e2e_compose_ps_healthy registry
 e2e_compose_ps_healthy bee
 e2e_compose_ps_healthy caddy
 
-# Registry host must resolve for podman. podman on macOS (the common case for
-# this repo's maintainers) runs in a VM; give it the registry IP via
-# --add-host on the build/push/pull/run commands and --tls-verify=false
-# (podman has no insecure-registries file).
+# Registry host and token realm must resolve for podman. podman on macOS (the
+# common case for this repo's maintainers) runs in a VM; give it the registry
+# IP via --add-host for the registry host, map the compose-internal
+# controlplane hostname to 127.0.0.1 (the control plane publishes 8081 on the
+# host loopback) so the 401 token fetch can resolve, and use
+# --tls-verify=false (podman has no insecure-registries file).
 REG_IP="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}} {{end}}' "$E2E_PROJECT-registry-1" | awk '{print $1}')"
 [ -n "$REG_IP" ] || { echo "error: cannot resolve registry container IP" >&2; exit 1; }
 echo "registry IP: $REG_IP"
@@ -162,9 +164,9 @@ printf '%s' "$PASSWORD" | podman login --tls-verify=false --username "$EMAIL" \
   || { echo "error: podman login failed" >&2; exit 1; }
 
 e2e_info "podman build + push to brand-new repo pm-one"
-ONE_DIGEST="$(podman build --add-host "$REG_HOST:$REG_IP" -t "$REG_HOST/pm-one:latest" \
+ONE_DIGEST="$(podman build --add-host "$REG_HOST:$REG_IP" --add-host "controlplane:127.0.0.1" -t "$REG_HOST/pm-one:latest" \
   "$WORK_DIR/one" >/dev/null 2>&1 && \
-  podman push --tls-verify=false --add-host "$REG_HOST:$REG_IP" "$REG_HOST/pm-one:latest" 2>&1 \
+  podman push --tls-verify=false --add-host "$REG_HOST:$REG_IP" --add-host "controlplane:127.0.0.1" "$REG_HOST/pm-one:latest" 2>&1 \
   | sed -n 's/^.*digest: \(sha256:[0-9a-f]*\).*/\1/p')"
 [ "${#ONE_DIGEST}" = "71" ] \
   || { echo "error: podman push did not report a digest (got: ${ONE_DIGEST:-none})" >&2; exit 1; }
@@ -173,7 +175,7 @@ echo "pm-one pushed: $ONE_DIGEST"
 e2e_info "podman pull + digest comparison after registry restart"
 e2e_compose restart registry
 e2e_compose_ps_healthy registry
-PULLED="$(podman pull --tls-verify=false --add-host "$REG_HOST:$REG_IP" "$REG_HOST/pm-one:latest" 2>/dev/null \
+PULLED="$(podman pull --tls-verify=false --add-host "$REG_HOST:$REG_IP" --add-host "controlplane:127.0.0.1" "$REG_HOST/pm-one:latest" 2>/dev/null \
   | tail -1)"
 echo "pull result: $PULLED"
 podman image inspect --format '{{index .RepoDigests 0}}' "$REG_HOST/pm-one:latest" \

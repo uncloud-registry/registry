@@ -124,7 +124,7 @@ services:
       REGISTRY_TOKEN_ISSUER: uncloud-registry/registry
       REGISTRY_TOKEN_PUBLIC_KEYS_FILE: /var/run/uncloud-registry-secrets/registry-jwks.json
       REGISTRY_TOKEN_AUDIENCE: ${REGISTRY_TOKEN_AUDIENCE:-}
-      REGISTRY_AUTH_REALM: ${REGISTRY_AUTH_REALM:-${CONTROLPLANE_EXTERNAL_URL}/token}
+      REGISTRY_AUTH_REALM: ${REGISTRY_AUTH_REALM:-https://controlplane.uncloud-registry.test/token}
       # Registry -> control-plane internal feed signer (TLS, custom CA bundle).
       CONTROLPLANE_URL: https://controlplane:8089
       CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt
@@ -243,8 +243,8 @@ services:
 
   localchain:
     # Swarm dev chain with the postage/swap/staking contracts pre-deployed
-    # (chain id 12345). Pinned to the tag the bee team ships for current bee.
-    image: ethersphere/bee-localchain:latest
+    # (chain id 12345). Pinned to 0.9.4 (matches deploy/rpc-proxy.py).
+    image: ethersphere/bee-localchain:0.9.4
     restart: unless-stopped
     ports:
       # 8546 on the host to avoid collisions with locally running chains.
@@ -269,7 +269,9 @@ services:
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
+      # / 308-redirects to internal-CA HTTPS (untrusted to the image's busybox
+      # wget), so probe Caddy's admin API on localhost:2019 instead.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
       interval: 10s
       timeout: 4s
       retries: 12
