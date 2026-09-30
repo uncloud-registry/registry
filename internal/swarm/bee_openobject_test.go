@@ -25,13 +25,13 @@ func TestBeeObjectStoreOpenObject(t *testing.T) {
 		}
 		ref := strings.TrimPrefix(r.URL.Path, "/bytes/")
 		switch ref {
-		case "obj-exact":
+		case beeTestRefExact:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("0123456789")) // 10 bytes, exact
-		case "obj-oversize":
+		case beeTestRefOversize:
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("0123456789ABCDEF")) // 16 bytes > any 10-byte bound
-		case "obj-error":
+		case beeTestRefError:
 			w.WriteHeader(http.StatusInternalServerError)
 			// An untrusted error body: the client must never echo it.
 			_, _ = w.Write([]byte("internal detail secret"))
@@ -45,7 +45,7 @@ func TestBeeObjectStoreOpenObject(t *testing.T) {
 	ctx := context.Background()
 
 	// Exact-size stream within the bound returns the full body unchanged.
-	rc, err := store.OpenObject(ctx, "obj-exact", 10)
+	rc, err := store.OpenObject(ctx, beeTestRefExact, 10)
 	if err != nil {
 		t.Fatalf("open exact stream: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestBeeObjectStoreOpenObject(t *testing.T) {
 	}
 
 	// A LARGER bound still delivers the exact object.
-	rc, err = store.OpenObject(ctx, "obj-exact", 100)
+	rc, err = store.OpenObject(ctx, beeTestRefExact, 100)
 	if err != nil {
 		t.Fatalf("open generous stream: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestBeeObjectStoreOpenObject(t *testing.T) {
 	// Overflow: an object larger than maxBytes fails the STREAM closed — the
 	// read must error (never silently truncate to maxBytes bytes), and the
 	// failure must be data-free (no ref, no body text).
-	rc, err = store.OpenObject(ctx, "obj-oversize", 10)
+	rc, err = store.OpenObject(ctx, beeTestRefOversize, 10)
 	if err != nil {
 		t.Fatalf("oversize open: %v", err)
 	}
@@ -89,19 +89,19 @@ func TestBeeObjectStoreOpenObject(t *testing.T) {
 	if readErr == nil {
 		t.Fatal("oversize stream must fail the read past the bound")
 	}
-	if strings.Contains(readErr.Error(), "obj-oversize") {
+	if strings.Contains(readErr.Error(), beeTestRefOversize) {
 		t.Fatalf("oversize failure must be data-free, got %v", readErr)
 	}
 
 	// Non-200 and missing objects fail BEFORE any byte is streamed, with
 	// data-free errors (the untrusted error body must never surface).
-	if rc, err = store.OpenObject(ctx, "obj-error", 100); err == nil {
+	if rc, err = store.OpenObject(ctx, beeTestRefError, 100); err == nil {
 		_ = rc.Close()
 		t.Fatal("non-200 open must fail")
 	} else if strings.Contains(err.Error(), "internal detail secret") {
 		t.Fatalf("error body must never leak, got %v", err)
 	}
-	if rc, err = store.OpenObject(ctx, "obj-missing", 100); err == nil {
+	if rc, err = store.OpenObject(ctx, beeTestRefMissing, 100); err == nil {
 		_ = rc.Close()
 		t.Fatal("missing object open must fail")
 	}
@@ -127,7 +127,7 @@ func TestBeeObjectStoreOpenObjectNonNegativeBound(t *testing.T) {
 	defer server.Close()
 
 	store := NewBeeObjectStore(server.URL, server.Client())
-	if rc, err := store.OpenObject(context.Background(), "any", -1); err == nil {
+	if rc, err := store.OpenObject(context.Background(), beeTestRefExact, -1); err == nil {
 		if rc != nil {
 			_ = rc.Close()
 		}

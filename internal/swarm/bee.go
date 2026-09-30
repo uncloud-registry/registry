@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -292,14 +293,34 @@ func (s *BeeObjectStore) Get(ctx context.Context, ref string) ([]byte, error) {
 // ReadBounded implements BoundedBytesReader: it reads the immutable object at
 // ref with overflow detection at maxBytes (reading at most maxBytes+1 bytes)
 // so the caller's bound can never be exceeded by a hostile or broken Bee
-// node. A body larger than maxBytes, any non-200 status, and any transport
-// failure are DATA-FREE errors (the fixed status number may appear, but never
-// the response body, the ref, or untrusted transport text); the response body
-// is always closed; the caller's deadline is respected with the same bounded
-// per-request timeout as every other Bee call. maxBytes must be non-negative.
+// node. It FAILS CLOSED before any I/O on a nil receiver, an empty BaseURL, a
+// nil HTTPClient, and a non-canonical ref (exactly 64 hex characters — a
+// 32-byte Swarm content address, the only wire form the /bytes endpoint
+// accepts), and rejects a negative bound and a bound at math.MaxInt64 (whose
+// maxBytes+1 overflow probe would wrap negative and disable the limit). A body
+// larger than maxBytes, any non-200 status, and any transport failure are
+// DATA-FREE errors (the fixed status number may appear, but never the response
+// body, the ref, or untrusted transport text); the response body is always
+// closed; the caller's deadline is respected with the same bounded per-request
+// timeout as every other Bee call.
 func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes int64) ([]byte, error) {
+	if s == nil {
+		return nil, errors.New("bounded bee read requires a bee object store")
+	}
+	if strings.TrimSpace(s.BaseURL) == "" {
+		return nil, errors.New("bounded bee read requires a configured base url")
+	}
+	if s.HTTPClient == nil {
+		return nil, errors.New("bounded bee read requires an http client")
+	}
+	if !isBeeReference(ref) {
+		return nil, errors.New("bounded bee read requires a 64-hex object reference")
+	}
 	if maxBytes < 0 {
 		return nil, errors.New("bounded bee read requires a non-negative bound")
+	}
+	if maxBytes >= math.MaxInt64 {
+		return nil, errors.New("bounded bee read bound is too large")
 	}
 	reqCtx, cancel := writeRequestContext(ctx)
 	defer cancel()
@@ -332,17 +353,29 @@ func (s *BeeObjectStore) ReadBounded(ctx context.Context, ref string, maxBytes i
 // EXPLICIT upper bound enforced DURING streaming. It is the pull-integrity
 // counterpart of ReadBounded: blob content is streamed into a bounded
 // verification file without ever buffering the whole object in memory, so a
-// hostile or broken Bee node cannot force an unbounded allocation. An object
-// LARGER than maxBytes fails the STREAM closed at the read past the bound
-// (never a truncated payload masquerading as an in-bounds object), any
-// non-200 status and every transport failure are DATA-FREE errors (the fixed
-// status number may appear, never the response body or ref), the response
-// body is always closed (the returned closer closes it and releases the
-// per-request deadline), and maxBytes must be non-negative. A nil receiver
-// fails closed instead of panicking.
+// hostile or broken Bee node cannot force an unbounded allocation. It FAILS
+// CLOSED before any I/O on a nil receiver, an empty BaseURL, a nil
+// HTTPClient, and a non-canonical ref (exactly 64 hex characters — the only
+// wire form the /bytes endpoint accepts). An object LARGER than maxBytes
+// fails the STREAM closed at the read past the bound (never a truncated
+// payload masquerading as an in-bounds object), any non-200 status and every
+// transport failure are DATA-FREE errors (the fixed status number may appear,
+// never the response body or ref), the response body is always closed (the
+// returned closer closes it and releases the per-request deadline), and
+// maxBytes must be non-negative. A nil receiver fails closed instead of
+// panicking.
 func (s *BeeObjectStore) OpenObject(ctx context.Context, ref string, maxBytes int64) (io.ReadCloser, error) {
 	if s == nil {
 		return nil, errors.New("bee object stream requires a bee object store")
+	}
+	if strings.TrimSpace(s.BaseURL) == "" {
+		return nil, errors.New("bee object stream requires a configured base url")
+	}
+	if s.HTTPClient == nil {
+		return nil, errors.New("bee object stream requires an http client")
+	}
+	if !isBeeReference(ref) {
+		return nil, errors.New("bee object stream requires a 64-hex object reference")
 	}
 	if maxBytes < 0 {
 		return nil, errors.New("bounded bee stream requires a non-negative bound")

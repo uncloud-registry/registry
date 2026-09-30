@@ -62,7 +62,7 @@ func TestBeeObjectStoreReadBoundedTransportReadsAtMostLimitPlusOne(t *testing.T)
 	tr := &countingTransport{payload: payload}
 	store := &swarm.BeeObjectStore{BaseURL: "http://unused.invalid", HTTPClient: &http.Client{Transport: tr}}
 
-	_, err := store.ReadBounded(context.Background(), "abc", limit)
+	_, err := store.ReadBounded(context.Background(), strings.Repeat("1", 64), limit)
 	if err == nil {
 		t.Fatal("an oversized /bytes object must fail closed")
 	}
