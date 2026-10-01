@@ -1,6 +1,6 @@
 module github.com/uncloud-registry/registry
 
-go 1.25.13
+go 1.26.0
 
 require (
 	github.com/ethereum/go-ethereum v1.17.0
@@ -39,7 +39,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/holiman/uint256 v1.3.2 // indirect
-	golang.org/x/crypto v0.44.0
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/crypto v0.57.0
+	golang.org/x/sys v0.48.0 // indirect
 	modernc.org/sqlite v1.23.0
 )
