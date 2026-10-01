@@ -1,0 +1,218 @@
+# Swarm TESTNET deployment for uncloud-registry v1 (Sepolia + Bee testnet).
+#
+# Same stack shape as compose.yaml, minus the local dev chain: controlplane,
+# registry data plane, a REAL Bee testnet node, and Caddy for TLS routing.
+# Bee connects to the Swarm testnet (chain 11155111 / network 10) via its
+# built-in testnet config — bootnodes (testnet.ethswarm.org), sBZZ token, and
+# postage/staking/redistribution contract addresses are all baked into the
+# bee 2.8.2 binary, so none of the localchain contract-address flags appear
+# here. The ONLY chain-specific input you supply is BEE_BLOCKCHAIN_RPC (a
+# Sepolia RPC endpoint).
+#
+# Unlike the reference stack's isolated light node, this runs --full-node=true
+# so feed publication works and the registry's auth-policy feed resolution is
+# fully exercisable (the thing the localchain stack defers to "Phase 4").
+#
+# Funding (manual — no localchain minting helper):
+#   - GET http://<bee>:1633/addresses -> ethereum address
+#   - send Sepolia ETH to it (gas) and sBZZ (postage stamps)
+#   - then mint a batch: curl -X POST http://<bee>:1633/stamps/<amount>/<depth>
+#
+# Ports (host):
+#   controlplane 8081 (loopback), registry 80, bee 1633/1635 (loopback),
+#   caddy 80/443 public HTTPS
+#
+# Secrets: identical layout to compose.yaml (master.json, internal-secret.txt,
+# internal-ca.pem, internal-cert.pem, internal-key.pem, registry-jwks.json,
+# bee-password.txt) under ${SECRETS_DIR}.
+
+name: uncloud-registry-testnet
+
+services:
+  controlplane:
+    build:
+      context: .
+      dockerfile: Dockerfile.controlplane
+    image: uncloud-registry/controlplane:testnet
+    restart: unless-stopped
+    # Stage an owner-matched copy of the :ro secrets mount, then drop to the
+    # image's non-root uid before exec (bind mounts keep the host's uid/gid).
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /var/run/uncloud-registry-secrets
+        cp -a /run/secrets /var/run/uncloud-registry-secrets
+        chown -R 65532:65532 /var/run/uncloud-registry-secrets
+        chmod 0600 /var/run/uncloud-registry-secrets/master.json \
+                   /var/run/uncloud-registry-secrets/internal-secret.txt \
+                   /var/run/uncloud-registry-secrets/internal-key.pem
+        exec setpriv --reuid=65532 --regid=65532 --clear-groups \
+          /usr/local/bin/controlplane
+    environment:
+      CONTROLPLANE_MODE: ${CONTROLPLANE_MODE:-production}
+      CONTROLPLANE_ADDR: ":8081"
+      CONTROLPLANE_DB_PATH: "file:/var/lib/uncloud-registry/controlplane.db?_pragma=foreign_keys(1)"
+      CONTROLPLANE_SESSION_TTL: ${CONTROLPLANE_SESSION_TTL:-24h}
+      CONTROLPLANE_TOKEN_SECRET: ${CONTROLPLANE_TOKEN_SECRET:-}
+      CONTROLPLANE_EXTERNAL_URL: ${CONTROLPLANE_EXTERNAL_URL:-https://controlplane.uncloud-registry.test}
+      CONTROLPLANE_REGISTRY_DOMAIN: ${CONTROLPLANE_REGISTRY_DOMAIN:-uncloud-registry.test}
+      CONTROLPLANE_REGISTRY_ED25519_KEY: ${CONTROLPLANE_REGISTRY_ED25519_KEY:-}
+      CONTROLPLANE_REGISTRY_KEY_ID: ${CONTROLPLANE_REGISTRY_KEY_ID:-cp-ed25519-1}
+      CONTROLPLANE_MASTER_KEY_FILE: /var/run/uncloud-registry-secrets/master.json
+      CONTROLPLANE_BEE_API_URL: http://bee:1633
+      CONTROLPLANE_TLS_TERMINATION: trusted-proxy
+      CONTROLPLANE_TRUSTED_PROXIES: ${CONTROLPLANE_TRUSTED_PROXIES:-172.29.0.0/16}
+      CONTROLPLANE_INTERNAL_ADDR: ":8089"
+      CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt
+      CONTROLPLANE_INTERNAL_TLS_CERT_FILE: /var/run/uncloud-registry-secrets/internal-cert.pem
+      CONTROLPLANE_INTERNAL_TLS_KEY_FILE: /var/run/uncloud-registry-secrets/internal-key.pem
+    volumes:
+      - controlplane-data:/var/lib/uncloud-registry
+      - ${SECRETS_DIR:-./.secrets}:/run/secrets:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/readyz || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+      start_period: 10s
+    depends_on:
+      bee:
+        condition: service_healthy
+
+  registry:
+    build:
+      context: .
+      dockerfile: Dockerfile.registry
+    image: uncloud-registry/registry:testnet
+    restart: unless-stopped
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /var/run/uncloud-registry-secrets
+        cp -a /run/secrets /var/run/uncloud-registry-secrets
+        chown -R 65532:65532 /var/run/uncloud-registry-secrets
+        chmod 0600 /var/run/uncloud-registry-secrets/internal-secret.txt \
+                   /var/run/uncloud-registry-secrets/internal-key.pem
+        exec setpriv --reuid=65532 --regid=65532 --clear-groups \
+          /usr/local/bin/registry
+    environment:
+      REGISTRY_BACKEND: bee
+      REGISTRY_ADDR: ":80"
+      BEE_API_URL: http://bee:1633
+      REGISTRY_RESOLUTION_MODE: ${REGISTRY_RESOLUTION_MODE:-static}
+      REGISTRY_OWNER_MAP: ${REGISTRY_OWNER_MAP:-}
+      REGISTRY_ID_MAP: ${REGISTRY_ID_MAP:-}
+      REGISTRY_TOKEN_ISSUER: uncloud-registry/registry
+      REGISTRY_TOKEN_PUBLIC_KEYS_FILE: /var/run/uncloud-registry-secrets/registry-jwks.json
+      REGISTRY_TOKEN_AUDIENCE: ${REGISTRY_TOKEN_AUDIENCE:-}
+      REGISTRY_AUTH_REALM: ${REGISTRY_AUTH_REALM:-https://controlplane.uncloud-registry.test/token}
+      CONTROLPLANE_URL: https://controlplane:8089
+      CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt
+      CONTROLPLANE_CA_BUNDLE_FILE: /var/run/uncloud-registry-secrets/internal-ca.pem
+      REGISTRY_STAGING_ROOT: /var/lib/uncloud-registry/spool
+      REGISTRY_STAGING_DB: /var/lib/uncloud-registry/staging.db
+      REGISTRY_UPLOAD_TTL: ${REGISTRY_UPLOAD_TTL:-24h}
+      REGISTRY_MAX_UPLOAD_BYTES: ${REGISTRY_MAX_UPLOAD_BYTES:-2147483648}
+      REGISTRY_MAX_REPOSITORY_BYTES: ${REGISTRY_MAX_REPOSITORY_BYTES:-26843545600}
+      REGISTRY_MAX_TOTAL_STAGING_BYTES: ${REGISTRY_MAX_TOTAL_STAGING_BYTES:-53687091200}
+      REGISTRY_CLEANUP_INTERVAL: ${REGISTRY_CLEANUP_INTERVAL:-5m}
+      REGISTRY_CLEANUP_BATCH: ${REGISTRY_CLEANUP_BATCH:-100}
+    volumes:
+      - staging-data:/var/lib/uncloud-registry
+      - ${SECRETS_DIR:-./.secrets}:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/readyz || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+      start_period: 10s
+    depends_on:
+      controlplane:
+        condition: service_healthy
+      bee:
+        condition: service_healthy
+
+  bee:
+    image: ethersphere/bee:2.8.2
+    restart: unless-stopped
+    # Real Swarm TESTNET node. --mainnet=false (or absent) with no --network-id
+    # defaults to testnet network 10 / chain 11155111; bootnodes
+    # (testnet.ethswarm.org) and all contract addresses come from bee's built-in
+    # testnet config, so none are passed here. swap/chequebook are ON (required
+    # on a real network); fund the node before minting a batch.
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /var/run/uncloud-registry-secrets
+        cp -a /run/secrets /var/run/uncloud-registry-secrets
+        chown -R 999:999 /var/run/uncloud-registry-secrets
+        chmod 0600 /var/run/uncloud-registry-secrets/bee-password.txt
+        exec setpriv --reuid=999 --regid=999 --clear-groups \
+          /usr/local/bin/bee start \
+          --api-addr=:1633 \
+          --p2p-addr=:1634 \
+          --data-dir=/home/bee/.bee \
+          --password-file=/var/run/uncloud-registry-secrets/bee-password.txt \
+          --blockchain-rpc-endpoint=${BEE_BLOCKCHAIN_RPC:?set a Sepolia RPC endpoint} \
+          --mainnet=false \
+          --swap-enable=true \
+          --chequebook-enable=true \
+          --full-node=true \
+          --verbosity=4 \
+          --welcome-message=uncloud-registry-testnet
+    volumes:
+      - bee-data:/home/bee
+      - ${SECRETS_DIR:-./.secrets}:/run/secrets:ro
+    ports:
+      - "127.0.0.1:1633:1633"
+    healthcheck:
+      test: ["CMD-SHELL", "grep -Eq ':0661 ' /proc/net/tcp /proc/net/tcp6 || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 60
+      start_period: 60s
+
+  caddy:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    environment:
+      CONTROLPLANE_HOST: ${CONTROLPLANE_HOST:-controlplane.uncloud-registry.test}
+      REGISTRY_HOST_GLOB: ${REGISTRY_HOST_GLOB:-*.uncloud-registry.test}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      registry:
+        condition: service_healthy
+      controlplane:
+        condition: service_healthy
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+volumes:
+  controlplane-data:
+  staging-data:
+  bee-data:
