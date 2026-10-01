@@ -741,7 +741,7 @@ func parseSystemRootsEnv() (bool, error) {
 // mode.
 func requireRegistryIDs(resolver resolve.RegistryIdentityResolver) error {
 	switch resolver.(type) {
-	case *publish.ControlPlaneRegistryIdentityResolver:
+	case publish.ControlPlaneRegistryIdentityResolver:
 		// Dynamic resolution: the control plane is the single source of truth
 		// for host → (owner, RegistryID). The ID is authoritative at resolve
 		// time, so there is nothing to pre-validate here — the resolver rejects

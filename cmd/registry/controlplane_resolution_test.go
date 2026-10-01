@@ -43,7 +43,7 @@ func TestBuildRegistryIdentityResolverControlPlane(t *testing.T) {
 // the dynamic resolver (IDs authoritative from the control plane) while still
 // rejecting the static zero-ID case and every other resolver shape.
 func TestRequireRegistryIDsAcceptsControlPlane(t *testing.T) {
-	cp := &publish.ControlPlaneRegistryIdentityResolver{
+	cp := publish.ControlPlaneRegistryIdentityResolver{
 		BaseURL: "https://controlplane.internal:8089",
 		Secret:  []byte("secret"),
 	}
