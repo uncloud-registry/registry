@@ -100,7 +100,7 @@ jobs:
             type=sha
       - name: Build + push registry
         id: build-registry
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.registry
@@ -118,7 +118,7 @@ jobs:
             type=sha
       - name: Build + push controlplane
         id: build-controlplane
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.controlplane
