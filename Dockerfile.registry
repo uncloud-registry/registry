@@ -28,7 +28,7 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/registry ./cmd/registry
 
-FROM alpine:3.21
+FROM alpine:3.24
 # Required operating-system certificates for outbound TLS (the control-plane
 # CA bundle itself is mounted at runtime). util-linux provides setpriv, which
 # the compose entrypoint uses to drop from the secret-staging root to the
