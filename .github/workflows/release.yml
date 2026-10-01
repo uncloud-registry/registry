@@ -92,7 +92,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Metadata (registry)
         id: meta-registry
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/registry
           tags: |
@@ -110,7 +110,7 @@ jobs:
           labels: ${{ steps.meta-registry.outputs.labels }}
       - name: Metadata (controlplane)
         id: meta-controlplane
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/controlplane
           tags: |
