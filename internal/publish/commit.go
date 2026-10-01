@@ -62,6 +62,24 @@ const InternalFeedUpdatePathV2 = "/internal/v2/feed-updates"
 // user session, registry token, or feed-owner key.
 const InternalAuthHeader = "X-Uncloud-Internal-Auth"
 
+// InternalResolvePath is the exact internal endpoint prefix for dynamic
+// registry-identity resolution. A resolve request is GET
+// InternalResolvePath + <canonical-hostname> (the data plane strips any port
+// before sending; the control plane stores hosts WITHOUT a port). It shares
+// the internal credential header with feed commits and operation bindings, so
+// dynamic resolution rides the SAME internal listener and trust boundary —
+// never the public router.
+const InternalResolvePath = "/internal/v1/resolve/"
+
+// ResolveResponse is the exact response a successful registry-identity
+// resolution returns: the registry's feed-owner address and its unambiguous
+// control-plane RegistryID (the data plane routes internal feed commits by
+// this ID). JSON names are the fixed contract.
+type ResolveResponse struct {
+	Owner      string `json:"owner"`
+	RegistryID int64  `json:"registryID"`
+}
+
 // FeedCommitRequest is the exact request the registry data plane sends to the
 // control-plane internal feed signer. Field/JSON names are the fixed contract
 // from the Task 10 interface. Topic is the FULL deterministic repository-state

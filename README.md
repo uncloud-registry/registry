@@ -470,6 +470,10 @@ Resolution-specific variables:
   - `ETH_RPC_URL`
   - `REGISTRY_ENS_SUFFIX`
   - optional `ENS_REGISTRY_ADDRESS`
+- when `REGISTRY_RESOLUTION_MODE=controlplane`:
+  - `CONTROLPLANE_URL` (the control plane's internal listener — also required for
+    feed commits)
+  - `CONTROLPLANE_INTERNAL_SECRET_FILE` (the shared internal credential)
 
 Behavior:
 
@@ -506,6 +510,32 @@ In ENS mode, the registry server:
 - resolves the ENS resolver on-chain
 - reads the ENS `addr` record
 - uses that address as the registry feed owner
+
+For control-plane-backed dynamic resolution, run:
+
+```bash
+REGISTRY_BACKEND=bee \
+REGISTRY_RESOLUTION_MODE=controlplane \
+BEE_API_URL=http://localhost:1633 \
+CONTROLPLANE_URL=http://127.0.0.1:8089 \
+CONTROLPLANE_INTERNAL_SECRET_FILE=/path/to/internal-secret \
+go run ./cmd/registry
+```
+
+In controlplane mode, the registry server resolves every host to its
+feed-owner address and RegistryID by calling the control plane's internal
+`/internal/v1/resolve/{host}` endpoint on each request (no cache). This reuses
+the same internal credential as feed commits — there is no separate token for
+resolution.
+
+Known limitations of controlplane mode:
+
+- resolution is a live call per request, so the data plane depends on the
+  control plane being reachable to resolve any host (an availability deviation
+  from the static/ENS modes' offline behavior)
+- the periodic staging-cleanup loop is not started (its committed-state guard
+  needs the full static identity list up front); staged uploads still expire
+  via the upload-time checks
 
 ### Port override
 

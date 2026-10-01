@@ -194,10 +194,6 @@ func buildBeeHandler() (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	registryResolver, err := buildRegistryIdentityResolver(depClient)
-	if err != nil {
-		return nil, err
-	}
 
 	// Bee-mode repository-state commits go exclusively through the control
 	// plane's internal feed signer. The registry process NEVER holds or accepts
@@ -221,6 +217,14 @@ func buildBeeHandler() (http.Handler, error) {
 		return nil, err
 	}
 	cpHTTPClient, err := buildControlPlaneHTTPClient(cpURL)
+	if err != nil {
+		return nil, err
+	}
+	// The controlplane resolution mode needs the same control-plane origin,
+	// credential, and bounded client the committer/binder use. Build the
+	// resolver after they are loaded so the three control-plane clients can
+	// never drift onto different origins or credentials.
+	registryResolver, err := buildRegistryIdentityResolver(depClient, cpURL, internalSecret, cpHTTPClient)
 	if err != nil {
 		return nil, err
 	}
@@ -280,34 +284,42 @@ func buildBeeHandler() (http.Handler, error) {
 	// The loop honors context cancellation. The staging store handed to the
 	// handler is wrapped so that closing the handler cancels the loop BEFORE
 	// the underlying staging service (spool + SQLite) is released.
-	cleanup, err := buildCleanup(stageStore, objects, resolver)
-	if err != nil {
-		return nil, fmt.Errorf("staging cleanup: %w", err)
-	}
-	interval, err := cleanupIntervalFromEnv()
-	if err != nil {
-		return nil, err
-	}
-	batch, err := cleanupBatchFromEnv()
-	if err != nil {
-		return nil, err
-	}
-	cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
-	cleanupDone := runCleanupLoop(cleanupCtx, cleanup, interval, batch, func(res staging.CleanupResult, passErr error) {
-		if metrics != nil {
-			if passErr != nil {
-				metrics.ObserveCleanupPass(false)
-				return
-			}
-			metrics.ObserveCleanupPass(true)
-			metrics.ObserveCleanupResult(res.Examined, res.Expired, res.Removed, res.Unpinned, res.Failed)
+	//
+	// Cleanup is gated to STATIC resolution only (dynamic-resolution option 2):
+	// the committed-state guard needs the full static identity list up front,
+	// which controlplane resolution cannot enumerate at startup. Under
+	// controlplane resolution the loop is NOT started — staged uploads still
+	// expire via the upload-time checks, but the periodic reaper is off.
+	if _, isStatic := registryResolver.(resolve.StaticRegistryIdentityResolver); isStatic {
+		cleanup, err := buildCleanup(stageStore, objects, resolver)
+		if err != nil {
+			return nil, fmt.Errorf("staging cleanup: %w", err)
 		}
-	})
-	closeSvc := func() error { return nil }
-	if ic, ok := stageStore.(io.Closer); ok {
-		closeSvc = ic.Close
+		interval, err := cleanupIntervalFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		batch, err := cleanupBatchFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		cleanupCtx, cancelCleanup := context.WithCancel(context.Background())
+		cleanupDone := runCleanupLoop(cleanupCtx, cleanup, interval, batch, func(res staging.CleanupResult, passErr error) {
+			if metrics != nil {
+				if passErr != nil {
+					metrics.ObserveCleanupPass(false)
+					return
+				}
+				metrics.ObserveCleanupPass(true)
+				metrics.ObserveCleanupResult(res.Examined, res.Expired, res.Removed, res.Unpinned, res.Failed)
+			}
+		})
+		closeSvc := func() error { return nil }
+		if ic, ok := stageStore.(io.Closer); ok {
+			closeSvc = ic.Close
+		}
+		stageStore = &cancelOnCloseStore{RegistryStore: stageStore, cancel: cancelCleanup, done: cleanupDone, close: closeSvc}
 	}
-	stageStore = &cancelOnCloseStore{RegistryStore: stageStore, cancel: cancelCleanup, done: cleanupDone, close: closeSvc}
 
 	handler := registry.NewHandler(
 		resolver,
@@ -728,19 +740,27 @@ func parseSystemRootsEnv() (bool, error) {
 // feed-owner, never a control-plane RegistryID) is therefore rejected in Bee
 // mode.
 func requireRegistryIDs(resolver resolve.RegistryIdentityResolver) error {
-	static, ok := resolver.(resolve.StaticRegistryIdentityResolver)
-	if !ok {
-		return fmt.Errorf("Bee-mode repository feed commits require an explicit host→registryID map (REGISTRY_ID_MAP); resolution mode must be static")
-	}
-	for host, identity := range static.Hosts {
-		if identity.RegistryID <= 0 {
-			return fmt.Errorf("Bee-mode repository feed commands require a positive registryID for host %q; configure REGISTRY_ID_MAP", host)
+	switch resolver.(type) {
+	case *publish.ControlPlaneRegistryIdentityResolver:
+		// Dynamic resolution: the control plane is the single source of truth
+		// for host → (owner, RegistryID). The ID is authoritative at resolve
+		// time, so there is nothing to pre-validate here — the resolver rejects
+		// a non-positive ID when it decodes the response.
+		return nil
+	case resolve.StaticRegistryIdentityResolver:
+		static := resolver.(resolve.StaticRegistryIdentityResolver)
+		for host, identity := range static.Hosts {
+			if identity.RegistryID <= 0 {
+				return fmt.Errorf("Bee-mode repository feed commands require a positive registryID for host %q; configure REGISTRY_ID_MAP", host)
+			}
 		}
+		if len(static.Hosts) == 0 {
+			return fmt.Errorf("Bee-mode repository feed commits require at least one host mapped to a registryID (REGISTRY_ID_MAP)")
+		}
+		return nil
+	default:
+		return fmt.Errorf("Bee-mode repository feed commits require an explicit host→registryID map (REGISTRY_ID_MAP); resolution mode must be static or controlplane")
 	}
-	if len(static.Hosts) == 0 {
-		return fmt.Errorf("Bee-mode repository feed commits require at least one host mapped to a registryID (REGISTRY_ID_MAP)")
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +976,7 @@ func parseRegistryOwners(raw string) map[string]string {
 	return owners
 }
 
-func buildRegistryIdentityResolver(depClient *http.Client) (resolve.RegistryIdentityResolver, error) {
+func buildRegistryIdentityResolver(depClient *http.Client, cpURL string, internalSecret []byte, cpClient *http.Client) (resolve.RegistryIdentityResolver, error) {
 	switch envOrDefault("REGISTRY_RESOLUTION_MODE", "static") {
 	case "static":
 		return staticRegistryIdentityResolverFromEnv(), nil
@@ -978,6 +998,14 @@ func buildRegistryIdentityResolver(depClient *http.Client) (resolve.RegistryIden
 			resolver.ENSRegistryAddr = common.HexToAddress(addr)
 		}
 		return resolver, nil
+	case "controlplane":
+		// Dynamic resolution reuses the control-plane origin, shared internal
+		// credential, and bounded client already loaded for feed commits.
+		return publish.ControlPlaneRegistryIdentityResolver{
+			BaseURL:    cpURL,
+			Secret:     internalSecret,
+			HTTPClient: cpClient,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported REGISTRY_RESOLUTION_MODE %q", os.Getenv("REGISTRY_RESOLUTION_MODE"))
 	}
