@@ -1,83 +1,20 @@
 package auth
 
-import (
-	"errors"
-	"fmt"
-	"strings"
-	"time"
+import "strings"
 
-	"github.com/golang-jwt/jwt/v4"
-)
-
-type TokenManager struct {
-	secret []byte
-}
-
-type Claims struct {
-	TokenType string `json:"typ"`
-	Service   string `json:"service,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	jwt.RegisteredClaims
-}
-
-func NewTokenManager(secret string) (*TokenManager, error) {
-	if strings.TrimSpace(secret) == "" {
-		return nil, errors.New("token secret is required")
-	}
-	return &TokenManager{secret: []byte(secret)}, nil
-}
-
-func (m *TokenManager) IssueSessionToken(subject string, ttl time.Duration) (string, error) {
-	return m.issue(Claims{
-		TokenType: "session",
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   subject,
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-	})
-}
-
-func (m *TokenManager) IssueRegistryToken(subject string, service string, scope string, ttl time.Duration) (string, error) {
-	return m.issue(Claims{
-		TokenType: "registry",
-		Service:   service,
-		Scope:     scope,
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   subject,
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-		},
-	})
-}
-
-func (m *TokenManager) Parse(token string) (Claims, error) {
-	parsed, err := jwt.ParseWithClaims(token, &Claims{}, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method %v", t.Header["alg"])
-		}
-		return m.secret, nil
-	})
-	if err != nil {
-		return Claims{}, err
-	}
-
-	claims, ok := parsed.Claims.(*Claims)
-	if !ok || !parsed.Valid {
-		return Claims{}, errors.New("invalid token claims")
-	}
-	return *claims, nil
-}
-
-func (m *TokenManager) issue(claims Claims) (string, error) {
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(m.secret)
-}
-
+// SubjectResolver extracts a bearer subject from an Authorization header. It
+// only understands session tokens (via SessionTokenManager); it has no generic
+// parser and cannot read registry tokens. It is fail-closed: an untrusted,
+// unparsable, or cross-purpose token never becomes a policy subject. There is
+// no raw-bearer fallback, so an attacker cannot present a literal `role:write`
+// bearer value to assume a privileged actor.
 type SubjectResolver struct {
-	Tokens *TokenManager
+	Tokens *SessionTokenManager
 }
 
+// Subject returns the verified session subject, or "" when the header is not a
+// verifiable session token. An absent manager, an invalid signature, a
+// cross-purpose token, or an empty/malformed header all resolve to no subject.
 func (r SubjectResolver) Subject(authHeader string) string {
 	authHeader = strings.TrimSpace(authHeader)
 	if authHeader == "" {
@@ -94,12 +31,13 @@ func (r SubjectResolver) Subject(authHeader string) string {
 		return ""
 	}
 
-	if r.Tokens != nil {
-		claims, err := r.Tokens.Parse(token)
-		if err == nil {
-			return claims.Subject
-		}
+	if r.Tokens == nil {
+		return ""
 	}
 
-	return token
+	claims, err := r.Tokens.Verify(token)
+	if err != nil {
+		return ""
+	}
+	return claims.Subject
 }

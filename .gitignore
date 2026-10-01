@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Local secrets directory used by the reference deployment
+/.secrets/
 
 # Local databases
 *.db
@@ -20,3 +22,9 @@ coverage.out
 .DS_Store
 .idea/
 .vscode/
+
+# Local brainstorming companion artifacts
+.superpowers/
+
+# Isolated implementation worktrees
+.worktrees/

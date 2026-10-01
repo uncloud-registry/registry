@@ -1,53 +1,489 @@
 package main
 
 import (
+	"context"
+	"crypto/ed25519"
+	"crypto/tls"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/config"
 	"github.com/uncloud-registry/registry/internal/controlplane"
+	"github.com/uncloud-registry/registry/internal/credential"
+	"github.com/uncloud-registry/registry/internal/observability"
+	"github.com/uncloud-registry/registry/internal/server"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
 func main() {
-	addr := envOrDefault("CONTROLPLANE_ADDR", ":8081")
-	dbPath := envOrDefault("CONTROLPLANE_DB_PATH", "file:controlplane.db?_pragma=foreign_keys(1)")
-	tokenSecret := envOrDefault("CONTROLPLANE_TOKEN_SECRET", "dev-secret-change-me")
-	registryDomain := envOrDefault("CONTROLPLANE_REGISTRY_DOMAIN", "uncloud-registry.com")
-	beeAPIURL := strings.TrimSpace(os.Getenv("CONTROLPLANE_BEE_API_URL"))
-
-	store, err := controlplane.OpenSQLite(dbPath)
+	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
 	}
-	tokens, err := auth.NewTokenManager(tokenSecret)
+	if err := cfg.Validate(); err != nil {
+		log.Fatal(err)
+	}
+
+	comps, err := prepareControlPlane(cfg, defaultDeps())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var publisher *controlplane.Publisher
-	if beeAPIURL != "" {
-		publisher = &controlplane.Publisher{
-			Documents: swarm.NewBeeObjectStore(beeAPIURL, nil),
-			Feeds: controlplane.BeeRegistryFeedUpdater{
-				BaseURL: beeAPIURL,
-			},
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Run the provisioning outbox reconciler for the process lifetime. It is
+	// joined before exit so no worker goroutine leaks and its DB transactions
+	// finish before the process dies.
+	var wg sync.WaitGroup
+	if comps.reconciler != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := comps.reconciler.Run(ctx); err != nil && ctx.Err() == nil {
+				log.Printf("control plane reconciler: %v", err)
+			}
+		}()
+	}
+
+	// The public router is served through the bounded server lifecycle
+	// (Task 22): configured read-header/read/write/idle timeouts applied to
+	// the http.Server, graceful drain on context cancellation, forced close
+	// after the shutdown deadline. Direct TLS termination uses the already
+	// parsed certificate — never plaintext, never a deferred file read.
+	publicCfg, err := controlPlaneServerConfig(cfg.ListenAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var publicOpts []server.Option
+	if comps.tlsCert != nil {
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{*comps.tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		publicOpts = append(publicOpts, server.WithTLSConfig(tlsConfig))
+		log.Printf("control plane serving TLS (direct) on %s", cfg.ListenAddr)
+	} else {
+		// Trusted-proxy termination: a trusted reverse proxy terminates TLS
+		// and forwards to this internal plaintext listener.
+		log.Printf("control plane serving internal HTTP behind trusted proxy on %s", cfg.ListenAddr)
+	}
+
+	// The internal feed-signing listener is served on its own dedicated
+	// socket, separate from the public router, so it can never inherit the
+	// public browser CSRF/session assumptions. It runs through the same
+	// bounded lifecycle with its fixed strict timeouts, and is stopped
+	// gracefully with the process; a serve failure here aborts the whole
+	// process with a nonzero exit (never log-and-continue), while a forced
+	// close during shutdown is logged and joined without cutting the public
+	// drain short.
+	var internalDone chan struct{}
+	if comps.internalHandler != nil && comps.internalAddr != "" {
+		internalCfg := server.Config{
+			Address:           comps.internalAddr,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			ShutdownTimeout:   publicCfg.ShutdownTimeout,
+			MaxHeaderBytes:    64 * 1024,
+		}
+		var internalOpts []server.Option
+		mode := "plaintext"
+		if comps.internalTLS != nil {
+			tlsConfig := &tls.Config{
+				Certificates: []tls.Certificate{*comps.internalTLS},
+				MinVersion:   tls.VersionTLS12,
+			}
+			internalOpts = append(internalOpts, server.WithTLSConfig(tlsConfig))
+			mode = "TLS"
+		}
+		log.Printf("control plane internal feed signer (%s) listening on %s", mode, comps.internalAddr)
+		internalDone = make(chan struct{})
+		go func() {
+			defer close(internalDone)
+			if err := server.Run(ctx, internalCfg, comps.internalHandler, internalOpts...); err != nil {
+				if ctx.Err() != nil {
+					// Shutdown path: a forced-close deadline is a degraded but
+					// complete shutdown; log it and let the graceful exit
+					// finish instead of aborting mid-drain.
+					log.Printf("control plane internal feed signer shutdown: %v", err)
+					return
+				}
+				log.Fatal(err)
+			}
+		}()
+	}
+
+	if err := server.Run(ctx, publicCfg, comps.handler, publicOpts...); err != nil {
+		log.Fatal(err)
+	}
+
+	// Graceful join: stop the reconciler loop and wait for it to exit, and
+	// wait for the internal feed-signing listener to finish its own drain so
+	// no server socket or worker outlives main.
+	stop()
+	wg.Wait()
+	if internalDone != nil {
+		<-internalDone
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 22: bounded dependency client and bounded server lifecycle config.
+// ---------------------------------------------------------------------------
+
+// Dependency-client deadlines for the control plane's one outbound HTTP
+// client (Bee store/resolver adapters and the feed updater/signer): bounded
+// connect/TLS-handshake/response-header/idle transport plus an overall
+// per-request Timeout, never the bare http.DefaultClient. depRequestTimeout
+// exceeds the swarm layer's internal 30s per-request context deadlines so
+// those stay authoritative and keep their context.DeadlineExceeded signal.
+const (
+	depConnectTimeout        = 10 * time.Second
+	depTLSHandshakeTimeout   = 10 * time.Second
+	depResponseHeaderTimeout = 30 * time.Second
+	depIdleConnTimeout       = 90 * time.Second
+	depRequestTimeout        = 60 * time.Second
+)
+
+// buildDependencyHTTPClient constructs THE bounded HTTP client for this
+// process, built once and injected into every Bee adapter (never the bare
+// http.DefaultClient). The standard transport is cloned so Proxy and other Go
+// defaults are preserved.
+func buildDependencyHTTPClient() *http.Client {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.DialContext = (&net.Dialer{Timeout: depConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+	base.TLSHandshakeTimeout = depTLSHandshakeTimeout
+	base.ResponseHeaderTimeout = depResponseHeaderTimeout
+	base.IdleConnTimeout = depIdleConnTimeout
+	return &http.Client{Transport: base, Timeout: depRequestTimeout}
+}
+
+// Control-plane public server lifecycle defaults. These bound the browser/
+// API router: small JSON/HTML exchanges, so every timeout is positive and
+// strict; each is overridable with a CONTROLPLANE_*_TIMEOUT env. The internal
+// feed-signing listener keeps its own fixed strict timeouts.
+const (
+	defaultControlPlaneReadHeaderTimeout = 5 * time.Second
+	defaultControlPlaneReadTimeout       = 15 * time.Second
+	defaultControlPlaneWriteTimeout      = 30 * time.Second
+	defaultControlPlaneIdleTimeout       = 2 * time.Minute
+	defaultControlPlaneShutdownTimeout   = 5 * time.Second
+)
+
+const (
+	envControlPlaneReadHeaderTimeout = "CONTROLPLANE_READ_HEADER_TIMEOUT"
+	envControlPlaneReadTimeout       = "CONTROLPLANE_READ_TIMEOUT"
+	envControlPlaneWriteTimeout      = "CONTROLPLANE_WRITE_TIMEOUT"
+	envControlPlaneIdleTimeout       = "CONTROLPLANE_IDLE_TIMEOUT"
+	envControlPlaneShutdownTimeout   = "CONTROLPLANE_SHUTDOWN_TIMEOUT"
+)
+
+// controlPlaneServerConfig builds the bounded public-server configuration from
+// strict env parsing: malformed or non-positive values fail closed with a
+// data-free error naming only the variable, before any listener opens.
+func controlPlaneServerConfig(addr string) (server.Config, error) {
+	readHeader, err := serverTimeoutFromEnv(envControlPlaneReadHeaderTimeout, defaultControlPlaneReadHeaderTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	read, err := serverTimeoutFromEnv(envControlPlaneReadTimeout, defaultControlPlaneReadTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	write, err := serverTimeoutFromEnv(envControlPlaneWriteTimeout, defaultControlPlaneWriteTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	idle, err := serverTimeoutFromEnv(envControlPlaneIdleTimeout, defaultControlPlaneIdleTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	shutdown, err := serverTimeoutFromEnv(envControlPlaneShutdownTimeout, defaultControlPlaneShutdownTimeout)
+	if err != nil {
+		return server.Config{}, err
+	}
+	return server.Config{
+		Address:           addr,
+		ReadHeaderTimeout: readHeader,
+		ReadTimeout:       read,
+		WriteTimeout:      write,
+		IdleTimeout:       idle,
+		ShutdownTimeout:   shutdown,
+	}, nil
+}
+
+// serverTimeoutFromEnv parses an optional duration env value strictly: an
+// unset variable yields def, a malformed or non-positive value fails closed.
+func serverTimeoutFromEnv(name string, def time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration", name)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration", name)
+	}
+	return d, nil
+}
+
+// controlPlaneDeps captures every external side-effect the startup assembler
+// performs, so tests can inject spies that prove invalid values cause zero
+// file, DB, or listening side effects before startup fails.
+type controlPlaneDeps struct {
+	newSessionManager      func(secret, issuer, audience string) (*auth.SessionTokenManager, error)
+	loadMasterKey          func(path string) (*controlplane.FeedKeyCipher, error)
+	parseRegistrySeed      func(seedHex string) (ed25519.PrivateKey, error)
+	newRegistryIssuer      func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error)
+	loadTLSKeyPair         func(certFile, keyFile string) (tls.Certificate, error)
+	loadInternalTLSKeyPair func(certFile, keyFile string) (tls.Certificate, error)
+	openStore              func(dbPath string) (*controlplane.Store, error)
+	loadInternalSecret     func(path string) ([]byte, error)
+}
+
+func defaultDeps() controlPlaneDeps {
+	return controlPlaneDeps{
+		newSessionManager: auth.NewSessionTokenManager,
+		loadMasterKey:     controlplane.LoadMasterKeyFile,
+		parseRegistrySeed: parseRegistrySeedHex,
+		newRegistryIssuer: func(priv ed25519.PrivateKey, issuer, keyID string) (*auth.RegistryTokenIssuer, error) {
+			return auth.NewRegistryTokenIssuer(priv, issuer, keyID)
+		},
+		loadTLSKeyPair:         credential.LoadTLSKeyPair,
+		loadInternalTLSKeyPair: credential.LoadTLSKeyPair,
+		openStore:              controlplane.OpenSQLite,
+		loadInternalSecret:     credential.LoadSecretFile,
+	}
+}
+
+// controlPlaneComponents is the fully assembled, validated control plane.
+type controlPlaneComponents struct {
+	handler http.Handler
+	// tlsCert is non-nil exactly when termination is direct and TLS must be
+	// served with this preloaded certificate. It is parsed before the DB opens.
+	tlsCert *tls.Certificate
+	// reconciler, when non-nil, owns the provisioning outbox worker loop. It
+	// is created only when a Bee endpoint is configured (documents+feeds).
+	// Nil means no external publication is wired and no reconciler runs.
+	reconciler *controlplane.Reconciler
+	// internalHandler, when non-nil, is the constrained internal feed-signing
+	// server served on its own dedicated listener (internalAddr), so it can
+	// never inherit the public router's browser CSRF/session assumptions.
+	internalHandler http.Handler
+	internalAddr    string
+	// internalTLS, when non-nil, is the already-parsed certificate for the
+	// internal feed-signing listener (non-loopback internal binds require TLS).
+	// It is loaded and validated BEFORE the database opens.
+	internalTLS *tls.Certificate
+}
+
+// prepareControlPlane assembles every component strictly in dependency order:
+// session manager → master-key file → registry seed → TLS keypair (direct) →
+// database → service → optional legacy migration → publisher → HTTP handler.
+// Every invalid value returns an error BEFORE the database is opened (the only
+// persistent side effect), so a misconfiguration never touches storage or
+// listens. Errors contain no secret material and no file paths.
+func prepareControlPlane(cfg *config.ControlPlaneConfig, deps controlPlaneDeps) (*controlPlaneComponents, error) {
+	if deps.newSessionManager == nil || deps.loadMasterKey == nil || deps.parseRegistrySeed == nil ||
+		deps.newRegistryIssuer == nil || deps.loadTLSKeyPair == nil || deps.loadInternalTLSKeyPair == nil ||
+		deps.openStore == nil || deps.loadInternalSecret == nil {
+		return nil, errors.New("startup dependencies must be fully supplied")
+	}
+
+	tokens, err := deps.newSessionManager(cfg.SessionSecret, auth.DefaultSessionIssuer, auth.DefaultSessionAudience)
+	if err != nil {
+		return nil, err
+	}
+
+	// The master-key file is required in every mode and always loaded before
+	// the database — there is no development-only plaintext feed-key path.
+	feedKeyCipher, err := deps.loadMasterKey(cfg.MasterKeyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	// The internal feed-signing credential is loaded and validated BEFORE the
+	// database opens (Task 8 ordering: every secret and config value is
+	// settled before any SQLite side effect). It is mounted from a secure file
+	// and never supplied directly in env/flags/JSON. The local byte copy is
+	// wiped after the internal server is constructed.
+	var internalSecret []byte
+	if cfg.InternalSecretFile != "" {
+		internalSecret, err = deps.loadInternalSecret(cfg.InternalSecretFile)
+		if err != nil {
+			return nil, err
+		}
+		if err := credential.ValidateSecret(internalSecret); err != nil {
+			return nil, err
 		}
 	}
 
-	handler := controlplane.NewHTTPServer(&controlplane.Service{
+	// A non-loopback internal feed-signing listener requires TLS (config
+	// validation enforces the prerequisite); the cert/key pair is loaded and
+	// validated BEFORE the database opens, so a malformed pair can never touch
+	// SQLite. Errors are data-free.
+	var internalTLS *tls.Certificate
+	if cfg.InternalTLSCertFile != "" {
+		cert, err := deps.loadInternalTLSKeyPair(cfg.InternalTLSCertFile, cfg.InternalTLSKeyFile)
+		if err != nil {
+			return nil, errors.New("failed to load the internal TLS certificate and private key pair")
+		}
+		internalTLS = &cert
+	}
+
+	registryPriv, err := deps.parseRegistrySeed(cfg.RegistryEd25519Key)
+	if err != nil {
+		return nil, err
+	}
+	registryTokens, err := deps.newRegistryIssuer(registryPriv, auth.RegistryIssuer, cfg.RegistryKeyID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Direct termination: parse the TLS keypair now, before any DB side
+	// effect. trusted-proxy termination does not need a local certificate.
+	var tlsCert *tls.Certificate
+	if cfg.TLSTermination == config.TLSTermDirect {
+		cert, err := deps.loadTLSKeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			// Data-free: never leak the certificate/key file paths.
+			return nil, errors.New("failed to load the TLS certificate and private key pair")
+		}
+		tlsCert = &cert
+	}
+
+	store, err := deps.openStore(cfg.DBPath)
+	if err != nil {
+		return nil, err
+	}
+
+	service := &controlplane.Service{
 		Store:          store,
 		Tokens:         tokens,
-		RegistryDomain: registryDomain,
-		Publisher:      publisher,
-	}, auth.SubjectResolver{Tokens: tokens})
-
-	log.Printf("control plane listening on %s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatal(err)
+		RegistryTokens: registryTokens,
+		RegistryDomain: cfg.RegistryDomain,
+		FeedKeys:       feedKeyCipher,
+		SessionTTL:     cfg.SessionTTL,
 	}
+
+	// Legacy plaintext feed keys are read and encrypted ONLY under the
+	// validated explicit opt-in (CONTROLPLANE_MIGRATE_LEGACY_KEYS=true, already
+	// parsed into the config before any file or DB work).
+	if cfg.LegacyKeyMigration {
+		if _, err := service.MigrateLegacyFeedKeys(context.Background()); err != nil {
+			return nil, err
+		}
+	}
+
+	// The Bee object store is shared by the reconciler/publisher (immutable
+	// document writes) and the internal feed signer (the bounded /bytes
+	// artifact reader); it exists only in Bee mode and is nil otherwise. All
+	// Bee adapters share ONE bounded HTTP client built once for this process
+	// (Task 22): never the bare http.DefaultClient, so a stalled Bee node can
+	// never block reconciliation, signing, or publication indefinitely.
+	var objectStore *swarm.BeeObjectStore
+	if cfg.BeeAPIURL != nil {
+		beeHTTPClient := buildDependencyHTTPClient()
+		objectStore = swarm.NewBeeObjectStore(cfg.BeeAPIURL.String(), beeHTTPClient)
+		service.Publisher = &controlplane.Publisher{
+			Documents: objectStore,
+			Feeds: controlplane.BeeRegistryFeedUpdater{
+				BaseURL:    cfg.BeeAPIURL.String(),
+				HTTPClient: beeHTTPClient,
+				Keys:       service,
+			},
+			// Feed read-back resolution: the reconciler proves a policy feed
+			// points at the uploaded object by resolving it back to its ref.
+			// The constructor normalizes the base URL and guarantees a non-nil
+			// HTTP client plus the per-request context timeout, so a direct
+			// zero-value struct (with no base URL) is never used in production.
+			FeedsReader: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), beeHTTPClient),
+		}
+	}
+
+	// Task 23 telemetry: ONE instrumentation instance (the publication-queue
+	// gauges source is the Service's own OutboxStats) and the JSON request
+	// logger, wired onto the public router. The internal feed-signing
+	// listener intentionally gets NO request telemetry: it is a
+	// machine-to-machine side channel and stays as thin as it is today.
+	metrics := observability.New()
+	if err := metrics.RegisterOutbox(service); err != nil {
+		return nil, fmt.Errorf("register outbox metrics source: %w", err)
+	}
+	handler := controlplane.NewHTTPServerWithConfig(service, auth.SubjectResolver{Tokens: tokens}, cfg)
+	if hs, ok := handler.(*controlplane.HTTPServer); ok {
+		hs.Metrics = metrics
+		hs.Logger = slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+
+	comps := &controlPlaneComponents{handler: handler, tlsCert: tlsCert}
+	// Wire the provisioning reconciler against the validated, already-open
+	// store and the configured Bee object store / feed updater / feed
+	// resolver. Construction fails closed: a Publisher missing read-back
+	// capability aborts startup rather than running a worker that could mark
+	// unverified jobs complete. The reconciler opens no database and performs
+	// no I/O at construction.
+	if service.Publisher != nil && service.Publisher.Documents != nil && service.Publisher.Feeds != nil && service.Publisher.FeedsReader != nil {
+		r, err := service.NewReconciler()
+		if err != nil {
+			return nil, err
+		}
+		comps.reconciler = r
+	}
+
+	// The internal feed signer signs repository-state feed commits for the
+	// registry data plane and is served on its own dedicated listener. It is
+	// wired only when Bee feed capability is configured, and it depends on the
+	// same Bee object store / feed resolver / updater plus the pre-validated
+	// internal secret. Both CONTROPLANE_INTERNAL_ADDR and the secret file must
+	// be present, or startup fails closed before any listener binds.
+	if cfg.BeeAPIURL != nil {
+		// Config validation has already required the internal addr + secret
+		// pair when Bee signing is enabled, so this is a defensive guard only.
+		if cfg.InternalAddr == "" || len(internalSecret) == 0 {
+			return nil, errors.New("control-plane Bee feed signing requires CONTROLPLANE_INTERNAL_ADDR and CONTROLPLANE_INTERNAL_SECRET_FILE")
+		}
+		beeHTTPClient := buildDependencyHTTPClient()
+		signer := &controlplane.FeedSigner{
+			Store:        store,
+			Feeds:        controlplane.BeeRegistryFeedUpdater{BaseURL: cfg.BeeAPIURL.String(), HTTPClient: beeHTTPClient, Keys: service},
+			ResolveFeeds: swarm.NewBeeFeedResolver(cfg.BeeAPIURL.String(), beeHTTPClient),
+			Docs:         swarm.NewBeeDocumentStore(cfg.BeeAPIURL.String(), beeHTTPClient),
+			// The bounded /bytes reader for the artifact-proven blob
+			// transition: the signer INDEPENDENTLY re-reads the operated
+			// manifest body (bounded, data-free) through the SAME object
+			// store the reconciler/publisher write with. It is always wired
+			// in Bee mode; Commit fails closed when absent.
+			Bytes: objectStore,
+		}
+		internal, err := controlplane.NewInternalFeedServer(signer, &controlplane.PublicationBinder{Store: store}, internalSecret, nil)
+		if err != nil {
+			return nil, err
+		}
+		for i := range internalSecret {
+			internalSecret[i] = 0
+		}
+		comps.internalHandler = internal
+		comps.internalAddr = cfg.InternalAddr
+		comps.internalTLS = internalTLS
+	}
+	return comps, nil
 }
 
 func envOrDefault(name string, fallback string) string {
@@ -55,4 +491,38 @@ func envOrDefault(name string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// envRequiredSecret returns the value of a required environment variable,
+// failing loudly if it is missing or empty. Used for secrets that must never
+// have a default.
+func envRequiredSecret(name string) (string, error) {
+	value := os.Getenv(name)
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s is required and must not be empty", name)
+	}
+	return value, nil
+}
+
+// masterKeyFileFromEnv resolves the required CONTROLPLANE_MASTER_KEY_FILE
+// path. The value is preserved byte-for-byte (whitespace is a legitimate part
+// of a path); only blank values are rejected, and the error names the variable
+// never its value, so no path material reaches logs.
+func masterKeyFileFromEnv() (string, error) {
+	return envRequiredSecret("CONTROLPLANE_MASTER_KEY_FILE")
+}
+
+// parseRegistrySeedHex decodes an Ed25519 signing seed from a 64-char hex
+// string into a private key. It fails closed on missing, malformed, or
+// wrong-length input and never returns or logs the seed value itself.
+func parseRegistrySeedHex(seedHex string) (ed25519.PrivateKey, error) {
+	seedHex = strings.TrimSpace(seedHex)
+	if seedHex == "" {
+		return nil, errors.New("CONTROLPLANE_REGISTRY_ED25519_KEY is required: set a stable 64-character hex Ed25519 seed")
+	}
+	seed, err := hex.DecodeString(seedHex)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		return nil, fmt.Errorf("CONTROLPLANE_REGISTRY_ED25519_KEY must be exactly %d hex characters", ed25519.SeedSize*2)
+	}
+	return ed25519.NewKeyFromSeed(seed), nil
 }

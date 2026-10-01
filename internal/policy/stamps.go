@@ -28,13 +28,22 @@ func (r StampPolicyResolver) Resolve(ctx context.Context, registry resolve.Regis
 	return spec.DecodeStampPolicyDocument(data)
 }
 
+// PushAuthorizer authorizes push for a single verified principal and returns
+// the stamp batch the push may consume. It consumes ONLY auth.Principal; the
+// anonymous principal (or an empty subject) can never push, even if a policy
+// document listed "anonymous" in a push list. The actor identity used for
+// staging ownership and stamp policy is the principal's verified subject.
 type PushAuthorizer struct {
 	AuthPolicies  AuthPolicyResolver
 	StampPolicies StampPolicyResolver
-	Subjects      auth.SubjectResolver
 }
 
-func (a PushAuthorizer) Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, actor string) (string, bool, error) {
+func (a PushAuthorizer) Authorize(ctx context.Context, registry resolve.RegistryIdentity, repo string, principal auth.Principal) (string, bool, error) {
+	actor := principal.Subject
+	if actor == "" || actor == auth.AnonymousSubject {
+		return "", false, nil
+	}
+
 	authPolicy, err := a.AuthPolicies.Resolve(ctx, registry)
 	if err != nil {
 		return "", false, err

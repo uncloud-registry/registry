@@ -1,6 +1,6 @@
 # Uncloud Registry
 
-`uncloud-registry` is a Docker Registry HTTP API v2 compatible server that stores both image content and published registry metadata in Swarm.
+`uncloud-registry` is a registry server implementing a **documented subset** of the Docker Registry HTTP API v2 / OCI Distribution API. It stores both image content and published registry metadata in Swarm. The exact wire contract — supported endpoints and methods, headers, error codes, media types, authentication behavior, and deferred operations — is pinned by the conformance matrix in [docs/compatibility.md](docs/compatibility.md) and enforced by `TestDistributionConformanceMatrix`. It is not a drop-in replacement for Docker Distribution; endpoints outside the documented subset are not supported.
 
 The core idea is:
 
@@ -267,7 +267,7 @@ This mode uses Bee for:
 - blob/manifest upload via `/bytes`
 - feed publication via `/chunks` and `/soc`
 
-Bee mode still uses in-memory upload staging right now. Published state and content are Swarm-backed, but staging is ephemeral inside the registry process.
+Bee mode uses durable upload staging (SQLite metadata + filesystem spool) and Swarm-backed published state and content.
 
 ## Feed Update Design
 
@@ -282,31 +282,40 @@ It works by:
 5. signing `identifier || wrappedChunkAddress`
 6. uploading the SOC to `/soc/{owner}/{identifier}?sig=...`
 
-This is why Bee-backed publish needs a signer private key.
+The feed-owner private key lives in the control plane; the registry data plane requests each feed commit through the constrained control-plane signing service (`CONTROLPLANE_URL`) and never holds or reads a feed private key.
 
 ## Current Limitations
 
-This repository is intentionally still early-stage. Important current limitations:
+The exact compatibility subset — including supported routes, methods, and
+error codes — is documented in [docs/compatibility.md](docs/compatibility.md)
+and enforced by the `TestDistributionConformanceMatrix` conformance test.
+Important current limitations:
 
-- manifest publish by digest is not supported
-- concurrent multi-writer publish is not handled yet
-- staging is still in-memory even in Bee mode
+- registry **catalog** (`/v2/_catalog`), **manifest/blob deletion**, and
+  **cross-repository blob mounting** are deferred and answer explicit
+  `405 UNSUPPORTED` (see docs/compatibility.md §2)
+- tag listing (`/v2/<name>/tags/list`) is not implemented
+- manifest publish by **digest** is not supported; publish by tag only
+- concurrent multi-writer publish is handled by per-repository serialization
+  plus an authoritative control-plane generation fence — no active-active
+  writers
+- staging is process-local durable (SQLite metadata + filesystem spool); publication is serialized in-process plus a control-plane generation fence
+- secure JWKS key-file loading for registry token verification (kernel `O_NOFOLLOW`/`O_NONBLOCK` single-descriptor open) is implemented on macOS and Linux only; on any other platform the registry fails closed at startup rather than loading keys through a weaker fallback — there is no Windows (or other non-macOS/Linux) keys-file loading support
 - ENS resolution is currently subdomain-to-ENS naming convention, not a full external ENS resolver integration
-- OCI validation is still minimal
 - no GC or retention policy yet
-- no Redis-backed staging or repo locking yet
+- no Redis-backed distributed staging/locking
 
 ## Repository Walkthrough
 
 ### Entry point
 
-- [cmd/registry/main.go](/Users/Alok/dev/uncloud-registry/cmd/registry/main.go)
+- [cmd/registry/main.go](/cmd/registry/main.go)
 
 Chooses the backend and wires the HTTP handler.
 
 ### Spec layer
 
-- [internal/spec/documents.go](/Users/Alok/dev/uncloud-registry/internal/spec/documents.go)
+- [internal/spec/documents.go](/internal/spec/documents.go)
 
 Typed schema definitions and validation for:
 
@@ -319,7 +328,7 @@ Typed schema definitions and validation for:
 
 ### Resolution layer
 
-- [internal/resolve/registry.go](/Users/Alok/dev/uncloud-registry/internal/resolve/registry.go)
+- [internal/resolve/registry.go](/internal/resolve/registry.go)
 
 Responsible for:
 
@@ -329,8 +338,8 @@ Responsible for:
 
 ### Policy layer
 
-- [internal/policy/authz.go](/Users/Alok/dev/uncloud-registry/internal/policy/authz.go)
-- [internal/policy/stamps.go](/Users/Alok/dev/uncloud-registry/internal/policy/stamps.go)
+- [internal/policy/authz.go](/internal/policy/authz.go)
+- [internal/policy/stamps.go](/internal/policy/stamps.go)
 
 Responsible for:
 
@@ -340,19 +349,20 @@ Responsible for:
 
 ### Registry HTTP layer
 
-- [internal/registry/handler.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler.go)
+- [internal/registry/handler.go](/internal/registry/handler.go)
 
-Implements the registry API surface currently supported:
+Implements the registry API surface documented in [docs/compatibility.md](docs/compatibility.md):
 
-- `GET /v2/`
-- `GET/HEAD /v2/<name>/manifests/<reference>`
+- `GET/HEAD /v2`, `/v2/` (base ping)
+- `GET/HEAD /v2/<name>/manifests/<tag|digest>`
 - `PUT /v2/<name>/manifests/<tag>`
 - `GET/HEAD /v2/<name>/blobs/<digest>`
-- `POST/PATCH/PUT/GET/DELETE /v2/<name>/blobs/uploads/...`
+- `POST/GET/PATCH/PUT/DELETE /v2/<name>/blobs/uploads/...`
+- deferred (explicit `405 UNSUPPORTED`): catalog, manifest/blob deletion, cross-repo mount
 
 ### Staging layer
 
-- [internal/staging/store.go](/Users/Alok/dev/uncloud-registry/internal/staging/store.go)
+- [internal/staging/store.go](/internal/staging/store.go)
 
 Ephemeral upload state:
 
@@ -361,13 +371,13 @@ Ephemeral upload state:
 
 ### Publish layer
 
-- [internal/publish/publisher.go](/Users/Alok/dev/uncloud-registry/internal/publish/publisher.go)
+- [internal/publish/publisher.go](/internal/publish/publisher.go)
 
 Builds the next repo state and publishes it by moving the repo feed.
 
 ### Swarm adapter layer
 
-- [internal/swarm/bee.go](/Users/Alok/dev/uncloud-registry/internal/swarm/bee.go)
+- [internal/swarm/bee.go](/internal/swarm/bee.go)
 
 Bee-backed adapters for:
 
@@ -378,18 +388,37 @@ Bee-backed adapters for:
 
 ## Tests
 
+The compatibility contract, its gate commands, and the supported test suites
+are listed in [docs/compatibility.md](docs/compatibility.md) and enforced by
+the conformance matrix.
+
 Run all tests with:
 
 ```bash
 go test ./...
 ```
 
+Gate commands (all must pass before a release):
+
+```bash
+# Conformance matrix (distribution wire contract, no mocks)
+go test ./internal/registry -run TestDistributionConformanceMatrix -count=1 -v
+go test -race -count=1 ./internal/registry -run TestDistributionConformanceMatrix -v
+
+# Full suite, vet, build, formatting, module hygiene
+go test ./...
+go vet ./...
+go build ./...
+gofmt -l .
+go mod tidy   # must produce no diff
+```
+
 The most useful test files are:
 
-- [internal/registry/handler_test.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler_test.go)
-- [internal/swarm/bee_test.go](/Users/Alok/dev/uncloud-registry/internal/swarm/bee_test.go)
-- [internal/staging/store_test.go](/Users/Alok/dev/uncloud-registry/internal/staging/store_test.go)
-- [internal/spec/documents_test.go](/Users/Alok/dev/uncloud-registry/internal/spec/documents_test.go)
+- [internal/registry/handler_test.go](/internal/registry/handler_test.go)
+- [internal/swarm/bee_test.go](/internal/swarm/bee_test.go)
+- [internal/staging/store_test.go](/internal/staging/store_test.go)
+- [internal/spec/documents_test.go](/internal/spec/documents_test.go)
 
 ## How To Run
 
@@ -422,7 +451,7 @@ REGISTRY_BACKEND=bee \
 REGISTRY_RESOLUTION_MODE=static \
 BEE_API_URL=http://localhost:1633 \
 REGISTRY_OWNER_MAP=alice.uncloud-registry.com=0xfeedowner \
-BEE_FEED_SIGNER_PRIVATE_KEY=<hex-private-key> \
+CONTROLPLANE_URL=http://localhost:8081 \
 go run ./cmd/registry
 ```
 
@@ -430,24 +459,32 @@ Required variables in Bee mode:
 
 - `BEE_API_URL`
 - `REGISTRY_RESOLUTION_MODE`
+- `CONTROLPLANE_URL` (repository feed commits are signed by the control plane)
 
 Resolution-specific variables:
 
 - when `REGISTRY_RESOLUTION_MODE=static`:
-  - `REGISTRY_OWNER_MAP`
+  - `REGISTRY_OWNER_MAP` (host → feed-owner address)
+  - `REGISTRY_ID_MAP` (host → registry id)
 - when `REGISTRY_RESOLUTION_MODE=ens`:
   - `ETH_RPC_URL`
   - `REGISTRY_ENS_SUFFIX`
   - optional `ENS_REGISTRY_ADDRESS`
-
-Optional but required for publish:
-
-- `BEE_FEED_SIGNER_PRIVATE_KEY`
+- when `REGISTRY_RESOLUTION_MODE=controlplane`:
+  - `CONTROLPLANE_URL` (the control plane's internal listener — also required for
+    feed commits)
+  - `CONTROLPLANE_INTERNAL_SECRET_FILE` (the shared internal credential)
 
 Behavior:
 
-- without `BEE_FEED_SIGNER_PRIVATE_KEY`, Bee mode can read documents and upload objects but cannot publish repo state
-- with `BEE_FEED_SIGNER_PRIVATE_KEY`, Bee mode can also update repo `stateFeed`
+- without `CONTROLPLANE_URL`, Bee mode can read documents and upload objects but cannot publish repo state (repository feed commits are refused)
+- with `CONTROLPLANE_URL`, the registry requests each feed commit from the control-plane constrained signer
+
+> **Canonical deployment:** the reference `compose.yaml` stack is the
+> supported way to run the two services together (see
+> [docs/operations/install.md](docs/operations/install.md) for the secrets
+> layout, config, and readiness checks). The standalone `go run` examples
+> below are for local development only.
 
 `REGISTRY_OWNER_MAP` is a comma-separated host-to-owner mapping:
 
@@ -463,7 +500,7 @@ REGISTRY_RESOLUTION_MODE=ens \
 BEE_API_URL=http://localhost:1633 \
 ETH_RPC_URL=https://your-ethereum-rpc \
 REGISTRY_ENS_SUFFIX=registry.eth \
-BEE_FEED_SIGNER_PRIVATE_KEY=<hex-private-key> \
+CONTROLPLANE_URL=http://localhost:8081 \
 go run ./cmd/registry
 ```
 
@@ -474,6 +511,32 @@ In ENS mode, the registry server:
 - reads the ENS `addr` record
 - uses that address as the registry feed owner
 
+For control-plane-backed dynamic resolution, run:
+
+```bash
+REGISTRY_BACKEND=bee \
+REGISTRY_RESOLUTION_MODE=controlplane \
+BEE_API_URL=http://localhost:1633 \
+CONTROLPLANE_URL=http://127.0.0.1:8089 \
+CONTROLPLANE_INTERNAL_SECRET_FILE=/path/to/internal-secret \
+go run ./cmd/registry
+```
+
+In controlplane mode, the registry server resolves every host to its
+feed-owner address and RegistryID by calling the control plane's internal
+`/internal/v1/resolve/{host}` endpoint on each request (no cache). This reuses
+the same internal credential as feed commits — there is no separate token for
+resolution.
+
+Known limitations of controlplane mode:
+
+- resolution is a live call per request, so the data plane depends on the
+  control plane being reachable to resolve any host (an availability deviation
+  from the static/ENS modes' offline behavior)
+- the periodic staging-cleanup loop is not started (its committed-state guard
+  needs the full static identity list up front); staged uploads still expire
+  via the upload-time checks
+
 ### Port override
 
 ```bash
@@ -482,7 +545,7 @@ REGISTRY_ADDR=:5000 \
 BEE_API_URL=http://localhost:1633 \
 REGISTRY_RESOLUTION_MODE=static \
 REGISTRY_OWNER_MAP=alice.uncloud-registry.com=0xfeedowner \
-BEE_FEED_SIGNER_PRIVATE_KEY=<hex-private-key> \
+CONTROLPLANE_URL=http://localhost:8081 \
 go run ./cmd/registry
 ```
 
@@ -556,16 +619,49 @@ The intended setup flow is:
 6. Run the registry server in `ens` resolution mode.
 7. Push and pull using the registry host.
 
+## Operations
+
+Production runbooks for the reference deployment (Task 24 `compose.yaml`),
+grounded in the actual binaries:
+
+- [docs/operations/install.md](docs/operations/install.md) — secrets layout,
+  key/JWKS generation, `.env`, start and readiness verification.
+- [docs/operations/backup-restore.md](docs/operations/backup-restore.md) —
+  `scripts/operations/backup.sh`, `verify-backup.sh`, `restore.sh`; archive
+  contents, what is deliberately excluded (master key, credential files,
+  `.env`), restore safety gates, and the honest status of the deferred
+  push/pull stack drill (Phase 4).
+- [docs/operations/key-rotation.md](docs/operations/key-rotation.md) —
+  registry-token signing key rotation by `kid` overlap, session-key
+  rotation, master-key rotation + feed-key re-encryption, feed-owner
+  rotation limitations, verification and rollback.
+- [docs/operations/upgrade-rollback.md](docs/operations/upgrade-rollback.md) —
+  migration order (control plane v17 / staging v11), the backup gate,
+  compatibility window, and rollback-by-restore restrictions.
+- [docs/operations/incidents.md](docs/operations/incidents.md) — integrity
+  incidents, postage exhaustion, Bee outage, signer outage, staging disk
+  pressure, credential exposure.
+- [docs/evidence/phase-5-recovery.md](docs/evidence/phase-5-recovery.md) —
+  the executed backup/restore drill against the real SQLite databases
+  (fixture → backup → verify → tamper/determinism checks → restore →
+  schema/data equivalence → re-open + decrypt with the real constructors).
+- [docs/release-checklist.md](docs/release-checklist.md) — the operator/CI
+  release checklist (check.sh, traceability checker, secret scan, E2E,
+  operational drills, sign-off record).
+- [docs/evidence/v1-release.md](docs/evidence/v1-release.md) — the v1 release
+  decision record (source SHA, images, migration/Bee versions, client matrix,
+  backup drill result, honest deferral statement).
+
 ## Suggested Reading Order
 
 If you are new to the codebase, read in this order:
 
-1. [README.md](/Users/Alok/dev/uncloud-registry/README.md)
-2. [internal/spec/documents.go](/Users/Alok/dev/uncloud-registry/internal/spec/documents.go)
-3. [internal/registry/handler.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler.go)
-4. [internal/publish/publisher.go](/Users/Alok/dev/uncloud-registry/internal/publish/publisher.go)
-5. [internal/swarm/bee.go](/Users/Alok/dev/uncloud-registry/internal/swarm/bee.go)
-6. [internal/registry/handler_test.go](/Users/Alok/dev/uncloud-registry/internal/registry/handler_test.go)
+1. [README.md](/README.md)
+2. [internal/spec/documents.go](/internal/spec/documents.go)
+3. [internal/registry/handler.go](/internal/registry/handler.go)
+4. [internal/publish/publisher.go](/internal/publish/publisher.go)
+5. [internal/swarm/bee.go](/internal/swarm/bee.go)
+6. [internal/registry/handler_test.go](/internal/registry/handler_test.go)
 
 That sequence goes from the conceptual model to the request flow to the Swarm integration.
 
@@ -584,10 +680,12 @@ These are the main choices made so far:
 
 ## Near-Term Next Steps
 
-The most practical next steps are:
+v1 is feature-complete for its documented scope; the remaining work is the
+deferred Phase 4 / real-Bee E2E gate, then the production release sign-off:
 
-- seedable memory-mode configuration
-- stronger OCI manifest validation
-- Redis-backed staging
-- repo locking for concurrent push
-- cleanup/retention policy for staged uploads and old metadata
+- run the real-Bee feed-publication and Docker/Podman round-trip gates
+  (deferred pending a Bee full node — see [docs/compatibility.md](docs/compatibility.md) §8)
+- pin container image digests and produce release SBOMs/checksums
+- execute the full push/backup/restore/pull and live upgrade/rollback drills
+- complete the operator release checklist ([docs/release-checklist.md](docs/release-checklist.md))
+- record the final release decision in [docs/evidence/v1-release.md](docs/evidence/v1-release.md)

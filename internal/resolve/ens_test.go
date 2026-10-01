@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -60,6 +62,63 @@ func TestENSRegistryIdentityResolver(t *testing.T) {
 	}
 	if registry.Owner != ownerAddress.Hex() {
 		t.Fatalf("unexpected owner: %s", registry.Owner)
+	}
+}
+
+// hangingRPCServer returns an httptest server that accepts RPC requests and
+// never responds until the test closes the returned channel.
+func hangingRPCServer(t *testing.T) (*httptest.Server, chan struct{}) {
+	t.Helper()
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-done
+	}))
+	t.Cleanup(func() {
+		close(done)
+		srv.Close()
+	})
+	return srv, done
+}
+
+// TestENSResolutionTimeoutPreservesDeadlineExceeded proves an ENS resolution
+// against an RPC endpoint that never responds returns within the configured
+// client timeout and keeps context.DeadlineExceeded intact in the error chain.
+func TestENSResolutionTimeoutPreservesDeadlineExceeded(t *testing.T) {
+	t.Parallel()
+
+	hang, _ := hangingRPCServer(t)
+	resolver := ENSRegistryIdentityResolver{
+		DomainSuffix: "registry.eth",
+		RPCURL:       hang.URL,
+		HTTPClient:   &http.Client{Timeout: 200 * time.Millisecond},
+	}
+
+	start := time.Now()
+	_, err := resolver.ResolveRegistry(context.Background(), "alice.uncloud-registry.com")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("resolution error must wrap context.DeadlineExceeded, got %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("resolution exceeded the configured timeout: %v", elapsed)
+	}
+}
+
+// TestENSDefaultClientTimeoutBounded asserts the ENS resolver never falls back
+// to the bare http.DefaultClient: a nil client yields a bounded client.
+func TestENSDefaultClientTimeoutBounded(t *testing.T) {
+	t.Parallel()
+
+	c := boundedENSHClient()
+	if c == nil {
+		t.Fatal("fallback ENS client is nil")
+	}
+	if c == http.DefaultClient {
+		t.Fatal("fallback ENS client must not be http.DefaultClient")
+	}
+	if c.Timeout <= 0 {
+		t.Fatalf("fallback ENS client is unbounded (Timeout=%v)", c.Timeout)
 	}
 }
 

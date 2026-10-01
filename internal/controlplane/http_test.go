@@ -20,14 +20,13 @@ func TestUIRegistryCreationFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	tokens, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	tokens := newTestSessionManager(t)
 	server := httptest.NewServer(NewHTTPServer(&Service{
 		Store:          store,
 		Tokens:         tokens,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
 
@@ -58,6 +57,7 @@ func TestUIRegistryCreationFlow(t *testing.T) {
 		"ens_name":               {"alice.registry.eth"},
 		"default_stamp_batch_id": {"batch-1"},
 		"anonymous_pull":         {"true"},
+		"_csrf":                  {sessionCSRFForTest(t, cookies[0].Value)},
 	}
 	req, err := http.NewRequest(http.MethodPost, server.URL+"/ui/registries/new", strings.NewReader(form.Encode()))
 	if err != nil {
@@ -86,14 +86,13 @@ func TestUIInviteAcceptanceFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	tokens, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	tokens := newTestSessionManager(t)
 	service := &Service{
 		Store:          store,
 		Tokens:         tokens,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()
@@ -152,14 +151,13 @@ func TestUIRegistryDetailShowsAcceptedUserEmails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
-	tokens, err := auth.NewTokenManager("secret")
-	if err != nil {
-		t.Fatalf("new token manager: %v", err)
-	}
+	tokens := newTestSessionManager(t)
 	service := &Service{
 		Store:          store,
 		Tokens:         tokens,
 		RegistryDomain: "uncloud-registry.com",
+		FeedKeys:       newTestFeedKeyCipher(t),
+		Publisher:      newMemPublisher(),
 	}
 	server := httptest.NewServer(NewHTTPServer(service, auth.SubjectResolver{Tokens: tokens}))
 	defer server.Close()

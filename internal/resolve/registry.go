@@ -1,16 +1,45 @@
 package resolve
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 
 	"github.com/uncloud-registry/registry/internal/spec"
 )
 
+// ErrFeedNotFound is the conclusive not-found outcome for a repository/policy
+// feed that has never been written. Feed resolvers wrap this sentinel; callers
+// use errors.Is to distinguish a definitively absent feed from a resolver
+// failure (network, timeout, decode, malformed), and only treat the wrapped
+// outcome as generation zero.
+var ErrFeedNotFound = errors.New("feed not found")
+
+// ErrDocumentNotFound is the conclusive not-found outcome for an immutable
+// object/document read (a definitive HTTP 404 on a Bee read). It lets the
+// optional resolver distinguish "the repository feed payload has never been
+// written" from corruption or transport failures when a feed reference maps to
+// itself and the document reader performs the actual feed read.
+var ErrDocumentNotFound = errors.New("document not found")
+
 type RegistryIdentity struct {
-	Host  string
+	Host string
+	// Owner is the registry's feed-owner address as configured on the control
+	// plane, used to derive its deterministic feeds.
 	Owner string
+	// RegistryID is the unambiguous control-plane registry identifier for the
+	// host, so the data plane can route an internal feed commit to the exact
+	// registry. It is 0 when the resolver does not carry an explicit ID — an
+	// in-memory/dev identity — in which case authenticated control-plane feed
+	// commits (which require a positive RegistryID) fail closed rather than
+	// silently assigning an ID.
+	RegistryID int64
 }
 
 type Reader interface {
@@ -32,7 +61,17 @@ type RegistryResolver struct {
 }
 
 func (r RegistryResolver) ResolveRegistry(ctx context.Context, host string) (RegistryIdentity, error) {
-	registry, err := r.Registries.ResolveRegistry(ctx, host)
+	// Every registry resolution happens under the canonical service name:
+	// raw client hosts (case, trailing dot, port, IPv6 spelling) are
+	// normalized exactly once at the request boundary before ANY resolver —
+	// configured-static, ENS, or subdomain — sees the value. The resolved
+	// identity's Host is what the token service comparison uses, so the
+	// canonical form must be in place before identity resolution.
+	normalized, err := NormalizeRegistryHost(host)
+	if err != nil {
+		return RegistryIdentity{}, fmt.Errorf("normalize registry host: %w", err)
+	}
+	registry, err := r.Registries.ResolveRegistry(ctx, normalized)
 	if err != nil {
 		return RegistryIdentity{}, fmt.Errorf("resolve registry identity: %w", err)
 	}
@@ -61,14 +100,66 @@ func (r RegistryResolver) ResolveRepoState(ctx context.Context, registry Registr
 	return doc, nil
 }
 
+// ResolveRepoStateOptional is the SAFE first-publication variant of
+// ResolveRepoState: it resolves the current repo state but treats a
+// CONCLUSIVELY ABSENT repository feed (never written) as (zero state,
+// found=false, nil) instead of an error. Every other failure — feed
+// resolution network/timeout, document read/decode, integrity, repo
+// mismatch — stays a wrapped error. It never synthesizes or writes state, so
+// callers can run it on every authorized manifest PUT and only create
+// generation zero when found=false. A feed that RESOLVES but points at a
+// missing or malformed document is corruption and remains an error; only a
+// missing feed (or a feed:// reference whose payload read definitively 404s,
+// the Bee-mode wiring) counts as absent.
+func (r RegistryResolver) ResolveRepoStateOptional(ctx context.Context, registry RegistryIdentity, repo string) (spec.RepoStateDocument, bool, error) {
+	stateRef, err := r.Feeds.ResolveFeed(ctx, spec.RepoStateFeedRef(registry.Owner, repo))
+	if err != nil {
+		if errors.Is(err, ErrFeedNotFound) {
+			return spec.RepoStateDocument{}, false, nil
+		}
+		return spec.RepoStateDocument{}, false, fmt.Errorf("resolve repo state feed: %w", err)
+	}
+
+	data, err := r.Docs.Read(ctx, stateRef)
+	if err != nil {
+		// A feed:// reference IS the repository feed itself (Bee mode maps the
+		// repo feed to itself and reads its payload through the document
+		// reader), so a definitive not-found on that read is the same
+		// conclusively-missing-feed outcome. A plain content reference that
+		// 404s is corruption.
+		if strings.HasPrefix(stateRef, "feed://") && errors.Is(err, ErrDocumentNotFound) {
+			return spec.RepoStateDocument{}, false, nil
+		}
+		return spec.RepoStateDocument{}, false, fmt.Errorf("read repo state document: %w", err)
+	}
+
+	doc, err := spec.DecodeRepoStateDocument(data)
+	if err != nil {
+		return spec.RepoStateDocument{}, false, err
+	}
+	if doc.Repo != repo {
+		return spec.RepoStateDocument{}, false, fmt.Errorf("repo state document repo mismatch: got %q want %q", doc.Repo, repo)
+	}
+	return doc, true, nil
+}
+
 type StaticRegistryIdentityResolver struct {
 	Hosts map[string]RegistryIdentity
 }
 
 func (s StaticRegistryIdentityResolver) ResolveRegistry(_ context.Context, host string) (RegistryIdentity, error) {
-	ref, ok := s.Hosts[host]
+	// Normalize the QUERY host so a configured canonical key matches
+	// regardless of client casing, trailing dot, or port spelling, even when
+	// this resolver is used directly (RegistryResolver also normalizes at its
+	// boundary; normalization is idempotent). Configured keys are expected to
+	// be canonical service names.
+	normalized, err := NormalizeRegistryHost(host)
+	if err != nil {
+		return RegistryIdentity{}, err
+	}
+	ref, ok := s.Hosts[normalized]
 	if !ok {
-		return RegistryIdentity{}, fmt.Errorf("host %q not found", host)
+		return RegistryIdentity{}, fmt.Errorf("host %q not found", normalized)
 	}
 	return ref, nil
 }
@@ -80,7 +171,7 @@ type MemoryReader struct {
 func (m MemoryReader) Read(_ context.Context, ref string) ([]byte, error) {
 	data, ok := m.Documents[ref]
 	if !ok {
-		return nil, fmt.Errorf("document %q not found", ref)
+		return nil, fmt.Errorf("document %q not found: %w", ref, ErrDocumentNotFound)
 	}
 	out := make([]byte, len(data))
 	copy(out, data)
@@ -98,20 +189,18 @@ type StaticFeedResolver struct {
 func (s StaticFeedResolver) ResolveFeed(_ context.Context, feed string) (string, error) {
 	ref, ok := s.Feeds[feed]
 	if !ok {
-		return "", fmt.Errorf("feed %q not found", feed)
+		return "", fmt.Errorf("feed %q not found: %w", feed, ErrFeedNotFound)
 	}
 	return ref, nil
 }
 
 type MemoryDocumentStore struct {
 	mu        sync.RWMutex
-	nextID    int64
 	Documents map[string][]byte
 }
 
 func NewMemoryDocumentStore() *MemoryDocumentStore {
 	return &MemoryDocumentStore{
-		nextID:    1,
 		Documents: map[string][]byte{},
 	}
 }
@@ -122,7 +211,7 @@ func (m *MemoryDocumentStore) Read(_ context.Context, ref string) ([]byte, error
 
 	data, ok := m.Documents[ref]
 	if !ok {
-		return nil, fmt.Errorf("document %q not found", ref)
+		return nil, fmt.Errorf("document %q not found: %w", ref, ErrDocumentNotFound)
 	}
 	out := make([]byte, len(data))
 	copy(out, data)
@@ -133,16 +222,87 @@ func (m *MemoryDocumentStore) Get(ctx context.Context, ref string) ([]byte, erro
 	return m.Read(ctx, ref)
 }
 
+// ReadBounded implements the registry publication-verification bounded byte
+// reader (BoundedBytesReader): it returns the immutable object at ref only if
+// its length does not exceed maxBytes, so a verification read is strictly
+// bounded BEFORE allocation — matching the production BeeObjectStore.ReadBounded
+// /bytes contract used for artifact bodies. A non-negative bound is required;
+// an object larger than the bound and a missing object are data-free errors.
+func (m *MemoryDocumentStore) ReadBounded(_ context.Context, ref string, maxBytes int64) ([]byte, error) {
+	if maxBytes < 0 {
+		return nil, errors.New("bounded read requires a non-negative bound")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	data, ok := m.Documents[ref]
+	if !ok {
+		return nil, fmt.Errorf("document %q not found: %w", ref, ErrDocumentNotFound)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("document read exceeded the bound")
+	}
+	return append([]byte(nil), data...), nil
+}
+
+// OpenObject streams the immutable object at ref with an EXPLICIT upper
+// bound (BoundedObjectStreamer) — the in-memory counterpart of
+// *swarm.BeeObjectStore.OpenObject used by pull-integrity pre-verification.
+// The bound is enforced before any byte is returned (the whole object is
+// already in memory in this dev/test store); an object larger than the bound
+// and a missing object are data-free errors.
+func (m *MemoryDocumentStore) OpenObject(_ context.Context, ref string, maxBytes int64) (io.ReadCloser, error) {
+	if maxBytes < 0 {
+		return nil, errors.New("bounded object stream requires a non-negative bound")
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	data, ok := m.Documents[ref]
+	if !ok {
+		return nil, fmt.Errorf("document %q not found: %w", ref, ErrDocumentNotFound)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, errors.New("object stream exceeds the bound")
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// Put stores data under its deterministic content address — the exact
+// in-memory model of Bee's content-addressed immutable store that
+// restart-safe retries depend on: identical bytes ALWAYS produce the identical
+// reference, so a retried publication (same manifest and repo-state bytes)
+// resolves to the same immutable objects and NEVER grows the store.
 func (m *MemoryDocumentStore) Put(_ context.Context, data []byte, _ string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	ref := fmt.Sprintf("mem-ref-%d", m.nextID)
-	m.nextID++
+	sum := sha256.Sum256(data)
+	ref := "mem-ref-" + hex.EncodeToString(sum[:])
 	out := make([]byte, len(data))
 	copy(out, data)
 	m.Documents[ref] = out
 	return ref, nil
+}
+
+// PutStream is the streaming dev/test counterpart of Put: it reads exactly
+// size bytes from src (bounded at size+1, failing closed on overflow) into a
+// content-addressed in-memory document. It exists so the memory handler passes
+// the same reader+size object-uploader contract as production Bee without
+// buffering the payload twice in the handler.
+func (m *MemoryDocumentStore) PutStream(ctx context.Context, src io.Reader, size int64, _ string) (string, error) {
+	if size < 0 {
+		return "", fmt.Errorf("streamed put requires a non-negative size")
+	}
+	if src == nil {
+		return "", fmt.Errorf("streamed put requires a source reader")
+	}
+	data, err := io.ReadAll(io.LimitReader(src, size+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) > size {
+		return "", fmt.Errorf("streamed put payload exceeds the declared size")
+	}
+	return m.Put(ctx, data, "")
 }
 
 type MemoryFeedStore struct {
@@ -160,7 +320,7 @@ func (m *MemoryFeedStore) ResolveFeed(_ context.Context, feed string) (string, e
 
 	ref, ok := m.Feeds[feed]
 	if !ok {
-		return "", fmt.Errorf("feed %q not found", feed)
+		return "", fmt.Errorf("feed %q not found: %w", feed, ErrFeedNotFound)
 	}
 	return ref, nil
 }

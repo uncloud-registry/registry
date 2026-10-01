@@ -1,0 +1,297 @@
+# Canonical reference deployment for uncloud-registry v1 (Task 24).
+#
+# Services: controlplane (public API + internal feed signer), registry (data
+# plane), Bee (Swarm storage), and Caddy (reference TLS routing, see
+# deploy/Caddyfile). All services restart unless stopped. Every credential is
+# mounted read-only from ${SECRETS_DIR} (never baked into images or committed);
+# see .env.example for every variable and the expected secrets-dir files.
+#
+# NOTE: bee runs as an ISOLATED LIGHT node (--full-node=false, no bootnodes);
+# feed publication requires a full-node peer and is deferred to the Phase 4 /
+# real-Bee E2E gate (see docs/compatibility.md "Known limitations").
+#
+# The compose network uses a FIXED subnet (172.29.0.0/16): the trusted-proxy
+# declaration and the e2e Docker/Podman helper containers rely on it.
+#
+# Ports:
+#   controlplane  8081 public API  (published on host loopback only)
+#                8089 internal feed-signing listener (TLS, compose-network only)
+#   registry      80   HTTP data plane (served portless so in-network e2e
+#                     clients address the registry host without a port; the
+#                     image default and documented port is 8080)
+#   bee           1633 API, 1635 debug API (host loopback only)
+#   caddy         80/443 public HTTPS entry point (TLS via deploy/Caddyfile)
+
+name: uncloud-registry
+
+services:
+  controlplane:
+    build:
+      context: .
+      dockerfile: Dockerfile.controlplane
+    image: uncloud-registry/controlplane:local
+    restart: unless-stopped
+    # The binaries enforce owner-only (0600) permissions on secret/key files,
+    # but bind-mounted files keep the HOST's uid/gid, which no non-root
+    # container uid can read. The entrypoint below runs as root ONCE to stage
+    # an owner-matched copy under /var/run/uncloud-registry-secrets (the bind
+    # mount itself stays read-only), then drops to uid 65532 with setpriv
+    # before exec'ing. The image's default USER stays 65532 for plain run.
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /var/run/uncloud-registry-secrets
+        cp -a /run/secrets /var/run/uncloud-registry-secrets
+        chown -R 65532:65532 /var/run/uncloud-registry-secrets
+        chmod 0600 /var/run/uncloud-registry-secrets/master.json \
+                   /var/run/uncloud-registry-secrets/internal-secret.txt \
+                   /var/run/uncloud-registry-secrets/internal-key.pem
+        exec setpriv --reuid=65532 --regid=65532 --clear-groups \
+          /usr/local/bin/controlplane
+    environment:
+      CONTROLPLANE_MODE: ${CONTROLPLANE_MODE:-production}
+      CONTROLPLANE_ADDR: ":8081"
+      # Durable SQLite store on the persistent volume (migrations run at
+      # startup). A bare file path keeps the volume simple; pragmas are pinned.
+      CONTROLPLANE_DB_PATH: "file:/var/lib/uncloud-registry/controlplane.db?_pragma=foreign_keys(1)"
+      CONTROLPLANE_SESSION_TTL: ${CONTROLPLANE_SESSION_TTL:-24h}
+      CONTROLPLANE_TOKEN_SECRET: ${CONTROLPLANE_TOKEN_SECRET:-}
+      CONTROLPLANE_EXTERNAL_URL: ${CONTROLPLANE_EXTERNAL_URL:-https://controlplane.uncloud-registry.test}
+      CONTROLPLANE_REGISTRY_DOMAIN: ${CONTROLPLANE_REGISTRY_DOMAIN:-uncloud-registry.test}
+      CONTROLPLANE_REGISTRY_ED25519_KEY: ${CONTROLPLANE_REGISTRY_ED25519_KEY:-}
+      CONTROLPLANE_REGISTRY_KEY_ID: ${CONTROLPLANE_REGISTRY_KEY_ID:-cp-ed25519-1}
+      CONTROLPLANE_MASTER_KEY_FILE: /var/run/uncloud-registry-secrets/master.json
+      CONTROLPLANE_BEE_API_URL: http://bee:1633
+      # Caddy terminates TLS; the control plane trusts only the compose subnet.
+      CONTROLPLANE_TLS_TERMINATION: trusted-proxy
+      CONTROLPLANE_TRUSTED_PROXIES: ${CONTROLPLANE_TRUSTED_PROXIES:-172.29.0.0/16}
+      # Internal feed-signing listener (TLS, served to the registry data plane
+      # over the compose network).
+      CONTROLPLANE_INTERNAL_ADDR: ":8089"
+      CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt
+      CONTROLPLANE_INTERNAL_TLS_CERT_FILE: /var/run/uncloud-registry-secrets/internal-cert.pem
+      CONTROLPLANE_INTERNAL_TLS_KEY_FILE: /var/run/uncloud-registry-secrets/internal-key.pem
+    volumes:
+      - controlplane-data:/var/lib/uncloud-registry
+      - ${SECRETS_DIR:-./.secrets}:/run/secrets:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/readyz || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+      start_period: 10s
+    depends_on:
+      bee:
+        condition: service_healthy
+
+  registry:
+    build:
+      context: .
+      dockerfile: Dockerfile.registry
+    image: uncloud-registry/registry:local
+    restart: unless-stopped
+    # Same secret-staging + privilege-drop pattern as the control plane:
+    # root stages an owner-matched copy of the :ro secrets mount, then
+    # setpriv drops to 65532 before exec (image default USER stays 65532).
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /var/run/uncloud-registry-secrets
+        cp -a /run/secrets /var/run/uncloud-registry-secrets
+        chown -R 65532:65532 /var/run/uncloud-registry-secrets
+        chmod 0600 /var/run/uncloud-registry-secrets/internal-secret.txt \
+                   /var/run/uncloud-registry-secrets/internal-key.pem
+        exec setpriv --reuid=65532 --regid=65532 --clear-groups \
+          /usr/local/bin/registry
+    environment:
+      REGISTRY_BACKEND: bee
+      REGISTRY_ADDR: ":80"
+      BEE_API_URL: http://bee:1633
+      REGISTRY_RESOLUTION_MODE: static
+      # Hosts served by this data plane and their control-plane identities are
+      # operator-supplied (one <host>=<owner> pair and one <host>=<id> pair per
+      # host). The e2e scripts derive them from the control plane's registries.
+      REGISTRY_OWNER_MAP: ${REGISTRY_OWNER_MAP:-}
+      REGISTRY_ID_MAP: ${REGISTRY_ID_MAP:-}
+      REGISTRY_TOKEN_ISSUER: uncloud-registry/registry
+      REGISTRY_TOKEN_PUBLIC_KEYS_FILE: /var/run/uncloud-registry-secrets/registry-jwks.json
+      REGISTRY_TOKEN_AUDIENCE: ${REGISTRY_TOKEN_AUDIENCE:-}
+      REGISTRY_AUTH_REALM: ${REGISTRY_AUTH_REALM:-https://controlplane.uncloud-registry.test/token}
+      # Registry -> control-plane internal feed signer (TLS, custom CA bundle).
+      CONTROLPLANE_URL: https://controlplane:8089
+      CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt
+      CONTROLPLANE_CA_BUNDLE_FILE: /var/run/uncloud-registry-secrets/internal-ca.pem
+      # Durable staging (Task 15): spool + dedicated SQLite on the volume.
+      REGISTRY_STAGING_ROOT: /var/lib/uncloud-registry/spool
+      REGISTRY_STAGING_DB: /var/lib/uncloud-registry/staging.db
+      REGISTRY_UPLOAD_TTL: ${REGISTRY_UPLOAD_TTL:-24h}
+      REGISTRY_MAX_UPLOAD_BYTES: ${REGISTRY_MAX_UPLOAD_BYTES:-2147483648}
+      REGISTRY_MAX_REPOSITORY_BYTES: ${REGISTRY_MAX_REPOSITORY_BYTES:-26843545600}
+      REGISTRY_MAX_TOTAL_STAGING_BYTES: ${REGISTRY_MAX_TOTAL_STAGING_BYTES:-53687091200}
+      REGISTRY_CLEANUP_INTERVAL: ${REGISTRY_CLEANUP_INTERVAL:-5m}
+      REGISTRY_CLEANUP_BATCH: ${REGISTRY_CLEANUP_BATCH:-100}
+    volumes:
+      - staging-data:/var/lib/uncloud-registry
+      - ${SECRETS_DIR:-./.secrets}:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/readyz || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+      start_period: 10s
+    depends_on:
+      controlplane:
+        condition: service_healthy
+      bee:
+        condition: service_healthy
+
+  bee:
+    image: ethersphere/bee:2.8.2
+    restart: unless-stopped
+    # The bee image runs as uid 999 (bee) and has no shell tools; bind-mounted
+    # secrets keep host ownership, so stage an owner-matched copy as root,
+    # then drop to 999 with setpriv. The named volume at /home/bee inherits
+    # the image's bee-owned directory, keeping the data dir writable.
+    # Postage stamps come from the pinned local dev chain (localchain, chain
+    # id 12345), whose pre-deployed contract addresses follow the values the
+    # swarm team's own localchain image exports. bee runs in an ISOLATED
+    # overlay (network-id 12345, no bootnodes): nothing leaves this stack.
+    # The stake registry is pinned explicitly: bee 2.8 queries it for the
+    # potential-stake check at startup even with swap/staking off, and without
+    # it the call goes to the zero address and bee aborts on an ABI unmarshal
+    # error. The chain RPC goes through localchain-proxy: the pinned localchain
+    # node (hardhat/EDR 0.2.0-dev) only reads the "data" field on transaction
+    # objects, while bee's go-ethereum serializes calldata as "input"; the
+    # shim bridges that one field (see deploy/rpc-proxy.py).
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /var/run/uncloud-registry-secrets
+        cp -a /run/secrets /var/run/uncloud-registry-secrets
+        chown -R 999:999 /var/run/uncloud-registry-secrets
+        chmod 0600 /var/run/uncloud-registry-secrets/bee-password.txt
+        exec setpriv --reuid=999 --regid=999 --clear-groups \
+          /usr/local/bin/bee start \
+          --api-addr=:1633 \
+          --p2p-addr=:1634 \
+          --data-dir=/home/bee/.bee \
+          --password-file=/var/run/uncloud-registry-secrets/bee-password.txt \
+          --blockchain-rpc-endpoint=http://localchain-proxy:8545 \
+          --mainnet=false \
+          --network-id=12345 \
+          --bootnode= \
+          --swap-enable=false \
+          --chequebook-enable=false \
+          --bzz-token-address=0x6AAB14FE9cccd64A502d23842d916eB5321c26E7 \
+          --postage-stamp-address=0x657241f4494A2F15Ba75346E691d753A978C72Df \
+          --postage-stamp-start-block=1 \
+          --staking-address=0xfc28330f1ecE0ef2371B724E0D19c1EE60B728b2 \
+          --swap-factory-address=0xdD661f2500bA5831e3d1FEbAc379Ea1bF80773Ac \
+          --full-node=false \
+          --verbosity=4 \
+          --welcome-message=uncloud-registry-reference
+    volumes:
+      - bee-data:/home/bee
+      - ${SECRETS_DIR:-./.secrets}:/run/secrets:ro
+    ports:
+      - "127.0.0.1:1633:1633"
+    healthcheck:
+      # No network tools exist in the bee image; probe the kernel TCP table
+      # (v4 + v6) for the API listener (port 1633 = 0x0661) instead.
+      test: ["CMD-SHELL", "grep -Eq ':0661 ' /proc/net/tcp /proc/net/tcp6 || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 60
+      start_period: 60s
+    depends_on:
+      localchain-proxy:
+        condition: service_healthy
+
+  localchain-proxy:
+    # Transparent RPC shim: bridges the "input" calldata field (go-ethereum in
+    # bee 2.8.2) to the "data" field the pinned hardhat localchain node reads
+    # (see deploy/rpc-proxy.py). Stateless, mounted read-only; no build step.
+    image: python:3.12-alpine
+    restart: unless-stopped
+    environment:
+      LOCALCHAIN_RPC_UPSTREAM: http://localchain:8545
+    volumes:
+      - ./deploy/rpc-proxy.py:/rpc-proxy.py:ro
+    command:
+      - python3
+      - /rpc-proxy.py
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8545/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      localchain:
+        condition: service_healthy
+
+  localchain:
+    # Swarm dev chain with the postage/swap/staking contracts pre-deployed
+    # (chain id 12345). Pinned to 0.9.4 (matches deploy/rpc-proxy.py).
+    image: ethersphere/bee-localchain:0.9.4
+    restart: unless-stopped
+    ports:
+      # 8546 on the host to avoid collisions with locally running chains.
+      - "127.0.0.1:8546:8545"
+    healthcheck:
+      # hardhat RPC listener (port 8545 = 0x2161) in the kernel TCP table.
+      test: ["CMD-SHELL", "grep -Eq ':2161 ' /proc/net/tcp /proc/net/tcp6 || exit 1"]
+      interval: 5s
+      timeout: 4s
+      retries: 60
+      start_period: 60s
+
+  caddy:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    environment:
+      CONTROLPLANE_HOST: ${CONTROLPLANE_HOST:-controlplane.uncloud-registry.test}
+      REGISTRY_HOST_GLOB: ${REGISTRY_HOST_GLOB:-*.uncloud-registry.test}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      # / 308-redirects to internal-CA HTTPS (untrusted to the image's busybox
+      # wget), so probe Caddy's admin API on localhost:2019 instead.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
+      interval: 10s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      registry:
+        condition: service_healthy
+      controlplane:
+        condition: service_healthy
+
+networks:
+  default:
+    ipam:
+      config:
+        # 172.28.0.0/16 is commonly claimed by other local stacks (e.g. the
+        # mev-commit dev harness); 172.29.0.0/16 avoids the collision while
+        # keeping a predictable range for CONTROLPLANE_TRUSTED_PROXIES.
+        - subnet: 172.29.0.0/16
+
+volumes:
+  controlplane-data:
+  staging-data:
+  bee-data:

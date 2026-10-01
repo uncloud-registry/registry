@@ -1,0 +1,528 @@
+package controlplane
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"math"
+	"reflect"
+	"time"
+)
+
+// ObjectStore is the writable/readable content-address store a publication
+// worker uses: Put uploads bytes and returns a content address, Get reads a
+// content address back so read-back can be verified. The production Bee object
+// store satisfies it; tests use a memory implementation.
+type ObjectStore interface {
+	Put(ctx context.Context, data []byte, batchID string) (string, error)
+	Get(ctx context.Context, ref string) ([]byte, error)
+}
+
+// FeedResolver resolves a registry policy feed to the ref currently stored AT
+// it, so reconciliation can PROVE the feed really points at the object it
+// uploaded. A no-op, wrong, or overwritten feed updater — one that reports
+// success but never writes, writes to a different feed, or was later
+// clobbered — must never complete a job: the resolved ref must equal the
+// expected object ref before a job is marked verified. Persisting or trusting
+// the feed_ref identifier is NOT proof; only an independent resolution equals
+// the uploaded object ref. Per the Bee feed contract the feed endpoint returns
+// the feed payload bytes directly (the raw object reference — no 8-byte length
+// prefix), so the production BeeFeedResolver reads and canonically normalizes
+// that bounded body; tests use a memory feed store whose independent map can
+// simulate a mis-directed feed.
+type FeedResolver interface {
+	ResolveFeed(ctx context.Context, feed string) (string, error)
+}
+
+// Provisioning state vocabulary. A registry is born 'provisioning', transitions
+// to 'ready' only after BOTH bootstrap jobs have completed verified read-back,
+// and to 'failed' only under the explicit bounded-attempts rule. Partial success
+// (one job done, the other still retrying) always remains 'provisioning'.
+const (
+	ProvisioningStateProvisioning = "provisioning"
+	ProvisioningStateReady        = "ready"
+	ProvisioningStateFailed       = "failed"
+)
+
+// Publication kinds: the two deterministic logical bootstrap jobs created
+// transactionally with every registry. There is exactly one row per
+// (registry, kind), enforced by the schema's unique(registry_id, kind).
+const (
+	PublicationKindAuth  = "auth"
+	PublicationKindStamp = "stamp"
+)
+
+// Publication states: pending (eligible for a worker), claimed (held by one
+// worker until a lease), succeeded (terminal, verified read-back), and failed
+// (terminal, attempts exhausted). Stale claimed jobs are reclaimed after the
+// lease by another worker.
+const (
+	PublicationStatePending   = "pending"
+	PublicationStateClaimed   = "claimed"
+	PublicationStateSucceeded = "succeeded"
+	PublicationStateFailed    = "failed"
+)
+
+// Claim/ownership failures that must never leak as a retryable external
+// failure (they mean the job is legitimately owned by another, newer worker,
+// so a stale worker must back off, not overwrite).
+var (
+	errLostClaim        = errors.New("publication claim was lost to another worker")
+	errReadBackMismatch = errors.New("publication read-back did not match expected content")
+)
+
+// errReconcilerNotConfigured is the data-free, fail-closed error returned by
+// RunOnce (and NewReconciler) when the reconciler is missing any dependency it
+// needs to publish and verify a job (store, documents, feeds, or feed
+// resolver). It is a configuration error, never a panic.
+var errReconcilerNotConfigured = errors.New("reconciler is not fully configured: store, documents, feeds, and feed resolver are required")
+
+// isNilDependency reports whether v is nil OR a nil-capable TYPED nil: an
+// interface (or pointer) whose dynamic value is a nil pointer/map/slice/func/
+// chan. A plain `v == nil` test misses the typed-nil case — e.g. a
+// (*t) (nil) stored in an interface slot never equals nil — so a facade check
+// would pass and the first method invocation would panic. Reflection closes
+// that gap so every dependency is validated fail-closed (no panic, a data-free
+// configuration error) BEFORE any key generation, DB write, or method call.
+func isNilDependency(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// errProvisioningNotConfigured is the data-free, fail-closed error returned by
+// Service.CreateRegistry when the control plane cannot actually provision a
+// registry (no Store, no Publisher, or a Publisher missing its Documents,
+// Feeds, or feed read-back resolver). Creation rejects BEFORE key generation
+// or any database write, so a misconfigured deployment never silently enqueues
+// a registry that would sit provisioning forever.
+var errProvisioningNotConfigured = errors.New("registry provisioning is not configured: a publisher with documents, feeds, and feed read-back is required")
+
+// errRegistryNotReady is the typed service error returned when a registry
+// settings update is attempted before verified bootstrap publication completes
+// (provisioning_state != ready). It is a stable sentinel so the API/UI can map
+// it to a clear, safe response without leaking internals.
+var errRegistryNotReady = errors.New("registry is still provisioning; settings can be changed only after bootstrap policy publication completes")
+
+// PublicationJob is the inbox row for one logical bootstrap publication. The
+// payload holds the DETERMINISTIC canonical policy-document JSON and contains
+// NO secret key material; the object_ref (uploaded content address) and
+// feed_ref (published topic feed) are persisted stage-by-stage so a retry after
+// an upload or feed-update failure resumes without repeating finished stages.
+// LastError is a sanitized coarse class (never a payload, secret, or internal
+// response body).
+type PublicationJob struct {
+	ID           int64
+	RegistryID   int64
+	Kind         string
+	PayloadJSON  []byte
+	State        string
+	ObjectRef    string
+	FeedRef      string
+	Attempts     int
+	NextAttempt  time.Time
+	ClaimedUntil *time.Time
+	ClaimedBy    string
+	LastError    string
+	CreatedAt    time.Time
+	CompletedAt  *time.Time
+}
+
+// publicationJobColumns is the canonical read column list for
+// registry_publication_jobs.
+const publicationJobColumns = `id, registry_id, kind, state, payload_json, object_ref, feed_ref,
+	attempts, next_attempt_at, claimed_until, claimed_by, last_error, created_at, completed_at`
+
+// Timestamps in registry_publication_jobs are stored as bounded INTEGER Unix
+// NANOSECONDS (migration 8), because SQLite cannot robustly validate a
+// canonical UTC RFC3339/RFC3339Nano TEXT value (calendar validity, canonical
+// form) in a CHECK; an INTEGER with a typeof guard is a representation the
+// database CAN enforce exactly. Nanoseconds (not milliseconds) are used so a
+// sub-millisecond RFC3339Nano instants survives migration 8 EXACTLY — no
+// representable instant is truncated. These helpers convert to/from time.Time.
+func timeToNanos(t time.Time) int64 {
+	return t.UTC().UnixNano()
+}
+
+func nanosToTime(ns int64) time.Time {
+	return time.Unix(0, ns).UTC()
+}
+
+// parseCanonicalUTCNanos parses a legacy (v7) TEXT journal timestamp into its
+// epoch nanoseconds. It is the store-side inverse of the migration 8
+// conversion and is used by migration 8 to validate+convert every existing
+// row: it accepts ONLY a canonical UTC RFC3339/RFC3339Nano value (real
+// calendar/time validity via time.Parse, and a trailing 'Z' so an offset form
+// is rejected) and returns its exact nanosecond instant, so the migrated
+// INTEGER columns and any consumer agree to the last nanosecond. The bounds
+// check is mathematically exact: the parsed instant is compared as a time.Time
+// against the real int64-nanosecond extremes (time.Unix(0, math.MinInt64) and
+// time.Unix(0, math.MaxInt64), UTC) BEFORE any UnixNano() call, so the exact
+// minimum 1677-09-21T00:12:43.145224192Z and maximum
+// 2262-04-11T23:47:16.854775807Z are accepted, one nanosecond outside either
+// edge is rejected, and a whole-second bound can never admit a fractional
+// overflow/underflow. Noncanonical forms are rejected; no silent fallback ever
+// turns a malformed timestamp into a zero time.
+func parseCanonicalUTCNanos(s string) (int64, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return 0, err
+	}
+	if t.Location() != time.UTC || len(s) == 0 || s[len(s)-1] != 'Z' {
+		return 0, fmt.Errorf("timestamp %q is not canonical UTC (must end in 'Z')", s)
+	}
+	// Compare against the exact representable int64-nanosecond extremes as
+	// time.Time values (not after a lossy Unix()/seconds bound), so boundary
+	// nanoseconds are not silently wrapped by an overflow or underflow.
+	if t.Before(time.Unix(0, math.MinInt64).UTC()) || t.After(time.Unix(0, math.MaxInt64).UTC()) {
+		return 0, fmt.Errorf("timestamp %q is out of the int64-nanosecond range", s)
+	}
+	// t is now provably within [minInt64, maxInt64] nanoseconds, so UnixNano is
+	// well-defined and cannot overflow.
+	return t.UTC().UnixNano(), nil
+}
+
+func scanPublicationJob(s scanRow, job *PublicationJob) error {
+	var nextAttemptNanos, createdAtNanos int64
+	var claimedUntil, completedAt sql.NullInt64
+	var payload []byte
+	if err := s.Scan(&job.ID, &job.RegistryID, &job.Kind, &job.State, &payload,
+		&job.ObjectRef, &job.FeedRef, &job.Attempts, &nextAttemptNanos, &claimedUntil,
+		&job.ClaimedBy, &job.LastError, &createdAtNanos, &completedAt); err != nil {
+		return err
+	}
+	job.PayloadJSON = payload
+	job.NextAttempt = nanosToTime(nextAttemptNanos)
+	job.CreatedAt = nanosToTime(createdAtNanos)
+	if claimedUntil.Valid {
+		t := nanosToTime(claimedUntil.Int64)
+		job.ClaimedUntil = &t
+	}
+	if completedAt.Valid {
+		t := nanosToTime(completedAt.Int64)
+		job.CompletedAt = &t
+	}
+	return nil
+}
+
+// randomWorkerToken returns a fresh cryptographically random hex token that
+// identifies one claim. It is generated inside the claim transaction so a
+// worker's ownership of a claimed job is provable and unforgeable.
+func randomWorkerToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// CreateProvisionedRegistry atomically creates a registry, its owner
+// membership, and its two durable bootstrap jobs (auth, stamp) in ONE write
+// transaction. The feed-owner signing key is encrypted inside the transaction
+// with the row's own ID and owner as AES-GCM AAD (the same custody contract as
+// CreateRegistry; the plaintext is owned by the caller and wiped after the
+// call). Any failure — including a second job insert failing — rolls the whole
+// thing back, so there is never an orphan registry, member, or job, and no
+// external publication happens here. The registry is returned 'provisioning',
+// never claiming published bootstrap refs.
+func (s *Store) CreateProvisionedRegistry(ctx context.Context, registry Registry, keyCipher *FeedKeyCipher, feedKey []byte, authPayload []byte, stampPayload []byte) (Registry, error) {
+	if keyCipher == nil {
+		return Registry{}, errFeedKeyCipherNotConfigured
+	}
+	if len(feedKey) == 0 {
+		return Registry{}, errors.New("create registry: feed key plaintext is required")
+	}
+	if len(authPayload) == 0 || len(stampPayload) == 0 {
+		return Registry{}, errors.New("create registry: both bootstrap policy payloads are required")
+	}
+	registry.ProvisioningState = ProvisioningStateProvisioning
+
+	var created Registry
+	err := s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		now := time.Now().UTC()
+		// registries/memberships created_at stay canonical RFC3339 TEXT (read
+		// back via time.Parse); only the jobs table's journal timestamps are
+		// INTEGER Unix nanoseconds (migration 8's exact, DB-enforceable form).
+		nowText := now.Format(time.RFC3339)
+		nowMillis := timeToNanos(now)
+		result, err := c.ExecContext(ctx, `insert into registries
+			(slug, host, ens_name, owner_user_id, feed_owner_address, encrypted_feed_private_key, default_stamp_batch_id, anonymous_pull, provisioning_state, created_at)
+			values (?, ?, ?, ?, ?, '', ?, ?, ?, ?)`,
+			registry.Slug, registry.Host, registry.ENSName, registry.OwnerUserID, registry.FeedOwnerAddress,
+			registry.DefaultStampBatchID, boolToInt(registry.AnonymousPull), registry.ProvisioningState, nowText)
+		if err != nil {
+			return fmt.Errorf("create registry: %w", err)
+		}
+		id, _ := result.LastInsertId()
+
+		enc, err := keyCipher.Encrypt(id, registry.FeedOwnerAddress, feedKey)
+		if err != nil {
+			return err
+		}
+		if _, err := c.ExecContext(ctx, `update registries set feed_key_ciphertext = ?, feed_key_nonce = ?, feed_key_version = ? where id = ?`,
+			enc.Ciphertext, enc.Nonce, enc.KeyVersion, id); err != nil {
+			return err
+		}
+
+		if _, err := c.ExecContext(ctx, `insert into registry_memberships (registry_id, user_id, role, can_pull, can_push, created_at) values (?, ?, ?, ?, ?, ?)`,
+			id, registry.OwnerUserID, "owner", 1, 1, nowText); err != nil {
+			return err
+		}
+
+		for _, j := range []struct {
+			kind    string
+			payload []byte
+		}{
+			{PublicationKindAuth, authPayload},
+			{PublicationKindStamp, stampPayload},
+		} {
+			if _, err := c.ExecContext(ctx, `insert into registry_publication_jobs
+				(registry_id, kind, state, payload_json, attempts, next_attempt_at, created_at)
+				values (?, ?, ?, ?, 0, ?, ?)`,
+				id, j.kind, PublicationStatePending, string(j.payload), nowMillis, nowMillis); err != nil {
+				return err
+			}
+		}
+
+		created = registry
+		created.ID = id
+		created.FeedKey = enc
+		created.FeedKeySet = true
+		return nil
+	})
+	if err != nil {
+		return Registry{}, err
+	}
+	return created, nil
+}
+
+// ClaimStalePublicationJobs atomically claims a bounded batch of jobs that are
+// either pending (and due) or claimed past their lease, returning the claimed
+// rows plus the worker token that owns them for the lease. The claim is a
+// guarded conditional UPDATE so concurrent workers never both win: only the
+// worker whose conditional update affected exactly one row owns the job, and a
+// job claimed by a live lease is invisible to other workers until it expires.
+// This is a short write transaction with no network calls inside it.
+func (s *Store) ClaimStalePublicationJobs(ctx context.Context, now time.Time, lease time.Duration, limit int) ([]PublicationJob, string, error) {
+	if limit <= 0 {
+		return nil, "", errors.New("claim: limit must be positive")
+	}
+	worker, err := randomWorkerToken()
+	if err != nil {
+		return nil, "", err
+	}
+	nowText := timeToNanos(now)
+	untilText := timeToNanos(now.Add(lease))
+
+	var claimed []PublicationJob
+	err = s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		rows, err := c.QueryContext(ctx, `select id from registry_publication_jobs
+			where (state = 'pending' and next_attempt_at <= ?)
+			   or (state = 'claimed' and claimed_until <= ?)
+			order by id asc limit ?`, nowText, nowText, limit)
+		if err != nil {
+			return err
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		for _, id := range ids {
+			res, err := c.ExecContext(ctx, `update registry_publication_jobs
+				set state = 'claimed', claimed_by = ?, claimed_until = ?, last_error = ''
+				where id = ? and ((state = 'pending' and next_attempt_at <= ?)
+				              or (state = 'claimed' and claimed_until <= ?))`,
+				worker, untilText, id, nowText, nowText)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n != 1 {
+				continue // another worker claimed it first in a concurrent batch; skip
+			}
+			var job PublicationJob
+			if err := scanPublicationJob(c.QueryRowContext(ctx, `select `+publicationJobColumns+` from registry_publication_jobs where id = ?`, id), &job); err != nil {
+				return err
+			}
+			claimed = append(claimed, job)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return claimed, worker, nil
+}
+
+// SetPublicationObjectRef persists the uploaded object reference for a claimed
+// job. It is conditional on ownership so a stale worker cannot write onto a job
+// it no longer owns. Returns errLostClaim when the claim was lost (the job was
+// reclaimed after lease expiry by a newer worker).
+func (s *Store) SetPublicationObjectRef(ctx context.Context, jobID int64, worker string, ref string) error {
+	return s.jobGuardUpdate(ctx, jobID, worker,
+		`update registry_publication_jobs set object_ref = ? where id = ? and state = 'claimed' and claimed_by = ?`, ref)
+}
+
+// SetPublicationFeedRef persists the published feed reference for a claimed
+// job, conditionally on ownership (see SetPublicationObjectRef).
+func (s *Store) SetPublicationFeedRef(ctx context.Context, jobID int64, worker string, ref string) error {
+	return s.jobGuardUpdate(ctx, jobID, worker,
+		`update registry_publication_jobs set feed_ref = ? where id = ? and state = 'claimed' and claimed_by = ?`, ref)
+}
+
+// CompletePublicationJob marks a claimed job succeeded (terminal) conditionally
+// on ownership and current state, so a stale worker cannot overwrite a newer
+// claim. Returns errLostClaim if ownership was lost.
+func (s *Store) CompletePublicationJob(ctx context.Context, jobID int64, worker string, now time.Time) error {
+	return s.jobGuardUpdate(ctx, jobID, worker,
+		`update registry_publication_jobs set state = 'succeeded', completed_at = ?, claimed_by = '', claimed_until = null
+		 where id = ? and state = 'claimed' and claimed_by = ?`, timeToNanos(now))
+}
+
+// FailPublicationJob registers a retryable failure for a claimed job: it
+// increments the attempt count, schedules the next attempt with bounded
+// exponential backoff, and applies the terminal rule (state becomes 'failed'
+// once attempts reach maxAttempts). It is conditional on ownership. Returns
+// terminal=true when the job exhausts attempts, and the caller then marks the
+// registry 'failed' — the only explicit bounded path to terminal provisioning
+// failure. LastError holds only a sanitized class string (never payload,
+// secrets, or internal response body).
+func (s *Store) FailPublicationJob(ctx context.Context, jobID int64, worker string, now time.Time, maxAttempts int, backoffBase, backoffMax time.Duration, safeErr string) (bool, error) {
+	var terminal bool
+	err := s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		var attempts int
+		if err := c.QueryRowContext(ctx, `select attempts from registry_publication_jobs where id = ? and state = 'claimed' and claimed_by = ?`, jobID, worker).Scan(&attempts); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return errLostClaim
+			}
+			return err
+		}
+		newAttempts := attempts + 1
+		state := PublicationStatePending
+		if maxAttempts > 0 && newAttempts >= maxAttempts {
+			state = PublicationStateFailed
+			terminal = true
+		}
+		next := timeToNanos(now.Add(attemptBackoff(newAttempts, backoffBase, backoffMax)))
+		res, err := c.ExecContext(ctx, `update registry_publication_jobs
+			set attempts = ?, state = ?, last_error = ?, next_attempt_at = ?, claimed_by = '', claimed_until = null
+			where id = ? and state = 'claimed' and claimed_by = ?`,
+			newAttempts, state, safeErr, next, jobID, worker)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return errLostClaim
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return terminal, nil
+}
+
+// jobGuardUpdate runs a single-by-statement ownership-guarded UPDATE and
+// returns errLostClaim when fewer than one row changed. args are by-position:
+// [<dynamic values...>, jobID, worker].
+func (s *Store) jobGuardUpdate(ctx context.Context, jobID int64, worker string, query string, dynamicArgs ...any) error {
+	return s.withWriteTx(ctx, func(ctx context.Context, c *sql.Conn) error {
+		args := append(append([]any{}, dynamicArgs...), jobID, worker)
+		res, err := c.ExecContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return errLostClaim
+		}
+		return nil
+	})
+}
+
+// attemptBackoff returns the bounded exponential backoff for the given attempt
+// number: base << (attempt-1), capped at max, with a hard shift cap so naive
+// overflow cannot blow the delay into the far future.
+func attemptBackoff(attempt int, base, max time.Duration) time.Duration {
+	shift := attempt - 1
+	if shift > 16 {
+		shift = 16
+	}
+	d := base << shift
+	if d > max {
+		d = max
+	}
+	if d < 0 {
+		return max
+	}
+	return d
+}
+
+// MarkRegistryReady transitions a registry from provisioning to ready. It is
+// guarded in SQL to only apply from the provisioning state, so it can never
+// regress a ready or failed registry.
+func (s *Store) MarkRegistryReady(ctx context.Context, registryID int64) error {
+	return s.updateProvisioningState(ctx, registryID, ProvisioningStateReady)
+}
+
+// MarkRegistryFailed transitions a registry from provisioning to failed. See
+// MarkRegistryReady.
+func (s *Store) MarkRegistryFailed(ctx context.Context, registryID int64) error {
+	return s.updateProvisioningState(ctx, registryID, ProvisioningStateFailed)
+}
+
+func (s *Store) updateProvisioningState(ctx context.Context, registryID int64, state string) error {
+	_, err := s.DB.ExecContext(ctx, `update registries set provisioning_state = ? where id = ? and provisioning_state = 'provisioning'`, state, registryID)
+	return err
+}
+
+// RegistryProvisioningJobsComplete reports whether both bootstrap jobs for a
+// registry are in the terminal succeeded state — the only condition under which
+// the reconciler marks the registry 'ready'.
+func (s *Store) RegistryProvisioningJobsComplete(ctx context.Context, registryID int64) (bool, error) {
+	var n int
+	if err := s.DB.QueryRowContext(ctx, `select count(*) from registry_publication_jobs where registry_id = ? and state = 'succeeded'`, registryID).Scan(&n); err != nil {
+		return false, err
+	}
+	return n == 2, nil
+}
+
+// GetPublicationJob returns one job row by id (test/diagnostic helper; not used
+// by the reconciler's happy path).
+func (s *Store) GetPublicationJob(ctx context.Context, jobID int64) (PublicationJob, error) {
+	var job PublicationJob
+	if err := scanPublicationJob(s.DB.QueryRowContext(ctx, `select `+publicationJobColumns+` from registry_publication_jobs where id = ?`, jobID), &job); err != nil {
+		return PublicationJob{}, err
+	}
+	return job, nil
+}

@@ -1,0 +1,191 @@
+name: ci
+
+# PHASE 4 REAL-BEE GATE (disabled by default): the bee-integration,
+# docker-compat, and podman-compat jobs below are NOT run on push/PR. They
+# depend on Bee full-node feed publication, which the reference stack's
+# isolated light node cannot perform (docs/compatibility.md §8), so they
+# would FAIL once genuinely exercised; podman-compat would additionally have
+# been a silent no-op on runners without podman (the round-trip script now
+# fails closed under CI=true). They become live only when this
+# workflow is dispatched with enable_phase4_e2e=true against a runner that
+# carries docker, podman, and a real Bee full node (the Phase 4 gate).
+"on":
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      enable_phase4_e2e:
+        description: >-
+          Run the Phase 4 real-Bee E2E jobs (bee-integration, docker-compat,
+          podman-compat). Requires a runner with a real Bee full node and
+          (for podman-compat) the podman CLI installed.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go quality + race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: go mod tidy -diff
+        run: go mod tidy -diff
+      - name: go mod verify
+        run: go mod verify
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race -count=1 ./...
+      # git diff --check would be vacuous on a clean checkout; scan tracked
+      # files for trailing whitespace instead (gofmt -l above already covers
+      # Go sources).
+      - name: whitespace check (trailing whitespace, tracked files)
+        run: |
+          if git grep -nE '[[:blank:]]+$' -- .; then
+            echo "error: trailing whitespace found on tracked files (listed above)" >&2
+            exit 1
+          fi
+          echo "no trailing whitespace in tracked files"
+
+  secrets:
+    name: Secret scan
+    # gitleaks/gitleaks-action@v2 is intentionally NOT used here: it requires
+    # a GITLEAKS_LICENSE key for organization-owned repositories and fails on
+    # this repo with "missing gitleaks license". The deterministic gate below
+    # is the enforced, fail-closed secret check and needs no external engine
+    # or license key.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Deterministic repository secret gate
+        run: bash scripts/security/check-repository-secrets.sh
+
+  govulncheck:
+    name: Vulnerability scan (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        run: "$(go env GOPATH)/bin/govulncheck ./..."
+
+  licenses:
+    name: Dependency license check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@latest
+      - name: Run dependency license gate
+        run: python3 scripts/ci/check-licenses.py --go-licenses "$(go env GOPATH)/bin/go-licenses"
+
+  container-build:
+    name: Container build (registry + controlplane)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build registry image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.registry
+          push: false
+          tags: uncloud-registry/registry:ci
+      - name: Build controlplane image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.controlplane
+          push: false
+          tags: uncloud-registry/controlplane:ci
+
+  # ---------------------------------------------------------------------------
+  # PHASE 4 GATE (disabled by default, TODO(phase4): remove the `if` and
+  # enable once a real-Bee full-node runner exists). These three jobs must
+  # NOT run on push/PR today:
+  #   * bee-integration runs compose-smoke.sh, whose feed-publication stage is
+  #     an explicit SKIP (the reference stack pins Bee 2.8.2 as an isolated
+  #     light node that cannot pushsync chunks);
+  #   * docker-compat / podman-compat round trips are blocked at their
+  #     first-push stage until a full node makes feed updates retrievable
+  #     (docs/compatibility.md §8: the docker/podman round-trip scripts are
+  #     "blocked at their first-push stage until a full node is available");
+  #   * podman-compat would additionally be a silent no-op on ubuntu-latest,
+  #     which ships no podman (the script now FAILS under CI=true when podman
+  #     is absent instead of exiting 0 SKIP).
+  # Wired to the workflow_dispatch input enable_phase4_e2e so the Phase 4
+  # gate can flip them on without editing this file; the dispatch runner must
+  # carry docker, podman, and a real Bee full node.
+  # ---------------------------------------------------------------------------
+  bee-integration:
+    name: Real Bee integration (reference stack) [phase4]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_phase4_e2e == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reference stack smoke (compose.yaml)
+        run: bash scripts/e2e/compose-smoke.sh
+
+  docker-compat:
+    name: Docker compatibility round trip [phase4]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_phase4_e2e == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker round trip
+        run: bash scripts/e2e/docker-roundtrip.sh
+
+  podman-compat:
+    name: Podman compatibility round trip [phase4]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.enable_phase4_e2e == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Podman round trip
+        run: bash scripts/e2e/podman-roundtrip.sh
+
+  docs:
+    name: Documentation checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No machine-local paths / required references
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('README.md').read_text()
+          assert '/Users/' not in s, 'machine-local path found in README.md'
+          assert 'docs/compatibility.md' in s, 'README must reference docs/compatibility.md'
+          print('README path/reference assertions OK')
+          PY
+      - name: Shell syntax check (bash -n)
+        run: |
+          find scripts -name '*.sh' -print0 | xargs -0 -n1 bash -n

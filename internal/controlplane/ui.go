@@ -1,13 +1,14 @@
 package controlplane
 
 import (
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"html/template"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const sessionCookieName = "uncloud_session"
@@ -356,7 +357,7 @@ func (s *HTTPServer) handleUIRoot(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:   "Login",
 			Heading: "Ship images through Swarm-backed registries.",
 			Lede:    "Sign in to manage registry settings, collaborators, policy publication, and Docker authentication.",
@@ -370,6 +371,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
       <p class="muted">Use your control-plane account to manage registries and invite collaborators.</p>
     </div>
     <form method="post" action="/ui/login">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Email<input type="email" name="email" required></label>
       <label>Password<input type="password" name="password" required></label>
       <button type="submit">Login</button>
@@ -385,17 +387,18 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 {{end}}`,
 		})
 	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		_, token, err := s.Service.Login(r.Context(), r.FormValue("email"), r.FormValue("password"))
 		if err != nil {
-			renderPage(w, pageData{
+			s.renderPage(w, r, pageData{
 				Title:   "Login",
 				Heading: "Welcome back",
 				Lede:    "Sign in to continue.",
-				Message: err.Error(),
+				// Generic, identical failure message so the UI never reveals
+				// whether the email exists.
+				Message: "Invalid email or password.",
 				Body: `
 {{define "content"}}
 <a class="button secondary" href="/ui/login">Try again</a>
@@ -403,7 +406,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		setSessionCookie(w, token)
+		s.setSessionCookie(w, token)
 		http.Redirect(w, r, "/ui/registries", http.StatusSeeOther)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -414,7 +417,7 @@ func (s *HTTPServer) handleUILogin(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:   "Register",
 			Heading: "Create your control-plane account.",
 			Lede:    "This account is used for registry administration, collaborator invites, and Docker token issuance.",
@@ -425,6 +428,7 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
     <div class="kicker">Register</div>
     <h2>Get started</h2>
     <form method="post" action="/ui/register">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Email<input type="email" name="email" required></label>
       <label>Password<input type="password" name="password" required></label>
       <button type="submit">Create account</button>
@@ -440,13 +444,12 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 {{end}}`,
 		})
 	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		_, token, err := s.Service.RegisterUser(r.Context(), r.FormValue("email"), r.FormValue("password"))
 		if err != nil {
-			renderPage(w, pageData{
+			s.renderPage(w, r, pageData{
 				Title:   "Register",
 				Heading: "Create account",
 				Lede:    "Set up a control-plane account.",
@@ -458,7 +461,7 @@ func (s *HTTPServer) handleUIRegister(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		setSessionCookie(w, token)
+		s.setSessionCookie(w, token)
 		http.Redirect(w, r, "/ui/registries", http.StatusSeeOther)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -480,7 +483,7 @@ func (s *HTTPServer) handleUIRegistries(w http.ResponseWriter, r *http.Request) 
 	if r.URL.Query().Get("accepted") == "1" {
 		message = "Invite accepted. The registry should now appear in your dashboard if the membership was published successfully."
 	}
-	renderPage(w, pageData{
+	s.renderPage(w, r, pageData{
 		Title:         "Registries",
 		Heading:       "Your registry dashboard.",
 		Lede:          "Create and manage Swarm-backed registries, review access rules, publish policy updates, and invite collaborators.",
@@ -520,7 +523,7 @@ func (s *HTTPServer) handleUIRegistries(w http.ResponseWriter, r *http.Request) 
   {{end}}
 </div>
 {{end}}`,
-		Data: map[string]any{"Registries": registries},
+		Data: map[string]any{"Registries": newPublicRegistries(registries)},
 	})
 }
 
@@ -531,7 +534,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
 	}
 	switch r.Method {
 	case http.MethodGet:
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:         "Create Registry",
 			Heading:       "Create a registry.",
 			Lede:          "Choose a registry slug, connect it to an ENS name, and set the initial default stamp and access mode.",
@@ -543,6 +546,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
     <div class="kicker">Create</div>
     <h2>Registry details</h2>
     <form method="post" action="/ui/registries/new">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Registry slug<input type="text" name="slug" placeholder="alice" required></label>
       <label>ENS name<input type="text" name="ens_name" placeholder="alice.registry.eth" required></label>
       <label>Default stamp batch ID<input type="text" name="default_stamp_batch_id" placeholder="batch-id" required></label>
@@ -553,15 +557,15 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
   <div class="card stack">
     <div class="kicker">What happens</div>
     <h2>Bootstrap flow</h2>
-    <p class="muted">The server generates a feed owner keypair, stores the signer privately, and publishes the initial auth and stamp policy topics.</p>
+    <p class="muted">The server generates a feed owner keypair and enqueues the initial auth and stamp policy documents for verified, asynchronous publication.</p>
+    <p class="muted">Provisioning runs in the background: the registry is created as <strong>provisioning</strong> and becomes <strong>ready</strong> only after bootstrap publication is independently verified.</p>
     <p class="muted">After creation, the detail page tells you which ENS address record to update so the registry host can resolve the correct owner.</p>
   </div>
 </div>
 {{end}}`,
 		})
 	case http.MethodPost:
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		created, err := s.Service.CreateRegistry(
@@ -573,7 +577,7 @@ func (s *HTTPServer) handleUICreateRegistry(w http.ResponseWriter, r *http.Reque
 			r.FormValue("default_stamp_batch_id"),
 		)
 		if err != nil {
-			renderPage(w, pageData{
+			s.renderPage(w, r, pageData{
 				Title:         "Create Registry",
 				Heading:       "Create a registry.",
 				Lede:          "Choose registry details and publish bootstrap topics.",
@@ -610,20 +614,36 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
 	}
 	message := ""
 	if r.URL.Query().Get("created") == "1" {
-		message = "Registry created. Next step: update the ENS address record to the generated owner address below, then run the registry in ENS resolution mode."
+		message = "Registry created and enqueued for provisioning. Bootstrap policy is published in the background and this registry becomes ready once verified publication completes. Next step: update the ENS address record to the generated owner address below."
 	}
 	if r.URL.Query().Get("updated") == "1" {
 		message = "Registry settings updated and policy topics republished."
 	}
+	if r.URL.Query().Get("updated") == "0" {
+		message = "Provisioning is still in progress, so settings were not changed. Save them again once the registry becomes ready."
+	}
 	if r.URL.Query().Get("permissions_updated") == "1" {
 		message = "Collaborator permissions updated and policies republished."
 	}
-	if token := r.URL.Query().Get("invite_token"); token != "" {
-		link := "/ui/invites/accept?token=" + url.QueryEscape(token)
-		message = "Invite created. Share this link with the collaborator: " + absoluteURL(r, link)
+	if r.URL.Query().Get("invite_stored") == "1" {
+		message = "Invite created. The one-time share link could not be prepared; please create a new invite to share it."
+	}
+	if r.URL.Query().Get("invite_revoked") == "1" {
+		message = "Invite revoked. The collaborator can no longer accept it."
+	}
+	if flashID := r.URL.Query().Get("invite_flash"); flashID != "" {
+		// Consume the one-time flash atomically: only the authenticated creator of
+		// THIS registry may retrieve it, once. Unknown, expired, wrong-user, and
+		// wrong-registry requests reveal nothing. The raw token never appears in the
+		// redirect URL, a cookie, a log, or an error.
+		if token, ok := s.inviteFlash().consume(flashID, userID, registryID); ok {
+			link := "/ui/invites/accept?token=" + url.QueryEscape(token)
+			message = "Invite created. Share this link with the collaborator: " + s.absoluteURL(link)
+		}
 	}
 	inviteModal := inviteModalState(r)
-	renderPage(w, pageData{
+	dashboardDTO := NewPublicRegistryDashboard(dashboard)
+	s.renderPage(w, r, pageData{
 		Title:         dashboard.Registry.Slug,
 		Heading:       dashboard.Registry.Slug + " settings",
 		Lede:          "Manage registry access, default stamp policy, pending invites, and collaborator permissions from one place.",
@@ -639,11 +659,21 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
         <h2>{{.Dashboard.Registry.Host}}</h2>
       </div>
       <span class="chip">{{if .Dashboard.Registry.AnonymousPull}}Anonymous pull{{else}}Authenticated pull{{end}}</span>
+      <span class="chip">{{if eq .Dashboard.Registry.ProvisioningState "ready"}}Ready{{else if eq .Dashboard.Registry.ProvisioningState "failed"}}Failed{{else}}Provisioning…{{end}}</span>
     </div>
     <table class="table">
       <tr><th>ENS name</th><td><span class="code" title="{{.Dashboard.Registry.ENSName}}">{{.Dashboard.Registry.ENSName}}</span></td></tr>
       <tr><th>ENS address target</th><td><span class="code" title="{{.Dashboard.Registry.FeedOwnerAddress}}">{{.Dashboard.Registry.FeedOwnerAddress}}</span></td></tr>
       <tr><th>Default stamp</th><td><span class="code" title="{{.Dashboard.Registry.DefaultStampBatchID}}">{{.Dashboard.Registry.DefaultStampBatchID}}</span></td></tr>
+      <tr><th>Provisioning</th><td>
+        {{if eq .Dashboard.Registry.ProvisioningState "ready"}}
+          <span class="muted">Ready — bootstrap policy is published and verified.</span>
+        {{else if eq .Dashboard.Registry.ProvisioningState "failed"}}
+          <span class="muted">Failed — bootstrap policy could not be verified. Re-create the registry, or contact the operator for the control-plane logs.</span>
+        {{else}}
+          <span class="muted">Provisioning — bootstrap policy publication is enqueued and runs in the background. This registry becomes ready once verified.</span>
+        {{end}}
+      </td></tr>
     </table>
     <div class="link-box">
       <strong>ENS setup</strong>
@@ -655,9 +685,15 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
     <div class="kicker">Registry settings</div>
     <h2>Registry settings</h2>
     <form method="post" action="/ui/registries/{{.Dashboard.Registry.ID}}/settings">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Default stamp batch ID<input type="text" name="default_stamp_batch_id" value="{{.Dashboard.Registry.DefaultStampBatchID}}" required></label>
       <label class="checkbox-row"><input type="checkbox" name="anonymous_pull" value="true" {{if .Dashboard.Registry.AnonymousPull}}checked{{end}}> <span>Allow anonymous pull</span></label>
+      {{if eq .Dashboard.Registry.ProvisioningState "ready"}}
       <button type="submit">Save and publish policy</button>
+      {{else}}
+      <button type="submit" disabled>Save and publish policy</button>
+      <div class="muted">Registry is not ready yet. Settings (including anonymous pull) are locked until verified bootstrap publication completes.</div>
+      {{end}}
     </form>
     <div class="muted">Published policies are derived from registry settings and role-based access. Adding or accepting users does not rewrite policy topics.</div>
   </div>
@@ -680,15 +716,20 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       <th>Email</th>
       <th>Access</th>
       <th>Status</th>
-      <th>Link</th>
+      <th>Expires (UTC)</th>
+      <th></th>
     </tr>
     {{range .Invites}}
     <tr>
       <td>{{.Email}}</td>
       <td>{{.Permissions}}</td>
       <td>{{.Status}}</td>
+      <td>{{.ExpiresAt}}</td>
       <td>
-        <button class="secondary" type="button" data-copy="{{.Link}}">Copy invite link</button>
+        <form method="post" action="/ui/registries/{{$.Dashboard.Registry.ID}}/invites/{{.ID}}/revoke" style="display:inline;">
+          <input type="hidden" name="_csrf" value="{{$.CSRF}}">
+          <button class="secondary" type="submit">Revoke</button>
+        </form>
       </td>
     </tr>
     {{end}}
@@ -696,6 +737,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
   {{end}}
   <h3>Accepted users</h3>
   <form method="post" action="/ui/registries/{{.Dashboard.Registry.ID}}/permissions">
+    <input type="hidden" name="_csrf" value="{{$.CSRF}}">
     <table class="table">
       <tr>
         <th>Email</th>
@@ -741,6 +783,7 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
       </div>
       {{if .InviteModal.Error}}<div class="error-box">{{.InviteModal.Error}}</div>{{end}}
       <form method="post" action="/ui/registries/{{.Dashboard.Registry.ID}}/invites">
+        <input type="hidden" name="_csrf" value="{{$.CSRF}}">
         <label>Email<input type="email" name="email" value="{{.InviteModal.Email}}" required></label>
         <div class="permissions">
           {{if not .Dashboard.Registry.AnonymousPull}}
@@ -754,8 +797,8 @@ func (s *HTTPServer) handleUIRegistryDetail(w http.ResponseWriter, r *http.Reque
   </dialog>
 {{end}}`,
 		Data: map[string]any{
-			"Dashboard":   dashboard,
-			"Invites":     inviteViewModels(r, dashboard.Invites),
+			"Dashboard":   dashboardDTO,
+			"Invites":     inviteViewModels(dashboardDTO.Invites),
 			"InviteModal": inviteModal,
 		},
 	})
@@ -771,8 +814,7 @@ func (s *HTTPServer) handleUIUpdateRegistrySettings(w http.ResponseWriter, r *ht
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !s.parseFormBounded(w, r) {
 		return
 	}
 	_, err := s.Service.UpdateRegistrySettings(
@@ -783,6 +825,16 @@ func (s *HTTPServer) handleUIUpdateRegistrySettings(w http.ResponseWriter, r *ht
 		r.FormValue("default_stamp_batch_id"),
 	)
 	if err != nil {
+		if errors.Is(err, errRegistryNotReady) {
+			// Safe, user-actionable recovery path: the registry is still
+			// provisioning, so settings (e.g. anonymous pull) must not be
+			// changed yet. Redirect with a clear notice rather than surfacing
+			// raw internals, and never publish or mutate anything.
+			u := "/ui/registries/" + strconv.FormatInt(registryID, 10) + "?updated=0&notice=" +
+				url.QueryEscape("settings can be changed only after bootstrap publication completes")
+			http.Redirect(w, r, u, http.StatusSeeOther)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -799,8 +851,7 @@ func (s *HTTPServer) handleUICreateInvite(w http.ResponseWriter, r *http.Request
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !s.parseFormBounded(w, r) {
 		return
 	}
 	canPull := r.FormValue("can_pull") == "true"
@@ -820,7 +871,42 @@ func (s *HTTPServer) handleUICreateInvite(w http.ResponseWriter, r *http.Request
 		http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?"+query.Encode(), http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_token="+url.QueryEscape(token), http.StatusSeeOther)
+	// Store the one-time raw token in a transient, principal/registry-bound flash and
+	// carry only a random opaque flash ID in the 303 redirect URL. If the store fails
+	// safely (e.g. at capacity) we still 303-redirect but render no token; the invite
+	// itself is already persisted and remains visible in the pending list.
+	flashID, flashErr := s.inviteFlash().store(token, userID, registryID)
+	if flashErr != nil {
+		http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_stored=1", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_flash="+url.QueryEscape(flashID), http.StatusSeeOther)
+}
+
+// handleUIRevokeInvite is the UI revocation boundary: owner/admin only (the
+// service enforces it), pending invites only, atomic and idempotent for the
+// same authorized request. Every unauthorized/terminal/unknown case redirects
+// through a generic result — a revoked invite disappears from the pending
+// list; nothing about token or digest material is ever rendered.
+func (s *HTTPServer) handleUIRevokeInvite(w http.ResponseWriter, r *http.Request) {
+	userID, ok := s.requireSessionUser(w, r)
+	if !ok {
+		return
+	}
+	registryID, inviteID, ok := parseInviteRevokePath(r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if _, err := s.Service.RevokeInvite(r.Context(), userID, registryID, inviteID); err != nil {
+		if errors.Is(err, errInviteNotFound) || errors.Is(err, errInviteCannotRevoke) {
+			http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10), http.StatusSeeOther)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/ui/registries/"+strconv.FormatInt(registryID, 10)+"?invite_revoked=1", http.StatusSeeOther)
 }
 
 func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter, r *http.Request) {
@@ -833,8 +919,7 @@ func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter
 		http.NotFound(w, r)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !s.parseFormBounded(w, r) {
 		return
 	}
 	userIDs := r.Form["user_id"]
@@ -864,14 +949,23 @@ func (s *HTTPServer) handleUIUpdateCollaboratorPermissions(w http.ResponseWriter
 }
 
 func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	// The raw query value is passed EXACTLY as received — no TrimSpace or any
+	// other mutation before the strict canonical ParseInviteToken, so
+	// whitespace-padded tokens are rejected, never silently accepted.
+	token := r.URL.Query().Get("token")
 	if token == "" {
 		http.NotFound(w, r)
 		return
 	}
 	invite, registry, err := s.Service.GetInvite(r.Context(), token)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		// Revoked, expired, accepted, unknown, and malformed tokens all render
+		// the same generic page; nothing distinguishes invite states.
+		if errors.Is(err, errInviteNotFound) {
+			http.Error(w, "This invite link is not valid or has expired.", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	switch r.Method {
@@ -891,10 +985,12 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
     <h2>{{if .SignedIn}}Confirm access{{else}}Create account and accept{{end}}</h2>
     {{if .SignedIn}}
     <form method="post" action="/ui/invites/accept?token={{.Token}}">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <button type="submit">Accept invite</button>
     </form>
     {{else}}
     <form method="post" action="/ui/invites/accept?token={{.Token}}">
+      <input type="hidden" name="_csrf" value="{{.CSRF}}">
       <label>Email<input type="email" name="email" value="{{.Invite.Email}}" required></label>
       <label>Password<input type="password" name="password" required></label>
       <button type="submit">Create account and accept invite</button>
@@ -903,16 +999,16 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
   </div>
 </div>
 {{end}}`
-		renderPage(w, pageData{
+		s.renderPage(w, r, pageData{
 			Title:         "Accept Invite",
 			Heading:       "Accept collaborator invite.",
 			Lede:          "This flow creates a control-plane account if needed, then grants access to the registry.",
 			Authenticated: signedIn,
 			Body:          body,
 			Data: map[string]any{
-				"Invite":            invite,
+				"Invite":            NewPublicInvite(invite),
 				"InvitePermissions": permissionLabel(invite.CanPull, invite.CanPush),
-				"Registry":          registry,
+				"Registry":          NewPublicRegistry(registry),
 				"Token":             token,
 				"SignedIn":          signedIn,
 			},
@@ -920,22 +1016,29 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 	case http.MethodPost:
 		if userID, ok := s.requireSessionUserID(r); ok {
 			if _, err := s.Service.AcceptInvite(r.Context(), token, userID); err != nil {
+				if errors.Is(err, errInviteNotFound) {
+					http.Error(w, "This invite link is not valid or has expired.", http.StatusNotFound)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
 			http.Redirect(w, r, "/ui/registries?accepted=1", http.StatusSeeOther)
 			return
 		}
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !s.parseFormBounded(w, r) {
 			return
 		}
 		_, _, sessionToken, err := s.Service.RegisterAndAcceptInvite(r.Context(), token, r.FormValue("email"), r.FormValue("password"))
 		if err != nil {
+			if errors.Is(err, errInviteNotFound) {
+				http.Error(w, "This invite link is not valid or has expired.", http.StatusNotFound)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		setSessionCookie(w, sessionToken)
+		s.setSessionCookie(w, sessionToken)
 		http.Redirect(w, r, "/ui/registries?accepted=1", http.StatusSeeOther)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -943,14 +1046,71 @@ func (s *HTTPServer) handleUIAcceptInvite(w http.ResponseWriter, r *http.Request
 	}
 }
 
-func setSessionCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{
+func (s *HTTPServer) setSessionCookie(w http.ResponseWriter, token string) {
+	ttl := s.sessionTTL()
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	var maxAge int
+	if lim := ttl.Seconds(); lim > float64(int(^uint(0)>>1)) {
+		maxAge = int(^uint(0) >> 1)
+	} else {
+		maxAge = int(lim)
+	}
+	http.SetCookie(w, s.sessionCookie(token, maxAge))
+}
+
+// sessionTTL returns the configured session lifetime, defaulting to 24h when
+// unset (back-compat).
+func (s *HTTPServer) sessionTTL() time.Duration {
+	if s.security != nil && s.security.sessionTTL > 0 {
+		return s.security.sessionTTL
+	}
+	return 24 * time.Hour
+}
+
+// clearSessionCookie expires the session cookie with attributes identical to
+// the one that was set, so browsers remove it.
+func (s *HTTPServer) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, s.sessionCookie("", -1))
+}
+
+// sessionCookie builds the control plane's single, fixed session cookie:
+// HttpOnly, SameSite=Lax, Path=/, a bounded MaxAge with a matching Expires
+// (and a past Expires for the deletion cookie), Secure when the deployment
+// warrants it (validated mode plus external URL), and never a Domain
+// attribute, so the cookie can never be scoped onto a host the server does not
+// serve.
+func (s *HTTPServer) sessionCookie(token string, maxAge int) *http.Cookie {
+	secure := false
+	if s.security != nil {
+		secure = s.security.secureCookie
+	}
+	// Expires matches MaxAge for the set-cookie (now+maxAge) and is a past
+	// timestamp for the deletion cookie (maxAge<0) so browsers honour expiry
+	// even when they ignore MaxAge.
+	expires := time.Unix(1, 0)
+	if maxAge > 0 {
+		expires = time.Now().Add(time.Duration(maxAge) * time.Second)
+	}
+	return &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
-	})
+		MaxAge:   maxAge,
+		Expires:  expires,
+	}
+}
+
+// handleLogout clears the session cookie and returns the user to login. It is
+// a cookie-authenticated POST, so it is protected by the session-bound CSRF
+// control like any other mutation.
+func (s *HTTPServer) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearSessionCookie(w)
+	http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
 }
 
 type pageData struct {
@@ -959,11 +1119,15 @@ type pageData struct {
 	Lede          string
 	Message       string
 	Authenticated bool
+	CSRF          string
 	Body          string
 	Data          map[string]any
 }
 
-func renderPage(w http.ResponseWriter, page pageData) {
+func (s *HTTPServer) renderPage(w http.ResponseWriter, r *http.Request, page pageData) {
+	if s.security != nil {
+		page.CSRF = s.security.sessionCSRF(r)
+	}
 	tmpl, err := layoutTemplate.Clone()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -980,6 +1144,7 @@ func renderPage(w http.ResponseWriter, page pageData) {
 		"Lede":          page.Lede,
 		"Message":       page.Message,
 		"Authenticated": page.Authenticated,
+		"CSRF":          page.CSRF,
 	}
 	for key, value := range page.Data {
 		payload[key] = value
@@ -989,10 +1154,11 @@ func renderPage(w http.ResponseWriter, page pageData) {
 }
 
 type inviteViewModel struct {
+	ID          string
 	Email       string
 	Permissions string
 	Status      string
-	Link        string
+	ExpiresAt   string
 }
 
 type inviteModalView struct {
@@ -1003,19 +1169,25 @@ type inviteModalView struct {
 	CanPush bool
 }
 
-func inviteViewModels(r *http.Request, invites []Invite) []inviteViewModel {
+// inviteViewModels builds owner-facing pending-invite rows from public invite
+// DTOs only. It intentionally never reads the persistence Invite.TokenDigest:
+// the one-time raw invite token is returned once in the invite-creation
+// response and the digest must never be reconstructed for the detail page.
+// Each pending row exposes only recipient, permissions, state, and expiry —
+// the revoke button uses the invite ID, never any credential material.
+func inviteViewModels(invites []PublicInvite) []inviteViewModel {
 	models := make([]inviteViewModel, 0, len(invites))
 	for _, invite := range invites {
 		if invite.Status != "pending" {
 			continue
 		}
-		model := inviteViewModel{
+		models = append(models, inviteViewModel{
+			ID:          strconv.FormatInt(invite.ID, 10),
 			Email:       invite.Email,
 			Permissions: permissionLabel(invite.CanPull, invite.CanPush),
 			Status:      invite.Status,
-		}
-		model.Link = absoluteURL(r, "/ui/invites/accept?token="+url.QueryEscape(tokenFromHash(invite.TokenHash)))
-		models = append(models, model)
+			ExpiresAt:   invite.ExpiresAt.UTC().Format(time.RFC3339),
+		})
 	}
 	return models
 }
@@ -1042,19 +1214,16 @@ func inviteModalState(r *http.Request) inviteModalView {
 	}
 }
 
-func tokenFromHash(tokenHash string) string {
-	if decoded, err := hex.DecodeString(tokenHash); err == nil {
-		return string(decoded)
+// absoluteURL renders a public absolute URL from the configured external
+// origin, never from r.Host or r.TLS (both attacker-influenced and unreliable
+// behind a trusted proxy). With no external URL configured (development) it
+// returns the relative path so no attacker-controlled host ever leaks into a
+// public invite link.
+func (s *HTTPServer) absoluteURL(path string) string {
+	if s.security != nil && s.security.externalBase != "" {
+		return s.security.externalBase + path
 	}
-	return ""
-}
-
-func absoluteURL(r *http.Request, path string) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host + path
+	return path
 }
 
 func parseUIRegistryID(path string) (int64, bool) {

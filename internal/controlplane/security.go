@@ -1,0 +1,1098 @@
+package controlplane
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"mime"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/uncloud-registry/registry/internal/auth"
+	"github.com/uncloud-registry/registry/internal/config"
+)
+
+// This file implements the control plane's hard security boundary: production
+// configuration defaults, session-bound CSRF, secure cookies, same-origin
+// checks, trusted-proxy client-IP resolution, bounded rate limiting, generic
+// login failures, and browser security headers. It is enforced for every
+// request the control plane serves, regardless of mode (development only
+// relaxes the caps, never the controls).
+
+// ---------------------------------------------------------------------------
+// Injectable clock (so rate-limit and refill logic is testable deterministically)
+// ---------------------------------------------------------------------------
+
+// Clock abstracts the current time for the rate limiter.
+type Clock interface {
+	Now() time.Time
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+// ---------------------------------------------------------------------------
+// Bounded token-bucket rate limiter
+// ---------------------------------------------------------------------------
+
+// LimiterLimits carries the bounded-bucket configuration for one limiter.
+type RateLimitConfig struct {
+	Rate      float64 // tokens added per second
+	Burst     float64 // bucket capacity (maximum burst)
+	MaxKeys   int     // hard cap on tracked keys; fail closed beyond it
+	IdleAfter time.Duration
+}
+
+// Limiter counters exposed for later metrics. Read with Counters().
+type LimiterCounters struct {
+	Allowed          uint64
+	Limited          uint64
+	CapacityRejected uint64
+}
+
+type tokenBucket struct {
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
+}
+
+// Limiter is a concurrency-safe, bounded, in-memory token bucket keyed by a
+// SHA-256 digest of the caller key (so raw emails/identifiers are never kept in
+// memory). It refills fractionally, tolerates a backward clock, prunes idle
+// buckets, and fails closed at its key capacity.
+type Limiter struct {
+	mu        sync.Mutex
+	rate      float64
+	burst     float64
+	maxKeys   int
+	idleAfter time.Duration
+	clock     Clock
+	buckets   map[[32]byte]*tokenBucket
+	lastPrune time.Time
+
+	allowed          atomic.Uint64
+	limited          atomic.Uint64
+	capacityRejected atomic.Uint64
+}
+
+const defaultMaxKeys = 10000
+
+const minNeededTokens = 1.0
+
+// NewLimiter returns a bounded token-bucket limiter. The clock may be nil to
+// use the system clock.
+func NewLimiter(rate, burst float64, maxKeys int, idleAfter time.Duration, clock Clock) *Limiter {
+	if maxKeys <= 0 {
+		maxKeys = defaultMaxKeys
+	}
+	if clock == nil {
+		clock = realClock{}
+	}
+	if rate <= 0 {
+		rate = 1e-9 // never divide by zero; effectively one token per ~31 years
+	}
+	if burst <= 0 {
+		burst = 1
+	}
+	return &Limiter{
+		rate:      rate,
+		burst:     burst,
+		maxKeys:   maxKeys,
+		idleAfter: idleAfter,
+		clock:     clock,
+		buckets:   make(map[[32]byte]*tokenBucket),
+	}
+}
+
+// Allow reports whether the request for key may proceed, consuming one token
+// when it may. Returned retryAfter is the duration to advertise on a 429 when
+// the request is denied.
+func (l *Limiter) Allow(key string) (bool, time.Duration) {
+	digest := sha256.Sum256([]byte(key))
+	return l.allowDigest(digest)
+}
+
+func (l *Limiter) allowDigest(key [32]byte) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.clock.Now()
+	if l.idleAfter > 0 && now.Sub(l.lastPrune) > l.idleAfter {
+		l.prune(now)
+		l.lastPrune = now
+	}
+
+	b, ok := l.buckets[key]
+	if !ok {
+		if len(l.buckets) >= l.maxKeys {
+			// Try to make room by pruning idle buckets; fail closed if still full.
+			if l.idleAfter > 0 {
+				l.prune(now)
+			}
+			if len(l.buckets) >= l.maxKeys {
+				l.capacityRejected.Add(1)
+				return false, l.capacityRetryAfter()
+			}
+		}
+		b = &tokenBucket{tokens: l.burst, last: now, lastSeen: now}
+		l.buckets[key] = b
+	}
+
+	b.lastSeen = now
+
+	// Fractional refill: only positive elapsed time adds tokens. A backward
+	// clock yields no refill and is otherwise harmless.
+	var elapsed float64
+	if now.After(b.last) {
+		elapsed = now.Sub(b.last).Seconds()
+	}
+	b.tokens = math.Min(l.burst, b.tokens+elapsed*l.rate)
+	b.last = now
+
+	if b.tokens >= minNeededTokens {
+		b.tokens -= minNeededTokens
+		l.allowed.Add(1)
+		return true, 0
+	}
+	l.limited.Add(1)
+	return false, l.retryAfter(b.tokens)
+}
+
+func (l *Limiter) retryAfter(tokens float64) time.Duration {
+	secs := (minNeededTokens - tokens) / l.rate
+	wait := time.Duration(secs * float64(time.Second))
+	if wait < time.Second {
+		wait = time.Second
+	}
+	return wait
+}
+
+func (l *Limiter) capacityRetryAfter() time.Duration {
+	if l.idleAfter > 0 {
+		return l.idleAfter
+	}
+	return time.Minute
+}
+
+// prune removes buckets idle for longer than idleAfter. Caller holds mu.
+func (l *Limiter) prune(now time.Time) {
+	for k, b := range l.buckets {
+		if now.Sub(b.lastSeen) > l.idleAfter {
+			delete(l.buckets, k)
+		}
+	}
+}
+
+// Counters returns concurrency-safe cumulative counters for metrics.
+func (l *Limiter) Counters() LimiterCounters {
+	return LimiterCounters{
+		Allowed:          l.allowed.Load(),
+		Limited:          l.limited.Load(),
+		CapacityRejected: l.capacityRejected.Load(),
+	}
+}
+
+// Len reports the number of tracked keys (test/observability only).
+func (l *Limiter) Len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.buckets)
+}
+
+// ---------------------------------------------------------------------------
+// Trusted-proxy client-IP resolution
+// ---------------------------------------------------------------------------
+
+const maxTrustedProxyChain = 10
+
+type ipResolver struct {
+	trusted []netip.Prefix
+}
+
+func newIPResolver(prefixes []netip.Prefix) *ipResolver {
+	return &ipResolver{trusted: prefixes}
+}
+
+func (r *ipResolver) isTrusted(addr netip.Addr) bool {
+	for _, p := range r.trusted {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClientIP resolves the effective client address from the TCP peer and the
+// X-Forwarded-For chain. RemoteAddr is parsed robustly (IPv4, IPv6 with port,
+// optional zone). When no trusted proxies are configured the peer is used
+// unconditionally and XFF is ignored. When proxies are configured, the peer
+// must itself be trusted before any forwarded hop is believed, and the chain is
+// walked right-to-left only through trusted hops; a malformed chain is rejected
+// rather than trusting attacker-controlled leftmost entries.
+func (r *ipResolver) ClientIP(remoteAddr string, xffHeaders []string) (netip.Addr, error) {
+	peer, err := parseRemoteAddr(remoteAddr)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if len(r.trusted) == 0 {
+		return peer, nil
+	}
+	if !r.isTrusted(peer) {
+		// The immediate peer is not a trusted proxy; its forwarded claims are
+		// attacker-controlled, so use the peer itself.
+		return peer, nil
+	}
+
+	entries := flattenForwardedFor(xffHeaders)
+	if len(entries) == 0 {
+		return peer, nil
+	}
+	if len(entries) > maxTrustedProxyChain {
+		return netip.Addr{}, errMalformedForwardChain
+	}
+
+	// Walk right-to-left across the header, the appended order being the order
+	// the proxies saw the request. The first hop from the right that is not a
+	// trusted proxy is the original client; every hop in between must parse and
+	// be trusted. Every parsed address is unmapped to canonical IPv4 first.
+	for i := len(entries) - 1; i >= 0; i-- {
+		addr, perr := netip.ParseAddr(strings.TrimSpace(entries[i]))
+		if perr != nil {
+			return netip.Addr{}, errMalformedForwardChain
+		}
+		addr = addr.Unmap()
+		if !r.isTrusted(addr) {
+			return addr, nil
+		}
+	}
+	// Every hop is trusted; the leftmost entry is the client boundary.
+	left, perr := netip.ParseAddr(strings.TrimSpace(entries[0]))
+	if perr != nil {
+		return netip.Addr{}, errMalformedForwardChain
+	}
+	return left.Unmap(), nil
+}
+
+var errMalformedForwardChain = &forwardChainError{}
+
+type forwardChainError struct{}
+
+func (*forwardChainError) Error() string { return "malformed or spoofed forwarded IP chain" }
+
+// parseRemoteAddr extracts the IP from a TCP peer address string, tolerating
+// IPv4, IPv6-with-brackets-and-port, and zone-qualified forms. IPv4-mapped
+// IPv6 addresses are unmapped to their canonical IPv4 form at every boundary.
+func parseRemoteAddr(remoteAddr string) (netip.Addr, error) {
+	remoteAddr = strings.TrimSpace(remoteAddr)
+	if remoteAddr == "" {
+		return netip.Addr{}, &forwardChainError{}
+	}
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		if a, aerr := netip.ParseAddr(host); aerr == nil {
+			return a.Unmap(), nil
+		}
+	}
+	if a, err := netip.ParseAddr(remoteAddr); err == nil {
+		return a.Unmap(), nil
+	}
+	return netip.Addr{}, &forwardChainError{}
+}
+
+// flattenForwardedFor combines potentially multiple X-Forwarded-For headers
+// into a single right-to-left chain (values concatenate in header order).
+func flattenForwardedFor(headers []string) []string {
+	var out []string
+	for _, h := range headers {
+		for _, part := range strings.Split(h, ",") {
+			if v := strings.TrimSpace(part); v != "" {
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Security policy (per-server, built from config)
+// ---------------------------------------------------------------------------
+
+// securityPolicy bundles every request-time control derived from config.
+type securityPolicy struct {
+	verifySession  func(string) (auth.SessionClaims, error)
+	production     bool
+	secureCookie   bool
+	externalOrigin string
+	// externalBase is the validated external origin (scheme://host), used to
+	// render public absolute URLs for invite links. Empty when no external URL
+	// is configured (development), in which case relative paths are used.
+	externalBase string
+	sessionTTL   time.Duration
+	resolver     *ipResolver
+
+	loginLimiter        *Limiter
+	registrationLimiter *Limiter
+	inviteLimiter       *Limiter
+	tokenLimiter        *Limiter
+}
+
+// Session-bound CSRF is always enforced. Development relaxes only the rate
+// caps (a local server exercises many registrations fast) and the origin rule
+// (tests/CLI clients omit Origin); every state-changing cookie-authenticated
+// request still needs its session-bound CSRF token in both modes.
+func newSecurityPolicy(tokens *auth.SessionTokenManager, cfg *config.ControlPlaneConfig) *securityPolicy {
+	p := &securityPolicy{verifySession: func(_ string) (auth.SessionClaims, error) {
+		return auth.SessionClaims{}, &forwardChainError{}
+	}, sessionTTL: 24 * time.Hour}
+	if tokens != nil {
+		p.verifySession = tokens.Verify
+	}
+
+	login, reg, invite, token := defaultRateCaps()
+	trusted := []netip.Prefix(nil)
+	if cfg != nil {
+		p.production = cfg.IsProduction()
+		p.secureCookie = cfg.SecureCookie
+		p.externalOrigin = cfg.ExternalOrigin()
+		if cfg.ExternalURL != nil {
+			p.externalBase = cfg.ExternalOrigin()
+		}
+		p.sessionTTL = cfg.SessionTTL
+		trusted = cfg.TrustedProxyCIDRs
+	}
+	p.resolver = newIPResolver(trusted)
+	if !p.production {
+		login, reg, invite, token = generousRateCaps()
+	}
+	p.loginLimiter = NewLimiter(login.Rate, login.Burst, login.MaxKeys, login.IdleAfter, nil)
+	p.registrationLimiter = NewLimiter(reg.Rate, reg.Burst, reg.MaxKeys, reg.IdleAfter, nil)
+	p.inviteLimiter = NewLimiter(invite.Rate, invite.Burst, invite.MaxKeys, invite.IdleAfter, nil)
+	p.tokenLimiter = NewLimiter(token.Rate, token.Burst, token.MaxKeys, token.IdleAfter, nil)
+	return p
+}
+
+// defaultRateCaps are the production bounds (binding): login 5/min burst 5 by
+// email+IP; registration 5/hour burst 5 by IP; invite creation 20/min burst 20
+// by principal+IP; registry-token issuance 30/min burst 30 by IP.
+func defaultRateCaps() (RateLimitConfig, RateLimitConfig, RateLimitConfig, RateLimitConfig) {
+	return RateLimitConfig{Rate: 5.0 / 60.0, Burst: 5, MaxKeys: defaultMaxKeys, IdleAfter: 15 * time.Minute},
+		RateLimitConfig{Rate: 5.0 / 3600.0, Burst: 5, MaxKeys: defaultMaxKeys, IdleAfter: time.Hour},
+		RateLimitConfig{Rate: 20.0 / 60.0, Burst: 20, MaxKeys: defaultMaxKeys, IdleAfter: 15 * time.Minute},
+		RateLimitConfig{Rate: 30.0 / 60.0, Burst: 30, MaxKeys: defaultMaxKeys, IdleAfter: 15 * time.Minute}
+}
+
+// generousRateCaps keep the controls in place but let a single development
+// server register/login many times within a minute during development without
+// tripping a production-grade throttle.
+func generousRateCaps() (RateLimitConfig, RateLimitConfig, RateLimitConfig, RateLimitConfig) {
+	return RateLimitConfig{Rate: 1000.0 / 60.0, Burst: 1000, MaxKeys: defaultMaxKeys, IdleAfter: 15 * time.Minute},
+		RateLimitConfig{Rate: 1000.0 / 3600.0, Burst: 1000, MaxKeys: defaultMaxKeys, IdleAfter: time.Hour},
+		RateLimitConfig{Rate: 1000.0 / 60.0, Burst: 1000, MaxKeys: defaultMaxKeys, IdleAfter: 15 * time.Minute},
+		RateLimitConfig{Rate: 1000.0 / 60.0, Burst: 1000, MaxKeys: defaultMaxKeys, IdleAfter: 15 * time.Minute}
+}
+
+// ---------------------------------------------------------------------------
+// CSRF
+// ---------------------------------------------------------------------------
+
+// securityContextKey is an unexported, typed context key so distinct security
+// context values can never collide (a bare struct{}{} key is identical for
+// every marker and would let the last write clobber the earlier ones).
+type securityContextKey string
+
+const (
+	csrfContextKey        securityContextKey = "csrf"
+	clientIPContextKey    securityContextKey = "client-ip"
+	requestIDContextKey   securityContextKey = "request-id"
+	requestBodyContextKey securityContextKey = "request-body"
+)
+
+// sessionClaimsFromCookie verifies the session cookie token, returning its
+// claims and whether it is a valid signed session.
+func (p *securityPolicy) sessionClaimsFromCookie(r *http.Request) (auth.SessionClaims, bool) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return auth.SessionClaims{}, false
+	}
+	claims, err := p.verifySession(cookie.Value)
+	if err != nil {
+		return auth.SessionClaims{}, false
+	}
+	return claims, true
+}
+
+// methodIsSafe reports whether the method is non-mutating.
+func methodIsSafe(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
+}
+
+// isFormContentType reports whether the request carries a canonical
+// application/x-www-form-urlencoded body — the only form type from which a
+// body CSRF candidate can be extracted. It parses the Content-Type with
+// mime.ParseMediaType (media type matching is case-insensitive/canonical and
+// ignores parameters/OWS/quoted values), NEVER substring matching, so a value
+// like "application/x-notmultipart" or a multipart string inside a quoted
+// parameter cannot false-match.
+func isFormContentType(r *http.Request) bool {
+	mediatype, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return mediatype == "application/x-www-form-urlencoded"
+}
+
+// isMultipartMediaType reports whether a canonical media type (already parsed
+// by mime.ParseMediaType, so lowercased and parameter/quote-stripped) is
+// multipart/form-data or any multipart/* subtype. The control plane rejects all
+// multipart bodies with 415 because no handler uses them.
+func isMultipartMediaType(mediaType string) bool {
+	return mediaType == "multipart/form-data" || strings.HasPrefix(mediaType, "multipart/")
+}
+
+// contentTypeState classifies the request's "Content-Type" header for routing.
+type contentTypeState int
+
+const (
+	// contentTypeUnspecified means the request carries no explicit Content-Type:
+	// either the header is absent entirely or it holds exactly one value that is
+	// blank after ASCII trimming. The body proceeds WITHOUT a Content-Type — this
+	// is a legitimate, common request (a bodyless POST, or a JSON/urlencoded body
+	// sent without a header) and must reach routing/CSRF/handler, never a 415.
+	contentTypeUnspecified contentTypeState = iota
+	// contentTypeOK carries a single present, well-formed, non-multipart media type.
+	contentTypeOK
+	// contentTypeMultipart carries a single present, well-formed multipart/* type.
+	contentTypeMultipart
+	// contentTypeMalformed carries a single present value that mime.ParseMediaType
+	// cannot parse (including a comma-joined list of media types, which the
+	// media-type grammar disallows).
+	contentTypeMalformed
+	// contentTypeAmbiguous carries multiple "Content-Type" header values (even
+	// when identical or all blank), which cannot be resolved to one media type.
+	contentTypeAmbiguous
+)
+
+// resolveContentType classifies the request's raw "Content-Type" header.
+// Header.Get is NEVER used here because a request may legitimately repeat the
+// header; Header.Get returns only the first value and would otherwise hide an
+// ambiguity. Every present value must agree to a single canonical media type:
+//
+//   - Absent, or exactly one value that is blank after ASCII trimming, is
+//     UNSPECIFIED, not malformed (the regression this round closes).
+//   - More than one value (Go keeps repeated lines as a slice) is ambiguous —
+//     even identical or all-blank values — and rejected rather than trusting
+//     one entry.
+//   - Exactly one present value is parsed canonically with mime.ParseMediaType
+//     (case-insensitive, parameter/OWS/quote aware, never substring matching);
+//     a parse error is malformed, a clean multipart/* is multipart, and
+//     anything else is OK.
+func resolveContentType(r *http.Request) contentTypeState {
+	vals := r.Header.Values("Content-Type")
+	if len(vals) == 0 {
+		return contentTypeUnspecified
+	}
+	if len(vals) > 1 {
+		return contentTypeAmbiguous
+	}
+	v := strings.Trim(vals[0], " \t")
+	if v == "" {
+		// A single value that trims to blank (ASCII SP/HTAB OWS only) counts as
+		// absent (unspecified). HTTP field OWS is exactly SP (0x20) and HTAB
+		// (0x09); other bytes — including Unicode whitespace like NBSP/U+00A0
+		// or U+2003 — stay present and go on to mime.ParseMediaType, where a
+		// non-media-type value is malformed (415), never "blank".
+		return contentTypeUnspecified
+	}
+	mediatype, _, err := mime.ParseMediaType(v)
+	if err != nil {
+		return contentTypeMalformed
+	}
+	if isMultipartMediaType(mediatype) {
+		return contentTypeMultipart
+	}
+	return contentTypeOK
+}
+
+// checkCSRF enforces the session-bound CSRF rule for cookie-authenticated
+// unsafe methods. An explicit Authorization header exempts ONLY when it is a
+// syntactically canonical Bearer whose session token the configured
+// verifier successfully validates. Any invalid or non-Bearer Authorization
+// does NOT exempt the request — if a valid session cookie is present the
+// cookie is authoritative and CSRF is required. Requests with an invalid
+// bearer and no valid cookie fall through so the router's authorization
+// boundary 401s. Returns false after writing a 403 when the request must be
+// rejected. It never consumes or caches the request body: form `_csrf` is
+// extracted from the exact bounded bytes already captured in request context
+// (url.ParseQuery), so the handler that parses independently later sees the
+// same bytes and a malformed form is never masked. JSON bodies are checked via
+// the header only.
+func (p *securityPolicy) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if methodIsSafe(r.Method) {
+		return true
+	}
+	if p.verifiedBearer(r) {
+		// Only a verified, canonical bearer is CSRF-exempt.
+		return true
+	}
+	claims, ok := p.sessionClaimsFromCookie(r)
+	if !ok {
+		// No valid session cookie: the router will 401 at the authorization
+		// boundary; there is no authenticated session to protect.
+		return true
+	}
+
+	// The stored session claim must itself be canonical lowercase 64-hex
+	// decoding to exactly 32 bytes before comparison; a legacy or malformed
+	// claim is rejected outright (403), so it can never be compared or pass.
+	expected, err := decodeCSRFCandidate(claims.CSRF)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid session CSRF"})
+		return false
+	}
+
+	// Collect EVERY candidate from all form fields and all headers. Exactly
+	// one candidate total is required: duplicates (even identical), conflicting
+	// form-vs-header pairs, and any extra value are all rejected.
+	var candidates []string
+	if isFormContentType(r) {
+		// NEVER call ParseForm/ParseMultipartForm here: it would consume AND
+		// cache r.Body, masking a malformed body from the handler and mutating
+		// r.Form/r.PostForm. Instead parse the exact bytes already bounded and
+		// restored by the middleware (an immutable copy, so the handler that
+		// parses independently later sees the same bytes). Multipart was
+		// already rejected 415 before this point.
+		body := requestBodyFromContext(r.Context())
+		values, perr := url.ParseQuery(string(body))
+		if perr != nil {
+			// ANY url.ParseQuery error — even when it returns partial values
+			// carrying a nominally-valid `_csrf` — is a 400 before CSRF or the
+			// handler runs, with no side effects. A malformed body is never
+			// silently accepted by extracting a partial token.
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed form body"})
+			return false
+		}
+		candidates = append(candidates, values["_csrf"]...)
+	}
+	for _, hv := range r.Header.Values("X-CSRF-Token") {
+		if hv != "" {
+			candidates = append(candidates, hv)
+		}
+	}
+
+	if len(candidates) == 0 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "missing CSRF token"})
+		return false
+	}
+	if len(candidates) != 1 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "conflicting CSRF tokens"})
+		return false
+	}
+	// Strict shape/decode of the single candidate before any comparison.
+	got, err := decodeCSRFCandidate(candidates[0])
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
+		return false
+	}
+	// Constant-time compare of the decoded 32-byte values. No side effects.
+	if subtle.ConstantTimeCompare(got, expected) != 1 {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid CSRF token"})
+		return false
+	}
+	*r = *r.WithContext(context.WithValue(r.Context(), csrfContextKey, claims.CSRF))
+	return true
+}
+
+var errMalformedCSRF = errors.New("malformed CSRF value")
+
+// decodeCSRFCandidate strictly validates a session CSRF value: it must be
+// canonical lowercase hex, exactly 64 characters, decoding to exactly 32
+// bytes. Uppercase, short, long, non-hex, whitespace-padded, and otherwise
+// malformed values are rejected so no ambiguous or legacy claim can be
+// compared. Returns the raw 32 byte key material for constant-time compare.
+func decodeCSRFCandidate(s string) ([]byte, error) {
+	if len(s) != 64 {
+		return nil, errMalformedCSRF
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
+			return nil, errMalformedCSRF
+		}
+	}
+	out, err := hex.DecodeString(s)
+	if err != nil || len(out) != 32 {
+		return nil, errMalformedCSRF
+	}
+	return out, nil
+}
+
+// CSRFFromContext returns the verified CSRF value surfaced to request context
+// (never to the authorization principal or policy).
+func CSRFFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(csrfContextKey).(string)
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// Origin validation for unauthenticated login/register forms
+// ---------------------------------------------------------------------------
+
+// checkOrigin enforces the login/register same-origin rule (ruling 1,
+// unauthenticated boundary). Production requires an Origin exactly equal to the
+// configured external origin; development permits an absent Origin but rejects
+// an explicit mismatch when an external URL is configured. Runs before any
+// credentials are touched.
+func (p *securityPolicy) checkOrigin(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost || !isLoginRegisterRoute(r.URL.Path) {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if p.production {
+		if origin == "" {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "origin required"})
+			return false
+		}
+		if !constantEqual(origin, p.externalOrigin) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request rejected"})
+			return false
+		}
+		return true
+	}
+	// Development: absent Origin allowed; explicit mismatch rejected when a
+	// canonical external URL is configured.
+	if origin == "" {
+		return true
+	}
+	if p.externalOrigin != "" && !constantEqual(origin, p.externalOrigin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request rejected"})
+		return false
+	}
+	return true
+}
+
+func isLoginRegisterRoute(path string) bool {
+	return path == "/api/auth/login" || path == "/api/users/register" ||
+		path == "/ui/login" || path == "/ui/register" || path == "/ui/invites/accept"
+}
+
+func constantEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit enforcement across routes
+// ---------------------------------------------------------------------------
+
+type routeClass string
+
+const (
+	routeNone   routeClass = ""
+	routeLogin  routeClass = "login"
+	routeReg    routeClass = "register"
+	routeInvite routeClass = "invite"
+	routeToken  routeClass = "token"
+)
+
+func classifyRoute(method string, path string) routeClass {
+	switch path {
+	case "/api/auth/login", "/ui/login":
+		if method == http.MethodPost {
+			return routeLogin
+		}
+	case "/api/users/register", "/ui/register", "/ui/invites/accept":
+		// /ui/invites/accept can create an account (RegisterAndAcceptInvite),
+		// so it always draws from the same per-IP registration bucket as
+		// /ui/register and cannot bypass it by alternating routes. Even when a
+		// signed-in user just accepts an invite, the registration cap still
+		// applies to this account-creation-capable route.
+		if method == http.MethodPost {
+			return routeReg
+		}
+	case "/token":
+		if method == http.MethodGet {
+			return routeToken
+		}
+	}
+	if strings.HasSuffix(path, "/invites") && method == http.MethodPost {
+		return routeInvite
+	}
+	return routeNone
+}
+
+func (p *securityPolicy) principalFor(r *http.Request) string {
+	if authz := r.Header.Get("Authorization"); authz != "" {
+		if subject := p.verifySubject(authz); subject != "" {
+			return subject
+		}
+	}
+	if claims, ok := p.sessionClaimsFromCookie(r); ok {
+		return claims.Subject
+	}
+	return ""
+}
+
+func (p *securityPolicy) verifySubject(authz string) string {
+	bearer := strings.TrimPrefix(authz, "Bearer ")
+	if bearer == authz {
+		return ""
+	}
+	claims, err := p.verifySession(bearer)
+	if err != nil {
+		return ""
+	}
+	return claims.Subject
+}
+
+// verifiedBearer reports whether the request's Authorization header is a
+// syntactically canonical Bearer whose session token the configured verifier
+// successfully validates. It is the ONLY condition under which a bearer
+// request is CSRF-exempt. A non-Bearer scheme, a malformed header, an
+// unverifiable/forged/expired token, or an empty token all return false.
+func (p *securityPolicy) verifiedBearer(r *http.Request) bool {
+	authz := r.Header.Get("Authorization")
+	if authz == "" {
+		return false
+	}
+	bearer := strings.TrimPrefix(authz, "Bearer ")
+	if bearer == authz {
+		// Not the canonical "Bearer " scheme.
+		return false
+	}
+	if strings.TrimSpace(bearer) == "" {
+		return false
+	}
+	if _, err := p.verifySession(bearer); err != nil {
+		return false
+	}
+	return true
+}
+
+func (p *securityPolicy) writeRateLimited(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.FormatInt(int64(math.Ceil(wait.Seconds())), 10))
+	writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests, please try again later"})
+}
+
+// checkRateLimit enforces the per-route bucket before any expensive credential
+// work. The route class is supplied by the caller (classified BEFORE any body
+// is read) so email extraction only happens on login routes. Keys are hashed in
+// memory and never stored raw.
+func (p *securityPolicy) checkRateLimit(w http.ResponseWriter, r *http.Request, class routeClass, clientIP netip.Addr, email string) bool {
+	if class == routeNone {
+		return true
+	}
+	key := ""
+	switch class {
+	case routeLogin:
+		key = hashLimiterKey(NormalizeEmail(email) + "|" + clientIP.String())
+	case routeReg:
+		key = hashLimiterKey(clientIP.String())
+	case routeInvite:
+		key = hashLimiterKey(p.principalFor(r) + "|" + clientIP.String())
+	case routeToken:
+		key = hashLimiterKey(clientIP.String())
+	}
+	limiter := p.limiterFor(class)
+	allowed, wait := limiter.Allow(key)
+	if !allowed {
+		p.writeRateLimited(w, wait)
+		return false
+	}
+	return true
+}
+
+func (p *securityPolicy) limiterFor(class routeClass) *Limiter {
+	switch class {
+	case routeLogin:
+		return p.loginLimiter
+	case routeReg:
+		return p.registrationLimiter
+	case routeInvite:
+		return p.inviteLimiter
+	case routeToken:
+		return p.tokenLimiter
+	}
+	return nil
+}
+
+func hashLimiterKey(k string) string {
+	sum := sha256.Sum256([]byte(k))
+	var b strings.Builder
+	for _, x := range sum {
+		const hexdig = "0123456789abcdef"
+		b.WriteByte(hexdig[x>>4])
+		b.WriteByte(hexdig[x&0xf])
+	}
+	return b.String()
+}
+
+// loginEmail peels the email from a login/register form or JSON body for the
+// rate-limit key, WITHOUT calling ParseForm, so a failed/malformed parse is
+// never cached-and-masked for the handler. It reads the exact bounded bytes
+// from the middleware context (an immutable copy) and leaves r.Body intact, so
+// the handler's own parse still observes real parse errors.
+func loginEmail(r *http.Request) string {
+	body := requestBodyFromContext(r.Context())
+	if len(body) == 0 {
+		return ""
+	}
+	if isFormContentType(r) {
+		values, perr := url.ParseQuery(string(body))
+		if perr != nil {
+			return ""
+		}
+		return values.Get("email")
+	}
+	var creds struct {
+		Email string `json:"email"`
+	}
+	_ = json.Unmarshal(body, &creds)
+	return creds.Email
+}
+
+// ---------------------------------------------------------------------------
+// Request middleware
+// ---------------------------------------------------------------------------
+
+// ClientIPFromContext returns the resolved client address for the request.
+func ClientIPFromContext(ctx context.Context) (netip.Addr, bool) {
+	a, ok := ctx.Value(clientIPContextKey).(netip.Addr)
+	return a, ok
+}
+
+// requestBodyFromContext returns the bounded body bytes captured by the
+// security middleware for body-capable methods. It is nil when no body was
+// captured (body-free method). The returned slice is an immutable copy; never
+// mutate it.
+func requestBodyFromContext(ctx context.Context) []byte {
+	b, _ := ctx.Value(requestBodyContextKey).([]byte)
+	return b
+}
+
+// requestIDHeader names the response header echoing the correlating request ID.
+const requestIDHeader = "X-Request-Id"
+
+// RequestIDFromContext returns the request ID generated by the security
+// middleware (never trusted from an incoming header).
+func RequestIDFromContext(ctx context.Context) string {
+	v, _ := ctx.Value(requestIDContextKey).(string)
+	return v
+}
+
+// requestIDRandom is the source of cryptographic randomness for request IDs. It
+// is an injectable package var so tests can force the crypto path to fail and
+// assert the deterministic process-unique fallback still yields a non-empty ID.
+var requestIDRandom = rand.Read
+
+// requestIDCounter backs the deterministic fallback (atomic count + time) so a
+// request ID can never be empty even when the entropy source fails.
+var requestIDCounter atomic.Uint64
+
+// newRequestID returns a fresh cryptographically random request ID (16 bytes,
+// hex-encoded). If the entropy source fails it falls back to a deterministic,
+// process-unique value (atomic counter + time, hashed) so it is NEVER empty.
+func newRequestID() string {
+	buf := make([]byte, 16)
+	if _, err := requestIDRandom(buf); err == nil {
+		return hex.EncodeToString(buf)
+	}
+	return fallbackRequestID()
+}
+
+// fallbackRequestID returns a non-empty, process-unique request ID derived from
+// an atomic counter plus the current time, hashed and hex-encoded. It is not
+// cryptographically random, but it never empties the correlator.
+func fallbackRequestID() string {
+	n := requestIDCounter.Add(1)
+	sum := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10) + ":" + strconv.FormatUint(n, 10)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// controlPlaneBodyLimit is the maximum request body the control plane accepts
+// (1 MiB). Larger bodies are rejected with 413 before any handler or parse.
+const controlPlaneBodyLimit = 1 << 20
+
+// maxBodyBytes is retained as an alias for backward-compatibility with the
+// existing body-bound tests.
+const maxBodyBytes = controlPlaneBodyLimit
+
+// methodMayHaveBody reports whether a request method can carry a body that must
+// be bounded before routing. Safe methods (GET/HEAD/OPTIONS) never read it.
+func methodMayHaveBody(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+// bufferRequestBody bounds and restores a request body for body-capable
+// methods. It reads at most controlPlaneBodyLimit+1 bytes: if the body is
+// larger (known via ContentLength or actual read, including chunked) it returns
+// overflow=true with no side effects; otherwise it returns the exact bounded
+// bytes and replaces r.Body with a fresh reader over them so every later
+// handler parse reads the buffer. The ORIGINAL body is closed exactly once on
+// every path (success, overflow, read error, and known-ContentLength fast
+// reject); the replacement reader is installed only after a successful bounded
+// read and is never closed before the handler. Safe methods leave the body
+// untouched.
+func bufferRequestBody(r *http.Request) (data []byte, overflow bool, err error) {
+	if !methodMayHaveBody(r.Method) || r.Body == nil {
+		return nil, false, nil
+	}
+	if r.ContentLength > int64(controlPlaneBodyLimit) {
+		// Known oversized from Content-Length: reject without reading a byte,
+		// closing the original body once.
+		r.Body.Close()
+		r.Body = http.NoBody
+		return nil, true, nil
+	}
+	data, err = io.ReadAll(io.LimitReader(r.Body, controlPlaneBodyLimit+1))
+	// Close the original body exactly once regardless of the read outcome.
+	r.Body.Close()
+	if err != nil {
+		r.Body = http.NoBody
+		return nil, false, err
+	}
+	if len(data) > controlPlaneBodyLimit {
+		r.Body = http.NoBody
+		return nil, true, nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return data, false, nil
+}
+
+const (
+	headerCSP      = "Content-Security-Policy"
+	headerNoSniff  = "X-Content-Type-Options"
+	headerFrame    = "X-Frame-Options"
+	headerReferrer = "Referrer-Policy"
+)
+
+// securityHeaders are applied to every response. The CSP is tuned for the
+// control plane's own templates, which render a single inline <style> and
+// inline <script> (no third-party assets).
+func securityHeaders(h http.Header) {
+	h.Set(headerCSP, "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'")
+	h.Set(headerNoSniff, "nosniff")
+	h.Set(headerFrame, "DENY")
+	h.Set(headerReferrer, "strict-origin-when-cross-origin")
+}
+
+// wrap returns the security-enforcing handler around the router. Order is
+// deliberate: security headers are set, the request body is bounded, a
+// cryptographically random request ID is minted (never trusted inbound) and
+// echoed, client IP is resolved once, the route is classified, login/register
+// origin and rate limits are enforced before any credential work (only login
+// routes read the body for the email key), and CSRF is enforced before any
+// state-changing cookie-authenticated handler runs.
+func (p *securityPolicy) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		securityHeaders(w.Header())
+
+		// Bound and restore the request body BEFORE any route classification,
+		// content-type parse, or handler. Body-capable methods are buffered up
+		// to limit+1; overflow is an immediate 413 with no side effects — even
+		// on an unknown route AND even for multipart (size wins over media type,
+		// so an oversized multipart body is 413, not 415). Within-limit bodies
+		// are restored as the exact bounded bytes for every later parse. Safe
+		// methods never read the body.
+		data, overflow, err := bufferRequestBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "could not read request body"})
+			return
+		}
+		if overflow {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body too large"})
+			return
+		}
+
+		// ONLY after the body is bounded, for body-capable methods, capture an
+		// immutable copy of the bounded bytes (for CSRF/email inspection, so
+		// r.Body is never consumed or cached by us) and resolve the canonical
+		// Content-Type. An ABSENT or blank Content-Type is UNSPECIFIED — a
+		// legitimate request (bodyless POST, JSON/urlencoded body without a
+		// header) proceeds to routing/CSRF/handler, never a blanket 415. A
+		// PRESENT value must parse canonically via mime.ParseMediaType
+		// (case-insensitive, parameter/quote aware, never substring matching)
+		// and must not be multipart/*; ambiguity (multiple header values even
+		// when identical, or a comma-joined value) is also 415. Body size was
+		// already enforced first, so an oversized body is 413 regardless.
+		if methodMayHaveBody(r.Method) {
+			r = r.WithContext(context.WithValue(r.Context(), requestBodyContextKey, append([]byte(nil), data...)))
+			switch resolveContentType(r) {
+			case contentTypeOK:
+				// A well-formed, non-multipart media type: proceed; the
+				// downstream handler/CSRF decides whether the type is usable.
+			case contentTypeMultipart:
+				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "multipart form data is not supported"})
+				return
+			case contentTypeMalformed, contentTypeAmbiguous:
+				writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+				return
+			}
+		}
+
+		rid := newRequestID()
+		w.Header().Set(requestIDHeader, rid)
+		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey, rid))
+
+		clientIP, err := p.resolver.ClientIP(r.RemoteAddr, r.Header.Values("X-Forwarded-For"))
+		if err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid peer address"})
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), clientIPContextKey, clientIP))
+
+		if !p.checkOrigin(w, r) {
+			return
+		}
+
+		// Classify BEFORE reading any body; only login routes extract email.
+		class := classifyRoute(r.Method, r.URL.Path)
+		email := ""
+		if class == routeLogin {
+			email = loginEmail(r)
+		}
+		if !p.checkRateLimit(w, r, class, clientIP, email) {
+			return
+		}
+		if !p.checkCSRF(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// sessionCSRF returns the verified CSRF claim for the request's session cookie
+// (empty when there is no valid cookie). UI rendering uses it to stamp every
+// form with its session-bound token.
+func (p *securityPolicy) sessionCSRF(r *http.Request) string {
+	claims, ok := p.sessionClaimsFromCookie(r)
+	if !ok {
+		return ""
+	}
+	return claims.CSRF
+}

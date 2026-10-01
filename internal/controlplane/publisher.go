@@ -3,19 +3,31 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
+	"github.com/uncloud-registry/registry/internal/resolve"
 	"github.com/uncloud-registry/registry/internal/spec"
 	"github.com/uncloud-registry/registry/internal/swarm"
 )
 
-type DocumentUploader interface {
-	Put(ctx context.Context, data []byte, batchID string) (string, error)
-}
-
+// RegistryFeedUpdater writes a registry policy/repo feed update. batchID is
+// the exact Bee postage batch to stamp the update with; it is carried
+// unchanged into the swarm updater so the signer never substitutes the content
+// reference as the postage batch.
+//
+// createOnly is the EXPLICIT creation intent (Task 13): true means the update
+// is the feed's FIRST write only — an already-existing feed must surface as
+// swarm.ErrFeedAlreadyExists (through errors.Is) with ZERO write side
+// effects; a lost creation race at the immutable SOC layer maps to the same
+// sentinel, never to an overwrite or a success. false keeps the strict
+// next-index advance contract. Implementations MUST never leak URLs/bodies
+// through the returned error, and MUST treat a non-404/non-conflict failure
+// as an ordinary dependency error.
 type RegistryFeedUpdater interface {
-	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string) error
+	UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string, createOnly bool) error
 }
 
 type MembershipSubject struct {
@@ -32,8 +44,76 @@ type BootstrapPublication struct {
 }
 
 type Publisher struct {
-	Documents DocumentUploader
-	Feeds     RegistryFeedUpdater
+	// Documents is the writable/readable object store: Put uploads a policy
+	// document and returns its content address; Get reads a content address
+	// back so the reconciler can prove read-back. The same store must serve
+	// both, so an outbox worker that uploaded a document can later read it.
+	Documents ObjectStore
+	// Feeds writes a policy feed update pointing at an uploaded document.
+	Feeds RegistryFeedUpdater
+	// FeedsReader independently resolves a policy feed to the ref currently
+	// stored at it, so the reconciler can verify the feed really points at
+	// the uploaded object before marking a job verified. Without it,
+	// CreateRegistry fails closed (a no-op/wrong/overwritten feed updater
+	// must never complete a job).
+	FeedsReader FeedResolver
+}
+
+// MemoryRegistryFeedStore is the combined in-memory feed updater + resolver
+// used by tests. Its single map holds feed->ref exactly as written, so
+// reconciliation resolves the SAME state the updater wrote. Tests may also
+// mutate Feeds directly to simulate an independent/overwritten feed mapping
+// (a mis-directed feed) and prove the reconciler refuses to complete a job
+// whose resolved ref does not equal the uploaded object ref. Batches records
+// the exact batchID each feed was updated with, so tests can assert the
+// signer's batch propagation precisely.
+type MemoryRegistryFeedStore struct {
+	Feeds   map[string]string
+	Batches map[string]string
+	mu      sync.Mutex
+}
+
+func (m *MemoryRegistryFeedStore) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, batchID string, createOnly bool) error {
+	if m == nil {
+		return errors.New("feed store is not configured")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Feeds == nil {
+		m.Feeds = map[string]string{}
+	}
+	if m.Batches == nil {
+		m.Batches = map[string]string{}
+	}
+	// Create-only models the swarm contract: an existing feed is the stable
+	// ErrFeedAlreadyExists BEFORE any write; a lost race (absent at lookup,
+	// present at write) is the same sentinel — never an overwrite.
+	if createOnly {
+		if _, exists := m.Feeds[feed]; exists {
+			return fmt.Errorf("create-only feed update: %w", swarm.ErrFeedAlreadyExists)
+		}
+		if _, exists := m.Batches[feed]; exists {
+			return fmt.Errorf("create-only feed update: %w", swarm.ErrFeedAlreadyExists)
+		}
+	}
+	m.Feeds[feed] = ref
+	m.Batches[feed] = batchID
+	return nil
+}
+
+func (m *MemoryRegistryFeedStore) ResolveFeed(_ context.Context, feed string) (string, error) {
+	if m == nil {
+		return "", errors.New("feed store is not configured")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ref, ok := m.Feeds[feed]
+	if !ok {
+		// Wrap the stable sentinel so the signer's generation-zero path can
+		// distinguish a conclusively absent feed from a real failure.
+		return "", fmt.Errorf("feed %q not found: %w", feed, resolve.ErrFeedNotFound)
+	}
+	return ref, nil
 }
 
 func (p Publisher) PublishBootstrap(ctx context.Context, registry Registry, memberships []MembershipSubject) (BootstrapPublication, error) {
@@ -72,7 +152,7 @@ func (p Publisher) PublishRawAuthPolicy(ctx context.Context, registry Registry, 
 		return "", fmt.Errorf("upload auth policy document: %w", err)
 	}
 	feed := authPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update auth policy feed: %w", err)
 	}
 	return feed, nil
@@ -88,7 +168,7 @@ func (p Publisher) PublishRawStampPolicy(ctx context.Context, registry Registry,
 		return "", fmt.Errorf("upload stamp policy document: %w", err)
 	}
 	feed := stampPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update stamp policy feed: %w", err)
 	}
 	return feed, nil
@@ -119,7 +199,7 @@ func (p Publisher) publishAuthPolicy(ctx context.Context, registry Registry, mem
 		return "", fmt.Errorf("upload auth policy document: %w", err)
 	}
 	feed := authPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update auth policy feed: %w", err)
 	}
 	return feed, nil
@@ -143,7 +223,7 @@ func (p Publisher) publishStampPolicy(ctx context.Context, registry Registry, me
 		return "", fmt.Errorf("upload stamp policy document: %w", err)
 	}
 	feed := stampPolicyFeedRef(registry)
-	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref); err != nil {
+	if err := p.Feeds.UpdateRegistryFeed(ctx, registry, feed, ref, registry.DefaultStampBatchID, false); err != nil {
 		return "", fmt.Errorf("update stamp policy feed: %w", err)
 	}
 	return feed, nil
@@ -161,20 +241,55 @@ type MemoryRegistryFeedUpdater struct {
 	Feeds map[string]string
 }
 
-func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string) error {
+func (m *MemoryRegistryFeedUpdater) UpdateRegistryFeed(_ context.Context, _ Registry, feed string, ref string, _ string, _ bool) error {
 	m.Feeds[feed] = ref
 	return nil
 }
 
+// FeedKeyDecryptor resolves the transient decrypted feed-owner signing key for
+// a registry. It is the boundary between at-rest encryption and the signer:
+// stored ciphertext must never be handed to a signer, and decrypted key
+// material must never be persisted, logged, or stringified. The decrypted
+// bytes are owned by the operation and handed to fn for the immediate signing
+// call only; the implementer wipes them after fn returns. Service implements
+// it via Service.WithDecryptedFeedKey; the constrained signing consumer
+// (Task 9/10) builds on the same contract.
+type FeedKeyDecryptor interface {
+	WithDecryptedFeedKey(ctx context.Context, registryID int64, fn func([]byte) error) error
+}
+
+// BeeRegistryFeedUpdater signs sequence-feed updates with the registry's
+// feed-owner key. The key is obtained ONLY through a FeedKeyDecryptor — never
+// from storage directly and never by stringifying decrypted bytes; without
+// one configured, updates fail closed rather than handing stored ciphertext
+// to the signer. The signer is constructed from the raw key bytes inside the
+// callback, so the plaintext is wiped as soon as the signing call returns.
 type BeeRegistryFeedUpdater struct {
 	BaseURL    string
 	HTTPClient *http.Client
+	Keys       FeedKeyDecryptor
 }
 
-func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string) error {
-	updater, err := swarm.NewBeeSequenceFeedUpdater(b.BaseURL, b.HTTPClient, registry.EncryptedFeedPrivateKey)
-	if err != nil {
-		return err
+func (b BeeRegistryFeedUpdater) UpdateRegistryFeed(ctx context.Context, registry Registry, feed string, ref string, batchID string, createOnly bool) error {
+	if b.Keys == nil {
+		return errors.New("registry feed key decryptor is not configured; refusing to sign feed updates with stored ciphertext")
 	}
-	return updater.UpdateFeed(ctx, feed, ref)
+	return b.Keys.WithDecryptedFeedKey(ctx, registry.ID, func(key []byte) error {
+		updater, err := swarm.NewBeeSequenceFeedUpdaterBytes(b.BaseURL, b.HTTPClient, key)
+		if err != nil {
+			return err
+		}
+		// The explicit postage batch flows through unchanged; the updater
+		// validates feed/owner/reference/batch strictly BEFORE any network
+		// call and never substitutes the content reference as the batch.
+		// createOnly carries the creation intent (ErrFeedAlreadyExists
+		// semantics) through the raw sentinel — the error carries no URL or
+		// body content.
+		return updater.Update(ctx, swarm.FeedUpdate{
+			Feed:       feed,
+			Reference:  ref,
+			BatchID:    batchID,
+			CreateOnly: createOnly,
+		})
+	})
 }
