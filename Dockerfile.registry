@@ -12,7 +12,7 @@
 # so the in-network Docker/Podman e2e clients can address the registry host
 # portless; the image default and documented port remain 8080.
 
-FROM golang:1.25.13-alpine AS build
+FROM golang:1.27.1-alpine AS build
 WORKDIR /src
 
 # Dependency layer first: changes to go.mod/go.sum invalidate only this layer.
