@@ -201,6 +201,13 @@ func (s *BeeDocumentStore) Read(ctx context.Context, ref string) ([]byte, error)
 		return s.readPath(ctx, "/feeds/"+owner+"/"+topic)
 	default:
 		normalized := normalizeBZZReference(ref)
+		// Policy/state documents are stored as raw /bytes objects (the
+		// publisher writes them with POST /bytes), which Bee serves only on
+		// /bytes/<ref>; /bzz/<ref> needs a manifest and 308s. Names that are
+		// not a 64-hex reference keep the /bzz path.
+		if len(normalized) == 64 && isHexString(normalized, 64) {
+			return s.readPath(ctx, "/bytes/"+normalized)
+		}
 		return s.readPath(ctx, "/bzz/"+url.PathEscape(normalized))
 	}
 }

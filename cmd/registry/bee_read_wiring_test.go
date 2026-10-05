@@ -245,12 +245,12 @@ func TestBeeHandlerProductionReadLayering(t *testing.T) {
 		t.Fatalf("unexpected resolved repo state: %+v", doc)
 	}
 	repoTopicPath := "/feeds/" + strings.TrimPrefix(spec.RepoStateFeedRef("0x"+beeWiringOwner, "backend/api"), "feed://")
-	feeds, bzz, _ := fixture.counts()
+	feeds, bzz, bytesHits := fixture.counts()
 	if feeds[repoTopicPath] != 1 {
 		t.Fatalf("repo feed must be read exactly once via /feeds, got %d", feeds[repoTopicPath])
 	}
-	if len(bzz) != 1 || bzz[binaryRef(0x10)] != 1 {
-		t.Fatalf("the resolved document must come from exactly one /bzz read of the decoded hex ref, got %v", bzz)
+	if len(bzz) != 0 || len(bytesHits) != 1 || bytesHits[binaryRef(0x10)] != 1 {
+		t.Fatalf("the resolved document must come from exactly one /bytes read of the decoded hex ref (and no /bzz), got bzz=%v bytes=%v", bzz, bytesHits)
 	}
 	// The feed body bytes are NOT JSON-valid; a JSON decode would have failed.
 	if json.Valid(fixture.feeds[repoTopicPath]) {
@@ -294,8 +294,11 @@ func TestBeeHandlerProductionReadLayering(t *testing.T) {
 	if feeds[repoTopicPath] != 2 || feeds[authTopicPath] != 1 {
 		t.Fatalf("read layering violated: repo path hits=%d (want 2: resolve+pull), auth policy hits=%d (want 1)", feeds[repoTopicPath], feeds[authTopicPath])
 	}
-	if bzz[binaryRef(0x10)] != 2 || bzz[binaryRef(0x20)] != 1 {
-		t.Fatalf("/bzz reads must be exactly the state+policy documents, got %v", bzz)
+	if len(bzz) != 0 {
+		t.Fatalf("documents must not be read via /bzz, got %v", bzz)
+	}
+	if bytes[binaryRef(0x10)] != 2 || bytes[binaryRef(0x20)] != 1 {
+		t.Fatalf("/bytes reads must include exactly the state+policy documents, got %v", bytes)
 	}
 	if bytes[binaryRef(0x30)] != 1 {
 		t.Fatalf("the manifest object must come from /bytes, got %v", bytes)

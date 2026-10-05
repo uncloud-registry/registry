@@ -49,7 +49,7 @@ func (f *docBeeFixture) handler() http.Handler {
 			w.Header().Set("Swarm-Feed-Index", "0000000000000001")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(binaryBytes(docRef))
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/bzz/"):
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/bytes/"):
 			w.WriteHeader(f.bzzStatus)
 			if f.bzzStatus == http.StatusOK {
 				_, _ = w.Write(f.bzzBody)
