@@ -613,22 +613,48 @@ func (h *Handler) handlePullBlob(w http.ResponseWriter, r *http.Request, registr
 		return
 	}
 
-	state, err := h.Resolver.ResolveRepoState(r.Context(), registryIdentity, repo)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", messageRepositoryNotFound)
-		return
-	}
+	state, stateErr := h.Resolver.ResolveRepoState(r.Context(), registryIdentity, repo)
 
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		// Unsupported methods on the blob route are an explicit data-free 405
 		// UNSUPPORTED with the route's Allow contract; DELETE is intercepted
 		// earlier as a documented deferred operation.
+		if stateErr != nil {
+			writeError(w, http.StatusNotFound, "NAME_UNKNOWN", messageRepositoryNotFound)
+			return
+		}
 		writeUnsupported(w, allowBlobs, messageUnsupportedMethod)
 		return
 	}
 
-	desc, ok := state.Blobs[digest]
-	if !ok {
+	var desc spec.BlobDescriptor
+	found := false
+	if stateErr == nil {
+		desc, found = state.Blobs[digest]
+	}
+	if !found {
+		// Docker re-checks a blob right after uploading it and before the
+		// manifest commit, so the blob may exist only as the caller's own
+		// finalized staged upload (the repo may not even have state yet).
+		// Scoped to the authenticated uploader; anonymous callers never see
+		// staged content.
+		if principal.Subject != "" && principal.Subject != auth.AnonymousSubject && h.Staging != nil {
+			if staged, err := h.Staging.ListStagedBlobs(r.Context(), repo, principal.Subject); err == nil {
+				for _, sb := range staged {
+					if sb.Digest == digest {
+						desc = spec.BlobDescriptor{SwarmRef: sb.SwarmRef, Size: sb.Size, MediaType: sb.MediaType}
+						found = true
+						break
+					}
+				}
+			}
+		}
+	}
+	if !found {
+		if stateErr != nil {
+			writeError(w, http.StatusNotFound, "NAME_UNKNOWN", messageRepositoryNotFound)
+			return
+		}
 		writeError(w, http.StatusNotFound, ErrorCodeBlobUnknown, "blob not found")
 		return
 	}
