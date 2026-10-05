@@ -119,6 +119,7 @@ func buildMemoryHandler() (http.Handler, error) {
 	if rh, ok := handler.(*registry.Handler); ok {
 		rh.Metrics = metrics
 		rh.Logger = logger
+		rh.PingChallenge = envOrDefault("REGISTRY_PING_CHALLENGE", "") == "true"
 	}
 	return handler, nil
 }
@@ -343,6 +344,7 @@ func buildBeeHandler() (http.Handler, error) {
 	if rh, ok := handler.(*registry.Handler); ok {
 		rh.MaxUploadBytes = stageCfg.MaxUploadBytes
 		rh.SessionTTL = stageCfg.UploadTTL
+		rh.PingChallenge = envOrDefault("REGISTRY_PING_CHALLENGE", "") == "true"
 		// Task 23 telemetry + readiness wiring: the request middleware, the
 		// operational endpoints, the staged-bytes/sessions gauges (durable
 		// staging source), and the Bee readiness probe. The Bee probe uses the

@@ -125,6 +125,7 @@ services:
       REGISTRY_TOKEN_PUBLIC_KEYS_FILE: /var/run/uncloud-registry-secrets/registry-jwks.json
       REGISTRY_TOKEN_AUDIENCE: ${REGISTRY_TOKEN_AUDIENCE:-}
       REGISTRY_AUTH_REALM: ${REGISTRY_AUTH_REALM:-https://controlplane.uncloud-registry.test/token}
+      REGISTRY_PING_CHALLENGE: ${REGISTRY_PING_CHALLENGE:-}
       # Registry -> control-plane internal feed signer (TLS, custom CA bundle).
       CONTROLPLANE_URL: https://controlplane:8089
       CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt

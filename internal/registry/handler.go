@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -117,6 +118,12 @@ type Handler struct {
 	Locker     *publish.RepositoryLocker
 	SessionTTL time.Duration
 	AuthRealm  string
+	// PingChallenge makes the /v2 base ping answer 401 with a Bearer
+	// challenge. Docker CLI only fetches a token after a challenged ping, so
+	// without it docker push never authenticates. Off by default: the
+	// control plane rejects token requests without credentials, so enabling
+	// it also ends anonymous docker pulls.
+	PingChallenge bool
 	// MaxUploadBytes bounds any single upload; when >0 it also bounds the
 	// copy boundary the handler passes to streaming Append for requests
 	// without an explicit Content-Range. Zero means the handler uses a
@@ -381,6 +388,11 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set(headerAPIVersion, "registry/2.0")
+		if h.PingChallenge && r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm=%q,service=%q`, h.AuthRealm, hostOnly(r.Host)))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1394,4 +1406,12 @@ func writeError(w http.ResponseWriter, status int, code string, message string) 
 			},
 		},
 	})
+}
+
+// hostOnly strips an optional :port from a Host header value.
+func hostOnly(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
 }

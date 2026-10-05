@@ -127,7 +127,7 @@ which keeps push working.
 
 ## 5. Authentication behavior
 
-- `/v2` base ping is anonymous and requires no token.
+- `/v2` base ping is anonymous and requires no token, unless `REGISTRY_PING_CHALLENGE=true`: then an unauthenticated ping answers `401` + `Bearer realm,service` so the Docker CLI fetches a token before pushing. Anonymous docker pulls stop working in that mode (the control plane's `/token` requires basic auth).
 - **Pull** may be anonymous **iff** the repository's auth policy lists
   `anonymous`; otherwise a pull without a valid credential answers
   `401` + `WWW-Authenticate` with the `Bearer realm/service/scope` challenge

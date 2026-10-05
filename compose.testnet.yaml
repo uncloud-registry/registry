@@ -114,6 +114,7 @@ services:
       REGISTRY_TOKEN_PUBLIC_KEYS_FILE: /var/run/uncloud-registry-secrets/registry-jwks.json
       REGISTRY_TOKEN_AUDIENCE: ${REGISTRY_TOKEN_AUDIENCE:-}
       REGISTRY_AUTH_REALM: ${REGISTRY_AUTH_REALM:-https://controlplane.uncloud-registry.test/token}
+      REGISTRY_PING_CHALLENGE: ${REGISTRY_PING_CHALLENGE:-}
       CONTROLPLANE_URL: https://controlplane:8089
       CONTROLPLANE_INTERNAL_SECRET_FILE: /var/run/uncloud-registry-secrets/internal-secret.txt
       CONTROLPLANE_CA_BUNDLE_FILE: /var/run/uncloud-registry-secrets/internal-ca.pem
@@ -169,6 +170,7 @@ services:
           --swap-enable=true \
           --chequebook-enable=true \
           --full-node=true \
+          --postage-stamp-start-block=${BEE_STAMP_START_BLOCK:-6596277} \
           --verbosity=4 \
           --welcome-message=uncloud-registry-testnet
     volumes:
@@ -189,11 +191,13 @@ services:
     environment:
       CONTROLPLANE_HOST: ${CONTROLPLANE_HOST:-controlplane.uncloud-registry.test}
       REGISTRY_HOST_GLOB: ${REGISTRY_HOST_GLOB:-*.uncloud-registry.test}
+    # Funnel (or any external TLS terminator) proxies to caddy on the host
+    # loopback; caddy must NOT publish 80/443 publicly when behind it. The
+    # ports are parameterized so a standalone deploy can opt back in.
     ports:
-      - "80:80"
-      - "443:443"
+      - "${CADDY_BIND:-127.0.0.1:8080}:8080"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${CADDYFILE_PATH:-./deploy/Caddyfile}:/etc/caddy/Caddyfile:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2019/config/ || exit 1"]
       interval: 10s
