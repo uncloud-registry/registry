@@ -1397,9 +1397,15 @@ func makeFeedIdentifier(topic []byte, index []byte) []byte {
 
 func signSOCIdentifier(identifier []byte, wrappedChunkRef []byte, privateKey *ecdsa.PrivateKey) ([]byte, error) {
 	digest := ethcrypto.Keccak256(append(append([]byte{}, identifier...), wrappedChunkRef...))
-	signature, err := ethcrypto.Sign(digest, privateKey)
+	prefixed := ethcrypto.Keccak256([]byte("\x19Ethereum Signed Message:\n32"), digest)
+	signature, err := ethcrypto.Sign(prefixed, privateKey)
 	if err != nil {
 		return nil, fmt.Errorf("sign soc digest: %w", err)
 	}
 	return signature, nil
 }
+// signSOCIdentifier signs keccak256(id||ref) the way Bee's SOC handler
+// verifies it: EIP-191 personal_sign prefix over the digest, and the
+// recovery byte offset by 27. A raw-digest signature is rejected by Bee
+// with 401 "invalid chunk".
+	signature[64] += 27
