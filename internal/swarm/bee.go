@@ -1030,6 +1030,10 @@ func (u *BeeSequenceFeedUpdater) uploadChunk(ctx context.Context, chunkData []by
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
+	// Bee defaults to a deferred upload that pushes in the background; a
+	// feed update then stays invisible for about a minute and the
+	// read-after-write verification fails. Push synchronously.
+	req.Header.Set("Swarm-Deferred-Upload", "false")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1182,6 +1186,10 @@ func (u *BeeSequenceFeedUpdater) uploadSOC(ctx context.Context, owner string, id
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Swarm-Postage-Batch-Id", batchID)
+	// Bee defaults to a deferred upload that pushes in the background; a
+	// feed update then stays invisible for about a minute and the
+	// read-after-write verification fails. Push synchronously.
+	req.Header.Set("Swarm-Deferred-Upload", "false")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1402,6 +1410,10 @@ func makeFeedIdentifier(topic []byte, index []byte) []byte {
 	return ethcrypto.Keccak256(append(append([]byte{}, topic...), index...))
 }
 
+// signSOCIdentifier signs keccak256(id||ref) the way Bee's SOC handler
+// verifies it: EIP-191 personal_sign prefix over the digest, and the
+// recovery byte offset by 27. A raw-digest signature is rejected by Bee
+// with 401 "invalid chunk".
 func signSOCIdentifier(identifier []byte, wrappedChunkRef []byte, privateKey *ecdsa.PrivateKey) ([]byte, error) {
 	digest := ethcrypto.Keccak256(append(append([]byte{}, identifier...), wrappedChunkRef...))
 	prefixed := ethcrypto.Keccak256([]byte("\x19Ethereum Signed Message:\n32"), digest)
@@ -1409,10 +1421,6 @@ func signSOCIdentifier(identifier []byte, wrappedChunkRef []byte, privateKey *ec
 	if err != nil {
 		return nil, fmt.Errorf("sign soc digest: %w", err)
 	}
+	signature[64] += 27
 	return signature, nil
 }
-// signSOCIdentifier signs keccak256(id||ref) the way Bee's SOC handler
-// verifies it: EIP-191 personal_sign prefix over the digest, and the
-// recovery byte offset by 27. A raw-digest signature is rejected by Bee
-// with 401 "invalid chunk".
-	signature[64] += 27
