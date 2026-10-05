@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -613,6 +614,17 @@ func (s *Service) IssueRegistryToken(ctx context.Context, host string, scope str
 			return "", &classifiedFailure{cause: causeRegistryNotFound, class: tokenClassNotFound}
 		}
 		return "", &classifiedFailure{cause: causeDatastore, class: tokenClassBackend}
+	}
+
+	// A scope-less request is the Docker CLI's `docker login` credential
+	// check: credentials and registry are already verified above, so answer
+	// with a token that grants no repository access.
+	if scope == "" {
+		tok, err := s.RegistryTokens.IssueLogin("user:"+strconv.FormatInt(user.ID, 10), host, time.Minute)
+		if err != nil {
+			return "", &classifiedFailure{cause: causeSigning, class: tokenClassSigning}
+		}
+		return tok, nil
 	}
 
 	repository, actions, err := auth.ParseDockerScope(scope)

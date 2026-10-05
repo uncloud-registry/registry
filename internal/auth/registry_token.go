@@ -124,6 +124,32 @@ func (i *RegistryTokenIssuer) Issue(_ context.Context, req RegistryTokenRequest)
 	return token.SignedString(i.privateKey)
 }
 
+// IssueLogin signs a token that grants NO repository access. It answers the
+// scope-less credential check `docker login` performs: the caller has already
+// proven the credentials, and the token authorizes nothing.
+func (i *RegistryTokenIssuer) IssueLogin(subject string, service string, ttl time.Duration) (string, error) {
+	if subject == "" || service == "" {
+		return "", errors.New("registry login token subject and service are required")
+	}
+	now := time.Now()
+	claims := RegistryClaims{
+		TokenType: RegistryTokenType,
+		Service:   service,
+		Access:    []RegistryAccess{},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   subject,
+			Issuer:    i.issuer,
+			Audience:  jwt.ClaimStrings{service},
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        newJWTID(),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
+	token.Header["kid"] = i.keyID
+	return token.SignedString(i.privateKey)
+}
+
 // RegistryTokenVerifier validates Ed25519 registry tokens against a PublicKeySet
 // and an expected issuer + audience/service. Verify is the consumer interface for
 // Task 5.

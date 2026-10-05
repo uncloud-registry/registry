@@ -3,6 +3,7 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -523,5 +524,52 @@ func TestOversizedRegistrationAndInviteRejected413(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized invite must be 413, got %d", resp.StatusCode)
+	}
+}
+
+func TestTokenEndpointScopelessLogin(t *testing.T) {
+	_, server, _ := buildTokenServer(t, true, nil)
+	defer server.Close()
+	// The fixture's shared in-memory DB may already hold the registry, so
+	// use its fixed host rather than the (then empty) create result.
+	const host = "acc.uncloud-registry.com"
+
+	get := func(service, pass string) (*http.Response, []byte) {
+		req, _ := http.NewRequest(http.MethodGet, server.URL+"/token?service="+url.QueryEscape(service), nil)
+		req.SetBasicAuth("admin@example.com", pass)
+		resp := doReq(t, &http.Client{}, req)
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp, body
+	}
+
+	resp, body := get(host, "admin-pass")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("scope-less login with valid credentials: got %d %s, want 200", resp.StatusCode, body)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(body, &payload); err != nil || payload["token"] == "" {
+		t.Fatalf("login response must carry a token, got %s", body)
+	}
+	claims := strings.Split(payload["token"], ".")
+	if len(claims) != 3 {
+		t.Fatalf("token is not a JWT: %q", payload["token"])
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(claims[1])
+	if err != nil {
+		t.Fatalf("decode claims: %v", err)
+	}
+	var c struct {
+		Access []any `json:"access"`
+	}
+	if err := json.Unmarshal(raw, &c); err != nil || len(c.Access) != 0 {
+		t.Fatalf("login token must grant no repository access, got %s", raw)
+	}
+
+	if resp, body := get(host, "wrong-pass"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("scope-less login with a bad password must be 401, got %d %s", resp.StatusCode, body)
+	}
+	if resp, body := get("unknown.example", "admin-pass"); resp.StatusCode == http.StatusOK {
+		t.Fatalf("scope-less login for an unknown registry must not succeed, got %d %s", resp.StatusCode, body)
 	}
 }
