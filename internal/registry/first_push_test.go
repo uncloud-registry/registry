@@ -517,3 +517,26 @@ func TestManifestPutStaleFeedReadBackFailsClosed502(t *testing.T) {
 		t.Fatalf("verification failure must retain the referenced staging as a durable claim, got %+v", claims)
 	}
 }
+
+// A real Docker push stages blobs as octet-stream while the manifest declares
+// concrete media types; post-commit verification must accept that.
+func TestManifestPublishVerifiesGenericStagedBlobMediaType(t *testing.T) {
+	t.Parallel()
+
+	h, docs, feeds, issuer := newFirstPushWorld(t)
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	configBytes := []byte(`{"architecture":"amd64"}`)
+	configDigest := stageBlob(t, server.URL, issuer, configBytes, "application/octet-stream")
+	manifestBody := []byte(`{"schemaVersion":2,"config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":` + fmt.Sprintf("%d", len(configBytes)) + `,"digest":"` + configDigest + `"},"layers":[]}`)
+	resp := putManifest(t, server.URL, issuer, manifestBody)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("publish status %d, want 201 (body %s)", resp.StatusCode, body)
+	}
+	if _, ok := loadRepoState(t, docs, feeds).Blobs[configDigest]; !ok {
+		t.Fatal("staged blob must be published")
+	}
+}

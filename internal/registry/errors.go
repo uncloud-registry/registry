@@ -411,7 +411,9 @@ func verifyPublicationCoherence(ctx context.Context, docs resolve.Reader, bounde
 			if !ok {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced blob is missing from published state"))
 			}
-			if blob.Size != ref.Size || blob.MediaType != ref.MediaType {
+			// Same rule as publish-time validation: exact size, and a generic
+			// octet-stream/empty stored type (what Docker uploads) is transparent.
+			if publish.CheckBlobReferenceCoherence(ref, blob) != nil {
 				return newIntegrityError(fmt.Errorf("verify publication: a referenced blob descriptor disagrees with the manifest reference"))
 			}
 		}

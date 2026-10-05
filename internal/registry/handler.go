@@ -1285,9 +1285,21 @@ func (h *Handler) handleManifestPut(w http.ResponseWriter, r *http.Request, regi
 
 	if err != nil {
 		h.observePublicationFailure(r, err)
+		h.logPublicationCause(r, err)
 		status, code, message := classifyPublicationError(err)
 		writeError(w, status, code, message)
 	}
+}
+
+// logPublicationCause writes the private diagnostic cause of a failed
+// publication to the server log only; the client still gets the fixed class.
+func (h *Handler) logPublicationCause(r *http.Request, err error) {
+	var diag interface{ diagnose() error }
+	if !errors.As(err, &diag) {
+		return
+	}
+	slog.LogAttrs(r.Context(), slog.LevelWarn, "publication failed",
+		slog.String("cause", fmt.Sprint(diag.diagnose())))
 }
 
 // observePublicationFailure records the dedicated dependency/integrity
